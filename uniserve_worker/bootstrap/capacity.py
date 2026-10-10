@@ -257,10 +257,14 @@ def tensor_slot_capacity(
     if feasible:
         return feasible[-1]
 
+    # A slot holds one request's tensors at the deployment's capacities, so
+    # the operator either serves smaller ones or grants the storage.
     raise RuntimeError(
         "insufficient device storage for a common request tensor slot count: "
         f"candidate range {minimum}..{maximum}, local requirements "
-        f"{requirements}, {available_bytes} bytes available"
+        f"{requirements}, {available_bytes} bytes available; serve smaller "
+        "prompt, condition or duration capacities, or give the worker more "
+        "device storage"
     )
 
 

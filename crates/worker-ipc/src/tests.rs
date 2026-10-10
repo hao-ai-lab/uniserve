@@ -474,6 +474,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 call_id: call.call_id,
                 cursor: 0,
                 max_units: 1,
+                ranks: Vec::new(),
             });
         }
     }

@@ -62,6 +62,7 @@ fn base_denoiser() -> VideoDenoiserInfo {
         canvases: Vec::new(),
         max_sequence_rows: None,
         condition_tiles: None,
+        max_condition_rows: 0,
     }
 }
 
@@ -85,7 +86,6 @@ fn video_service(
             video_max_pixels: 25_165_824,
         },
         max_video_seconds,
-        uniserve_server::EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
         1,
         &VideoMediaSettings::default(),
         Arc::clone(tokenizer),
@@ -215,7 +215,8 @@ fn try_resolved_model(
     // 15-second maximum video duration.
     let config = match description {
         ModelDescription::MiniMaxH3 => {
-            ModelConfig::from_pipeline(description.id(), description, 15.0, Some(4096)).unwrap()
+            ModelConfig::from_pipeline(description.id(), description, 15.0, Some(4096), None)
+                .unwrap()
         }
         _ => tokio::runtime::Builder::new_current_thread()
             .build()
@@ -735,6 +736,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
         max_sequence_rows: None,
         condition_tiles: None,
+        max_condition_rows: 0,
     };
     let processor = |max_video_seconds: f64| {
         let mut config = loaded.config().clone();

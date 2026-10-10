@@ -6,11 +6,11 @@ the official first-frame request (W3) on the diffusers root's ``denoiser``
 deployment, and the image-plus-audio (W4) and official video-plus-audio (W5)
 reference requests on the ``reference_denoiser`` deployment, with the
 diffusers root's reference DiT and with a FastH3 OmniRef component export.
-The OmniRef export also serves a request just under its 131,072-row
-sequence bound and refuses one just over it before admission. Condition
-media are read from ``file://`` URIs under ``--media-directory``. Every
-response is a complete MP4 at the canvas and frame count the request
-resolves to.
+The OmniRef export also serves a request that fills its deployment's text
+and condition capacities and refuses one whose conditions exceed the
+condition capacity before admission. Condition media are read from
+``file://`` URIs under ``--media-directory``. Every response is a complete
+MP4 at the canvas and frame count the request resolves to.
 """
 
 from __future__ import annotations
@@ -127,7 +127,8 @@ def test_base_first_frame_request(tmp_path: Path) -> None:
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
     # The official first-frame presentation holds 1935 text rows and its
-    # keyframe 1008 condition rows, within the default condition capacity.
+    # keyframe 1008 condition rows; without a stated condition capacity the
+    # deployment provisions the two keyframes a request may bring.
     options = [
         "--max-video-seconds",
         "8",
@@ -249,10 +250,10 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
     )
 
 
-# The OmniRef checkpoint packs at most 131,072 rows. Five seconds, 49,536
-# text tokens and 43,776 condition rows make the largest layout its workers
-# prepare 131,022 rows: 37,296 + 414 generated rows, the text capacity and
-# six 16:9 reference images of 7,296 condition rows each (57 whole tiles).
+# Five seconds, 49,536 text tokens and 43,776 condition rows make the largest
+# layout the deployment's workers prepare 131,022 rows: 37,296 + 414 generated
+# rows, the text capacity and six 16:9 reference images of 7,296 condition
+# rows each (57 whole tiles).
 BOUND_OPTIONS = [
     "--max-video-seconds",
     "5",
@@ -315,9 +316,9 @@ def _bound_request(inputs: Path, *, audio: bool) -> dict:
     }
 
 
-def test_omniref_sequence_bound(tmp_path: Path) -> None:
-    # A request just under the 131,072-row bound is served; one just over
-    # it is refused before admission, naming its rows.
+def test_omniref_condition_capacity(tmp_path: Path) -> None:
+    # A request that fills the deployment's capacities is served; one over
+    # the condition capacity is refused before admission, naming its rows.
     inputs = _inputs()
     export, base_copy = _omniref()
     port = find_free_port()

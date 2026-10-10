@@ -110,6 +110,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             canvases: Vec::new(),
             max_sequence_rows: None,
             condition_tiles: None,
+            max_condition_rows: 0,
         },
         VisionConfig {
             patch_size: 16,
@@ -121,7 +122,6 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             video_max_pixels: 25_165_824,
         },
         max_video_seconds,
-        crate::EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
         1,
         &crate::VideoMediaSettings::default(),
         configured_tokenizer(),

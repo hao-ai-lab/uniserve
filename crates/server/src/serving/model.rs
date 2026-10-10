@@ -313,11 +313,35 @@ impl ModelConfig {
                 }
                 let vision = VisionConfig::read(&processor[0], &processor[1])
                     .map_err(|error| ModelResolutionError::MediaContract(format!("{error:#}")))?;
+                // A deployment that places the reference denoiser presents
+                // its references' vision tokens in the prompt, which the
+                // text encoder's context bounds; the checkpoint states it.
+                let references = if config
+                    .engine
+                    .workers
+                    .iter()
+                    .any(|worker| worker.components.contains_key(Self::REFERENCE_DENOISER))
+                {
+                    let text_encoder = pipeline
+                        .component_file("text_encoder", "config.json")
+                        .await?;
+                    let context = crate::profile::assets::load_model_config(Some(&text_encoder))?
+                        .max_position_embeddings()
+                        .ok_or_else(|| {
+                            ModelResolutionError::MediaContract(
+                                "the text encoder states no max_position_embeddings".to_owned(),
+                            )
+                        })?;
+                    Some(context)
+                } else {
+                    None
+                };
                 let model = Self::from_pipeline(
                     &served_name,
                     description,
                     config.engine.max_video_seconds,
                     config.engine.max_model_len,
+                    references,
                 )?;
                 return Ok(LoadedModel {
                     config: model,

@@ -1588,10 +1588,17 @@ pub struct DecodeRange {
     pub cursor: u32,
     /// Maximum decoder units the call may process.
     pub max_units: u32,
+    /// Ranks of a distributed component that hold the call's units, in unit
+    /// order: each takes the next `units_per_rank` units and the last what
+    /// remains. Empty deals the units to the component's ranks in configured
+    /// order, the deal of every call whose units follow that order.
+    #[serde(default)]
+    pub ranks: Vec<u32>,
 }
 
 impl DecodeRange {
-    /// Validates decode identity and unit capacity.
+    /// Validates decode identity, unit capacity, and that no rank holds two
+    /// runs of the call's units.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.call_id.batch_id > 0,
@@ -1600,6 +1607,10 @@ impl DecodeRange {
         ensure_valid!(
             self.max_units > 0,
             "decode params unit bound must be positive"
+        );
+        ensure_valid!(
+            self.ranks.iter().collect::<HashSet<_>>().len() == self.ranks.len(),
+            "decode params name each rank once"
         );
         Ok(())
     }

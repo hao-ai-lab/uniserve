@@ -607,8 +607,14 @@ def _devices(
 def loaded_worker_config(
     model: nn.Module, config: WorkerConfig, queue_depth: int
 ) -> WorkerConfig:
-    """Resolve media request slots from the worker's publication lifetime.
+    """Resolve the capacities that follow from the loaded model.
 
+    The condition capacity becomes the rows the deployment's video denoiser
+    provisions (``bootstrap.inputs.condition_capacity``): the configured
+    rows, the largest condition set the denoiser admits when none are
+    configured, and zero for a model without a video denoiser.
+
+    Media request slots follow from the worker's publication lifetime.
     A resident media slot occupies three positions of the worker's batch
     queue, one reserved pipeline position and two unresolved outputs, and a
     media worker keeps at least two slots resident. The same three-position
@@ -624,7 +630,23 @@ def loaded_worker_config(
     Raises:
         WorkerError: With ``UNSUPPORTED_SETUP`` when the queue depth or
             ``max_batch_calls`` leaves fewer than two slots.
+        ValueError: The errors of ``video_denoiser`` and
+            ``condition_capacity``.
     """
+    # Imported here: the input builders import this module's siblings.
+    from uniserve_worker.bootstrap.inputs import (
+        condition_capacity,
+        video_denoiser,
+    )
+
+    denoiser = video_denoiser(model, config)
+    config = replace(
+        config,
+        max_condition_rows=0
+        if denoiser is None
+        else condition_capacity(model, denoiser, config),
+    )
+
     if any(isinstance(module, VideoDecoder) for module in model.modules()):
         state_slots = min(config.max_batch_calls, queue_depth // 3)
         if state_slots < 2:

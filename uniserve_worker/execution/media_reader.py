@@ -1,7 +1,7 @@
 """Host execution of a video request's media reading.
 
-The media reader runs on a host rank of the head host, where the server
-published each condition's fetched bytes to shared memory. One media reading
+The media reader runs on a rank of the head host, where the server published
+each condition's fetched bytes to shared memory. One media reading
 call per conditioned request decodes every condition exactly as the server
 planned it (``uniserve_worker.media.reader``) and writes the request's
 condition products (``uniserve_worker.execution.conditions``):
@@ -16,8 +16,13 @@ condition products (``uniserve_worker.execution.conditions``):
 
 Conditions follow each other in request order in every product. Decoding
 runs as one task on the rank's host lane; ``execute`` reserves the products
-and configures that task, whose completion publishes them as host products
-for the vision and latent encoders, which read them on their own hosts.
+and configures that task, whose completion publishes them for the vision and
+latent encoders where the rank's storage lies. A host rank's products are
+host bytes: encoders on its host map them, and a rank on another host
+receives them over the rank channel, whose payload capacity bounds them. A
+device rank's products lie in its device storage, which encoder ranks on
+every host read through the device transport, so a deployment whose
+condition encoders span hosts places the reader on a device rank.
 Within the task every condition's frames and every audio track decode
 concurrently, since nothing reads the products until all of them are filled.
 """

@@ -108,7 +108,8 @@ def test_export_reads_its_other_components_from_the_base(checkpoints):
     assert denoiser.attention == SparseAttention(
         tile=128, sparsity=0.9, reference_keep=0.1
     )
-    assert denoiser.max_sequence_rows == 131_072
+    # Region selection's 8192 tiles of 128 rows, not a checkpoint bound.
+    assert denoiser.max_sequence_rows == 1_048_576
     assert config.tokenizer == base / "tokenizer"
     # The identity names the export; the base is pinned by its revision.
     assert config.checkpoint_identity == models.checkpoint_identity(export)

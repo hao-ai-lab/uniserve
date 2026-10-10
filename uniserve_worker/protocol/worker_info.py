@@ -298,10 +298,12 @@ class VideoDenoiserInfo:
     Mirrors the Rust ``VideoDenoiserInfo``. ``schedule_points`` counts the
     fixed schedule's sigma points, the clean endpoint included; ``canvases``
     lists the only canvases the deployment serves, those it prepares;
-    ``max_sequence_rows`` is the checkpoint's packed sequence capacity,
-    ``None`` when the checkpoint sets none; ``condition_tiles`` is the
+    ``max_sequence_rows`` is the rows the denoiser packs at most, ``None``
+    when it states no such bound; ``condition_tiles`` is the
     whole-tile condition packing of a multi-region denoiser, ``None`` for
-    dense packing.
+    dense packing; ``max_condition_rows`` is the packed condition rows the
+    deployment provisioned for one request, which admission bounds requests
+    by.
     """
 
     tasks: tuple[str, ...]
@@ -311,6 +313,7 @@ class VideoDenoiserInfo:
     canvases: tuple[tuple[int, int], ...] = ()
     max_sequence_rows: int | None = None
     condition_tiles: ConditionTiles | None = None
+    max_condition_rows: int = 0
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -329,6 +332,7 @@ class VideoDenoiserInfo:
                 "rows": self.condition_tiles.rows,
                 "video": list(self.condition_tiles.video),
             },
+            "max_condition_rows": self.max_condition_rows,
         }
 
     @classmethod
@@ -379,6 +383,10 @@ class VideoDenoiserInfo:
             if rows is None
             else _uint(rows, f"{where}.max_sequence_rows"),
             condition_tiles=tiles,
+            max_condition_rows=_uint(
+                data.get("max_condition_rows", 0),
+                f"{where}.max_condition_rows",
+            ),
         )
 
 
@@ -454,9 +462,12 @@ class WorkerInfo:
         """Return the rank that publishes a component's host products.
 
         Host products belong to the component's first member rank, the rank
-        whose reports the engine's `WorkerGroup` joins a call's results on.
-        Cooperative numerical outputs may reside on other ranks. A
-        single-rank worker without the component resolves to rank 0.
+        whose reports the engine's `WorkerGroup` joins a call's results on
+        whenever the call runs there. A call whose units are dealt to other
+        ranks publishes no host product, and the engine joins it on the
+        first rank it is dealt to. Cooperative numerical outputs may reside
+        on other ranks. A single-rank worker without the component resolves
+        to rank 0.
 
         Raises:
             WorkerError: `unsupported_setup` when the component is not

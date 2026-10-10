@@ -813,20 +813,27 @@ class DecodeRange:
     cursor: int
     # Maximum media units the call may process; positive.
     max_units: int
+    # Ranks of a distributed component that hold the call's units, in unit
+    # order: each takes the next ``units_per_rank`` units and the last what
+    # remains. Empty deals the units to the component's ranks in configured
+    # order.
+    ranks: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate the call identity, cursor, and unit bound."""
+        """Validate the call identity, cursor, unit bound, and ranks."""
         if self.call_id.batch_id < 1 or self.max_units < 1:
             raise invalid_descriptor(
                 "decode params identity and unit bound must be positive"
             )
         _nonnegative(self.cursor, "decode params cursor")
+        if len(set(self.ranks)) != len(self.ranks):
+            raise invalid_descriptor("decode params name each rank once")
 
     @classmethod
     def from_mapping(
         cls, value: object, where: str = "decode params"
     ) -> DecodeRange:
-        """Parse the call's cursor and unit bound."""
+        """Parse the call's cursor, unit bound, and ranks."""
         data = _map(value, where)
         return cls(
             request_key=identity.RequestKey.from_mapping(
@@ -837,15 +844,20 @@ class DecodeRange:
             ),
             cursor=_uint(data.get("cursor"), f"{where}.cursor"),
             max_units=_uint(data.get("max_units"), f"{where}.max_units"),
+            ranks=tuple(
+                _uint(rank, f"{where}.ranks[{index}]")
+                for index, rank in enumerate(data.get("ranks", ()))
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize the call's cursor and unit bound."""
+        """Serialize the call's cursor, unit bound, and ranks."""
         return {
             "request_key": self.request_key.to_mapping(),
             "call_id": self.call_id.to_mapping(),
             "cursor": self.cursor,
             "max_units": self.max_units,
+            "ranks": list(self.ranks),
         }
 
 

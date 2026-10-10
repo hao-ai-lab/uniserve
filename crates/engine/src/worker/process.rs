@@ -256,7 +256,7 @@ impl Default for WorkerProcessArgs {
             flashinfer_disable_split_kv: false,
             max_model_len: 8192,
             max_video_seconds: 15.0,
-            max_condition_rows: 0,
+            max_condition_rows: None,
             ffmpeg: "ffmpeg".into(),
             min_video_seconds: None,
             expert_parallel: None,

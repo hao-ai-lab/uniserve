@@ -37,6 +37,11 @@ SAMPLE_ALIGNMENT = 256
 TEXT_CAPACITY_FIRST = 1024
 TEXT_CAPACITY_STEP = 2048
 
+#: The video task whose requests bring no conditions. Its requests are the
+#: ones the text-only capacity layouts hold: every other task's request
+#: brings at least one condition and evaluates in a layout of its own.
+PROMPT_TASK = "t2va"
+
 
 @dataclass(frozen=True, slots=True)
 class SamplePages:
@@ -129,7 +134,9 @@ class MediaBuilder:
     smallest text capacity with the request's own condition region, which
     its runner prepares on first use and steps without a graph.
     ``maximum_layout`` bounds every such layout: the largest text-only
-    layout widened to the worker's condition capacity.
+    layout widened to the worker's condition capacity. A denoiser that does
+    not serve ``PROMPT_TASK`` receives only such requests, so ``layouts`` is
+    empty for it and startup prepares the maximum alone.
 
     The samples a solver step rewrites live in the worker's latent pool (see
     ``sample_pages``); the request's slot holds only state written once: the
@@ -356,8 +363,12 @@ class MediaBuilder:
         row-shaped workspace dimension by dimension. Layouts start at the
         maximum's canvas and follow the other canvases in decreasing
         generated rows, then frame counts and text capacities in decreasing
-        order.
+        order. There are none when the denoiser does not serve
+        ``PROMPT_TASK``: no request it admits evaluates in one.
         """
+        if PROMPT_TASK not in self.denoiser.tasks:
+            return ()
+
         canvases = sorted(
             self.canvases,
             key=lambda canvas: (

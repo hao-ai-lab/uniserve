@@ -10,7 +10,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu --extra bench
 | --- | --- |
 | `uniserve_eval/fast_h3.toml` | The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) measurements |
 | `uniserve_eval/fast_h3_h200.toml` | The H200 measurements below |
-| `uniserve_eval/minimax_h3.toml` | The W1–W5 workloads across checkpoints and engines, and the OmniRef reference compositions W7–W12 |
+| `uniserve_eval/minimax_h3.toml` | The W1–W5 workloads across checkpoints and engines, and the OmniRef reference matrix |
 
 ## FastH3 post
 
@@ -76,27 +76,30 @@ The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb
 
 ## OmniRef reference compositions
 
-W7–W12 measure FastH3 OmniRef on the reference mixes of MiniMax-H3's ref2va interface, every target 16:9 (1344×768) and 5 seconds:
+The reference matrix measures FastH3 OmniRef (`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`) on nine reference compositions of MiniMax-H3's ref2va interface, each at 5, 10 and 15 seconds, every target 16:9 (1344×768). A workload is `ref-<composition>-<seconds>s`:
 
-| Workload | References | Prompt tokens with vision | Condition rows |
+| Composition | References | Prompt tokens with vision | Condition rows |
 | --- | --- | --- | --- |
-| W7 | One 16:9 subject image | about 7,500 | 7,296 |
-| W8 | Three images: a 16:9 subject, a product sheet and a 16:9 scene | about 22,400 | 22,016 |
-| W9 | Nine square images | about 37,400 | 36,864 |
-| W10 | One reference video (6 s, with its soundtrack) | about 6,450 | 46,592 |
-| W11 | Three 2-second reference clips, each with its soundtrack | about 9,500 | 42,240 |
-| W12 | One 16:9 image, one reference video with its soundtrack and a reference voice | about 13,850 | 54,400 |
+| `image` | One 16:9 subject image | about 7,600 | 7,296 |
+| `image-voice` | One 16:9 subject image and a reference voice | about 7,650 | 7,808 to 8,064 |
+| `images3` | Three 16:9 images: a subject, a product sheet and a scene | about 22,400 | 22,016 |
+| `images9` | Nine square images | 37,701 | 36,864 |
+| `clip` | One 2-second reference clip with its soundtrack | about 3,500 | 14,080 |
+| `video` | One reference video (6 s, with its soundtrack) | 6,458 to 7,630 | 46,592 to 51,200 |
+| `clips3` | Three 2-second reference clips, each with its soundtrack | 9,718 | 42,240 |
+| `mixed` | One 16:9 image, one reference video with its soundtrack and a reference voice | 13,911 to 15,118 | 54,400 to 59,264 |
+| `full` | Nine square images and three 2-second clips with their soundtracks | 47,160 | 79,104 |
 
-The checkpoint bounds a request's packed sequence at 131,072 rows: its prompt, which carries every reference's vision tokens, its condition rows and the 37,710 generated rows. A reference image is 7,296 prompt tokens and 7,296 condition rows at 16:9 and 4,096 of each when square, so nine images fit only when they are close to square (nine 16:9 images need about 169,000 rows), three five-second reference videos need about 164,000, and nine images with three videos exceed the bound at any size; the last mix is not measured. The square images of W9 are centred crops and the clips of W11 the leading two seconds of their sources, cut without re-encoding; each row's `metadata.condition_media` names the source and the derivation.
+A request's packed sequence is its prompt, which carries every visual reference's vision tokens, its condition rows and its generated rows: 37,710 at 5 s, 73,386 at 10 s and 109,062 at 15 s. A reference image, resized to a 2048-pixel short edge, is 7,296 prompt tokens and 7,296 condition rows at 16:9 and 4,096 of each when square. A reference video or voice longer than the target contributes the target's duration, so its rows grow with the target up to its own length. The largest cell, `ref-full-15s`, packs 236,294 rows. The square images are centred crops and the clips the leading two seconds of their sources, cut without re-encoding; each row's `metadata.condition_media` names the source and the derivation.
 
-A latency point sends one warmup at seed 42 and eight measured requests one at a time; a throughput point sends two priming requests per concurrency slot, then measures 16 requests at concurrency 4 on four GPUs, or 32 at concurrency 8 across two hosts. One deployment serves all six: `--max-model-len 38912 --video-text-capacities 8192,16384,24576,38912 --max-condition-rows 54400`, whose largest layout, 38,912 text and 54,400 condition rows, holds 131,022 rows.
+A point sends one warmup at seed 42 and three measured requests one at a time, seeds 0 to 2. One deployment across two four-GB200 hosts (`ulysses8-reference-two-node.json`) serves every cell: `--max-video-seconds 15 --max-model-len 48128 --video-text-capacities 4096,7168,8192,10240,14336,15360,22528,37888,48128 --max-condition-rows 79104`, a text capacity for each cell's prompt and the condition rows of `full`.
 
 ```bash
 export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastH3-OmniRef-v5-DMPDD8-w03-cfg2-step3500
 export UNISERVE_MINIMAX_H3_OMNIREF_BASE=/workspace/models/MiniMax-H3-9bfb6693
-.venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-omniref-refs --reuse-deployment
+.venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-8-omniref-refs --reuse-deployment
 ```
 
-The suites are `gb200-4-omniref-refs` and `gb200-4-omniref-refs-throughput` on four GB200, and `gb200-8-omniref-refs` and `gb200-8-omniref-refs-throughput` across two, both on one eight-way Ulysses replica (`ulysses8-reference-two-node.json`); start `uniserve-host` on `rank-1` for the two-host server, as in [Two hosts](minimax_h3.md#two-hosts).
+Start `uniserve-host` on `rank-1` for the two-host server, as in [Two hosts](minimax_h3.md#two-hosts). The `sglang-gb200-8-reference` suite measures SGLang's base Ref2VA on the same cells and hosts with the base schedule (50 sigma points), one measured request per cell after its warmup; start SGLang's node rank 1 on `rank-1` beside the head, as for `sglang-gb200-8`.
 
 Cross-engine results are not equal-work ratios: the engines differ in reference-image resizing, noise generators, media codecs and distributed attention. vLLM-Omni's W4 image processing keeps a smaller condition layout than the others, and its diffusion worker does not implement the two-host placement.

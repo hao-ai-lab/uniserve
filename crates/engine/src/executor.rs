@@ -146,6 +146,13 @@ impl ExecutorInfo {
     /// of a distributed serving component times its `units_per_rank`, or one
     /// for any other component, on the narrowest worker serving the call.
     ///
+    /// A latent encoding round is dealt to the latent encoder's ranks that a
+    /// request's prompt does not take (`Scheduler::latent_round`), so while
+    /// the prompt is encoded a round covers only the ranks the latent
+    /// encoder does not share with the text encoder of its worker. Those
+    /// ranks count; a latent encoder that shares every rank encodes after
+    /// the prompt, on all of them.
+    ///
     /// Returns `None` when no worker serves `call`, or the width does not
     /// fit in `u32`.
     pub fn media_lane_units(&self, call: MediaCall) -> Option<u32> {
@@ -153,16 +160,30 @@ impl ExecutorInfo {
             .iter()
             .filter_map(|(_, info)| {
                 let component = info.media_components.get(&call)?;
-                let binding = info
-                    .components
+                let find =
+                    |name: &String| info.components.iter().find(|binding| &binding.name == name);
+                let binding = find(component)?;
+                if binding.config.distribution.is_none() {
+                    return Some(1);
+                }
+
+                let prompt = info
+                    .media_components
+                    .get(&MediaCall::TextEncoding)
+                    .filter(|_| call == MediaCall::LatentEncoding)
+                    .and_then(find);
+                let unshared = binding
+                    .config
+                    .ranks
                     .iter()
-                    .find(|binding| &binding.name == component)?;
-                let units = if binding.config.distribution.is_some() {
-                    binding.config.ranks.len() * binding.config.units_per_rank.max(1)
+                    .filter(|rank| prompt.is_none_or(|prompt| !prompt.config.ranks.contains(rank)))
+                    .count();
+                let ranks = if unshared == 0 {
+                    binding.config.ranks.len()
                 } else {
-                    1
+                    unshared
                 };
-                u32::try_from(units).ok()
+                u32::try_from(ranks * binding.config.units_per_rank.max(1)).ok()
             })
             .min()
     }
@@ -1475,7 +1496,8 @@ mod tests {
 
     /// A distributed component's lane is its ranks times its units per rank,
     /// an undistributed one's a single unit, and the narrowest replica binds;
-    /// a call no worker serves has no lane.
+    /// a call no worker serves has no lane. A latent encoder's lane leaves
+    /// out the ranks its worker's text encoder takes.
     #[test]
     fn media_lanes_count_the_units_one_call_covers() {
         let encoder = |id: &str, ranks: usize, units_per_rank: usize| {
@@ -1501,6 +1523,34 @@ mod tests {
         let (id, mut single) = encoder("a", 4, 1);
         single.components[0].config.distribution = None;
         assert_eq!(lanes(vec![(id, single)]), Some(1));
+
+        // A latent encoding round covers the ranks the prompt's encoding
+        // leaves free: those the latent encoder does not share with its
+        // worker's text encoder, or all of them when it shares every one.
+        let beside = |text: Vec<usize>| {
+            let (id, mut info) = media_pool(
+                "a",
+                &[
+                    (MediaCall::LatentEncoding, "latent_encoder"),
+                    (MediaCall::TextEncoding, "text_encoder"),
+                ],
+                0,
+                1,
+            );
+            for binding in &mut info.components {
+                if binding.name == "text_encoder" {
+                    binding.config.ranks = text.clone();
+                } else {
+                    binding.config.ranks = vec![4, 5, 6, 7, 0, 1, 2, 3];
+                    binding.config.distribution =
+                        Some(uniserve_core::ComponentDistribution::TemporalUnits);
+                }
+            }
+            lanes(vec![(id, info)])
+        };
+        assert_eq!(beside(vec![0, 1, 2, 3]), Some(4));
+        assert_eq!(beside(vec![0]), Some(7));
+        assert_eq!(beside((0..8).collect()), Some(8));
         assert_eq!(
             lanes(vec![media_pool(
                 "a",
@@ -1537,6 +1587,7 @@ mod tests {
                 canvases: Vec::new(),
                 max_sequence_rows: None,
                 condition_tiles: None,
+                max_condition_rows: 0,
             });
             ExecutorInfo {
                 workers: vec![(WorkerId("model".to_owned()), info)],
