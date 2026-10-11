@@ -258,9 +258,7 @@ def _generate(
                 for name, value in request.items():
                     value.copy_(staged[name])
                 # The checkpoint is distilled for eight evaluations.
-                schedules = denoiser.make_schedules(
-                    8, shift=None, device=device
-                )
+                schedules = denoiser.make_schedules(device=device)
                 for step_index in range(8):
                     inputs = DenoiserInput(
                         {

@@ -211,7 +211,6 @@ fn media_sampling() -> DiffusionSamplingParams {
     DiffusionSamplingParams {
         num_frames: 22,
         video_units: 3,
-        num_inference_steps: 4,
         seed: 17,
         width: 1024,
         height: 768,
@@ -1662,7 +1661,13 @@ fn worker_info_round_trips() {
 fn kv_free_worker_info_round_trips() {
     let info = WorkerInfo {
         media_components: video_components(),
-        num_inference_steps: 4,
+        video_denoiser: Some(VideoDenoiserInfo {
+            tasks: vec!["t2va".into()],
+            schedule_points: 5,
+            video_shift: 12.0,
+            audio_shift: 3.0,
+            canvases: Vec::new(),
+        }),
         supported_calls: video_components()
             .into_keys()
             .map(CallKind::Media)
@@ -1678,7 +1683,6 @@ fn kv_free_worker_info_round_trips() {
         panic!("decoded response must preserve its info variant");
     };
     assert_eq!(decoded, info);
-    assert_eq!(decoded.denoise_steps(), 4);
 }
 
 #[test]
@@ -1947,7 +1951,6 @@ fn full_caps() -> WorkerInfo {
         encoder_cache_entries: 64,
         encoder_entry_bytes: 128 << 20,
         media_components: video_components(),
-        num_inference_steps: 4,
         supported_calls: CallKind::ALL.to_vec(),
         // A full-attention group with 64-token pages of one unit and a
         // sliding-window group with 32-token pages of two units share one

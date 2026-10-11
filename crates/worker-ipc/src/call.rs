@@ -1330,8 +1330,7 @@ impl NewRequest {
                     && diffusion.video_units > 0
                     && diffusion.height > 0
                     && diffusion.width > 0
-                    && self.prompt_token_ids.len() <= u32::MAX as usize
-                    && diffusion.num_inference_steps > 0,
+                    && self.prompt_token_ids.len() <= u32::MAX as usize,
                 "diffusion parameters are invalid"
             );
         }

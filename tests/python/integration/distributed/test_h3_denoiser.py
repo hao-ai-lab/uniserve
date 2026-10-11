@@ -234,7 +234,7 @@ def _run(rank, rendezvous, directory, source):
                     device=device,
                     dtype=torch.bfloat16,
                 )
-                schedules = model.make_schedules(4, shift=None, device=device)
+                schedules = model.make_schedules(device=device)
                 assert model.prediction_type == "velocity"
                 inputs = DenoiserInput(
                     latents={
@@ -541,9 +541,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                 views = storage.view(factory.buffers(size))
                 samples = factory.sample_views(size, runner.samples)
                 for seed in (31, 92):
-                    schedules = model.make_schedules(
-                        factory.num_steps, shift=None, device=device
-                    )
+                    schedules = model.make_schedules(device=device)
                     _stage(
                         factory,
                         latents,
@@ -678,9 +676,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                     seed=100 + slot,
                     features=features[slot],
                 )
-                schedules = model.make_schedules(
-                    factory.num_steps, shift=None, device=device
-                )
+                schedules = model.make_schedules(device=device)
                 ladder = _ladder(factory, runner, size, views, schedules, slot)
                 bank = 1
                 for index in range(4):
@@ -736,9 +732,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                         device=device,
                     ),
                 )
-                schedules = model.make_schedules(
-                    factory.num_steps, shift=None, device=device
-                )
+                schedules = model.make_schedules(device=device)
                 ladder = _ladder(
                     factory, runner, placeholder, views, schedules, 1
                 )
@@ -834,9 +828,7 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
                     seed=300 + slot,
                     features=features[slot],
                 )
-                schedules = model.make_schedules(
-                    factory.num_steps, shift=None, device=device
-                )
+                schedules = model.make_schedules(device=device)
                 ladder = _ladder(factory, runner, size, views, schedules, slot)
                 bank = 1
                 for index in range(factory.num_steps):
@@ -893,9 +885,7 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
                         device=device,
                     ),
                 )
-                schedules = model.make_schedules(
-                    padded.num_steps, shift=None, device=device
-                )
+                schedules = model.make_schedules(device=device)
                 ladder = _ladder(
                     padded, runner, placeholder, views, schedules, 1
                 )
@@ -966,7 +956,7 @@ def _capacity_prediction(rank, rendezvous, directory, cases, output):
         ),
         attention=AttentionParallelConfig(heads=Ulysses("heads")),
     )
-    schedules = model.make_schedules(4, shift=None, device=device)
+    schedules = model.make_schedules(device=device)
     for index, (frames, tokens, capacity) in enumerate(cases):
         size = model.make_size(frames, tokens, canvas=WIDE)
         generator = torch.Generator().manual_seed(60 + index)

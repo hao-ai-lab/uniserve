@@ -539,7 +539,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
                     key,
                     request_pool_idx=1,
                     diffusion=DiffusionParams(
-                        22, 3, 4, 1000, width=1344, height=768
+                        22, 3, 1000, width=1344, height=768
                     ),
                     video=VideoAdmission(
                         VideoTask.T2VA, text_tags=(1,) * len(prompt)
@@ -742,7 +742,7 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
         admission = NewRequest(
             key,
             request_pool_idx=1,
-            diffusion=DiffusionParams(22, 3, 4, 1000, width=1344, height=768),
+            diffusion=DiffusionParams(22, 3, 1000, width=1344, height=768),
             video=VideoAdmission(VideoTask.T2VA, text_tags=(1, 1, 1)),
             prompt_token_ids=(3, 8, 1),
         )

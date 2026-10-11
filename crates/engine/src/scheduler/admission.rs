@@ -408,9 +408,8 @@ impl Scheduler {
     ///
     /// Rejects with `RejectionKind::Invalid` when the request fails
     /// validation; the worker reports no muxing component or no video
-    /// denoiser; the denoiser does not serve the request's task; the request's
-    /// inference-step count differs from the loaded model's; its call graph
-    /// cannot be built; `media_outputs` cannot bound its products; or the
+    /// denoiser; the denoiser does not serve the request's task; its call
+    /// graph cannot be built; `media_outputs` cannot bound its products; or the
     /// worker has fewer than two request slots. A served task's calls all
     /// have components: the executor checked them at startup. Rejects with
     /// `RejectionKind::Overloaded` when the waiting bound is reached. A
@@ -460,13 +459,6 @@ impl Scheduler {
                     "the deployment's denoiser does not serve {}",
                     request.task.as_str()
                 ),
-            );
-            return;
-        }
-        if request.sampling.num_inference_steps != self.info.num_inference_steps {
-            reject(
-                RejectionKind::Invalid,
-                "request prediction count disagrees with the loaded model".to_string(),
             );
             return;
         }
@@ -580,6 +572,18 @@ impl Scheduler {
             let Some(submission) = self.waiting_media.pop_front() else {
                 break;
             };
+            // The denoiser's fixed schedule sets every request's step count;
+            // submission refused requests while the worker reports none.
+            let Some(steps) = self
+                .info
+                .video_denoiser
+                .as_ref()
+                .map(|video| video.denoise_steps())
+            else {
+                self.waiting_media.push_front(submission);
+                self.invariant_broken("a queued media request has a video denoiser");
+                break;
+            };
             let id = submission.request.request_id;
             let request_epoch = self.next_request_epoch;
             let request_key = RequestKey::new(self.engine_id, id, request_epoch);
@@ -648,7 +652,6 @@ impl Scheduler {
             }
             self.next_request_epoch = self.next_request_epoch.saturating_add(1);
             let root = CallId::new(0, 0);
-            let steps = submission.request.sampling.num_inference_steps;
             let mut state = MediaFlowState {
                 request: submission.request,
                 graph: submission.graph,

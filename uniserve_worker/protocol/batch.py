@@ -224,8 +224,6 @@ class DiffusionParams:
     num_frames: int
     # Video media units the decoder reconstructs, independent of rank count.
     video_units: int
-    # Denoising steps in the trajectory.
-    num_inference_steps: int
     # Deterministic noise seed; nonnegative.
     seed: int
     # Output raster in pixels: the request's canvas.
@@ -237,7 +235,6 @@ class DiffusionParams:
         for name in (
             "num_frames",
             "video_units",
-            "num_inference_steps",
             "width",
             "height",
         ):

@@ -251,7 +251,6 @@ table WorkerInfo {
   encoder_entry_bytes:ulong;
   max_unresolved_calls:uint = 1;
   media_components:[MediaComponent];
-  num_inference_steps:uint;
   host_lane_capacity:uint = 1;
   video_denoiser:VideoDenoiserInfo;
   /// Maximum calls in one prefill run, the rows the rank's captured prefill
@@ -606,7 +605,6 @@ table ArRequestParams {
 table DiffusionSamplingParams {
   num_frames:uint;
   video_units:uint;
-  num_inference_steps:uint;
   seed:ulong;
   /// Output raster in pixels: the request's canvas.
   width:uint;

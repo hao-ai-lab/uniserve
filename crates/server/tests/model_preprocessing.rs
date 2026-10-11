@@ -587,7 +587,6 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
     );
     let sampling = accepted.request.sampling;
     assert_eq!(sampling.seed, 42);
-    assert_eq!(sampling.num_inference_steps, 49);
     assert_eq!((sampling.num_frames, sampling.video_units), (124, 7));
     assert_eq!((sampling.width, sampling.height), (1344, 768));
     assert_eq!(accepted.duration_seconds, 5.0);
@@ -776,7 +775,6 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         .await
         .unwrap();
     assert_eq!(prepared.request.sampling.num_frames, 243);
-    assert_eq!(prepared.request.sampling.num_inference_steps, 8);
     assert_eq!(prepared.canvas, canvas(1344, 768));
 
     // A 480 short edge names the 480p training bucket of the ratio.

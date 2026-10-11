@@ -90,9 +90,11 @@ def image_state(builder, size, image: ImageParams) -> DiffusionState:
     return DiffusionState.open(
         denoiser,
         size,
-        steps=image.steps,
-        shift=image.timestep_shift if image.timestep_shift > 0 else None,
-        device="cpu",
+        schedules=denoiser.make_schedules(
+            image.steps,
+            shift=image.timestep_shift if image.timestep_shift > 0 else None,
+            device="cpu",
+        ),
         guidance=denoiser.make_guidance(
             text_scale=image.cfg_text_scale,
             image_scale=image.cfg_img_scale,

@@ -224,7 +224,7 @@ def test_h3_worker_advertises_bounded_media_products():
     from uniserve_worker.bootstrap.report import build_worker_layout
 
     info = build_worker_layout(model, config, queue_depth=6).info
-    assert info.num_inference_steps == 4
+    assert info.video_denoiser.schedule_points == 5
     assert info.request_slots == 2
     assert info.kv_cache is None
     assert info.max_batch_calls == 2
@@ -429,7 +429,7 @@ def test_h3_media_units_follow_each_request_canvas():
             RequestKey(1, 0, 0), CallId(1, 0), cursor=0, max_units=1
         )
         for width, height in ((1536, 672), (1344, 768), (768, 1344)):
-            media = DiffusionParams(124, 7, 50, 1, width=width, height=height)
+            media = DiffusionParams(124, 7, 1, width=width, height=height)
             assert runner.output_layout(
                 "video_decoder", 0, media, round_, 10
             ).shape == (1, 22, height, width, 3)

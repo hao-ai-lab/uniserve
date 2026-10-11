@@ -269,7 +269,6 @@ fn diffusion<'a>(
         &fbs::DiffusionSamplingParamsArgs {
             num_frames: v.num_frames,
             video_units: v.video_units,
-            num_inference_steps: v.num_inference_steps,
             seed: v.seed,
             width: v.width,
             height: v.height,
@@ -1553,7 +1552,6 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             encoder_entry_bytes: v.encoder_entry_bytes,
             max_unresolved_calls: v.max_unresolved_calls,
             media_components,
-            num_inference_steps: v.num_inference_steps,
             host_lane_capacity: v.host_lane_capacity,
             video_denoiser,
             max_prefill_calls: v.max_prefill_calls,

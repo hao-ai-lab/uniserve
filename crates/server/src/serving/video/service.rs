@@ -119,7 +119,7 @@ impl VideoService {
     /// The denoiser network evaluations of every request: one per schedule
     /// interval.
     pub fn num_inference_steps(&self) -> u32 {
-        self.denoiser.schedule_points - 1
+        self.denoiser.denoise_steps()
     }
 
     /// Describes the served video contract for `GET /v1/capabilities`.
@@ -281,7 +281,6 @@ impl VideoService {
                     // Each H3 video media unit decodes one 17-frame temporal
                     // latent window past the first 5 frames.
                     video_units: (plan.num_frames - 5) / 17,
-                    num_inference_steps: self.num_inference_steps(),
                     seed: request.seed,
                     width: plan.canvas.width,
                     height: plan.canvas.height,

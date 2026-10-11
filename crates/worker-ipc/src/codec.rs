@@ -617,14 +617,13 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
 }
 
 /// Decodes diffusion admission parameters; `NewRequest::validate` checks the
-/// frame, unit, and step counts and the output raster.
+/// frame and unit counts and the output raster.
 fn diffusion_params_from_table(
     admission: fbs::DiffusionSamplingParams<'_>,
 ) -> CodecResult<DiffusionSamplingParams> {
     Ok(DiffusionSamplingParams {
         num_frames: admission.num_frames(),
         video_units: admission.video_units(),
-        num_inference_steps: admission.num_inference_steps(),
         seed: admission.seed(),
         width: admission.width(),
         height: admission.height(),
@@ -1262,7 +1261,6 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             }
             components
         },
-        num_inference_steps: info.num_inference_steps(),
         video_denoiser: info.video_denoiser().map(video_denoiser_from_table),
     };
     info.validate()?;

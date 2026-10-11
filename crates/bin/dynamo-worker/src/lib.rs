@@ -336,11 +336,6 @@ impl RawEngine for DynamoFastH3Engine {
             &self.args.served_model_name,
             self.args.max_video_seconds,
             &self.rasters,
-            state
-                .runtime()
-                .model()
-                .video_service()
-                .map_or(0, |video| video.num_inference_steps()),
         )?;
         // The Dynamo context id is the UniServe request id, so `abort` can name
         // the same request from its own context.
@@ -506,8 +501,10 @@ enum ResponseFormat {
 }
 
 /// Dynamo's `nvext` video extensions. `prepare_request` accepts only the
-/// fields FastH3 can honor: `seed` at any non-negative value, and `fps`,
-/// `num_frames` and `num_inference_steps` only at the values FastH3 runs with.
+/// fields FastH3 can honor: `seed` at any non-negative value, and `fps` and
+/// `num_frames` only at the values FastH3 runs with. The checkpoint fixes the
+/// denoising schedule, so `num_inference_steps` is refused like the other
+/// controls FastH3 does not take.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VideoNvExt {
@@ -548,14 +545,12 @@ struct PreparedRequest {
 /// at `max_video_seconds`. `nvext.num_frames` is only checked against the
 /// aligned frame count of `seconds`; UniServe derives the frame count from
 /// the target duration again when it prepares the request.
-/// `nvext.num_inference_steps` counts denoiser evaluations, `denoise_steps`.
 /// Every refusal is an invalid-argument error.
 fn prepare_request(
     value: Value,
     served_model_name: &str,
     max_video_seconds: f64,
     rasters: &VideoRasters,
-    denoise_steps: u32,
 ) -> Result<PreparedRequest, DynamoError> {
     let request: DynamoVideoRequest = serde_json::from_value(value)
         .map_err(|error| invalid_argument(format!("invalid video request: {error}")))?;
@@ -617,6 +612,10 @@ fn prepare_request(
     let nvext = request.nvext.unwrap_or_default();
     reject_present("nvext.annotations", nvext.annotations.as_ref())?;
     reject_present("nvext.negative_prompt", nvext.negative_prompt.as_ref())?;
+    reject_present(
+        "nvext.num_inference_steps",
+        nvext.num_inference_steps.as_ref(),
+    )?;
     reject_present("nvext.guidance_scale", nvext.guidance_scale.as_ref())?;
     reject_present("nvext.boundary_ratio", nvext.boundary_ratio.as_ref())?;
     reject_present("nvext.guidance_scale_2", nvext.guidance_scale_2.as_ref())?;
@@ -626,14 +625,6 @@ fn prepare_request(
     if nvext.num_frames.is_some_and(|value| value != frames as i32) {
         return Err(invalid_argument(format!(
             "nvext.num_frames must be {frames} for {seconds} seconds"
-        )));
-    }
-    if nvext
-        .num_inference_steps
-        .is_some_and(|steps| i64::from(steps) != i64::from(denoise_steps))
-    {
-        return Err(invalid_argument(format!(
-            "nvext.num_inference_steps must be {denoise_steps}"
         )));
     }
     // Dynamo's seed is signed and UniServe's unsigned.
@@ -831,7 +822,7 @@ mod tests {
             "prompt": "A stream in a forest",
             "seconds": 5,
             "response_format": "b64_json",
-            "nvext": {"fps": 24, "num_frames": 124, "num_inference_steps": 4, "seed": 1000}
+            "nvext": {"fps": 24, "num_frames": 124, "seed": 1000}
         })
     }
 
@@ -863,8 +854,7 @@ mod tests {
 
     #[test]
     fn request_maps_to_uniserve_contract() {
-        let prepared = match prepare_request(request(), "FastH3", 15.0, &VideoRasters::default(), 4)
-        {
+        let prepared = match prepare_request(request(), "FastH3", 15.0, &VideoRasters::default()) {
             Ok(prepared) => prepared,
             Err(error) => panic!("supported request was rejected: {error}"),
         };
@@ -884,7 +874,7 @@ mod tests {
             &[ResolutionName::Landscape16x9, ResolutionName::Landscape21x9],
         )
         .unwrap_or_else(|error| panic!("trained rasters were rejected: {error}"));
-        let prepare = |request: Value| prepare_request(request, "FastH3", 15.0, &rasters, 4);
+        let prepare = |request: Value| prepare_request(request, "FastH3", 15.0, &rasters);
         for (size, short_edge, aspect_ratio) in
             [("1344x768", 768, "16:9"), ("992x416", 480, "21:9")]
         {
@@ -946,7 +936,6 @@ mod tests {
                 "FastH3",
                 max_video_seconds,
                 &VideoRasters::default(),
-                8,
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => panic!("max {max_video_seconds}s refused the default: {error}"),
@@ -965,33 +954,12 @@ mod tests {
             json!({"model":"FastH3", "prompt":"x", "size":"832x480"}),
             json!({"model":"FastH3", "prompt":"x", "nvext":{"seed":-1}}),
             json!({"model":"FastH3", "prompt":"x", "nvext":{"num_frames":120}}),
+            json!({"model":"FastH3", "prompt":"x", "nvext":{"num_inference_steps":4}}),
             json!({"model":"FastH3", "prompt":"x", "seconds":3}),
             json!({"model":"FastH3", "prompt":"x", "seconds":16}),
             json!({"model":"FastH3", "prompt":"x", "extra_args":{"media_passthrough":{"foo":1}}}),
         ] {
-            assert!(prepare_request(request, "FastH3", 15.0, &VideoRasters::default(), 8).is_err());
-        }
-    }
-
-    /// Explicit steps confirm the loaded schedule; they never change it.
-    #[test]
-    fn inference_steps_must_match_the_checkpoint() {
-        for checkpoint_steps in [4, 8] {
-            for requested_steps in [4, 8, 0, -1] {
-                let mut value = request();
-                value["nvext"]["num_inference_steps"] = json!(requested_steps);
-                assert_eq!(
-                    prepare_request(
-                        value,
-                        "FastH3",
-                        15.0,
-                        &VideoRasters::default(),
-                        checkpoint_steps
-                    )
-                    .is_ok(),
-                    i64::from(requested_steps) == i64::from(checkpoint_steps),
-                );
-            }
+            assert!(prepare_request(request, "FastH3", 15.0, &VideoRasters::default()).is_err());
         }
     }
 

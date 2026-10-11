@@ -947,7 +947,6 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         DiffusionSamplingParams {
             num_frames: 22,
             video_units: 1,
-            num_inference_steps: 4,
             seed: 1000,
             width: 1344,
             height: 768,
@@ -1746,7 +1745,6 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
                 sampling: DiffusionSamplingParams {
                     num_frames: 22,
                     video_units: 3,
-                    num_inference_steps: 4,
                     seed: index as u64,
                     width: 1344,
                     height: 768,

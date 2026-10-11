@@ -175,7 +175,6 @@ impl EngineClient {
                 || core.generation_limits() != first.generation_limits()
                 || core.model_dtype() != first.model_dtype()
                 || core.runtime_family() != first.runtime_family()
-                || core.info().denoise_steps() != first.info().denoise_steps()
                 || core.supports_token_sampling() != first.supports_token_sampling()
             {
                 return Err(Error::ClientClosed {

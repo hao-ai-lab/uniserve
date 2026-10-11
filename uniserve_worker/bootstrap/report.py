@@ -736,7 +736,6 @@ def _token_worker_layout(
         media_components={}
         if worker_config.role == "experts"
         else dict(media_components(model, worker_config.deployment_components)),
-        num_inference_steps=0,
         host_lane_capacity=1,
         encoder_cache_entries=encoder_cache_entries,
         encoder_entry_bytes=max(
@@ -844,7 +843,6 @@ def _request_tensor_worker_layout(
         media_components=dict(
             media_components(model, worker_config.deployment_components)
         ),
-        num_inference_steps=builder.num_steps,
         video_denoiser=video_denoiser_info(
             builder.denoiser, canvases=builder.canvases
         ),

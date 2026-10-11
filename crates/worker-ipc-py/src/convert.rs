@@ -1060,10 +1060,6 @@ fn diffusion_params_to_py<'py>(
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "num_frames"), diffusion.num_frames)?;
     dict.set_item(intern!(py, "video_units"), diffusion.video_units)?;
-    dict.set_item(
-        intern!(py, "num_inference_steps"),
-        diffusion.num_inference_steps,
-    )?;
     dict.set_item(intern!(py, "seed"), diffusion.seed)?;
     dict.set_item(intern!(py, "width"), diffusion.width)?;
     dict.set_item(intern!(py, "height"), diffusion.height)?;
@@ -2349,7 +2345,6 @@ mod tests {
             DiffusionSamplingParams {
                 num_frames: 22,
                 video_units: 3,
-                num_inference_steps: 4,
                 seed: 29,
                 width: 1344,
                 height: 768,
@@ -2890,13 +2885,12 @@ mod tests {
                                     "request_pool_idx",
                                     "diffusion.num_frames",
                                     "diffusion.video_units",
-                                    "diffusion.num_inference_steps",
                                     "diffusion.seed",
                                     "diffusion.width",
                                     "diffusion.height",
                                 ],
                             ),
-                            [2, 22, 3, 4, 29, 1344, 768]
+                            [2, 22, 3, 29, 1344, 768]
                         );
                         assert_eq!(
                             field(&media, "video.task.value")
