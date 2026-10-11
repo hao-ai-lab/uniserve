@@ -98,18 +98,6 @@ def video_denoiser(model: nn.Module, config: WorkerConfig):
     return placed[0]
 
 
-# Video tasks whose request calls the worker executes: generation from the
-# prompt alone, from keyframes, and from references.
-EXECUTED_VIDEO_TASKS = frozenset({"t2va", "fl2va", "ref2va"})
-
-
-def executed_video_tasks(denoiser: VideoDenoiser) -> tuple[str, ...]:
-    """The denoiser's tasks the worker executes, in the denoiser's order."""
-    return tuple(
-        task for task in denoiser.tasks if task in EXECUTED_VIDEO_TASKS
-    )
-
-
 def _max_frames(model: nn.Module, config: WorkerConfig) -> int:
     """Frames of the longest video the deployment serves.
 
@@ -146,31 +134,35 @@ def condition_capacity(
 ) -> int:
     """Packed condition rows a worker provisions for one request.
 
-    Only a conditioned task carries conditions, so a deployment whose
-    denoiser executes none provisions none, whatever ``max_condition_rows``
-    grants. A deployment that states no capacity provisions the largest
-    condition set its denoiser admits (``VideoDenoiser.max_conditions``) at
-    its longest duration, on the prepared canvas where that set packs the
-    most rows, so it refuses no request for its conditions.
+    A denoiser that admits no condition (``VideoDenoiser.max_conditions``
+    is empty on every prepared canvas) gets none, whatever
+    ``max_condition_rows`` grants. A deployment that states no capacity
+    provisions the largest condition set its denoiser admits at its longest
+    duration, on the prepared canvas where that set packs the most rows, so
+    it refuses no request for its conditions.
 
     Raises:
-        ValueError: Without a stated capacity, the errors of
-            ``_max_frames`` and ``VideoDenoiser.make_size``.
+        ValueError: The errors of ``_max_frames`` and, without a stated
+            capacity, ``VideoDenoiser.make_size``.
     """
-    if not set(executed_video_tasks(denoiser)) - {"t2va"}:
+    frames = denoiser.legal_frame_count(_max_frames(model, config))
+    admitted = {
+        canvas: denoiser.max_conditions(frames, canvas)
+        for canvas in _canvases(denoiser, config)
+    }
+    if not any(admitted.values()):
         return 0
     if config.max_condition_rows is not None:
         return config.max_condition_rows
 
-    frames = denoiser.legal_frame_count(_max_frames(model, config))
     return max(
         denoiser.make_size(
             frames,
             config.max_sequence_tokens,
             canvas=canvas,
-            conditions=denoiser.max_conditions(frames, canvas),
+            conditions=conditions,
         ).condition_rows
-        for canvas in _canvases(denoiser, config)
+        for canvas, conditions in admitted.items()
     )
 
 

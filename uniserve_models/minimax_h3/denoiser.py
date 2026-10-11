@@ -215,6 +215,11 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         return self.config.tasks
 
     @property
+    def text_only(self) -> bool:
+        # Only ``t2va`` generates from the prompt alone.
+        return "t2va" in self.config.tasks
+
+    @property
     def fixed_canvases(self) -> tuple[image.Config, ...] | None:
         return self.config.canvases
 

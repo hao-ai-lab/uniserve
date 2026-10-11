@@ -65,7 +65,6 @@ from uniserve_worker.bootstrap.components import (
 )
 from uniserve_worker.bootstrap.inputs import (
     capability,
-    executed_video_tasks,
     image_builder,
     media_builder,
 )
@@ -769,26 +768,15 @@ def video_denoiser_info(
 ) -> VideoDenoiserInfo:
     """Describe what the deployment's video denoiser serves.
 
-    The tasks are the denoiser's tasks whose request calls the worker
-    executes, in the denoiser's order. The schedule's sigma points include
-    the clean endpoint the network never evaluates. The canvases are
+    The tasks are the denoiser's, in its order. The schedule's sigma points
+    include the clean endpoint the network never evaluates. The canvases are
     ``canvases``, those the deployment prepares and admits, or without any
     every canvas the denoiser offers (``VideoDenoiser.canvases``).
-
-    Raises:
-        WorkerError: ``UnsupportedSetup`` when the worker executes none of
-            the denoiser's tasks.
     """
-    tasks = executed_video_tasks(denoiser)
-    if not tasks:
-        raise unsupported_setup(
-            f"the placed video denoiser serves {', '.join(denoiser.tasks)}, "
-            "none of which this worker executes"
-        )
     served = canvases or denoiser.canvases
     shifts = denoiser.schedule_shifts
     return VideoDenoiserInfo(
-        tasks=tasks,
+        tasks=denoiser.tasks,
         schedule_points=denoiser.num_steps + 1,
         video_shift=float(shifts["video"]),
         audio_shift=float(shifts["audio"]),
