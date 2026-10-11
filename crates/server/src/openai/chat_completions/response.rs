@@ -1175,8 +1175,6 @@ mod tests {
         vec![
             Ok(RequestOutput::Accepted {
                 request_id: "r".into(),
-                served_name: "m".to_string(),
-                description: "qwen3".to_string(),
                 compile_duration_us: 0,
                 prompt_token_count: 1,
                 prompt_token_ids: vec![1],

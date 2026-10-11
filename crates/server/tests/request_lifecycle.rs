@@ -15,8 +15,8 @@ use uniserve_server::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use uniserve_server::serving::media::{ImageFetchPolicy, ImageFetcher};
 use uniserve_server::serving::{
-    FinishStatus, InputProcessor, RequestLifecycleState, RequestOutput, ServedSamplingControl,
-    ServingRuntime, StopCause, TextPromptRequest,
+    FinishStatus, InputProcessor, RequestOutput, ServedSamplingControl, ServingRuntime, StopCause,
+    TextPromptRequest,
 };
 
 /// Builds a serving runtime over a default `SimEngine`.
@@ -105,10 +105,9 @@ fn request(id: &str) -> TextPromptRequest {
 }
 
 /// A request identifier is refused while a request holding it is live and
-/// becomes reusable once the finished request leaves the active registry,
-/// which `drain_request` waits for. Dropping the first, already exhausted
-/// stream afterwards must not affect the second request that reuses the
-/// identifier.
+/// becomes reusable once the finished request leaves the runtime, which
+/// `drain` waits for. Dropping the first, already exhausted stream afterwards
+/// must not affect the second request that reuses the identifier.
 #[tokio::test]
 async fn stop_completion_releases_identity_without_dropping_the_exhausted_stream() {
     let runtime = runtime();
@@ -147,10 +146,8 @@ async fn stop_completion_releases_identity_without_dropping_the_exhausted_stream
     // sampled tokens count toward usage.
     assert_eq!(text, "");
     assert_eq!(output_tokens, Some(2));
-    assert_eq!(
-        runtime.drain_request("same-id").await.unwrap().state,
-        RequestLifecycleState::Finished
-    );
+    runtime.drain().await;
+    assert_eq!(runtime.metrics_snapshot().finished, 1);
 
     let mut second = runtime.generate_text(request("same-id")).await.unwrap();
     // A retained exhausted stream must not cancel a reused external identity.
@@ -188,19 +185,13 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
         });
         ready_rx.await.unwrap();
 
-        for (id, expected) in [
-            ("cancel", RequestLifecycleState::Cancelled),
-            ("abort", RequestLifecycleState::Aborted),
-            ("disconnect", RequestLifecycleState::Cancelled),
-        ] {
+        // Each request adds to the cumulative count of its own outcome.
+        for (id, aborted, cancelled) in [("cancel", 0, 1), ("abort", 1, 1), ("disconnect", 1, 2)] {
             // One poll registers the request before it waits for the blocking
             // pool; the registered identifier already refuses a duplicate.
             let mut pending = Box::pin(runtime.generate_text(request(id)));
             assert!(poll!(pending.as_mut()).is_pending());
-            assert_eq!(
-                runtime.request_stats(id).unwrap().state,
-                RequestLifecycleState::Compiling
-            );
+            assert_eq!(runtime.metrics_snapshot().active, 1);
             assert!(matches!(
                 runtime.generate_text(request(id)).await,
                 Err(uniserve_server::openai::ApiError::InvalidRequest { .. })
@@ -215,20 +206,19 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
                 }
                 let mut stream = pending.await.unwrap();
                 let terminal = stream.next().await.unwrap().unwrap();
-                assert!(match expected {
-                    RequestLifecycleState::Cancelled =>
-                        matches!(terminal, RequestOutput::Cancelled { .. }),
-                    RequestLifecycleState::Aborted =>
-                        matches!(terminal, RequestOutput::Aborted { .. }),
-                    _ => unreachable!(),
+                assert!(if id == "abort" {
+                    matches!(terminal, RequestOutput::Aborted { .. })
+                } else {
+                    matches!(terminal, RequestOutput::Cancelled { .. })
                 });
                 assert!(stream.next().await.is_none());
             }
-            assert_eq!(runtime.drain_request(id).await.unwrap().state, expected);
+            runtime.drain().await;
+            let metrics = runtime.metrics_snapshot();
+            assert_eq!((metrics.aborted, metrics.cancelled), (aborted, cancelled));
+            assert_eq!(metrics.active, 0);
         }
 
-        assert_eq!(runtime.metrics_snapshot().cancelled, 2);
-        assert_eq!(runtime.metrics_snapshot().aborted, 1);
         release_tx.send(()).unwrap();
         occupied.await.unwrap();
         runtime.shutdown().await.unwrap();
@@ -237,8 +227,8 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
 
 /// A chat prompt that exceeds the total capacity of a two-unit KV cache is
 /// returned as a stream and then rejected by engine admission. Collecting the
-/// completion must report that rejection as HTTP 400 and record the request
-/// as `Rejected`.
+/// completion must report that rejection as HTTP 400 and count the request
+/// as rejected.
 #[tokio::test]
 async fn chat_admission_rejection_remains_a_bad_request() {
     let mut worker = SimEngine::new();
@@ -271,10 +261,7 @@ async fn chat_admission_rejection_remains_a_bad_request() {
     .unwrap_err();
 
     assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
-    assert_eq!(
-        runtime.request_stats("rejected-chat").unwrap().state,
-        RequestLifecycleState::Rejected
-    );
+    assert_eq!(runtime.metrics_snapshot().rejected, 1);
     runtime.shutdown().await.unwrap();
 }
 

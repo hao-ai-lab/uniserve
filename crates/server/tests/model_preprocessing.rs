@@ -1083,9 +1083,8 @@ fn cache_controls_preserve_isolation_and_prompt_logprob_requirements() {
 
         request.bypass_cache_read = true;
         request.no_cache_store = true;
-        let (disabled, response) = processor.preprocess_text_request(request.clone()).unwrap();
+        let (disabled, _) = processor.preprocess_text_request(request.clone()).unwrap();
         assert!(!disabled.cache.read && !disabled.cache.write);
-        assert!(!response.cache.read_enabled && !response.cache.write_enabled);
         assert_eq!(disabled.cache.isolation_key, other.cache.isolation_key);
 
         request.bypass_cache_read = false;
@@ -1093,7 +1092,6 @@ fn cache_controls_preserve_isolation_and_prompt_logprob_requirements() {
         request.stop.prompt_logprobs = Some(0);
         let (logprobs, response) = processor.preprocess_text_request(request).unwrap();
         assert!(!logprobs.cache.read && logprobs.cache.write);
-        assert!(!response.cache.read_enabled && response.cache.write_enabled);
         assert!(response.prompt_logprobs_requested);
     }
 }

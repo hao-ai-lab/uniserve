@@ -12,9 +12,9 @@
 
 use std::collections::HashMap;
 
+use crate::serving::ServeRequestId;
 use crate::serving::text::TextDecodeOptions;
 use crate::serving::text::tokenizer::DynTokenizer;
-use crate::serving::{CacheAccounting, ResourceAccounting, ServeRequestId};
 
 /// The public prompt: raw text or a chat conversation. Input images live in
 /// programmatic image inputs (and inside chat parts for the chat variant).
@@ -259,20 +259,9 @@ pub enum OutputProcessorPolicy {
     SenseNova(crate::profile::omni::OutputFilterPolicy),
 }
 
-/// Model identity stamped onto `Accepted` events.
-#[derive(Debug, Clone)]
-pub struct ModelEventIdentity {
-    /// Model name exposed through serving events.
-    pub served_name: String,
-    /// Stable profile description exposed through serving events.
-    pub description: String,
-}
-
 /// Tokenization resources and output requirements retained by the frontend.
 /// The corresponding generation request moves directly into the engine.
 pub struct ResponseOptions {
-    /// Caller-visible request identifier.
-    pub request_id: ServeRequestId,
     /// The model-bound tokenizer that owns decoding for this request.
     pub tokenizer: DynTokenizer,
     /// Copy of the prompt token identifiers submitted to the engine, kept
@@ -289,10 +278,4 @@ pub struct ResponseOptions {
     pub generated_logprobs_requested: bool,
     /// Model-selected semantic output processor.
     pub output_processor: OutputProcessorPolicy,
-    /// Model identity stamped onto accepted events.
-    pub identity: ModelEventIdentity,
-    /// Cache accounting limits propagated to the engine request.
-    pub cache: CacheAccounting,
-    /// Resource bounds propagated to admission control.
-    pub resources: ResourceAccounting,
 }

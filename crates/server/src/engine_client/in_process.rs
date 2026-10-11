@@ -289,18 +289,18 @@ impl EngineClient {
     /// the returned ID or complete its decoded-response lifecycle on failure.
     ///
     /// Returns `Error::DuplicateRequestId` when a live request already holds
-    /// `external_request_id`. With `output_identity`, the registration also
+    /// `external_request_id`. With `track_lifecycle`, the registration also
     /// carries per-request lifecycle statistics. Identifiers come from the
     /// first core's allocator alone, so they are unique across the replicas.
     pub fn register_request(
         &self,
         external_request_id: String,
-        output_identity: Option<crate::serving::ModelEventIdentity>,
+        track_lifecycle: bool,
     ) -> Result<RequestId> {
         let rid = self.first().next_request_id();
         if !self
             .requests
-            .register(external_request_id.clone().into(), rid, output_identity)
+            .register(external_request_id.clone().into(), rid, track_lifecycle)
         {
             return Err(Error::DuplicateRequestId {
                 request_id: external_request_id,
@@ -511,7 +511,7 @@ mod tests {
         let policy = ImageGenerationConfig::default();
         let generation = GenerationRequest {
             request_id: client
-                .register_request("req-text".to_string(), None)
+                .register_request("req-text".to_string(), false)
                 .expect("reserve request"),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: Default::default(),
@@ -609,7 +609,7 @@ mod tests {
         let mut ids = Vec::new();
         for name in ["first", "second"] {
             let rid = client
-                .register_request(name.to_string(), None)
+                .register_request(name.to_string(), false)
                 .expect("reserve request");
             ids.push(rid);
             streams.push(
@@ -677,7 +677,7 @@ mod tests {
         };
         let request = GenerationRequest {
             request_id: client
-                .register_request("req-image".to_string(), None)
+                .register_request("req-image".to_string(), false)
                 .expect("reserve request"),
             prompt_token_ids: vec![1, 2, 3],
             multimodal_inputs: Default::default(),

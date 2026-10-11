@@ -136,7 +136,7 @@ impl ServingRuntime {
         let external = format!("{request_id}-{index}");
         request.request_id = self
             .engine
-            .register_request(external.clone(), None)
+            .register_request(external.clone(), false)
             .map_err(|error| SystemOneError::Server(error.to_string()))?;
         let mut events = self
             .engine

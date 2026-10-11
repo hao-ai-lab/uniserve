@@ -62,9 +62,8 @@ use thiserror::Error;
 use uniserve_core::EngineCoreOutput;
 
 pub use input::{
-    DecodeControls, ImageGenControls, ModalitySelection, ModelEventIdentity, OutputDetail,
-    OutputProcessorPolicy, PromptInput, ResponseOptions, SamplingConfig, StopConfig,
-    TextPromptRequest,
+    DecodeControls, ImageGenControls, ModalitySelection, OutputDetail, OutputProcessorPolicy,
+    PromptInput, ResponseOptions, SamplingConfig, StopConfig, TextPromptRequest,
 };
 pub use media::ImageInput;
 pub(crate) use model::LoadedModel;
@@ -179,9 +178,6 @@ pub enum TokenizeError {
     /// The lowered request violates the canonical generation contract.
     #[error(transparent)]
     Generation(#[from] uniserve_core::GenerationRequestError),
-    /// Requested computation exceeds loaded model capacity.
-    #[error(transparent)]
-    Capacity(#[from] uniserve_core::GenerationResourceError),
     /// Multimodal request controls or geometry are invalid.
     #[error(transparent)]
     Omni(#[from] crate::serving::omni::OmniError),
@@ -361,7 +357,7 @@ pub(crate) fn cache_isolation_key(namespace: Option<&str>, salt: Option<&str>) -
 /// Tokenized input retains only the response processing its computation needs.
 ///
 /// Media requests carry no `ResponseOptions`: their stream is assembled from the prompt
-/// length and the runtime's model identity.
+/// length alone.
 enum Prepared {
     Generation(Box<(uniserve_core::GenerationRequest, ResponseOptions)>),
     Diffusion(uniserve_core::DiffusionRequest),
@@ -449,16 +445,6 @@ impl ServingRuntime {
         let mut snapshot = self.metrics.snapshot();
         snapshot.active = self.engine.requests.active_count() as u64;
         snapshot
-    }
-
-    /// Returns current lifecycle statistics for one request.
-    pub fn request_stats(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        self.engine.requests.stats(request_id)
-    }
-
-    /// Waits for one request to leave the active registry and returns its final snapshot.
-    pub async fn drain_request(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        self.engine.requests.drain_request(request_id).await
     }
 
     /// Waits until every active request leaves the runtime.
@@ -588,11 +574,10 @@ impl ServingRuntime {
         // image fetching and time spent queued for the blocking pool count toward
         // compilation.
         let compile_started = Instant::now();
-        let identity = self.model.event_identity();
 
         let engine_request_id = self
             .engine
-            .register_request(request_id.to_string(), Some(identity))
+            .register_request(request_id.to_string(), true)
             .map_err(|error| {
                 self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
                 match error {
@@ -677,7 +662,6 @@ impl ServingRuntime {
             Prepared::Generation(prepared) => {
                 let (request, response) = *prepared;
                 let ResponseOptions {
-                    request_id: _,
                     tokenizer,
                     prompt_token_ids,
                     decode,
@@ -685,9 +669,6 @@ impl ServingRuntime {
                     prompt_logprobs_requested,
                     generated_logprobs_requested,
                     output_processor,
-                    identity,
-                    cache,
-                    resources,
                 } = response;
                 let engine_stream = self
                     .engine
@@ -695,12 +676,8 @@ impl ServingRuntime {
                     .await;
 
                 let event_context = EventContext {
-                    served_name: identity.served_name.clone(),
-                    description: identity.description.clone(),
                     compile_duration_us,
                     started: lifecycle.started,
-                    cache,
-                    resources,
                     metrics: Arc::clone(&self.metrics),
                 };
 
@@ -735,12 +712,8 @@ impl ServingRuntime {
             Prepared::Diffusion(request) => {
                 let prompt_tokens = request.prompt_token_ids.len();
                 let context = EventContext {
-                    served_name: self.model.served_model_name().to_owned(),
-                    description: self.model.event_identity().description,
                     compile_duration_us,
                     started: lifecycle.started,
-                    cache: CacheAccounting::default(),
-                    resources: ResourceAccounting::default(),
                     metrics: Arc::clone(&self.metrics),
                 };
                 self.engine
@@ -865,9 +838,9 @@ pub enum ServeControlError {
     Engine(#[from] crate::engine_client::Error),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-/// Observable lifecycle phase of one serving request.
-pub enum RequestLifecycleState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Lifecycle phase of one serving request, as `RequestRegistry` tracks it.
+pub(crate) enum RequestLifecycleState {
     /// The public request is being validated and tokenized.
     Compiling,
     /// The tokenized request is being submitted to the engine.
@@ -894,75 +867,11 @@ pub enum RequestLifecycleState {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Point-in-time lifecycle state, usage, and timing statistics for one request.
-///
-/// `RequestRegistry` maintains it from the public events it observes and retains it for a
-/// bounded number of completed requests.
-pub struct RequestStatsSnapshot {
-    /// Caller-visible request identifier.
-    pub request_id: ServeRequestId,
-    /// Model name used for the request.
-    pub served_name: String,
-    /// Stable model profile description.
-    pub description: String,
-    /// Latest observed lifecycle phase.
-    pub state: RequestLifecycleState,
-    /// Number of prompt tokens submitted to the engine.
-    pub prompt_tokens: u32,
-    /// Number of generated tokens included in user-visible output.
-    pub visible_output_tokens: u32,
-    /// Number of generated tokens consumed by internal protocol sections.
-    pub internal_tokens: u32,
-    /// Number of generated images.
-    pub image_count: u32,
-    /// Total image-generation steps completed.
-    pub image_steps: u32,
-    /// Cache policy and pin counts.
-    pub cache: CacheAccounting,
-    /// KV and media resources reserved for the request.
-    pub resources: ResourceAccounting,
-    /// Request phase durations.
-    pub timings: RuntimeTimings,
-}
-
-impl RequestStatsSnapshot {
-    /// Creates a zeroed snapshot for a request entering engine submission.
-    pub(crate) fn submitting(
-        request_id: ServeRequestId,
-        served_name: String,
-        description: String,
-        compile_us: u64,
-    ) -> Self {
-        Self {
-            request_id,
-            served_name,
-            description,
-            state: RequestLifecycleState::Submitting,
-            prompt_tokens: 0,
-            visible_output_tokens: 0,
-            internal_tokens: 0,
-            image_count: 0,
-            image_steps: 0,
-            cache: CacheAccounting::default(),
-            resources: ResourceAccounting::default(),
-            timings: RuntimeTimings {
-                compile_us,
-                ..RuntimeTimings::default()
-            },
-        }
-    }
-}
-
 /// Request-scoped metadata the assemblers stamp onto public events and usage.
 #[derive(Debug, Clone)]
 struct EventContext {
     started: Instant,
-    served_name: String,
-    description: String,
     compile_duration_us: u64,
-    cache: CacheAccounting,
-    resources: ResourceAccounting,
     // The assemblers increment `scheduled` when the engine reports scheduling.
     metrics: Arc<RuntimeLifecycleMetrics>,
 }
@@ -1301,32 +1210,6 @@ impl Drop for LifecycleGuard {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// Cache policy and encoder-cache pin count resolved for one request during preprocessing.
-pub struct CacheAccounting {
-    /// Whether the request may reuse existing cache entries.
-    pub read_enabled: bool,
-    /// Whether the request may publish reusable cache entries.
-    pub write_enabled: bool,
-    /// Number of encoder-cache entries pinned for the request lifetime.
-    pub encoder_pin_count: usize,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// KV, latent, and encoder-cache requirements computed for one request during preprocessing.
-/// Media requests report `ResourceAccounting::default()`.
-pub struct ResourceAccounting {
-    /// KV-token capacity required for the request.
-    pub expected_kv_tokens: u64,
-    /// Latent image units reserved for generation.
-    pub image_latent_units: u64,
-    /// Number of encoder-cache entries retained by the request.
-    pub encoder_cache_pins: usize,
-    /// For a generation request, false when generated images feed back into the request's
-    /// context (`GenerationRequest::feeds_back_images`).
-    pub replayable: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 /// Queue, execution, and end-to-end duration totals.
 pub struct RuntimeTimings {
     /// Request validation and tokenization duration in microseconds, including time queued
@@ -1355,10 +1238,6 @@ pub enum RequestOutput {
     Accepted {
         /// Caller-visible request identifier.
         request_id: ServeRequestId,
-        /// Model name used for the request.
-        served_name: String,
-        /// Stable model profile description.
-        description: String,
         /// Validation and tokenization duration in microseconds.
         compile_duration_us: u64,
         /// Number of prompt tokens submitted to the engine.
@@ -1378,10 +1257,6 @@ pub enum RequestOutput {
         /// Engine wall-clock time, in UNIX seconds, at which the scheduler admitted the
         /// request for execution.
         scheduled_at: Option<f64>,
-        /// Cache policy and pin counts.
-        cache: CacheAccounting,
-        /// KV and media resources reserved for the request.
-        resources: ResourceAccounting,
     },
     /// Newly decoded user-visible text.
     TextDelta {
@@ -1499,10 +1374,6 @@ pub enum RequestOutput {
         image_count: u32,
         /// Total image-generation steps completed.
         image_steps: u32,
-        /// Cache policy and pin counts.
-        cache: CacheAccounting,
-        /// KV and media resources reserved for the request.
-        resources: ResourceAccounting,
         /// Request phase durations.
         timings: RuntimeTimings,
     },
@@ -1653,19 +1524,7 @@ mod tests {
     fn event_context() -> EventContext {
         EventContext {
             started: Instant::now(),
-            served_name: "profile".to_string(),
-            description: "bagel".to_string(),
             compile_duration_us: 7,
-            cache: CacheAccounting {
-                read_enabled: true,
-                write_enabled: true,
-                encoder_pin_count: 0,
-            },
-            resources: ResourceAccounting {
-                expected_kv_tokens: 2,
-                replayable: true,
-                ..ResourceAccounting::default()
-            },
             metrics: Arc::new(RuntimeLifecycleMetrics::default()),
         }
     }

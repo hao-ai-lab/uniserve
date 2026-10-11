@@ -35,15 +35,12 @@ use crate::serving::chat::{
     ChatOutputProcessor, ChatTemplateLoadOptions, HfChatRenderer, Qwen3ChatOutputProcessor,
 };
 use crate::serving::input::{
-    ModelEventIdentity, OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions,
-    TextPromptRequest,
+    OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions, TextPromptRequest,
 };
 use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
 use crate::serving::video::plan::VisionConfig;
 use crate::serving::video::{ProcessedVideo, VideoService};
-use crate::serving::{
-    CacheAccounting, ResourceAccounting, Result, ServeError, cache_isolation_key,
-};
+use crate::serving::{Result, ServeError, cache_isolation_key};
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -629,14 +626,6 @@ impl InputProcessor {
             .await
     }
 
-    /// Builds the model identity stamped onto accepted events.
-    pub fn event_identity(&self) -> ModelEventIdentity {
-        ModelEventIdentity {
-            served_name: self.config.served_name.clone(),
-            description: self.config.description().id().to_string(),
-        }
-    }
-
     /// Returns whether the model supports image output.
     pub fn supports_image_output(&self) -> bool {
         matches!(
@@ -943,77 +932,68 @@ impl InputProcessor {
         // Each model fills its actual computation inputs in the same request.
         // No partially prepared request is exposed to the submission boundary.
         // The closure gathers every `TokenizeError` so it maps once to `ServeError::Tokenize`.
-        let (output_processor, max_kv_tokens, image_latent_units) =
-            (|| -> std::result::Result<_, crate::serving::TokenizeError> {
-                let output_processor = match &self.config.parameters {
-                    ModelParameters::Qwen3 => self.preprocess_qwen3_input(
-                        prompt,
-                        &sampling,
-                        &stop,
-                        &mut generation,
-                        &mut decode,
-                    )?,
-                    ModelParameters::SenseNova(profile) => {
-                        crate::serving::omni::preprocess_sensenova(
-                            profile,
-                            self,
-                            &request_id,
-                            prompt,
-                            images,
-                            negative_text,
-                            image_gen,
-                            &mut generation,
-                        )?
-                    }
-                    ModelParameters::Bagel(profile) => crate::serving::omni::preprocess_bagel(
-                        profile,
-                        self,
-                        &request_id,
-                        prompt,
-                        images,
-                        negative_text,
-                        image_gen,
-                        &mut generation,
-                    )?,
-                    ModelParameters::DiffusionGemma(profile) => self
-                        .preprocess_diffusion_gemma_input(
-                            profile,
-                            prompt,
-                            &images,
-                            &sampling,
-                            &mut generation,
-                            &mut decode,
-                        )?,
-                    ModelParameters::MiniMaxH3 { .. } => {
-                        unreachable!("generation features checked above")
-                    }
-                };
-                if matches!(
-                    self.config.parameters,
-                    ModelParameters::Qwen3 | ModelParameters::DiffusionGemma(_)
-                ) {
-                    generation.validate()?;
-                } else {
-                    crate::serving::omni::prepare_generation_resources(
-                        self,
-                        &sampling,
-                        &stop,
-                        &mut generation,
-                    )?;
+        let output_processor = (|| -> std::result::Result<_, crate::serving::TokenizeError> {
+            let output_processor = match &self.config.parameters {
+                ModelParameters::Qwen3 => self.preprocess_qwen3_input(
+                    prompt,
+                    &sampling,
+                    &stop,
+                    &mut generation,
+                    &mut decode,
+                )?,
+                ModelParameters::SenseNova(profile) => crate::serving::omni::preprocess_sensenova(
+                    profile,
+                    self,
+                    &request_id,
+                    prompt,
+                    images,
+                    negative_text,
+                    image_gen,
+                    &mut generation,
+                )?,
+                ModelParameters::Bagel(profile) => crate::serving::omni::preprocess_bagel(
+                    profile,
+                    self,
+                    &request_id,
+                    prompt,
+                    images,
+                    negative_text,
+                    image_gen,
+                    &mut generation,
+                )?,
+                ModelParameters::DiffusionGemma(profile) => self.preprocess_diffusion_gemma_input(
+                    profile,
+                    prompt,
+                    &images,
+                    &sampling,
+                    &mut generation,
+                    &mut decode,
+                )?,
+                ModelParameters::MiniMaxH3 { .. } => {
+                    unreachable!("generation features checked above")
                 }
-                Ok((
-                    output_processor,
-                    generation.max_kv_tokens(&self.limits)?,
-                    generation.image_latent_units(&self.limits)?,
-                ))
-            })()
-            .map_err(|source| ServeError::Tokenize {
-                request_id: request_id.clone(),
-                source,
-            })?;
+            };
+            if matches!(
+                self.config.parameters,
+                ModelParameters::Qwen3 | ModelParameters::DiffusionGemma(_)
+            ) {
+                generation.validate()?;
+            } else {
+                crate::serving::omni::prepare_generation_resources(
+                    self,
+                    &sampling,
+                    &stop,
+                    &mut generation,
+                )?;
+            }
+            Ok(output_processor)
+        })()
+        .map_err(|source| ServeError::Tokenize {
+            request_id: request_id.clone(),
+            source,
+        })?;
 
         let response = ResponseOptions {
-            request_id,
             tokenizer: Arc::clone(&self.tokenizer),
             // Detokenization needs the prompt after ownership moves to the engine.
             prompt_token_ids: generation.prompt_token_ids.clone(),
@@ -1022,18 +1002,6 @@ impl InputProcessor {
             prompt_logprobs_requested: generation.sampling.prompt_logprobs_requested(),
             generated_logprobs_requested: generation.sampling.generated_logprobs_requested(),
             output_processor,
-            identity: self.event_identity(),
-            cache: CacheAccounting {
-                read_enabled: generation.cache.read,
-                write_enabled: generation.cache.write,
-                encoder_pin_count: generation.num_encoder_cache_entries(),
-            },
-            resources: ResourceAccounting {
-                expected_kv_tokens: max_kv_tokens as u64,
-                image_latent_units,
-                encoder_cache_pins: generation.num_encoder_cache_entries(),
-                replayable: !generation.feeds_back_images(),
-            },
         };
         Ok((generation, response))
     }
