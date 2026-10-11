@@ -218,23 +218,12 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
     """Resolve checkpoint aliases once, without allocating numerical resources.
 
     Raises:
-        RuntimeError: When the checkpoint requires a newer version of this
-            model implementation.
         ValueError: For malformed metadata, including a missing
             ``llm_config``, ``vision_config`` or text dimension without a
             default, conflicting aliases, an unsupported rotary recipe or
             sparse MoE text model, and fields that a rotary recipe or config
             dataclass rejects.
     """  # noqa: E501
-    from packaging.version import Version
-
-    # A checkpoint may name the minimum version of this model code it needs.
-    required = raw.get("uniserve_sensenova_min_version")
-    if required and Version("0.1.0") < Version(str(required)):
-        raise RuntimeError(
-            f"checkpoint requires UniServe model code >= {required}"
-        )
-
     text, image = raw.get("llm_config"), raw.get("vision_config")
     if not isinstance(text, Mapping) or not isinstance(image, Mapping):
         raise ValueError(
