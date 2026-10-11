@@ -187,13 +187,11 @@ pub enum ModelParameters {
     SenseNova(SenseNovaProfile),
     /// Bagel image, prompt, and generation settings.
     Bagel(BagelProfile),
-    /// MiniMax-H3 duration limit. What the placed denoiser serves (tasks,
+    /// MiniMax-H3 video generation. What the placed denoiser serves (tasks,
     /// schedule, canvases) belongs to the loaded worker, whose startup
-    /// handshake reports it.
-    MiniMaxH3 {
-        /// Maximum requested duration in seconds, before frame alignment.
-        max_video_seconds: f64,
-    },
+    /// handshake reports it, and the duration capacity to the deployment's
+    /// engine settings.
+    MiniMaxH3,
     /// DiffusionGemma canvas, control-token, image, and sampler settings.
     DiffusionGemma(DiffusionGemmaProfile),
 }
@@ -319,14 +317,11 @@ impl ModelConfig {
     pub fn from_pipeline(
         model_id: &str,
         description: ModelDescription,
-        max_video_seconds: f64,
         max_model_tokens: Option<u32>,
     ) -> assets::Result<Self> {
         let (parameters, default_max_model_tokens) = match description {
             // MiniMax H3's text encoder serves prompts of up to 16,384 tokens.
-            ModelDescription::MiniMaxH3 => {
-                (ModelParameters::MiniMaxH3 { max_video_seconds }, 16_384)
-            }
+            ModelDescription::MiniMaxH3 => (ModelParameters::MiniMaxH3, 16_384),
             ModelDescription::Qwen3
             | ModelDescription::SenseNova
             | ModelDescription::Bagel
@@ -353,7 +348,7 @@ impl ModelConfig {
             ModelParameters::Qwen3 => ModelDescription::Qwen3,
             ModelParameters::SenseNova(_) => ModelDescription::SenseNova,
             ModelParameters::Bagel(_) => ModelDescription::Bagel,
-            ModelParameters::MiniMaxH3 { .. } => ModelDescription::MiniMaxH3,
+            ModelParameters::MiniMaxH3 => ModelDescription::MiniMaxH3,
             ModelParameters::DiffusionGemma(_) => ModelDescription::DiffusionGemma,
         }
     }
@@ -559,7 +554,7 @@ mod tests {
                     );
                     assert!(profile.image_generation.feedback_source.is_some());
                 }
-                ModelParameters::MiniMaxH3 { .. } => {
+                ModelParameters::MiniMaxH3 => {
                     assert_eq!(description, ModelDescription::MiniMaxH3);
                 }
                 ModelParameters::DiffusionGemma(_) => {
@@ -577,8 +572,7 @@ mod tests {
         );
         assert_eq!(ModelDescription::from_model_type("minimax_h3"), None);
 
-        let profile =
-            ModelConfig::from_pipeline("h3", ModelDescription::MiniMaxH3, 15.0, None).unwrap();
+        let profile = ModelConfig::from_pipeline("h3", ModelDescription::MiniMaxH3, None).unwrap();
         assert_eq!(profile.description(), ModelDescription::MiniMaxH3);
         assert_eq!(profile.max_model_tokens, Some(16_384));
     }

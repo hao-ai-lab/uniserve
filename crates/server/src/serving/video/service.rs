@@ -52,7 +52,6 @@ pub struct ProcessedVideo {
 pub struct VideoService {
     denoiser: VideoDenoiserInfo,
     tasks: Vec<VideoTask>,
-    max_video_seconds: f64,
     /// Condition units one latent encoding round covers while a request's
     /// prompt is encoded, which reference images are banded to fill
     /// (`RequestPlan::image_bands`).
@@ -110,7 +109,6 @@ impl VideoService {
             processor: VideoProcessor::new(fetcher, prober, vision, limits, tokenizer),
             denoiser,
             tasks,
-            max_video_seconds,
             latent_encoding_lane: latent_encoding_lane.max(1),
             media: media.clone(),
         })
@@ -182,7 +180,7 @@ impl VideoService {
             },
             "fps": VIDEO_FPS,
             "min_seconds": MIN_VIDEO_SECONDS,
-            "max_seconds": self.max_video_seconds,
+            "max_seconds": self.processor.limits().max_video_seconds,
             "model_max_seconds": MAX_VIDEO_SECONDS,
             "schedule": {
                 "num_inference_steps": self.denoiser.schedule_points,

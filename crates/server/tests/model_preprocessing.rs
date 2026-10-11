@@ -25,7 +25,9 @@ use uniserve_server::serving::media::{
 };
 use uniserve_server::serving::video::VideoService;
 use uniserve_server::serving::video::plan::VisionConfig;
-use uniserve_server::serving::{InputProcessor, ResponseOptions, ServeRequestId, chat_image_urls};
+use uniserve_server::serving::{
+    InputProcessor, RequestRenderer, ResponseOptions, ServeRequestId, chat_image_urls,
+};
 
 /// Base64 payload of a 1x1 PNG image.
 const PNG_1X1: &str =
@@ -206,11 +208,11 @@ fn try_resolved_model(
     )
     .unwrap();
     // A diffusers pipeline checkpoint has no root `config.json`, so MiniMax H3
-    // is built by `ModelConfig::from_pipeline`, here with the server's default
-    // 15-second maximum video duration.
+    // is built by `ModelConfig::from_pipeline` and served by a video service
+    // with the server's default 15-second maximum video duration.
     let config = match description {
         ModelDescription::MiniMaxH3 => {
-            ModelConfig::from_pipeline(description.id(), description, 15.0, Some(4096)).unwrap()
+            ModelConfig::from_pipeline(description.id(), description, Some(4096)).unwrap()
         }
         _ => tokio::runtime::Builder::new_current_thread()
             .build()
@@ -224,17 +226,20 @@ fn try_resolved_model(
             ))
             .unwrap(),
     };
-    let video = (description == ModelDescription::MiniMaxH3)
-        .then(|| video_service(base_denoiser(), 15.0, &tokenizer));
+    let renderer = match description {
+        ModelDescription::MiniMaxH3 => {
+            RequestRenderer::Video(video_service(base_denoiser(), 15.0, &tokenizer))
+        }
+        _ => RequestRenderer::Chat(renderer),
+    };
     let model = InputProcessor::new(
         config,
         Arc::clone(&tokenizer),
-        Some(renderer),
+        renderer,
         uniserve_server::serving::WorkerCapabilities {
             limits,
             max_model_tokens: 4096,
         },
-        video,
         true,
     )?;
     Ok((directory, tokenizer, model))
@@ -698,31 +703,17 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         audio_shift: 3.0,
         canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
     };
-    let processor = |max_video_seconds: f64| {
-        let mut config = loaded.config().clone();
-        config.parameters =
-            uniserve_server::profile::ModelParameters::MiniMaxH3 { max_video_seconds };
-        InputProcessor::new(
-            config,
-            Arc::clone(&tokenizer),
-            None,
-            uniserve_server::serving::WorkerCapabilities {
-                limits: runtime_limits(),
-                max_model_tokens: 4096,
-            },
-            Some(video_service(
-                denoiser.clone(),
-                max_video_seconds,
-                &tokenizer,
-            )),
-            true,
-        )
-    };
-    for capacity in [0.0, 3.5, 15.5, f64::NAN] {
-        assert!(processor(capacity).is_err(), "{capacity} s");
-    }
-
-    let model = processor(10.0).unwrap();
+    let model = InputProcessor::new(
+        loaded.config().clone(),
+        Arc::clone(&tokenizer),
+        RequestRenderer::Video(video_service(denoiser, 10.0, &tokenizer)),
+        uniserve_server::serving::WorkerCapabilities {
+            limits: runtime_limits(),
+            max_model_tokens: 4096,
+        },
+        true,
+    )
+    .unwrap();
     let capabilities = model.video_capabilities();
     assert_eq!(capabilities["tasks"], serde_json::json!(["t2va"]));
     assert_eq!(capabilities["min_seconds"], 4.0);
@@ -814,26 +805,6 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
             "{target}"
         );
     }
-
-    // Only a video checkpoint has a video service, and it needs one.
-    let mut config = loaded.config().clone();
-    config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
-        max_video_seconds: 10.0,
-    };
-    assert!(
-        InputProcessor::new(
-            config,
-            Arc::clone(&tokenizer),
-            None,
-            uniserve_server::serving::WorkerCapabilities {
-                limits: runtime_limits(),
-                max_model_tokens: 4096,
-            },
-            None,
-            true,
-        )
-        .is_err()
-    );
 }
 
 /// `InputProcessor::new` replaces the checkpoint's context length with the
@@ -850,12 +821,11 @@ fn worker_context_capacity_limits_preprocessed_requests() {
     let processor = InputProcessor::new(
         loaded.config().clone(),
         tokenizer,
-        Some(renderer),
+        RequestRenderer::Chat(renderer),
         uniserve_server::serving::WorkerCapabilities {
             limits: runtime_limits(),
             max_model_tokens: 8,
         },
-        None,
         true,
     )
     .unwrap();
@@ -1157,12 +1127,11 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
     InputProcessor::new(
         loaded.config().clone(),
         tokenizer,
-        Some(renderer),
+        RequestRenderer::Chat(renderer),
         uniserve_server::serving::WorkerCapabilities {
             limits: runtime_limits(),
             max_model_tokens: 4096,
         },
-        None,
         true,
     )
     .unwrap()

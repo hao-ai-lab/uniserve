@@ -197,8 +197,7 @@ impl InputProcessor {
             self.parse_reasoning,
         )?;
         let rendered = self
-            .renderer
-            .as_ref()
+            .chat_renderer()
             .ok_or(crate::serving::chat::Error::MissingChatTemplate)?
             .render(&chat)?;
         let rendered = self.tokenizer.encode(&rendered, false)?;
@@ -275,7 +274,9 @@ mod tests {
     use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
     use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
     use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
-    use crate::serving::{FinishStatus, InputProcessor, RequestOutput, ServingRuntime};
+    use crate::serving::{
+        FinishStatus, InputProcessor, RequestOutput, RequestRenderer, ServingRuntime,
+    };
     use futures::StreamExt;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer};
@@ -364,7 +365,7 @@ mod tests {
         let processor = InputProcessor::new(
             model,
             Arc::clone(&tokenizer),
-            Some(
+            RequestRenderer::Chat(
                 HfChatRenderer::new(
                     Some("{{ messages[0].content }}".to_string()),
                     HashMap::new(),
@@ -376,7 +377,6 @@ mod tests {
                 limits: client.generation_limits(),
                 max_model_tokens: 4096,
             },
-            None,
             false,
         )
         .unwrap();

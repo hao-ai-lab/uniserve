@@ -77,7 +77,9 @@ pub struct EngineSettings {
     /// of a diffusers pipeline.
     pub max_model_len: Option<u32>,
     /// Largest request duration, in seconds, resident media state is sized to
-    /// serve. The video service rejects longer video requests.
+    /// serve, between `crate::serving::MIN_VIDEO_SECONDS` and
+    /// `MAX_VIDEO_SECONDS`, the range the video API admits. The video service
+    /// rejects longer video requests.
     pub max_video_seconds: f64,
     /// Video resolution classes a video deployment prepares. Crossed with
     /// `video_aspect_ratios`, they name the canvases its workers prepare and
@@ -333,8 +335,9 @@ impl EngineSettings {
     /// positive (they index, divide, or bound scheduling). This catches a `0`
     /// override before it reaches the scheduler or KV sizing math. It also
     /// rejects a `max_video_seconds` outside the video API's [4, 15] second
-    /// range (`validate_video_capacity`) and any
-    /// worker placement `WorkerConfig::validate_all` refuses.
+    /// range, since a smaller capacity admits no request and a larger one
+    /// exceeds what the API accepts, and any worker placement
+    /// `WorkerConfig::validate_all` refuses.
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.worker_process.block_size.is_none_or(|size| size > 0),
@@ -354,8 +357,14 @@ impl EngineSettings {
             self.max_model_len.map(|len| len > 0).unwrap_or(true),
             "max_model_len must be greater than 0"
         );
-        crate::serving::validate_video_capacity(self.max_video_seconds)
-            .map_err(anyhow::Error::msg)?;
+        let video_seconds = crate::serving::MIN_VIDEO_SECONDS..=crate::serving::MAX_VIDEO_SECONDS;
+        anyhow::ensure!(
+            video_seconds.contains(&self.max_video_seconds),
+            "max_video_seconds must lie in [{}, {}], got {}",
+            video_seconds.start(),
+            video_seconds.end(),
+            self.max_video_seconds
+        );
         anyhow::ensure!(
             self.worker_process.resp_slot_cap > 0,
             "resp_slot_cap must be greater than 0"

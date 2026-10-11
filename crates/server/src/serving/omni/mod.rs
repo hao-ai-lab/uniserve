@@ -139,8 +139,7 @@ pub(super) fn preprocess_sensenova(
         profile,
         &processor.tokenizer,
         processor
-            .renderer
-            .as_ref()
+            .chat_renderer()
             .ok_or(crate::serving::chat::Error::MissingChatTemplate)?,
         request_id,
         prompt,
@@ -221,8 +220,7 @@ pub(super) fn preprocess_bagel(
         profile,
         &processor.tokenizer,
         processor
-            .renderer
-            .as_ref()
+            .chat_renderer()
             .ok_or(crate::serving::chat::Error::MissingChatTemplate)?,
         request_id,
         prompt,

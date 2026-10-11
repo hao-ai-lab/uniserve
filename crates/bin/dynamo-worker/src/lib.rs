@@ -48,10 +48,7 @@ use uniserve_server::{
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
     profile::omni::resolution::ResolutionName,
     profile::video::{VideoRasters, VideoResolution},
-    serving::{
-        FinishStatus, RequestOutput, ServeRequestId, VIDEO_FPS, validate_video_capacity,
-        video_frame_count,
-    },
+    serving::{FinishStatus, RequestOutput, ServeRequestId, VIDEO_FPS, video_frame_count},
 };
 
 // The served canvases come from `--video-resolutions` and
@@ -176,7 +173,6 @@ impl DynamoFastH3Engine {
         if args.common.enable_rl {
             return Err(invalid_argument("RL engine routes are not supported"));
         }
-        validate_video_capacity(args.max_video_seconds).map_err(invalid_argument)?;
         if args.max_running_requests == 0 {
             return Err(invalid_argument("max-running-requests must be positive"));
         }
