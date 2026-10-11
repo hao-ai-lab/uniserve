@@ -1016,7 +1016,7 @@ def execute(
             )
 
     elif call.kind in {MediaCall.VIDEO_DECODING, MediaCall.AUDIO_DECODING}:
-        params = decode_range(call, state=state)
+        units = decode_range(call, state=state)
         inputs = call.inputs
         if len(inputs) != 1:
             raise invalid_descriptor(
@@ -1033,7 +1033,7 @@ def execute(
                 "media reconstruction requires complete input coverage"
             )
 
-        cursor, count = params.cursor, params.max_units
+        cursor, count = units.cursor, units.max_units
         track = (
             MediaTrack.AUDIO
             if call.kind is MediaCall.AUDIO_DECODING
