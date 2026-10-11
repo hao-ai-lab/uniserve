@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use crate::profile::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::profile::omni::bagel::BagelProfile;
-use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
 use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
 use thiserror::Error;
@@ -247,7 +246,7 @@ impl ModelConfig {
                 max_cfg_branches: 1,
                 ..Default::default()
             },
-            ModelParameters::SenseNova(_) => SenseNovaProfile::runtime_limits(model_dtype),
+            ModelParameters::SenseNova(profile) => profile.runtime_limits(model_dtype),
             ModelParameters::Bagel(_) => BagelProfile::runtime_limits(model_dtype),
             // A readout prefills text and encoded images and denoises its
             // canvases once over them. An image writes one KV entry per soft
