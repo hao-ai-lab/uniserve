@@ -184,14 +184,6 @@ fn image<'a>(
     let cfg_interval_lo = v.cfg_interval.0;
     let cfg_interval_hi = v.cfg_interval.1;
     let negative_prompt = Some(b.create_string(&v.negative_prompt));
-    let image_prompts = {
-        let items = v
-            .image_prompts
-            .iter()
-            .map(|s| b.create_string(s))
-            .collect::<Vec<_>>();
-        Some(b.create_vector(&items))
-    };
     fbs::ImageParams::create(
         b,
         &fbs::ImageParamsArgs {
@@ -207,7 +199,6 @@ fn image<'a>(
             width: v.width,
             seed: v.seed,
             negative_prompt,
-            image_prompts,
         },
     )
 }

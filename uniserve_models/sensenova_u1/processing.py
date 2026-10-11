@@ -73,14 +73,12 @@ _FLOW_SYSTEM_MESSAGE = (
 )
 
 
-# Chat framing of the guidance prefixes. The conditioned prompt closes an
-# empty think block, so generation starts in the system message's non-think
-# mode; both prompts end with the ``<img>`` token the image tokens follow.
+# Chat framing of the unconditional guidance prefix, which ends with the
+# ``<img>`` token the image tokens follow.
 flow_prompt = FlowPrompt(
     user_prefix="<|im_start|>user\n",
     user_suffix="<|im_end|>\n",
     assistant_suffix="<|im_start|>assistant\n",
-    conditioned_append="<think>\n\n</think>\n\n<img>",
     unconditional_append="<img>",
     system_prefix="<|im_start|>system\n",
     system_message=_FLOW_SYSTEM_MESSAGE,

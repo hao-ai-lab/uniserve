@@ -130,7 +130,7 @@ pub(super) fn preprocess_sensenova(
     let negative_prompt_token_ids = profile
         .render_negative_prompt_ids(&processor.tokenizer, negative_text.as_deref().unwrap_or(""))
         .map_err(|error| error.to_string())?;
-    let image = resolve_image_params(
+    let (image, max_images) = resolve_image_params(
         &profile.image_defaults,
         &profile.resolution_policy,
         image_gen.unwrap_or_default(),
@@ -163,6 +163,7 @@ pub(super) fn preprocess_sensenova(
     generation.negative_prompt_token_ids = negative_prompt_token_ids;
     generation.multimodal_inputs = multimodal_inputs;
     generation.image = image;
+    generation.max_images = max_images;
     generation.image_generation = policy;
     Ok(OutputProcessorPolicy::SenseNova(
         profile.output_filter.clone(),
@@ -206,7 +207,7 @@ pub(super) fn preprocess_bagel(
     let negative_prompt_token_ids = profile
         .render_negative_prompt_ids(&processor.tokenizer, negative_text.as_deref().unwrap_or(""))
         .map_err(|error| error.to_string())?;
-    let image = resolve_image_params(
+    let (image, max_images) = resolve_image_params(
         &profile.image_defaults,
         &profile.resolution_policy,
         image_gen.unwrap_or_default(),
@@ -231,6 +232,7 @@ pub(super) fn preprocess_bagel(
     generation.negative_prompt_token_ids = negative_prompt_token_ids;
     generation.multimodal_inputs = multimodal_inputs;
     generation.image = image;
+    generation.max_images = max_images;
     generation.image_generation = policy;
     Ok(OutputProcessorPolicy::None)
 }
@@ -536,14 +538,15 @@ pub(super) fn prepare_generation_resources(
 ///
 /// Request fields override profile defaults field by field. The sampling seed
 /// (already resolved from the image and text seeds) overrides the profile
-/// seed.
+/// seed. Returns the diffusion parameters and the request's image budget,
+/// which only the scheduler reads.
 fn resolve_image_params(
     defaults: &crate::profile::omni::ImageGenerationDefaults,
     resolution_policy: &ResolutionPolicy,
     image: crate::serving::ImageGenControls,
     sampling_seed: Option<u64>,
     negative_prompt: String,
-) -> OmniResult<ImageParams> {
+) -> OmniResult<(ImageParams, u16)> {
     let resolution = resolve_resolution(
         resolution_policy,
         image.resolution.or(Some(defaults.resolution)),
@@ -558,7 +561,7 @@ fn resolve_image_params(
     let max_images = image.max_images.unwrap_or(defaults.max_images);
     // `GenerationRequest::validate` checks the resolved steps, guidance,
     // interval, and shift (`ImageParams::validate`) once the request is built.
-    Ok(ImageParams {
+    let params = ImageParams {
         steps: image.steps.unwrap_or(defaults.steps),
         cfg_text_scale: image.cfg_text_scale.unwrap_or(defaults.cfg_text_scale),
         cfg_img_scale: image.cfg_img_scale.unwrap_or(defaults.cfg_img_scale),
@@ -570,9 +573,8 @@ fn resolve_image_params(
         width: resolution.width,
         seed: sampling_seed.or(defaults.seed),
         negative_prompt,
-        max_images,
-        image_prompts: Vec::new(),
-    })
+    };
+    Ok((params, max_images))
 }
 
 /// Resolves each image's encoder inputs at its final prompt position.

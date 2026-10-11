@@ -79,6 +79,7 @@ fn canvas_request(request_id: u64, prompt_len: u32, max_tokens: usize) -> Genera
             ..SamplingParams::default()
         },
         image: ImageParams::default(),
+        max_images: 1,
         max_und_tokens: max_tokens,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),

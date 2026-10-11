@@ -602,7 +602,6 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                     resolve_prefix(
                         runner.flow_prompt,
                         builder.branch_source(branch),
-                        image_prompt="",
                         negative_prompt="",
                         negative_token_ids=(),
                         tokenizer=tokenizer,

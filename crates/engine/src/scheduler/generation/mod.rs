@@ -1615,8 +1615,7 @@ impl RequestState {
 
     /// Returns whether the request can open a generation branch.
     pub(super) fn can_open_gen_branch(&self) -> bool {
-        self.req.generates_images()
-            && self.num_generated_images < self.req.image.max_images as usize
+        self.req.generates_images() && self.num_generated_images < self.req.max_images as usize
     }
 
     /// Returns whether generation starts after context ingestion.

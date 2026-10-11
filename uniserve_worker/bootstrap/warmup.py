@@ -812,7 +812,6 @@ def _warmup_flow_tables(
 
     runtime = request.accepted_progress
     query = generation.sequence_length(ImageConfig(height, width))
-    image_prompt = image.image_prompts[0] if image.image_prompts else ""
 
     # Each branch either reuses the request's conditioning KV (the flag is
     # True) or conditions on a prefix of its own.
@@ -821,7 +820,6 @@ def _warmup_flow_tables(
         prefix, copy_conditioning = resolve_prefix(
             requests.worker.runner.flow_prompt,
             generation.branch_source(branch),
-            image_prompt=image_prompt,
             negative_prompt=image.negative_prompt,
             negative_token_ids=request.negative_token_ids,
             tokenizer=requests.worker.tokenizer,

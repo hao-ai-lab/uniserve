@@ -141,7 +141,8 @@ class ImageParams:
     """Image-generation controls carried by a request's admission.
 
     Covers the diffusion schedule (steps, timestep shift), classifier-free
-    guidance scales and renormalization, output dimensions, and prompt inputs.
+    guidance scales and renormalization, output dimensions, and the negative
+    prompt.
     `NewRequest.image` holds one; `__post_init__` mirrors the limits of the
     Rust `ImageParams::validate`.
     """
@@ -157,7 +158,6 @@ class ImageParams:
     width: int = 512
     seed: int | None = None
     negative_prompt: str = ""
-    image_prompts: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate schedule, dimensions, guidance, and seed.

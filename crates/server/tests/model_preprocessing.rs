@@ -944,7 +944,7 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
             (width, height)
         );
         assert_eq!(generation.image.steps, 4);
-        assert_eq!(generation.image.max_images, 1);
+        assert_eq!(generation.max_images, 1);
         assert_eq!(generation.image.seed, Some(17));
         assert_eq!(generation.sampling.seed, Some(17));
         assert_eq!(generation.image.cfg_text_scale, 7.5);

@@ -139,6 +139,7 @@ fn generation_request(id: u64, constraint: GenerationConstraint) -> GenerationRe
             width: 128,
             ..Default::default()
         },
+        max_images: 1,
         max_und_tokens: 20,
         include_stop_token: false,
         stop_strings: Vec::new(),

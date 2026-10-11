@@ -575,6 +575,7 @@ impl InputProcessor {
                 ..SamplingParams::default()
             },
             image: ImageParams::default(),
+            max_images: 1,
             max_und_tokens: 0,
             include_stop_token: false,
             stop_strings: stop.stop_strings.clone(),

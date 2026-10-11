@@ -58,6 +58,6 @@ def image_processor(config: Config) -> ImageProcessor:
     )
 
 
-# BAGEL has no guidance prompt framing beyond its chat template. Without one,
-# the worker's ``resolve_prefix`` rejects a generation prompt override.
+# BAGEL has no guidance prompt framing beyond its chat template: its
+# unconditional prefix is the request's negative token ids or empty.
 flow_prompt = None

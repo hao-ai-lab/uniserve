@@ -1093,10 +1093,6 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
         intern!(py, "negative_prompt"),
         image.negative_prompt.as_str(),
     )?;
-    dict.set_item(
-        intern!(py, "image_prompts"),
-        PyTuple::new(py, image.image_prompts.iter().map(|prompt| prompt.as_str()))?,
-    )?;
     construct(py, "ImageParams", &dict)
 }
 
