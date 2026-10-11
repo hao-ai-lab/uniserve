@@ -920,10 +920,8 @@ impl SimEngine {
             }
             CallKind::Media(MediaCall::LatentPreparation) => {}
             CallKind::Media(MediaCall::Denoising) => {
-                // A denoising call's token bound is the number of steps it
-                // runs.
-                let steps = call.bounds.max_tokens.max(1) as u16;
-                request.flow_step = request.flow_step.saturating_add(steps);
+                // A denoising call runs one step.
+                request.flow_step = request.flow_step.saturating_add(1);
                 let total = request
                     .image()
                     .map(|image| image.steps)

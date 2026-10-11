@@ -20,8 +20,8 @@ use serde::Serialize;
 use serde_json::Value;
 use uniserve_engine::{
     DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    SchedulingPolicy, TransferConfig, WorkerConfig, WorkerProcessArgs,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, SchedulingPolicy, TransferConfig,
+    WorkerConfig, WorkerProcessArgs,
 };
 
 /// How the HTTP server obtains its listening socket.
@@ -61,10 +61,6 @@ pub struct EngineSettings {
     pub max_num_seqs: usize,
     /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
-    /// Per-step budget of text prefill tokens a decode pass may co-schedule.
-    /// The prefill tokens still travel as their own batch and numerical call.
-    /// `0` disables co-scheduling.
-    pub mixed_prefill_tokens: usize,
     /// Reuse and retain prompt KV prefixes across requests. Per-request cache
     /// policy can further restrict this deployment-wide setting.
     pub prefix_cache: bool,
@@ -115,7 +111,6 @@ impl Default for EngineSettings {
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
-            mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,

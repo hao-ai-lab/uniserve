@@ -407,11 +407,9 @@ class WorkerConfig:
             raise invalid_descriptor("worker role must be model or experts")
         if (
             type(self.expert_microbatches) is not int
-            or not 1 <= self.expert_microbatches <= 4
+            or self.expert_microbatches < 1
         ):
-            raise invalid_descriptor(
-                "expert microbatches must be from one to four"
-            )
+            raise invalid_descriptor("expert microbatches must be at least one")
         if not self.device:
             raise invalid_descriptor("worker device must be named")
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
@@ -493,10 +491,8 @@ def worker_config_from_namespace(
     """
     expert_parallel = getattr(namespace, "expert_parallel", None) or {}
     microbatches = getattr(namespace, "expert_microbatches", 1)
-    if type(microbatches) is not int or not 1 <= microbatches <= 4:
-        raise ValueError(
-            "expert_microbatches must be an integer from one to four"
-        )
+    if type(microbatches) is not int or microbatches < 1:
+        raise ValueError("expert_microbatches must be a positive integer")
     if microbatches > 1 and not expert_parallel.get("attention_ranks", 0):
         raise ValueError("expert microbatches require disaggregated experts")
     prefill_tokens = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS

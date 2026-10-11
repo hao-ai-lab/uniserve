@@ -113,7 +113,7 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--data-parallel-size` | `1` | Independent replicas, each with its own scheduler, KV cache and ranks |
 | `--expert-parallel` | Off | Shard routed experts across data-parallel replicas or dedicated expert workers |
 | `--expert-exchange` | `alltoall` | NVLink token exchange, `deepep` elastic dispatch/combine, `megamoe` fused experts, or `dwdp` asynchronous expert-weight prefetch |
-| `--expert-microbatches` | `1` | One to four independent microbatches; values above one require dedicated experts |
+| `--expert-microbatches` | `1` | Independent microbatches; values above one require dedicated experts |
 | `--max-video-seconds` | `15` | Longest admitted clip, from 4 to 15 seconds |
 | `--max-model-len` | Model configuration | Context-length ceiling |
 | `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities prepared at startup |

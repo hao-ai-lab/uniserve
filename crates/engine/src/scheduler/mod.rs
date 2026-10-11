@@ -43,7 +43,7 @@ pub(crate) use config::MAX_NUM_SEQS;
 use config::MAX_NUM_WAITING;
 pub use config::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulerConfig, SchedulingPolicy,
+    DEFAULT_MAX_NUM_SEQS, SchedulerConfig, SchedulingPolicy,
 };
 pub(crate) use execution::generation_consuming_calls;
 pub(crate) use run::{MAX_FLOW_PREFIX_ROWS, flow_prefix_rows};
@@ -74,7 +74,6 @@ pub(crate) use crate::executor::{
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-use std::env;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -94,8 +93,8 @@ use uniserve_core::{
     ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest, MediaKind,
     PositionLogprobs, Request, SharedMedia, TokenLogprob,
 };
-use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
 use uniserve_core::{ImageIngestStep, RejectionKind, UnitId, encoder_cache_key};
+use uniserve_core::{RequestId, RuntimeFamily};
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
@@ -115,8 +114,6 @@ use graph::{VideoGraph, product};
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
 use output::RequestOutput;
 
-/// Number of denoising steps planned for one scheduling burst by default.
-pub(crate) const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
 /// Upper bound on concurrently reserved transfer calls. Construction clamps
 /// the executor's `queue_depth * max_batch_calls` to between one and this
 /// value to form `Scheduler::transfer_capacity`.
@@ -144,9 +141,6 @@ const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
 /// results before ready decode work takes precedence over further prefill
 /// (`Scheduler::select_batch_kind`).
 const PREFILL_WINDOW_CREDITS: usize = 2;
-/// Environment variable overriding `DEFAULT_DENOISE_STEP_BURST`; a missing,
-/// unparsable, or zero value selects the default.
-const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
 
 /// Builds a validated image-completion event from a base64 PNG payload.
 ///
@@ -309,7 +303,6 @@ struct MediaFlowState {
     denoising: Denoising,
     scheduled_decode_units: u32,
     scheduled_encode_units: u32,
-    encoded_video_units: u32,
     audio_decoding_scheduled: bool,
     audio_encoding_scheduled: bool,
     audio_encoded: bool,
@@ -404,8 +397,6 @@ pub struct Scheduler {
     /// Maximum number of transfer calls holding a reservation at once
     /// (`Inflight::num_pending_transfers`).
     transfer_capacity: usize,
-    /// Maximum denoising steps one call covers.
-    denoise_step_burst: u16,
     /// IPC dtype of image latents, mapped from the model dtype by
     /// `worker_float_dtype`.
     latent_dtype: Option<DType>,
@@ -593,32 +584,21 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
     value.div_ceil(divisor)
 }
 
-/// Returns the maximum number of output events one in-flight call can add to
-/// its request's event journal.
-///
-/// `Scheduler::output_window_ready` charges this for every in-flight call; the
-/// per-kind counts must stay in step with `Scheduler::next_output_bound`,
-/// which charges the same events before the call is planned.
-fn call_output_bound(code: CallKind, bounds: &uniserve_worker_ipc::Bounds) -> usize {
-    match code {
-        CallKind::Forward(ForwardMode::Verify) => (bounds.max_tokens as usize)
-            .saturating_mul(2)
-            .saturating_add(2),
-        CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,
-        CallKind::Media(MediaCall::Denoising) => (bounds.max_tokens as usize).saturating_add(2),
-        CallKind::Media(MediaCall::VideoDecoding) => 2,
-        CallKind::Media(MediaCall::ImageDecoding) => 3,
-        _ => 2,
-    }
-}
+/// Output events a call kind with no entry in `output_bound` can add to its
+/// request's event journal.
+const DEFAULT_OUTPUT_EVENTS: usize = 2;
 
-/// Reads the denoising burst size from the environment.
-fn denoise_step_burst_from_env() -> u16 {
-    env::var(DENOISE_STEP_BURST_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u16>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_DENOISE_STEP_BURST)
+/// Returns the maximum number of output events one call of kind `code` can
+/// add to its request's event journal.
+///
+/// `Scheduler::output_window_ready` charges this for every in-flight call and
+/// for the call the request plans next.
+fn output_bound(code: CallKind) -> usize {
+    match code {
+        CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,
+        CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding) => 3,
+        _ => DEFAULT_OUTPUT_EVENTS,
+    }
 }
 
 /// Returns the number of classifier-free-guidance branches.

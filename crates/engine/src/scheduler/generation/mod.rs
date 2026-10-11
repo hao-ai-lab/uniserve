@@ -773,6 +773,15 @@ pub(super) fn plan_image_extend(
     finish_plan(request, call, 0)
 }
 
+/// Returns the call kind that runs one image encoder stage: the latent
+/// encoder of `VaeEncode` and the vision encoder of `VitEncode`.
+pub(crate) const fn encoder_call(step: ImageIngestStep) -> CallKind {
+    match step {
+        ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
+        ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
+    }
+}
+
 /// Encodes host image bytes or an existing device image into a feature tensor.
 ///
 /// A device `source` takes precedence over `image_base64`. Fails with
@@ -794,11 +803,7 @@ pub(super) fn plan_encode(
     } else if source.is_none() && image_base64.is_empty() {
         return Err(PlanningError::MissingImageInput);
     }
-    let code = match step {
-        ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
-        ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
-    };
-    let mut call = computation(request, code);
+    let mut call = computation(request, encoder_call(step));
     if source.is_none() && !image_base64.is_empty() {
         call.input_image = Some(image_base64.into());
     }
@@ -879,12 +884,11 @@ pub(super) fn plan_diffusion_prepare(
     finish_plan(request, call, 0)
 }
 
-/// Plans an exact denoising interval against its input latent and conditioning tensors.
+/// Plans one denoising step against its input latent and conditioning tensors.
 pub(super) fn plan_diffusion_step(
     limits: &uniserve_core::GenerationLimits,
     latent_dtype: Option<DType>,
     request: &GenerationRequest,
-    step_count: u16,
     conditioning: BufferId,
     latent: TensorRef,
 ) -> Result<Call, PlanningError> {
@@ -892,7 +896,6 @@ pub(super) fn plan_diffusion_step(
         return Err(PlanningError::GenerationBranchDisabled);
     }
     let mut call = computation(request, CallKind::Media(MediaCall::Denoising));
-    call.bounds.max_tokens = u32::from(step_count.max(1));
     call.kv_input = Some(conditioning);
     call.latent_input = Some(latent);
     call.latent_output = Some(latent_output(
@@ -1602,7 +1605,6 @@ pub(crate) struct RequestState {
     pub(super) generated_token_ids: Vec<u32>,
     /// Tokens since the last model round boundary, used by suffix-trigger matching.
     pub(super) round_token_ids: Vec<u32>,
-    pub(super) text_tokens_since_image: usize,
     /// Host image bytes retained only while artifact-based feedback needs them.
     pub(super) feedback_image_b64: Option<String>,
     /// False after a completed computation creates state unavailable from the input.

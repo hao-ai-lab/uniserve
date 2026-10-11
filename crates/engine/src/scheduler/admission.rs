@@ -170,7 +170,6 @@ impl Scheduler {
             prefix_published: Vec::new(),
             generated_token_ids: Vec::new(),
             round_token_ids: Vec::new(),
-            text_tokens_since_image: 0,
             feedback_image_b64: None,
             replayable: true,
             encoder_cache_pins: Vec::new(),
@@ -410,11 +409,10 @@ impl Scheduler {
     /// validation; the worker reports no muxing component or no video
     /// denoiser; the denoiser does not serve the request's task; the request's
     /// inference-step count differs from the loaded model's; its call graph
-    /// cannot be built; `media_outputs` cannot bound its products; or the
-    /// worker has fewer than two request slots. A served task's calls all
-    /// have components: the executor checked them at startup. Rejects with
-    /// `RejectionKind::Overloaded` when the waiting bound is reached. A
-    /// rejection's send result is ignored.
+    /// cannot be built; or `media_outputs` cannot bound its products. A
+    /// served task's calls all have components: the executor checked them at
+    /// startup. Rejects with `RejectionKind::Overloaded` when the waiting
+    /// bound is reached. A rejection's send result is ignored.
     pub(super) fn enqueue_media(
         &mut self,
         request: DiffusionRequest,
@@ -481,13 +479,6 @@ impl Scheduler {
             reject(
                 RejectionKind::Invalid,
                 format!("loaded media components cannot hold the request: {message}"),
-            );
-            return;
-        }
-        if self.info.request_slots < 2 {
-            reject(
-                RejectionKind::Invalid,
-                "worker does not provide two resident media state slots".to_string(),
             );
             return;
         }
@@ -682,7 +673,6 @@ impl Scheduler {
                 denoising: Denoising::new(steps),
                 scheduled_decode_units: 0,
                 scheduled_encode_units: 0,
-                encoded_video_units: 0,
                 audio_decoding_scheduled: false,
                 audio_encoding_scheduled: false,
                 audio_encoded: false,
@@ -943,7 +933,6 @@ impl Scheduler {
                     // with an error if a table covers fewer than `tokens`
                     // tokens.
                     self.ensure_request_capacity(id, 0, tokens);
-                    self.storage.reserved_units += need;
                     continue;
                 }
             } else {

@@ -25,8 +25,6 @@ pub(super) struct Storage {
     /// the runtime's `request_slots`.
     pub(super) request_pool: RequestPool,
     pub(super) latent_pool: LatentPool,
-    /// KV units reserved by admitted worst-case requests.
-    pub(super) reserved_units: usize,
     /// Byte spans of persistent products in the runtime's buffer pool.
     pub(super) buffer_pool: BufferPool,
     /// Per-worker row and buffer address spaces of the media workers.

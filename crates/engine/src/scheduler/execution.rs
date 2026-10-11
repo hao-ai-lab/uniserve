@@ -1035,7 +1035,7 @@ impl Scheduler {
 
         // A video request advances its ladder one step per call.
         let step = self.scheduled_steps(id, &state.denoising);
-        let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step, 1);
+        let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step);
         let units = state.graph.condition_units();
         let visual_round = media_call == MediaCall::LatentEncoding
             && state.scheduled_condition_units < units.len() as u32;
@@ -2272,14 +2272,12 @@ impl Scheduler {
             Phase::FeedbackEncode => {
                 let feedback = &state.req.image_generation;
                 feedback.feedback_source.as_ref()?;
-                match feedback
-                    .feedback_encoders
-                    .get(self.scheduled_feedback(id)?.0)?
-                    .encoder
-                {
-                    ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
-                    ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
-                }
+                generation::encoder_call(
+                    feedback
+                        .feedback_encoders
+                        .get(self.scheduled_feedback(id)?.0)?
+                        .encoder,
+                )
             }
             Phase::IngestState => return None,
         })
@@ -2349,9 +2347,9 @@ impl Scheduler {
     /// Returns whether output capacity can cover every unresolved token-producing call.
     ///
     /// The request's event journal must hold, besides `OUTPUT_TERMINAL_RESERVE`
-    /// events kept for its terminal output, the `call_output_bound` of every
-    /// in-flight call plus the `next_output_bound` of the next one. Returns
-    /// `false` for a request that is not running or whose journal is closed.
+    /// events kept for its terminal output, the `output_bound` of every
+    /// in-flight call plus that of the call it plans next. Returns `false`
+    /// for a request that is not running or whose journal is closed.
     pub(super) fn output_window_ready(&self, id: RequestId) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
@@ -2366,30 +2364,15 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .map(|pending| call_output_bound(pending.call.code, &pending.call.bounds))
+            .map(|pending| output_bound(pending.call.code))
             .sum::<usize>();
+        let next = self
+            .peek_next_call_variant(id)
+            .map_or(DEFAULT_OUTPUT_EVENTS, output_bound);
         available
             .saturating_sub(reserved)
             .saturating_sub(OUTPUT_TERMINAL_RESERVE)
-            >= self.next_output_bound(id)
-    }
-
-    /// Returns the output-size bound, in events, for the next call.
-    ///
-    /// Mirrors the per-kind counts of `call_output_bound`, which charges a
-    /// call once it is in flight, for the kinds `peek_next_call_variant`
-    /// predicts; a denoising call is budgeted at `denoise_step_burst` steps.
-    pub(super) fn next_output_bound(&self, id: RequestId) -> usize {
-        match self.peek_next_call_variant(id) {
-            Some(
-                CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode),
-            ) => 4,
-            Some(CallKind::Media(MediaCall::Denoising)) => {
-                usize::from(self.denoise_step_burst).saturating_add(2)
-            }
-            Some(CallKind::Media(MediaCall::ImageDecoding)) => 3,
-            Some(_) | None => 2,
-        }
+            >= next
     }
 
     /// Retains a submitted call and its inputs as in flight for its request,
@@ -2680,7 +2663,6 @@ impl Scheduler {
                             self.invariant_broken("a submitted media write keeps its input range");
                             return;
                         };
-                        state.encoded_video_units += range.max_units;
                         state.encoded_ready.insert(range.cursor, range.max_units);
                         if let Some((_, product)) = state.decoded_units.remove(&range.cursor) {
                             consumed_products.push(product);

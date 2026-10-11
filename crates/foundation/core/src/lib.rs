@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 /// Serializable statistics and observer-facing wire values.
 pub mod codec;
 mod events;
-/// Handing a bound socket to a rank process at its launch.
+/// The head-launcher messages and handing a bound socket to a rank process at
+/// its launch.
 pub mod launch;
 mod media;
 mod video;
@@ -973,22 +974,6 @@ impl KvCacheGroup {
             && self.total_kv_heads == other.total_kv_heads
             && self.head_dim == other.head_dim
     }
-}
-
-/// Algorithm used to derive prefix-cache block keys.
-///
-/// The engine's `block_hash` chains each page's key through its parent's key
-/// with either algorithm. FNV-1a is a non-cryptographic hash, while SHA-256
-/// is a cryptographic digest truncated to the cache's 64-bit key space. Both
-/// keys can collide, so a prefix hit also compares the page's tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum HashAlgo {
-    /// 64-bit FNV-1a hashing.
-    #[default]
-    Fnv1a,
-    /// SHA-256 truncated to the cache's 64-bit key space.
-    Sha256,
 }
 
 #[cfg(test)]

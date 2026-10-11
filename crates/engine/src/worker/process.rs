@@ -1530,22 +1530,6 @@ mod tests {
         }
     }
 
-    /// A lane partitions compute only: its calls share the worker-wide KV
-    /// and latent pools, whose placement the scheduler owns, so a lane
-    /// naming a capacity of its own is refused rather than accepted without
-    /// effect.
-    #[test]
-    fn a_lane_naming_a_pool_capacity_is_refused() {
-        let lane = r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]"#;
-        for capacity in [
-            r#""kv_capacity_tokens":4096"#,
-            r#""latent_capacity_units":8"#,
-        ] {
-            let parsed = format!("{lane},{capacity}}}").parse::<LaneConfig>();
-            assert!(parsed.is_err(), "{capacity} must be refused");
-        }
-    }
-
     /// Every rank runs with the head's caching-allocator configuration,
     /// under whichever names the head sets, or with expandable segments when
     /// the head configures none, and with its host heap out of transparent

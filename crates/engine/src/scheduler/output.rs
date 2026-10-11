@@ -71,12 +71,6 @@ pub(super) struct RequestOutput {
     pub(super) events: EventJournal,
     /// `TextToken` events accepted into the ordered output.
     pub(super) tokens_sent: usize,
-    /// Text-token count the frontend decoder has acknowledged.
-    ///
-    /// `Scheduler::acknowledge_output` treats an acknowledgement that exceeds
-    /// `tokens_sent` or moves backwards as an error finish; `mark_stopped` and
-    /// cancellation apply the same upper bound.
-    pub(super) tokens_acked: usize,
     /// Prompt score positions received from worker completions.
     pub(super) prompt_logprobs_processed: usize,
     /// Prompt score positions published as `PromptLogprobs` events.
@@ -97,7 +91,6 @@ impl RequestOutput {
         Self {
             events: EventJournal::new(event_tx),
             tokens_sent: 0,
-            tokens_acked: 0,
             prompt_logprobs_processed: 0,
             prompt_logprobs_emitted: 0,
             decoder_boundaries: VecDeque::new(),
@@ -453,7 +446,6 @@ impl Scheduler {
 
                         if let Some(st) = self.running.get_mut(&id) {
                             st.num_generated_images += 1;
-                            st.text_tokens_since_image = 0;
                             st.round_token_ids.clear();
                         }
 
@@ -689,18 +681,17 @@ impl Scheduler {
                 self.finish(id, FinishReason::Completed);
             }
             CallKind::Media(MediaCall::Denoising) => {
-                // Publish every newly committed step exactly once, including steps
-                // coalesced into a single worker completion. `bounds.max_tokens`
-                // is the call's step count, so subtracting it from the reported
-                // total gives the steps completed before this call. Step
-                // numbers saturate at `u16::MAX` to fit the event fields.
+                // Publish the newly committed step exactly once. A denoising
+                // call covers one step, so the steps completed before it are
+                // one fewer than the reported total. Step numbers saturate at
+                // `u16::MAX` to fit the event fields.
                 let Some(st) = self.running.get(&id) else {
                     return;
                 };
                 let (image_id, h, w, steps, prev_sd) = {
                     let prev = record
                         .num_completed_steps
-                        .saturating_sub(call.bounds.max_tokens)
+                        .saturating_sub(1)
                         .min(u32::from(u16::MAX)) as u16;
                     (
                         st.image_id,
@@ -805,7 +796,6 @@ impl Scheduler {
                     // ends with this image.
                     if let Some(st) = self.running.get_mut(&id) {
                         st.num_generated_images += 1;
-                        st.text_tokens_since_image = 0;
                     }
                     self.finish(id, FinishReason::ImageDone);
                 }
@@ -1096,7 +1086,6 @@ impl Scheduler {
 
             st.denoising.close();
             st.image_id += 1;
-            st.text_tokens_since_image = 0;
             st.phase = Phase::CloseKv;
             st.image_reservation_pending = true;
         }
@@ -1165,7 +1154,6 @@ impl Scheduler {
             return false;
         };
         st.generated_token_ids.push(tok);
-        st.text_tokens_since_image = st.text_tokens_since_image.saturating_add(1);
         if !st.req.emits_text() {
             return false;
         }
@@ -1186,7 +1174,6 @@ impl Scheduler {
             return;
         };
         st.generated_token_ids.extend_from_slice(&tokens);
-        st.text_tokens_since_image = st.text_tokens_since_image.saturating_add(tokens.len());
         if !st.req.emits_text() || tokens.is_empty() {
             return;
         }
@@ -1543,14 +1530,6 @@ impl Scheduler {
                 .storage
                 .reserved_encoder_entries
                 .saturating_sub(st.req.num_encoder_cache_entries());
-            if st.reserve_worstcase {
-                let reserved = self.storage.cache().map_or(0, |cache| {
-                    cache
-                        .coordinator
-                        .units_for_tokens(st.max_reserved_kv_tokens)
-                });
-                self.storage.reserved_units = self.storage.reserved_units.saturating_sub(reserved);
-            }
 
             // Releasing the request's encoder pins may make cache products
             // physically reclaimable by their owning worker.

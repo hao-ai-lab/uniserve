@@ -172,19 +172,17 @@ def test_execution_lanes_are_typed_and_domain_disjoint(tmp_path) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "capacity", ['"kv_capacity_tokens":4096', '"latent_capacity_units":8']
-)
-def test_execution_lanes_reject_a_pool_capacity(capacity, tmp_path) -> None:
-    # A lane partitions compute only; its calls share the worker-wide KV and
-    # latent pools, so a lane-local capacity is not a lane field.
+@pytest.mark.parametrize("field", ['"max_batch_token":4096', '"max_inflght":2'])
+def test_execution_lanes_reject_an_unknown_field(field, tmp_path) -> None:
+    # A misspelled optional limit fails at argument parsing instead of leaving
+    # the lane without that limit.
     with pytest.raises(SystemExit):
         worker_args(
             tmp_path,
             max_batch_tokens=8192,
             lane=[
                 '{"lane_id":"decode","sm_budget":64,"domains":["decode"],'
-                + capacity
+                + field
                 + "}"
             ],
         )

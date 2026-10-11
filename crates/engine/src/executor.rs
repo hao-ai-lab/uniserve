@@ -179,20 +179,6 @@ impl ExecutorInfo {
             .min()
     }
 
-    /// Returns the sole worker capability record.
-    ///
-    /// # Panics
-    ///
-    /// Panics unless the executor contains exactly one physical pool.
-    pub fn single_worker(&self) -> &WorkerInfo {
-        assert_eq!(
-            self.workers.len(),
-            1,
-            "executor does not contain exactly one physical pool"
-        );
-        &self.workers[0].1
-    }
-
     /// Derives the runtime's immutable capacity view from concrete pools.
     /// The returned value is not part of executor identity and is never
     /// reported as a physical worker.

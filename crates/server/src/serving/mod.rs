@@ -658,9 +658,9 @@ impl ServingRuntime {
     /// A submission failure with no pending control records `Failed` and returns the error.
     ///
     /// A control found after a successful submission reaches the engine by dropping the
-    /// unpolled output stream: its `EventRx` sends the engine a cancel at the acknowledged
-    /// prefix, which releases the engine request for a cancel and an abort alike, and then
-    /// releases the registry's engine side. The client's `Cancelled` or `Aborted` event comes
+    /// unpolled output stream: its `EventRx` sends the engine a cancel, which releases the
+    /// engine request for a cancel and an abort alike, and then releases the registry's
+    /// engine side. The client's `Cancelled` or `Aborted` event comes
     /// from the registry's recorded control, not from the engine.
     async fn submit_and_stream(
         &self,
@@ -760,8 +760,8 @@ impl ServingRuntime {
 
         // A control recorded before `claim_submission` was not forwarded to the engine (one
         // recorded after it was). Dropping the unpolled stream drops its `EventRx`, which
-        // delivers it as a cancel at the acknowledged prefix and releases the registry's
-        // engine side. A failed submission has no engine request to control.
+        // delivers it as a cancel and releases the registry's engine side. A failed
+        // submission has no engine request to control.
         if let Some(terminal) = self.engine.requests.control_terminal(&request_id) {
             if let Ok(stream) = stream_result {
                 drop(stream);
@@ -830,7 +830,7 @@ impl ServingRuntime {
         Box::pin(LifecycleTrackedStream::new(inner, lifecycle))
     }
 
-    /// Cancels a live request at its acknowledged output prefix.
+    /// Cancels a live request.
     pub async fn cancel(
         &self,
         request_id: impl Into<ServeRequestId>,

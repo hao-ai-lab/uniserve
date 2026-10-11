@@ -1067,7 +1067,7 @@ fn abort_and_cancel_are_distinct() {
     assert_eq!(run_until_control(true), FinishReason::Aborted);
 }
 
-/// A stop-string cutoff reported through `EngineHandle::stop_at` finishes only
+/// A stop-string cutoff reported through `EngineHandle::stop` finishes only
 /// its own request with `Stop`; a concurrent request runs to its own end.
 #[test]
 fn stop_string_cutoff_is_request_local() {
@@ -1101,10 +1101,9 @@ fn stop_string_cutoff_is_request_local() {
     stopping.stop_strings = vec!["boundary".to_string()];
     let mut stopping_events = handle.submit(stopping).unwrap();
 
-    // A request with stop strings is acknowledged by the frontend decoder, not
-    // on receive (see `EngineHandle::submit`). The test plays that role for the
-    // first token and, once a second token arrives, stops the output at that
-    // one-token prefix.
+    // A request with stop strings is acknowledged by the frontend decoder
+    // (see `EngineHandle::submit`). The test plays that role for the first
+    // token and, once a second token arrives, stops the request.
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut consumed_tokens = 0;
     while consumed_tokens < 2 && Instant::now() < deadline {
@@ -1120,7 +1119,7 @@ fn stop_string_cutoff_is_request_local() {
         }
     }
     assert_eq!(consumed_tokens, 2);
-    handle.stop_at(RequestId(2), 1);
+    handle.stop(RequestId(2));
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut stop_reason = None;

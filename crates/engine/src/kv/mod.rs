@@ -45,7 +45,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use uniserve_core::{HashAlgo, KvCacheGroup, Modality, UnitId};
+use uniserve_core::{KvCacheGroup, Modality, UnitId};
 use uniserve_worker_ipc::WorkerEndpoint;
 
 mod encoder_cache;
@@ -54,58 +54,33 @@ mod freeq;
 pub(crate) use encoder_cache::EncoderCacheManager;
 use freeq::UnitMeta;
 
-/// Computes an incremental per-page prefix hash.
+/// Computes an incremental per-page prefix hash with 64-bit FNV-1a.
 ///
 /// `parent` is the hash of the preceding page (or the chain seed for the
 /// first page), so equal hashes identify equal complete prefixes up to hash
 /// collisions. `group_id` and `modality_tag` separate chains that hash the
-/// same tokens for different cache groups or modalities. Both algorithms
-/// produce a 64-bit key, so callers must still compare exact tokens before
+/// same tokens for different cache groups or modalities. FNV-1a is not
+/// collision resistant, so callers must still compare exact tokens before
 /// reusing a page.
-pub(crate) fn block_hash(
-    parent: u64,
-    group_id: u32,
-    modality_tag: u8,
-    tokens: &[u32],
-    algo: HashAlgo,
-) -> u64 {
+pub(crate) fn block_hash(parent: u64, group_id: u32, modality_tag: u8, tokens: &[u32]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001B3;
     let token_count = tokens.len() as u32;
-    match algo {
-        HashAlgo::Fnv1a => {
-            const OFFSET: u64 = 0xcbf29ce484222325;
-            const PRIME: u64 = 0x00000100000001B3;
-            let mut h = OFFSET;
-            let mix = |bytes: &[u8], h: &mut u64| {
-                for b in bytes {
-                    *h ^= u64::from(*b);
-                    *h = h.wrapping_mul(PRIME);
-                }
-            };
-            mix(&parent.to_le_bytes(), &mut h);
-            mix(&group_id.to_le_bytes(), &mut h);
-            mix(&[modality_tag], &mut h);
-            mix(&token_count.to_le_bytes(), &mut h);
-            for token in tokens {
-                mix(&token.to_le_bytes(), &mut h);
-            }
-            h
+    let mut h = OFFSET;
+    let mix = |bytes: &[u8], h: &mut u64| {
+        for b in bytes {
+            *h ^= u64::from(*b);
+            *h = h.wrapping_mul(PRIME);
         }
-        HashAlgo::Sha256 => {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(parent.to_le_bytes());
-            hasher.update(group_id.to_le_bytes());
-            hasher.update([modality_tag]);
-            hasher.update(token_count.to_le_bytes());
-            for token in tokens {
-                hasher.update(token.to_le_bytes());
-            }
-            // The page hash is the little-endian first eight digest bytes.
-            let digest: [u8; 32] = hasher.finalize().into();
-            let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = digest;
-            u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
-        }
+    };
+    mix(&parent.to_le_bytes(), &mut h);
+    mix(&group_id.to_le_bytes(), &mut h);
+    mix(&[modality_tag], &mut h);
+    mix(&token_count.to_le_bytes(), &mut h);
+    for token in tokens {
+        mix(&token.to_le_bytes(), &mut h);
     }
+    h
 }
 
 /// Returns the stable byte tag included in modality-specific prefix hashes.
@@ -854,19 +829,17 @@ struct PrefixSelection {
 pub(crate) struct KvCacheCoordinator {
     groups: Vec<GroupShape>,
     prefix_enabled: bool,
-    hash_algo: HashAlgo,
     /// Root of every hash chain; an isolation key is mixed into it.
     hash_seed: u64,
 }
 
 impl KvCacheCoordinator {
     /// Creates a coordinator for the given cache groups with prefix caching
-    /// enabled, FNV-1a hashing and a zero chain seed.
+    /// enabled and a zero chain seed.
     pub(crate) fn new(groups: Vec<GroupShape>) -> Self {
         Self {
             groups,
             prefix_enabled: true,
-            hash_algo: HashAlgo::Fnv1a,
             hash_seed: 0,
         }
     }
@@ -879,11 +852,6 @@ impl KvCacheCoordinator {
     /// Enables or disables prefix-cache lookup and publication.
     pub(crate) fn set_prefix_enabled(&mut self, enabled: bool) {
         self.prefix_enabled = enabled;
-    }
-
-    /// Sets the prefix-cache hashing algorithm.
-    pub(crate) fn set_hash_algo(&mut self, algorithm: HashAlgo) {
-        self.hash_algo = algorithm;
     }
 
     /// Returns the largest page size of any group, in tokens.
@@ -1082,13 +1050,8 @@ impl KvCacheCoordinator {
                 prompt
                     .chunks_exact(shape.page_tokens)
                     .map(|tokens| {
-                        parent = block_hash(
-                            parent,
-                            group as u32,
-                            modality_tag(Modality::Und),
-                            tokens,
-                            self.hash_algo,
-                        );
+                        parent =
+                            block_hash(parent, group as u32, modality_tag(Modality::Und), tokens);
                         parent
                     })
                     .collect()
