@@ -1614,6 +1614,7 @@ fn kv_free_worker_info_round_trips() {
             schedule_points: 5,
             video_shift: 12.0,
             audio_shift: 3.0,
+            audio_sample_rate: 32_000,
             canvases: Vec::new(),
         }),
         supported_calls: video_components()

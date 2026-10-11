@@ -183,13 +183,15 @@ table ComponentInfo {
 struct Canvas { width:uint; height:uint; }
 
 /// What a deployment's video denoiser serves: its tasks, its fixed schedule
-/// (sigma points including the clean endpoint, and the per-modality shifts)
-/// and the canvases it prepares and accepts.
+/// (sigma points including the clean endpoint, and the per-modality shifts),
+/// the sample rate of the audio it generates with a video (zero when it
+/// generates none) and the canvases it prepares and accepts.
 table VideoDenoiserInfo {
   tasks:[string];
   schedule_points:uint;
   video_shift:double;
   audio_shift:double;
+  audio_sample_rate:uint;
   canvases:[Canvas];
 }
 

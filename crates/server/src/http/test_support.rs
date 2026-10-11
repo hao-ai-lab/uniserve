@@ -99,6 +99,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             schedule_points: 5,
             video_shift: 12.0,
             audio_shift: 3.0,
+            audio_sample_rate: 32_000,
             canvases: crate::serving::video::plan::NAMED_ASPECT_RATIOS
                 .iter()
                 .map(|&(width, height)| {

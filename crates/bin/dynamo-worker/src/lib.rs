@@ -57,7 +57,6 @@ use uniserve_server::{
 // The served canvases come from `--video-resolutions` and
 // `--video-aspect-ratios`, as for `uniserve serve`; the loaded checkpoint
 // determines the step count.
-const H3_AUDIO_SAMPLE_RATE: i32 = 32_000;
 /// The duration of a Dynamo request that omits `seconds`, at most the
 /// deployment's capacity.
 const DEFAULT_SECONDS: f64 = 5.0;
@@ -352,6 +351,7 @@ impl RawEngine for DynamoFastH3Engine {
             .map_err(api_error)?;
         let cancel = self.cancel.clone();
         let served_model_name = self.args.served_model_name.clone();
+        let audio_sample_rate = audio_sample_rate(&state.runtime().model().video_capabilities());
         let response_format = prepared.response_format;
 
         // Unless stopped, the stream yields exactly one item: the response
@@ -434,6 +434,7 @@ impl RawEngine for DynamoFastH3Engine {
                 &served_model_name,
                 response_format,
                 artifact.media.as_bytes(),
+                audio_sample_rate,
                 started_at.elapsed(),
             ));
         }))
@@ -674,6 +675,15 @@ fn check_fasth3(capabilities: &Value, rasters: &VideoRasters) -> Result<(), Stri
     ))
 }
 
+/// Reads the sample rate, in Hz, of the audio muxed into each video from a
+/// deployment's capabilities; `None` for a deployment that generates no audio.
+fn audio_sample_rate(capabilities: &Value) -> Option<i32> {
+    capabilities["audio_sample_rate"]
+        .as_i64()
+        .filter(|rate| *rate > 0)
+        .and_then(|rate| i32::try_from(rate).ok())
+}
+
 fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> {
     match value {
         Some(_) => Err(invalid_argument(format!(
@@ -687,13 +697,15 @@ fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> 
 /// `NvVideosResponse`.
 ///
 /// The MP4 is embedded in the response: `Url` returns it as a `data:` URL and
-/// `B64Json` as bare base64. `fps` and `audio_sample_rate` report the fixed
-/// FastH3 contract, not values read from the artifact.
+/// `B64Json` as bare base64. `fps` reports the fixed FastH3 contract and
+/// `audio_sample_rate` the rate the deployment declares for its audio, neither
+/// read from the artifact.
 fn video_response(
     id: &str,
     model: &str,
     response_format: ResponseFormat,
     media: &[u8],
+    audio_sample_rate: Option<i32>,
     elapsed: Duration,
 ) -> Value {
     let encoded = base64::engine::general_purpose::STANDARD.encode(media);
@@ -713,7 +725,7 @@ fn video_response(
             "url": url,
             "b64_json": b64_json,
             "fps": VIDEO_FPS,
-            "audio_sample_rate": H3_AUDIO_SAMPLE_RATE,
+            "audio_sample_rate": audio_sample_rate,
         }],
         "inference_time_s": elapsed.as_secs_f64(),
     })
@@ -971,13 +983,33 @@ mod tests {
             "FastH3",
             ResponseFormat::B64Json,
             b"mp4",
+            Some(32_000),
             Duration::from_millis(1_500),
         );
         assert_eq!(response["data"][0]["b64_json"], "bXA0");
         assert!(response["data"][0]["url"].is_null());
+        assert_eq!(response["data"][0]["audio_sample_rate"], 32_000);
         assert_eq!(response["inference_time_s"], 1.5);
 
-        let response = video_response("id", "FastH3", ResponseFormat::Url, b"mp4", Duration::ZERO);
+        let response = video_response(
+            "id",
+            "FastH3",
+            ResponseFormat::Url,
+            b"mp4",
+            None,
+            Duration::ZERO,
+        );
         assert_eq!(response["data"][0]["url"], "data:video/mp4;base64,bXA0");
+        assert!(response["data"][0]["audio_sample_rate"].is_null());
+    }
+
+    #[test]
+    fn the_audio_rate_is_the_one_the_deployment_declares() {
+        assert_eq!(
+            audio_sample_rate(&json!({"audio_sample_rate": 32_000})),
+            Some(32_000)
+        );
+        assert_eq!(audio_sample_rate(&json!({"audio_sample_rate": 0})), None);
+        assert_eq!(audio_sample_rate(&json!({})), None);
     }
 }

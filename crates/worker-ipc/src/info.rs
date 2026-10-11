@@ -283,6 +283,9 @@ pub struct VideoDenoiserInfo {
     pub video_shift: f64,
     /// Shift of the audio schedule.
     pub audio_shift: f64,
+    /// Sample rate, in Hz, of the audio track generated with each video; zero
+    /// for a deployment that generates none.
+    pub audio_sample_rate: u32,
     /// The only canvases the deployment serves: those it prepares.
     #[serde(default)]
     pub canvases: Vec<uniserve_core::Canvas>,

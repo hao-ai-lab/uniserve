@@ -145,14 +145,17 @@ class VideoDenoiserInfo:
     """What the video denoiser a deployment places serves.
 
     Mirrors the Rust ``VideoDenoiserInfo``. ``schedule_points`` counts the
-    fixed schedule's sigma points, the clean endpoint included; ``canvases``
-    lists the only canvases the deployment serves, those it prepares.
+    fixed schedule's sigma points, the clean endpoint included;
+    ``audio_sample_rate`` is the rate of the audio generated with each video,
+    zero when the model generates none; ``canvases`` lists the only canvases
+    the deployment serves, those it prepares.
     """
 
     tasks: tuple[str, ...]
     schedule_points: int
     video_shift: float
     audio_shift: float
+    audio_sample_rate: int
     canvases: tuple[tuple[int, int], ...] = ()
 
     def to_mapping(self) -> dict[str, object]:
@@ -161,6 +164,7 @@ class VideoDenoiserInfo:
             "schedule_points": self.schedule_points,
             "video_shift": self.video_shift,
             "audio_shift": self.audio_shift,
+            "audio_sample_rate": self.audio_sample_rate,
             "canvases": [
                 {"width": width, "height": height}
                 for width, height in self.canvases

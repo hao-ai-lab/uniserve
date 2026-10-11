@@ -12,7 +12,10 @@ from uniserve.media import image
 from uniserve_models.minimax_h3 import Model
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import media_builder, video_denoiser
-from uniserve_worker.bootstrap.report import video_denoiser_info
+from uniserve_worker.bootstrap.report import (
+    build_worker_layout,
+    video_denoiser_info,
+)
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.protocol.call import MediaCall
 
@@ -54,7 +57,10 @@ def test_the_placed_denoiser_receives_the_video_calls(base, placed):
 
 
 def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
-    info = video_denoiser_info(video_denoiser(base, _config("transformer")))
+    info = video_denoiser_info(
+        video_denoiser(base, _config("transformer")),
+        audio_sample_rate=base.audio_decoder.sample_rate,
+    )
     # The worker executes both tasks of the t2va/fl2va DiT on the released
     # schedule: 50 sigma points, video shift 12, audio shift 3, the canvas
     # rule's canvas of every named aspect ratio.
@@ -71,7 +77,10 @@ def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
 
     # The reference DiT serves ref2va alone.
     reference = video_denoiser(base, _config("transformer_ref"))
-    assert video_denoiser_info(reference).tasks == ("ref2va",)
+    reference_info = video_denoiser_info(
+        reference, audio_sample_rate=base.audio_decoder.sample_rate
+    )
+    assert reference_info.tasks == ("ref2va",)
 
 
 @pytest.mark.parametrize("placed", [(), ("transformer", "transformer_ref")])
@@ -85,7 +94,8 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
         model = Model(fasth3_config())
     # One candidate needs no deployment to name it.
     denoiser = video_denoiser(model, cpu_worker_config(device="cpu"))
-    info = video_denoiser_info(denoiser)
+    rate = model.audio_decoder.sample_rate
+    info = video_denoiser_info(denoiser, audio_sample_rate=rate)
     assert info.tasks == ("t2va",)
     assert info.schedule_points == 5
     # Without a deployment's selection, every (width, height) training
@@ -105,7 +115,22 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
         (480, 832),
     )
     served = (image.Config(480, 832), image.Config(1344, 768))
-    assert video_denoiser_info(denoiser, canvases=served).canvases == (
-        (832, 480),
-        (768, 1344),
+    declared = video_denoiser_info(
+        denoiser, audio_sample_rate=rate, canvases=served
+    )
+    assert declared.canvases == ((832, 480), (768, 1344))
+
+
+def test_a_worker_reports_the_audio_rate_of_its_model(base):
+    config = cpu_worker_config(
+        device="cpu",
+        max_model_len=1024,
+        max_video_seconds=5.0,
+        deployment_components=(*_HOST, "transformer"),
+        max_request_pool_size=2,
+        max_batch_calls=2,
+    )
+    declared = build_worker_layout(base, config, queue_depth=6).info
+    assert declared.video_denoiser.audio_sample_rate == (
+        base.audio_decoder.sample_rate
     )

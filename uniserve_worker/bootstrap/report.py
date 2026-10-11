@@ -27,6 +27,7 @@ from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.media import image
 from uniserve.model import (
+    AudioDecoder,
     CausalLM,
     PatchEncoder,
     VideoDenoiser,
@@ -677,7 +678,10 @@ def _token_worker_layout(
 
 
 def video_denoiser_info(
-    denoiser: VideoDenoiser, *, canvases: tuple[image.Config, ...] = ()
+    denoiser: VideoDenoiser,
+    *,
+    audio_sample_rate: int,
+    canvases: tuple[image.Config, ...] = (),
 ) -> VideoDenoiserInfo:
     """Describe what the deployment's video denoiser serves.
 
@@ -685,6 +689,9 @@ def video_denoiser_info(
     include the clean endpoint the network never evaluates. The canvases are
     ``canvases``, those the deployment prepares and admits, or without any
     every canvas the denoiser offers (``VideoDenoiser.canvases``).
+    ``audio_sample_rate`` is the model's audio rate
+    (``AudioDecoder.sample_rate``), zero for a model without an audio
+    decoder.
     """
     served = canvases or denoiser.canvases
     shifts = denoiser.schedule_shifts
@@ -693,6 +700,7 @@ def video_denoiser_info(
         schedule_points=denoiser.num_steps + 1,
         video_shift=float(shifts["video"]),
         audio_shift=float(shifts["audio"]),
+        audio_sample_rate=audio_sample_rate,
         canvases=tuple((canvas.width, canvas.height) for canvas in served),
     )
 
@@ -721,6 +729,7 @@ def _request_tensor_worker_layout(
     # samples allocates it.
     plan = latent_pool_plan(model, worker_config)
     builder = media_builder(model, worker_config)
+    audio = capability(model, AudioDecoder)
 
     info = WorkerInfo(
         endpoint=endpoint,
@@ -740,7 +749,9 @@ def _request_tensor_worker_layout(
             media_components(model, worker_config.deployment_components)
         ),
         video_denoiser=video_denoiser_info(
-            builder.denoiser, canvases=builder.canvases
+            builder.denoiser,
+            audio_sample_rate=0 if audio is None else audio.sample_rate,
+            canvases=builder.canvases,
         ),
         host_lane_capacity=1,
     )
