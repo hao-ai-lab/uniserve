@@ -198,8 +198,7 @@ struct Canvas { width:uint; height:uint; }
 
 /// What a deployment's video denoiser serves: its tasks, its fixed schedule
 /// (sigma points including the clean endpoint, and the per-modality shifts)
-/// and the canvases it accepts. An empty canvas list is the model's canvas
-/// rule.
+/// and the canvases it prepares and accepts.
 table VideoDenoiserInfo {
   tasks:[string];
   schedule_points:uint;

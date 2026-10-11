@@ -20,9 +20,9 @@ use uniserve_core::{
 use uniserve_engine::VideoDenoiserInfo;
 
 use super::plan::{
-    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_ASPECT_RATIO,
-    MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES,
-    MIN_ASPECT_RATIO, NAMED_ASPECT_RATIOS, PlanLimits, ProcessorConfig, ReferenceConfig, Target,
+    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_AUDIO_REFERENCES,
+    MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES, NAMED_ASPECT_RATIOS, PlanLimits,
+    ProcessorConfig, ReferenceConfig, Target,
 };
 use super::probe::{MediaProber, ProbeConfig};
 use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
@@ -61,17 +61,17 @@ pub struct VideoService {
 }
 
 impl VideoService {
-    /// Binds the served denoiser, whose handshake states the condition rows
-    /// the deployment provisioned, the checkpoint's vision processor, the
-    /// deployment's duration capacity, the condition units its latent
-    /// encoder covers in one round, its media policy, how it sizes
+    /// Binds the served denoiser, whose handshake states its tasks, schedule
+    /// and the canvases the deployment prepared, the checkpoint's vision
+    /// processor, the deployment's duration capacity, the condition units its
+    /// latent encoder covers in one round, its media policy, how it sizes
     /// references, and the tokenizer.
     ///
     /// # Errors
     ///
-    /// Fails when the handshake names a task this server does not know or
-    /// is otherwise invalid, when the reference config is invalid, or when
-    /// the media fetcher cannot be built.
+    /// Fails when the handshake names a task this server does not know,
+    /// declares no canvas or is otherwise invalid, when the reference config
+    /// is invalid, or when the media fetcher cannot be built.
     pub fn new(
         denoiser: VideoDenoiserInfo,
         vision: ProcessorConfig,
@@ -84,6 +84,10 @@ impl VideoService {
         denoiser
             .validate()
             .map_err(|error| anyhow::anyhow!("invalid video denoiser handshake: {error}"))?;
+        anyhow::ensure!(
+            !denoiser.canvases.is_empty(),
+            "invalid video denoiser handshake: the worker prepared no canvas"
+        );
         references.validate().map_err(anyhow::Error::msg)?;
         let tasks = denoiser
             .tasks
@@ -105,9 +109,7 @@ impl VideoService {
         let limits = PlanLimits {
             tasks: tasks.clone(),
             max_video_seconds,
-            // An empty list means the denoiser generates every canvas of the
-            // canvas rule.
-            canvases: (!denoiser.canvases.is_empty()).then(|| denoiser.canvases.clone()),
+            canvases: denoiser.canvases.clone(),
             references,
         };
         Ok(Self {
@@ -128,11 +130,10 @@ impl VideoService {
     /// Describes the served video contract for `GET /v1/capabilities`.
     ///
     /// Reports the tasks and their condition rules, with how the deployment
-    /// sizes `ref2va` references, the canvas rule, the
-    /// short edges and named aspect ratios the deployment serves and the
-    /// canvas each pair resolves to, the duration range, the fixed schedule
-    /// (its sigma points and shifts), the
-    /// prompt and sequence capacities, and the media sources and size caps.
+    /// sizes `ref2va` references, the canvas rule, the short edges and named
+    /// aspect ratios the deployment serves and the canvas each pair resolves
+    /// to, the duration range, the fixed schedule (its sigma points and
+    /// shifts), the prompt capacity, and the media sources and size caps.
     pub fn capabilities(&self, max_prompt_tokens: u32) -> Value {
         // The named ratios served at any short edge, in their canonical
         // order, and each served pair's canvas; `auto` is 16:9 for t2va and
@@ -184,8 +185,7 @@ impl VideoService {
                 "max_pixels": CANVAS_MAX_PIXELS,
                 "aspect_ratios": named,
                 "sizes": sizes,
-                "free_aspect_range": [MIN_ASPECT_RATIO, MAX_ASPECT_RATIO],
-                "canvases": (!self.denoiser.canvases.is_empty()).then_some(&self.denoiser.canvases),
+                "canvases": self.denoiser.canvases,
             },
             "fps": VIDEO_FPS,
             "min_seconds": MIN_VIDEO_SECONDS,
@@ -341,7 +341,7 @@ mod tests {
                 schedule_points: 50,
                 video_shift: 12.0,
                 audio_shift: 3.0,
-                canvases: Vec::new(),
+                canvases: super::super::plan::tests::served_canvases(),
             },
             vision(&fixture()),
             15.0,

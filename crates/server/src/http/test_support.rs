@@ -89,9 +89,9 @@ pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
     ServingRuntime::new(processor, client, images, false)
 }
 
-/// The video service of a four-step text-to-video denoiser that generates
-/// every canvas of the canvas rule, with the released checkpoint's vision
-/// processor geometry and the default media policy.
+/// The video service of a four-step text-to-video denoiser that prepared the
+/// named aspect ratios' canvases of the canvas rule, with the released
+/// checkpoint's vision processor geometry and the default media policy.
 pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
     VideoService::new(
         uniserve_engine::VideoDenoiserInfo {
@@ -99,7 +99,13 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             schedule_points: 5,
             video_shift: 12.0,
             audio_shift: 3.0,
-            canvases: Vec::new(),
+            canvases: crate::serving::video::plan::NAMED_ASPECT_RATIOS
+                .iter()
+                .map(|&(width, height)| {
+                    crate::serving::video::plan::canvas(f64::from(width), f64::from(height))
+                        .unwrap()
+                })
+                .collect(),
         },
         ProcessorConfig {
             patch_size: 16,
