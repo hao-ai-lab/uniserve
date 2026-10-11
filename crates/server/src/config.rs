@@ -81,12 +81,6 @@ pub struct EngineSettings {
     /// `MAX_VIDEO_SECONDS`, the range the video API admits. The video service
     /// rejects longer video requests.
     pub max_video_seconds: f64,
-    /// Video resolution classes a video deployment prepares. Crossed with
-    /// `video_aspect_ratios`, they name the canvases its workers prepare and
-    /// report as the only canvases requests may target.
-    pub video_resolutions: Vec<crate::profile::video::VideoResolution>,
-    /// Video aspect ratios a video deployment prepares.
-    pub video_aspect_ratios: Vec<crate::profile::omni::resolution::ResolutionName>,
     /// Most denoiser rows a video request's conditions may take
     /// (`--max-condition-rows`). Video workers provision their condition
     /// products for it, and the worker that packs a request's conditions
@@ -123,12 +117,6 @@ impl Default for EngineSettings {
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: crate::serving::MAX_VIDEO_SECONDS,
-            video_resolutions: crate::profile::video::VideoRasters::default()
-                .resolutions()
-                .to_vec(),
-            video_aspect_ratios: crate::profile::video::VideoRasters::default()
-                .aspect_ratios()
-                .to_vec(),
             max_condition_rows: None,
             // One local CUDA rank running `DEFAULT_COMPONENT`. The `uniserve`
             // CLI and the Dynamo worker binary both replace this with a

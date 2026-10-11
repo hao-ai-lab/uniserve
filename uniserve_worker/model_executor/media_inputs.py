@@ -160,6 +160,7 @@ class MediaBuilder:
         zero for a worker that serves no conditions. ``canvases`` are the
         canvases the deployment prepares and admits, distinct members of
         ``VideoDenoiser.canvases``; without any they are all of those.
+        (``VideoDenoiser.select_canvases`` resolves a deployment's names.)
 
         Raises:
             ValueError: No frame count or canvas is admitted, a canvas
@@ -176,13 +177,13 @@ class MediaBuilder:
         frames = denoiser.legal_frame_count(max_frames)
         self.denoiser = denoiser
         self.num_steps = denoiser.num_steps
-        self.canvases = tuple(canvases) or denoiser.canvases
+        offered = tuple(denoiser.canvases.values())
+        self.canvases = tuple(canvases) or offered
         self.max_text_tokens = max_text_tokens
         if not self.canvases:
             raise ValueError("media input admits no canvas")
         if len(set(self.canvases)) != len(self.canvases):
             raise ValueError("media input canvases must be distinct")
-        offered = denoiser.canvases
         if not set(self.canvases) <= set(offered):
             raise ValueError(
                 f"the denoiser offers only the canvases {offered}, not every "

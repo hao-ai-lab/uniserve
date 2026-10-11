@@ -367,8 +367,9 @@ class VideoTask(BenchmarkTask):
                     (video.width, video.height) == (shape.width, shape.height)
                     for video, shape in pairs
                 ),
-                # The container frame rate is a rational; require exactly 24.
-                "24fps_video": present
+                # The container frame rate is a rational; require exactly the
+                # model's output frame rate.
+                "output_frame_rate": present
                 and all(
                     video.fps_numerator == fps * video.fps_denominator
                     for video in videos

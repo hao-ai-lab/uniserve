@@ -8,7 +8,7 @@ presentation. The rules are checked against
 diffusers reference pipeline. This module states only what Python
 computation and tools use: the frame count a duration generates within the
 API's range, the aspect ratio ``auto`` means, and the reference limits a
-denoiser provisions its condition capacity for.
+denoiser declares and provisions its condition capacity for.
 """
 
 from __future__ import annotations
@@ -19,7 +19,9 @@ from .packing import FPS, align_num_frames
 
 __all__ = [
     "DEFAULT_ASPECT_RATIO",
+    "MAX_AUDIO_REFERENCES",
     "MAX_IMAGE_REFERENCES",
+    "MAX_REFERENCES",
     "MAX_SECONDS",
     "MAX_VIDEO_REFERENCES",
     "MIN_SECONDS",
@@ -39,9 +41,13 @@ DEFAULT_ASPECT_RATIO = (16, 9)
 # edge, without an area cap.
 REFERENCE_IMAGE_SHORT_EDGE = 2048
 
-# Reference counts the released checkpoint documents for one request.
+# Reference counts the released checkpoint documents for one ``ref2va``
+# request: nine images, three videos (each with its soundtrack) and three
+# audio tracks, twelve references of all types in all.
 MAX_IMAGE_REFERENCES = 9
 MAX_VIDEO_REFERENCES = 3
+MAX_AUDIO_REFERENCES = 3
+MAX_REFERENCES = 12
 
 
 def frame_count(seconds: float) -> int:

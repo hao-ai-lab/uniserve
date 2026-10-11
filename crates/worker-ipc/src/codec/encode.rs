@@ -1349,9 +1349,29 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
         let canvases = value
             .canvases
             .iter()
-            .map(|canvas| fbs::Canvas::new(canvas.width, canvas.height))
+            .map(|served| {
+                let aspect_ratio = Some(b.create_string(&served.aspect_ratio));
+                fbs::ServedCanvas::create(
+                    b,
+                    &fbs::ServedCanvasArgs {
+                        short_edge: served.short_edge,
+                        aspect_ratio,
+                        width: served.canvas.width,
+                        height: served.canvas.height,
+                    },
+                )
+            })
             .collect::<Vec<_>>();
         let canvases = Some(b.create_vector(&canvases));
+        let references = Some(fbs::ReferenceLimits::create(
+            b,
+            &fbs::ReferenceLimitsArgs {
+                images: value.references.images,
+                videos: value.references.videos,
+                audios: value.references.audios,
+                total: value.references.total,
+            },
+        ));
         fbs::VideoDenoiserInfo::create(
             b,
             &fbs::VideoDenoiserInfoArgs {
@@ -1359,7 +1379,9 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 schedule_points: value.schedule_points,
                 video_shift: value.video_shift,
                 audio_shift: value.audio_shift,
+                frame_rate: value.frame_rate,
                 canvases,
+                references,
             },
         )
     });

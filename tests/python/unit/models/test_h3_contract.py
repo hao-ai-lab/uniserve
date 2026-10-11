@@ -61,22 +61,26 @@ def test_t2va_fasth3_resolves_its_trained_rungs(checkpoint):
     }
     assert denoiser.attention == SparseAttention(tile=64, sparsity=0.9)
     assert denoiser.tasks == ("t2va",)
-    # The student generates its 12 (width, height) training buckets: 21:9,
-    # 16:9, 4:3, 1:1, 3:4 and 9:16 at 768p, then at 480p.
-    assert [(canvas.width, canvas.height) for canvas in denoiser.canvases] == [
-        (1536, 672),
-        (1344, 768),
-        (1024, 768),
-        (768, 768),
-        (768, 1024),
-        (768, 1344),
-        (992, 416),
-        (832, 480),
-        (640, 480),
-        (480, 480),
-        (480, 640),
-        (480, 832),
-    ]
+    # The student generates its 12 training buckets: 21:9, 16:9, 4:3, 1:1,
+    # 3:4 and 9:16 at 768p, then at 480p, by the (short edge, aspect ratio)
+    # a request names them with.
+    assert {
+        name: (canvas.width, canvas.height)
+        for name, canvas in denoiser.canvases.items()
+    } == {
+        (768, "21:9"): (1536, 672),
+        (768, "16:9"): (1344, 768),
+        (768, "4:3"): (1024, 768),
+        (768, "1:1"): (768, 768),
+        (768, "3:4"): (768, 1024),
+        (768, "9:16"): (768, 1344),
+        (480, "21:9"): (992, 416),
+        (480, "16:9"): (832, 480),
+        (480, "4:3"): (640, 480),
+        (480, "1:1"): (480, 480),
+        (480, "3:4"): (480, 640),
+        (480, "9:16"): (480, 832),
+    }
 
 
 def test_base_release_serves_both_task_families(base):

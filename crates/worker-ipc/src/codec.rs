@@ -594,16 +594,30 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
         schedule_points: table.schedule_points(),
         video_shift: table.video_shift(),
         audio_shift: table.audio_shift(),
+        frame_rate: table.frame_rate(),
         canvases: table
             .canvases()
             .map(|canvases| {
                 canvases
                     .iter()
-                    .map(|canvas| uniserve_core::Canvas {
-                        width: canvas.width(),
-                        height: canvas.height(),
+                    .map(|served| crate::ServedCanvas {
+                        short_edge: served.short_edge(),
+                        aspect_ratio: served.aspect_ratio().unwrap_or_default().to_owned(),
+                        canvas: uniserve_core::Canvas {
+                            width: served.width(),
+                            height: served.height(),
+                        },
                     })
                     .collect()
+            })
+            .unwrap_or_default(),
+        references: table
+            .references()
+            .map(|limits| crate::ReferenceLimits {
+                images: limits.images(),
+                videos: limits.videos(),
+                audios: limits.audios(),
+                total: limits.total(),
             })
             .unwrap_or_default(),
     }

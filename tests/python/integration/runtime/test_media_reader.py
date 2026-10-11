@@ -44,7 +44,6 @@ import torch
 from safetensors.torch import load_file
 
 from tests.python.fixtures.h3_conditions import (
-    FPS,
     SAMPLE_RATE,
     published,
     read,
@@ -52,6 +51,7 @@ from tests.python.fixtures.h3_conditions import (
     vision_encoder,
 )
 from uniserve.media import image
+from uniserve_models.minimax_h3.packing import FPS
 from uniserve_worker.media.reader import read_image
 from uniserve_worker.protocol.video import ImageFit
 

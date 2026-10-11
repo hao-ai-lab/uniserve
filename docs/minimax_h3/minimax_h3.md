@@ -149,7 +149,7 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 | Option | Meaning |
 | --- | --- |
 | `--max-video-seconds` | Longest admitted duration, 4 to 15 seconds; 15 by default. |
-| `--video-resolutions`, `--video-aspect-ratios` | The canvases startup prepares: each resolution with each aspect ratio, `768p` and `16:9,9:16` by default. FastH3 serves `768p` and `480p`, the others `768p`. A request for any other canvas is refused. |
+| `--video-resolutions`, `--video-aspect-ratios` | The canvases startup prepares: each resolution with each aspect ratio, `768p` and `16:9,9:16` by default. FastH3 serves `768p` and `480p`, the others `768p`; the worker refuses at startup a resolution or aspect ratio its checkpoint does not generate. A request for any other canvas is refused. |
 | `--max-model-len` | Longest prompt presentation in tokens, vision tokens included; 16384 by default, for text, keyframe and reference deployments alike. The text encoder itself accepts up to 262144 positions; the default bounds the prompt capacities startup prepares layouts and storage for (`--video-text-capacities`). A reference deployment states the bound its references' vision tokens need. The official keyframe request presents 1935 tokens and the official video-plus-audio request 6913. |
 | `--video-text-capacities` | Prompt capacities startup prepares; each prompt runs in the smallest that holds it. By default 1024, then steps of 2048 up to `--max-model-len`. |
 | `--max-running-requests` | Concurrently resident requests, up to the workers' request slots. |

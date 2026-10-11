@@ -676,29 +676,31 @@ pub const MIN_VIDEO_SECONDS: f64 = 4.0;
 /// configure a lower `max_video_seconds` capacity, never a higher one.
 pub const MAX_VIDEO_SECONDS: f64 = 15.0;
 
-/// Frame rate, in frames per second, of every MiniMax H3 video.
-pub const VIDEO_FPS: u32 = 24;
-
-/// Converts an explicit MiniMax H3 duration into its output frame count.
+/// Converts an explicit MiniMax H3 duration into its output frame count at `frame_rate`
+/// frames per second, the rate the worker's denoiser declares.
 ///
-/// The requested frame count is `seconds * 24` rounded half to even, as the reference
+/// The requested frame count is `seconds * frame_rate` rounded half to even, as the reference
 /// implementations round with Python's `round`, and the output extends it upward to the next
 /// complete native temporal window, a count of the form `17n + 5`. The output may therefore
-/// last longer than requested: 4 seconds yields 107 frames and 15 seconds 362.
+/// last longer than requested: at 24 fps, 4 seconds yields 107 frames and 15 seconds 362.
 ///
 /// # Errors
 ///
 /// Returns a message when `seconds` is not finite or lies outside
 /// `[MIN_VIDEO_SECONDS, max_video_seconds]`.
-pub fn video_frame_count(seconds: f64, max_video_seconds: f64) -> std::result::Result<u32, String> {
+pub fn video_frame_count(
+    seconds: f64,
+    max_video_seconds: f64,
+    frame_rate: u32,
+) -> std::result::Result<u32, String> {
     if !seconds.is_finite() || !(MIN_VIDEO_SECONDS..=max_video_seconds).contains(&seconds) {
         return Err(format!(
             "video duration must be a finite number of seconds in [{MIN_VIDEO_SECONDS}, \
              {max_video_seconds}]"
         ));
     }
-    // The range bounds the product to [96, 360], so the conversion is exact.
-    let requested = (seconds * f64::from(VIDEO_FPS)).round_ties_even() as u32;
+    // The range bounds the product well below `u32::MAX`, so the conversion is exact.
+    let requested = (seconds * f64::from(frame_rate)).round_ties_even() as u32;
     Ok(requested + (22 - requested % 17) % 17)
 }
 

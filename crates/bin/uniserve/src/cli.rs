@@ -23,8 +23,6 @@ use uniserve_engine::{
     TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::profile::diffusion_gemma::DenoisingOverrides;
-use uniserve_server::profile::omni::resolution::ResolutionName;
-use uniserve_server::profile::video::VideoResolution;
 use uniserve_server::serving::MAX_VIDEO_SECONDS;
 use uniserve_server::serving::systemone::{
     CandidateTokens, CanvasMode, ReadoutLayout, ReadoutOptions,
@@ -167,26 +165,6 @@ pub(crate) struct SharedRuntimeArgs {
     /// advertised as `max_seconds`.
     #[arg(long = "max-video-seconds", default_value_t = MAX_VIDEO_SECONDS)]
     pub max_video_seconds: f64,
-    /// Comma-separated video resolution classes (`768p`, `480p`) a video
-    /// deployment prepares, each at every `--video-aspect-ratios` entry. A
-    /// request's `target.short_edge` selects one: 768 or 480. Only a FastH3
-    /// export generates the 480p buckets.
-    #[arg(
-        long = "video-resolutions",
-        value_delimiter = ',',
-        default_value = "768p"
-    )]
-    pub video_resolutions: Vec<VideoResolution>,
-    /// Comma-separated video aspect ratios, from the trained buckets `21:9`,
-    /// `16:9`, `4:3`, `1:1`, `3:4`, `9:16`, a video deployment prepares. A
-    /// request's `target.aspect_ratio` selects one; requests are refused at
-    /// any canvas the deployment did not prepare.
-    #[arg(
-        long = "video-aspect-ratios",
-        value_delimiter = ',',
-        default_value = "16:9,9:16"
-    )]
-    pub video_aspect_ratios: Vec<ResolutionName>,
     /// Most denoiser rows the conditions of one video request may take: a
     /// capacity video workers provision their condition products, request
     /// slots and largest denoiser layout for. The worker that packs a
@@ -521,8 +499,6 @@ impl SharedRuntimeArgs {
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
-            video_resolutions: self.video_resolutions.clone(),
-            video_aspect_ratios: self.video_aspect_ratios.clone(),
             max_condition_rows: self.max_condition_rows,
             // Without a written configuration each replica serves one
             // component over its `--worker-ranks` ranks. A model whose
@@ -674,6 +650,19 @@ pub(crate) struct WorkerProcessOptions {
     /// 1024 tokens, then steps of 2048 tokens.
     #[arg(long)]
     pub video_text_capacities: Option<String>,
+    /// Comma-separated resolution classes (`768p`, `480p`) a video
+    /// deployment prepares, each at every `--video-aspect-ratios` entry. A
+    /// request's `target.short_edge` selects one. The video worker refuses a
+    /// class its denoiser does not generate: a released base checkpoint
+    /// generates 768p, a FastH3 DMD export also 480p.
+    #[arg(long, default_value = "768p", value_name = "LIST")]
+    pub video_resolutions: String,
+    /// Comma-separated aspect ratios (`21:9`, `16:9`, `4:3`, `1:1`, `3:4`,
+    /// `9:16`) a video deployment prepares, at every `--video-resolutions`
+    /// entry. A request's `target.aspect_ratio` selects one; requests are
+    /// refused at any canvas the deployment did not prepare.
+    #[arg(long, default_value = "16:9,9:16", value_name = "LIST")]
+    pub video_aspect_ratios: String,
     /// `ffmpeg` executable the media reader decodes reference videos with.
     /// The reference conditioning decodes with FFmpeg 8.1.2, whose LANCZOS
     /// scaler a reference video's pixels depend on.
@@ -723,6 +712,8 @@ impl WorkerProcessOptions {
             flow_graph_batch_sizes: self.flow_graph_batch_sizes.clone(),
             flow_graph_shapes: self.flow_graph_shapes.clone(),
             video_text_capacities: self.video_text_capacities.clone(),
+            video_resolutions: Some(self.video_resolutions.clone()),
+            video_aspect_ratios: Some(self.video_aspect_ratios.clone()),
             ffmpeg: self.ffmpeg.clone(),
             flashinfer_workspace_size: self.flashinfer_workspace_size,
             flashinfer_use_tensor_core: self.flashinfer_use_tensor_core.clone(),

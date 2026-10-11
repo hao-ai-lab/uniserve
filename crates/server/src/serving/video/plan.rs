@@ -2,8 +2,8 @@
 //!
 //! [`plan_request`] resolves everything a request implies before any pixel is
 //! decoded: the generated canvas and frame counts, how every condition is
-//! prepared (keyframe fit, reference image size, 24 fps reference clip,
-//! 32 kHz soundtrack), what the Qwen3-VL conditioner sees of it (vision
+//! prepared (keyframe fit, reference image size, reference clip at the
+//! output frame rate, 32 kHz soundtrack), what the Qwen3-VL conditioner sees of it (vision
 //! grids, 2 fps samples and block timestamps), and the units the worker
 //! encodes each condition in. [`check_request`] applies the subset of rules
 //! that needs no media, so a malformed request is rejected before its media
@@ -16,11 +16,12 @@
 //! `tests/python/fixtures/minimax_h3_plan.json`, generated from that
 //! pipeline. Rules the reference leaves open are fixed here:
 //!
-//! - `start_time_seconds` skips the first `floor(s * 24 + 0.5)` frames of a
-//!   reference video's 24 fps timeline and the first `floor(s * rate + 0.5)`
-//!   samples of its soundtrack;
+//! - `start_time_seconds` skips the first `floor(s * fps + 0.5)` frames of a
+//!   reference video's timeline at the output frame rate `fps` (24 for the
+//!   released checkpoint) and the first `floor(s * rate + 0.5)` samples of
+//!   its soundtrack;
 //! - a reference video needs at least 22 frames (one `17n + 5` VAE window)
-//!   on its 24 fps timeline after the start offset;
+//!   on that timeline after the start offset;
 //! - `ref2va` keyframes are fitted to the target canvas like `fl2va` ones
 //!   (the first stretched, a second cover-cropped) and do not enter the
 //!   conditioner;
@@ -35,11 +36,11 @@ use serde::{Deserialize, Serialize};
 use uniserve_core::{
     Canvas, ConditionMedia, ConditionVision, ImageFit, MediaLocator, VideoCondition, VideoTask,
 };
+use uniserve_engine::{ReferenceLimits, ServedCanvas};
 
 use super::probe::{AudioFacts, ImageFacts, MediaFacts, VideoFacts};
 use super::{RequestField, VideoInputError};
-use crate::profile::video::{VideoRaster, VideoResolution};
-use crate::serving::{VIDEO_FPS, video_frame_count};
+use crate::serving::video_frame_count;
 
 /// Short edge of the adapt_shape_v1 canvas rule, in pixels.
 pub const CANVAS_SHORT_EDGE: u32 = 768;
@@ -52,9 +53,6 @@ pub const CANVAS_MULTIPLE: u32 = 32;
 pub const MIN_ASPECT_RATIO: f64 = 0.25;
 /// Widest accepted width-to-height ratio, 4:1.
 pub const MAX_ASPECT_RATIO: f64 = 4.0;
-/// The aspect ratios `t2va` and `ref2va` accept besides `auto`.
-pub const NAMED_ASPECT_RATIOS: [(u32, u32); 6] =
-    [(21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16)];
 /// The ratio `auto` means for `t2va` and `ref2va`.
 const DEFAULT_ASPECT_RATIO: (u32, u32) = (16, 9);
 
@@ -64,7 +62,8 @@ pub const REFERENCE_IMAGE_SHORT_EDGE: u32 = 2048;
 /// Pixel frames per video VAE window, and the overlap a window carries.
 const VAE_FRAMES_PER_CHUNK: u32 = 17;
 const VAE_LATENTS_PER_CHUNK: u32 = 5;
-/// Fewest 24 fps frames a reference video must keep: one VAE window.
+/// Fewest frames at the output rate a reference video must keep: one VAE
+/// window.
 pub const MIN_REFERENCE_FRAMES: u32 = VAE_FRAMES_PER_CHUNK + VAE_LATENTS_PER_CHUNK;
 
 /// The audio VAE's sample rate and hop: 40 latents per second.
@@ -76,16 +75,6 @@ const AUDIO_CHANNELS: u32 = 2;
 
 /// The rate the conditioner samples a reference video at.
 const VIDEO_SAMPLE_FPS: f64 = 2.0;
-
-/// Image references one `ref2va` request may carry, as documented for the
-/// released checkpoint.
-pub const MAX_IMAGE_REFERENCES: usize = 9;
-/// Video references, with or without soundtrack, one request may carry.
-pub const MAX_VIDEO_REFERENCES: usize = 3;
-/// Audio references one request may carry, not counting video soundtracks.
-pub const MAX_AUDIO_REFERENCES: usize = 3;
-/// References of all types one request may carry; keyframes not counted.
-pub const MAX_REFERENCES: usize = 12;
 
 /// The media type of a condition, by its request name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -179,8 +168,8 @@ fn nearest_multiple(value: f64) -> u32 {
 /// The requested output, as the request states it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Target<'a> {
-    /// `target.short_edge`: 768, the canvas rule's, or 480 where the
-    /// deployment serves a FastH3 export's 480p buckets.
+    /// `target.short_edge`: the resolution class, in pixels, of a canvas the
+    /// deployment serves; 768 is the canvas rule's.
     pub short_edge: u32,
     /// `target.aspect_ratio`: `auto` or `W:H`.
     pub aspect_ratio: &'a str,
@@ -286,27 +275,50 @@ pub struct PlanLimits {
     pub tasks: Vec<VideoTask>,
     /// Longest requested duration served (`--max-video-seconds`).
     pub max_video_seconds: f64,
-    /// The only canvases the deployment serves: those its workers prepare
-    /// and declare in their handshake.
-    pub canvases: Vec<Canvas>,
+    /// Frame rate of every generated video, in frames per second, as the
+    /// denoiser declares it; reference videos are resampled to it.
+    pub frame_rate: u32,
+    /// The only canvases the deployment serves, as its workers declare them
+    /// in their handshake: each with the `target.short_edge` and
+    /// `target.aspect_ratio` that select it.
+    pub canvases: Vec<ServedCanvas>,
+    /// The references one `ref2va` request may carry, as the denoiser
+    /// declares them in its handshake.
+    pub reference_limits: ReferenceLimits,
     /// How the deployment sizes references.
     pub references: ReferenceConfig,
 }
 
 impl PlanLimits {
     /// The `target.short_edge` values the deployment serves, in the order of
-    /// its canvases: each served canvas's training-bucket class, or the
-    /// canvas rule's 768 for a canvas no bucket has.
+    /// its canvases.
     pub fn short_edges(&self) -> Vec<u32> {
         let mut edges = Vec::new();
-        for canvas in &self.canvases {
-            let edge = VideoRaster::find(canvas.width, canvas.height)
-                .map_or(CANVAS_SHORT_EDGE, |bucket| bucket.resolution.short_edge());
-            if !edges.contains(&edge) {
-                edges.push(edge);
+        for served in &self.canvases {
+            if !edges.contains(&served.short_edge) {
+                edges.push(served.short_edge);
             }
         }
         edges
+    }
+
+    /// The `target.aspect_ratio` values the deployment serves at
+    /// `short_edge`, in the order of its canvases.
+    pub fn aspect_ratios(&self, short_edge: u32) -> Vec<&str> {
+        self.canvases
+            .iter()
+            .filter(|served| served.short_edge == short_edge)
+            .map(|served| served.aspect_ratio.as_str())
+            .collect()
+    }
+
+    /// The canvas the deployment serves for a short edge and an aspect ratio
+    /// named `W:H`.
+    fn served_canvas(&self, short_edge: u32, aspect_ratio: &str) -> Option<Canvas> {
+        self.canvases
+            .iter()
+            .find(|served| served.short_edge == short_edge && served.aspect_ratio == aspect_ratio)
+            .map(|served| served.canvas)
     }
 }
 
@@ -562,9 +574,9 @@ impl AudioClip {
 pub struct VideoClip {
     /// The canvas of the video's own display aspect the frames are put on.
     pub canvas: Canvas,
-    /// Frames of the 24 fps timeline skipped at the start.
+    /// Frames of the output-rate timeline skipped at the start.
     pub start_frame: u32,
-    /// 24 fps frames kept after the start offset, at most the generated
+    /// Output-rate frames kept after the start offset, at most the generated
     /// frame count; the conditioner samples these.
     pub frames: u32,
     /// The leading `17n + 5` frames the VAE encodes.
@@ -589,7 +601,7 @@ pub struct VideoVision {
     pub grid: VisionGrid,
     /// Vision tokens of each block.
     pub block_tokens: u32,
-    /// The 24 fps frames sampled at 2 fps.
+    /// The output-rate frames sampled at 2 fps.
     pub frame_indices: Vec<u32>,
     /// The timestamp label of each block, in seconds.
     pub block_timestamps: Vec<f64>,
@@ -868,11 +880,13 @@ pub fn reference_image_size(
     })
 }
 
-/// Samples a 24 fps clip at 2 fps and labels its vision blocks.
+/// Samples a clip of `frame_rate` frames per second at 2 fps and labels its
+/// vision blocks.
 ///
-/// Every twelfth frame is sampled. The conditioner merges the samples in
-/// groups of `temporal_patch`, repeating the last one to fill a group, and
-/// labels a group with the mean of its timestamps.
+/// Every `frame_rate / 2`-th frame is sampled (every twelfth at 24 fps). The
+/// conditioner merges the samples in groups of `temporal_patch`, repeating
+/// the last one to fill a group, and labels a group with the mean of its
+/// timestamps.
 ///
 /// # Errors
 ///
@@ -880,8 +894,9 @@ pub fn reference_image_size(
 pub fn sample_video_frames(
     frames: u32,
     temporal_patch: u32,
+    frame_rate: u32,
 ) -> Result<(Vec<u32>, Vec<f64>), String> {
-    let stride = f64::from(VIDEO_FPS) / VIDEO_SAMPLE_FPS;
+    let stride = f64::from(frame_rate) / VIDEO_SAMPLE_FPS;
     let mut indices: Vec<u32> = Vec::new();
     let mut cursor = 0.0_f64;
     loop {
@@ -938,6 +953,7 @@ pub fn audio_clip(
     media: &AudioFacts,
     start_seconds: f64,
     frames: u32,
+    frame_rate: u32,
 ) -> Result<AudioClip, String> {
     let rate = media.sample_rate;
     let start_sample = start_offset(start_seconds, f64::from(rate));
@@ -945,8 +961,8 @@ pub fn audio_clip(
         return Err("start_time_seconds lies past the end of the audio track".to_owned());
     }
     let available = media.samples - start_sample;
-    // The reference truncates to `int(frames / 24 * rate)` samples.
-    let limit = (f64::from(frames) / f64::from(VIDEO_FPS) * f64::from(rate)).trunc() as u64;
+    // The reference truncates to `int(frames / fps * rate)` samples.
+    let limit = (f64::from(frames) / f64::from(frame_rate) * f64::from(rate)).trunc() as u64;
     let source = available.min(limit);
     let samples = if rate == AUDIO_SAMPLE_RATE {
         source
@@ -980,9 +996,9 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
 
 /// Sizes a reference video and the conditioner's view of it.
 ///
-/// The video is resampled to 24 fps (each frame held until the slot of the
-/// next), its first `floor(s * 24 + 0.5)` frames are skipped and the rest is
-/// truncated to the generated frame count, on the canvas of its own display
+/// The video is resampled to `frame_rate` (each frame held until the slot of
+/// the next), its first `floor(s * frame_rate + 0.5)` frames are skipped and
+/// the rest is truncated to the generated frame count, on the canvas of its own display
 /// aspect. A video with fewer pixels than that canvas keeps its own size,
 /// each side rounded half to even to a multiple of 32, unless
 /// `config.enlarge` scales it up to the canvas. Its soundtrack is offset by
@@ -997,6 +1013,7 @@ pub fn video_reference(
     media: &VideoFacts,
     start_seconds: f64,
     frames: u32,
+    frame_rate: u32,
     vision: &ProcessorConfig,
     config: &ReferenceConfig,
 ) -> Result<(VideoClip, VideoVision), String> {
@@ -1010,20 +1027,20 @@ pub fn video_reference(
             height: nearest_multiple(f64::from(media.height)),
         };
     }
-    let frame_rate =
+    let source_rate =
         f64::from(media.frame_rate.numerator) / f64::from(media.frame_rate.denominator);
-    let fps = f64::from(VIDEO_FPS);
-    let timeline = if frame_rate == fps {
+    let fps = f64::from(frame_rate);
+    let timeline = if source_rate == fps {
         media.frames
     } else {
-        // The timeline ends at the 24 fps slot the stream's end rounds to.
-        (media.frames as f64 * (fps / frame_rate) + 0.5).floor() as u64
+        // The timeline ends at the output-rate slot the stream's end rounds to.
+        (media.frames as f64 * (fps / source_rate) + 0.5).floor() as u64
     };
     let start_frame = start_offset(start_seconds, fps);
     let available = timeline.saturating_sub(start_frame);
     if available < u64::from(MIN_REFERENCE_FRAMES) {
         return Err(format!(
-            "a reference video needs at least {MIN_REFERENCE_FRAMES} frames at {VIDEO_FPS} fps \
+            "a reference video needs at least {MIN_REFERENCE_FRAMES} frames at {frame_rate} fps \
              after start_time_seconds, got {available}"
         ));
     }
@@ -1035,10 +1052,11 @@ pub fn video_reference(
     let soundtrack = media
         .soundtrack
         .as_ref()
-        .map(|track| audio_clip(track, start_seconds, frames))
+        .map(|track| audio_clip(track, start_seconds, frames, frame_rate))
         .transpose()?;
 
-    let (frame_indices, block_timestamps) = sample_video_frames(kept, vision.temporal_patch_size)?;
+    let (frame_indices, block_timestamps) =
+        sample_video_frames(kept, vision.temporal_patch_size, frame_rate)?;
     let sampled = u32::try_from(frame_indices.len()).unwrap_or(u32::MAX);
     let grid = vision.video_grid(sampled, size.height, size.width)?;
     let clip = VideoClip {
@@ -1069,106 +1087,55 @@ fn parse_aspect_ratio(value: &str) -> Option<(u32, u32)> {
     Some((side(width)?, side(height)?))
 }
 
-/// The aspect ratio a target asks for: a named ratio for `t2va` and
-/// `ref2va` (`auto` being 16:9), any ratio within 1:4 to 4:1 for `fl2va`,
-/// and `None` for `fl2va` with `auto`, whose canvas follows the first
-/// keyframe.
-fn requested_ratio(
-    task: VideoTask,
-    aspect_ratio: &str,
-) -> Result<Option<(u32, u32)>, VideoInputError> {
-    if aspect_ratio == "auto" {
-        return Ok((task != VideoTask::Fl2va).then_some(DEFAULT_ASPECT_RATIO));
-    }
-    let ratio = parse_aspect_ratio(aspect_ratio);
-    let (accepted, allowed) = match task {
-        VideoTask::Fl2va => (
-            ratio.is_some_and(|(width, height)| {
-                (MIN_ASPECT_RATIO..=MAX_ASPECT_RATIO)
-                    .contains(&(f64::from(width) / f64::from(height)))
-            }),
-            "auto or W:H within 1:4 to 4:1".to_owned(),
-        ),
-        VideoTask::T2va | VideoTask::Ref2va => {
-            let named: Vec<String> = NAMED_ASPECT_RATIOS
-                .iter()
-                .map(|(width, height)| format!("{width}:{height}"))
-                .collect();
-            (
-                ratio.is_some_and(|ratio| NAMED_ASPECT_RATIOS.contains(&ratio)),
-                format!("auto or one of {}", named.join(", ")),
-            )
-        }
-    };
-    match ratio {
-        Some(ratio) if accepted => Ok(Some(ratio)),
-        _ => Err(VideoInputError::invalid(
-            RequestField::TargetAspectRatio,
-            format!("must be {allowed}, got {aspect_ratio:?}"),
-        )),
-    }
-}
-
 /// The canvas a target names without consulting media; `None` for `fl2va`
-/// with `auto`.
+/// with `auto`, whose canvas follows the first keyframe.
 ///
-/// At the canvas rule's 768-pixel short edge a ratio resolves through
-/// [`canvas`]. Another short edge names the FastH3 training bucket of that
-/// resolution class, whose sides the rule does not produce: 480p 21:9 is
-/// 992x416.
-fn named_canvas(task: VideoTask, target: &Target<'_>) -> Result<Option<Canvas>, VideoInputError> {
-    let Some((width, height)) = requested_ratio(task, target.aspect_ratio)? else {
+/// `auto` is 16:9 for `t2va` and `ref2va`. A `W:H` ratio the deployment
+/// prepared at the target's short edge names that canvas, as its workers
+/// declare it. `fl2va` also takes any ratio from 1:4 to 4:1, which the canvas
+/// rule resolves at its 768-pixel short edge; such a canvas must still be one
+/// the deployment prepared ([`check_served`]).
+fn named_canvas(
+    task: VideoTask,
+    target: &Target<'_>,
+    limits: &PlanLimits,
+) -> Result<Option<Canvas>, VideoInputError> {
+    let name = if target.aspect_ratio != "auto" {
+        target.aspect_ratio.to_owned()
+    } else if task == VideoTask::Fl2va {
         return Ok(None);
+    } else {
+        format!("{}:{}", DEFAULT_ASPECT_RATIO.0, DEFAULT_ASPECT_RATIO.1)
     };
-    if target.short_edge == CANVAS_SHORT_EDGE {
+    if let Some(canvas) = limits.served_canvas(target.short_edge, &name) {
+        return Ok(Some(canvas));
+    }
+
+    let by_rule = task == VideoTask::Fl2va && target.short_edge == CANVAS_SHORT_EDGE;
+    if by_rule && let Some((width, height)) = parse_aspect_ratio(&name) {
         return canvas(f64::from(width), f64::from(height))
             .map(Some)
             .map_err(|error| VideoInputError::invalid(RequestField::TargetAspectRatio, error));
     }
-    VideoResolution::from_short_edge(target.short_edge)
-        .and_then(|resolution| VideoRaster::named(resolution, &format!("{width}:{height}")))
-        .map(|bucket| {
-            Some(Canvas {
-                width: bucket.width,
-                height: bucket.height,
-            })
-        })
-        .ok_or_else(|| {
-            VideoInputError::invalid(
-                RequestField::TargetAspectRatio,
-                format!(
-                    "{width}:{height} has no canvas at a {}-pixel short edge",
-                    target.short_edge
-                ),
-            )
-        })
+
+    let served = limits.aspect_ratios(target.short_edge).join(", ");
+    let allowed = match (task, by_rule) {
+        (VideoTask::Fl2va, true) => "auto or W:H within 1:4 to 4:1".to_owned(),
+        (VideoTask::Fl2va, false) => format!("one of {served}"),
+        _ => format!("auto or one of {served}"),
+    };
+    Err(VideoInputError::invalid(
+        RequestField::TargetAspectRatio,
+        format!(
+            "must be {allowed} at a {}-pixel short edge, got {:?}",
+            target.short_edge, target.aspect_ratio
+        ),
+    ))
 }
 
-/// Every named aspect ratio the deployment serves at each of its short edges,
-/// with the canvas it resolves to, short edge by short edge in
-/// [`NAMED_ASPECT_RATIOS`] order.
-pub fn named_canvases(limits: &PlanLimits) -> Vec<(u32, String, Canvas)> {
-    let mut served = Vec::new();
-    for short_edge in limits.short_edges() {
-        for (width, height) in NAMED_ASPECT_RATIOS {
-            let aspect_ratio = format!("{width}:{height}");
-            let target = Target {
-                short_edge,
-                aspect_ratio: &aspect_ratio,
-                duration_seconds: None,
-            };
-            if let Ok(Some(size)) = named_canvas(VideoTask::T2va, &target)
-                && check_served(size, limits).is_ok()
-            {
-                served.push((short_edge, aspect_ratio, size));
-            }
-        }
-    }
-    served
-}
-
+/// Checks that a canvas is one the deployment's workers prepared.
 fn check_served(size: Canvas, limits: &PlanLimits) -> Result<(), VideoInputError> {
-    if limits.canvases.contains(&size) {
+    if limits.canvases.iter().any(|served| served.canvas == size) {
         return Ok(());
     }
     Err(VideoInputError::invalid(
@@ -1217,15 +1184,15 @@ pub fn check_request(
         ));
     }
 
-    if let Some(size) = named_canvas(task, target)? {
+    if let Some(size) = named_canvas(task, target, limits)? {
         check_served(size, limits)?;
     }
 
-    check_conditions(task, conditions)?;
+    check_conditions(task, conditions, limits)?;
 
     match target.duration_seconds {
         Some(seconds) => {
-            video_frame_count(seconds, limits.max_video_seconds)
+            video_frame_count(seconds, limits.max_video_seconds, limits.frame_rate)
                 .map_err(|error| VideoInputError::invalid(RequestField::TargetDuration, error))?;
         }
         None => {
@@ -1246,7 +1213,11 @@ pub fn check_request(
 
 /// Checks each condition's fields, then the task's counts and keyframe
 /// order.
-fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(), VideoInputError> {
+fn check_conditions(
+    task: VideoTask,
+    conditions: &[ConditionSpec],
+    limits: &PlanLimits,
+) -> Result<(), VideoInputError> {
     if task == VideoTask::T2va {
         if !conditions.is_empty() {
             return Err(VideoInputError::invalid(
@@ -1322,13 +1293,14 @@ fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(),
         let images = count(|kind| kind == ConditionType::Image);
         let audios = count(|kind| kind == ConditionType::Audio);
         let videos = count(|kind| matches!(kind, ConditionType::Video | ConditionType::VideoAudio));
+        let declared = &limits.reference_limits;
         for (kind, found, limit) in [
-            ("image", images, MAX_IMAGE_REFERENCES),
-            ("video", videos, MAX_VIDEO_REFERENCES),
-            ("audio", audios, MAX_AUDIO_REFERENCES),
-            ("reference", references().count(), MAX_REFERENCES),
+            ("image", images, declared.images),
+            ("video", videos, declared.videos),
+            ("audio", audios, declared.audios),
+            ("reference", references().count(), declared.total),
         ] {
-            if found > limit {
+            if found > limit as usize {
                 return Err(VideoInputError::invalid(
                     RequestField::Conditions,
                     format!("at most {limit} {kind} references, got {found}"),
@@ -1396,7 +1368,7 @@ fn resolve_frames(
     limits: &PlanLimits,
 ) -> Result<(f64, u32), VideoInputError> {
     if let Some(seconds) = target.duration_seconds {
-        return video_frame_count(seconds, limits.max_video_seconds)
+        return video_frame_count(seconds, limits.max_video_seconds, limits.frame_rate)
             .map(|frames| (seconds, frames))
             .map_err(|error| VideoInputError::invalid(RequestField::TargetDuration, error));
     }
@@ -1418,7 +1390,7 @@ fn resolve_frames(
         ));
     }
     let seconds = (track.samples - start_sample) as f64 / rate;
-    video_frame_count(seconds, limits.max_video_seconds)
+    video_frame_count(seconds, limits.max_video_seconds, limits.frame_rate)
         .map(|frames| (seconds, frames))
         .map_err(|error| {
             VideoInputError::condition(
@@ -1433,8 +1405,9 @@ fn target_canvas(
     task: VideoTask,
     target: &Target<'_>,
     media: &[MediaFacts],
+    limits: &PlanLimits,
 ) -> Result<Canvas, VideoInputError> {
-    if let Some(size) = named_canvas(task, target)? {
+    if let Some(size) = named_canvas(task, target, limits)? {
         return Ok(size);
     }
     // fl2va with `auto`: the conditions are keyframes and the first one sets
@@ -1506,6 +1479,7 @@ fn plan_reference(
     condition: &ConditionSpec,
     media: &MediaFacts,
     frames: u32,
+    frame_rate: u32,
     vision: &ProcessorConfig,
     config: &ReferenceConfig,
 ) -> Result<ConditionPlan, VideoInputError> {
@@ -1527,13 +1501,13 @@ fn plan_reference(
             Ok(plan(Prepared::Image(size), Some(seen), 0))
         }
         MediaFacts::Audio(audio) => {
-            let clip = audio_clip(audio, 0.0, frames).map_err(reject)?;
+            let clip = audio_clip(audio, 0.0, frames, frame_rate).map_err(reject)?;
             Ok(plan(Prepared::Audio(clip), None, clip.rows()))
         }
         MediaFacts::Video(video) => {
             let start = condition.start_seconds.unwrap_or(0.0);
-            let (clip, seen) =
-                video_reference(video, start, frames, vision, config).map_err(reject)?;
+            let (clip, seen) = video_reference(video, start, frames, frame_rate, vision, config)
+                .map_err(reject)?;
             let audio_rows = clip.soundtrack.map_or(0, |track| track.rows());
             Ok(plan(
                 Prepared::Video(clip),
@@ -1580,7 +1554,7 @@ pub fn plan_request(
     }
     let (duration_seconds, frames) = resolve_frames(target, &soundtracks, limits)?;
 
-    let size = target_canvas(task, target, media)?;
+    let size = target_canvas(task, target, media, limits)?;
     check_served(size, limits)?;
 
     let mut plans = Vec::with_capacity(conditions.len());
@@ -1597,9 +1571,15 @@ pub fn plan_request(
                     "a keyframe must be an image",
                 ));
             }
-            (ConditionRole::Reference, _) => {
-                plan_reference(index, condition, facts, frames, vision, &limits.references)?
-            }
+            (ConditionRole::Reference, _) => plan_reference(
+                index,
+                condition,
+                facts,
+                frames,
+                limits.frame_rate,
+                vision,
+                &limits.references,
+            )?,
         };
         plans.push(plan);
     }
@@ -1616,6 +1596,7 @@ pub fn plan_request(
 pub(super) mod tests {
     use serde::Deserialize;
     use serde_json::{Value, json};
+    use uniserve_engine::ServedCanvas;
 
     use super::super::RequestField;
     use super::super::presentation::present;
@@ -1624,8 +1605,9 @@ pub(super) mod tests {
     use super::{
         AudioClip, Canvas, ConditionPlan, ConditionRole, ConditionSpec, ConditionType,
         FramePosition, KeyframeFit, PlanLimits, Prepared, ProcessorConfig, ReferenceConfig,
-        RequestPlan, Target, VideoTask, Vision, audio_clip, canvas, check_request, cover_crop,
-        latent_frames, plan_request, reference_image_size, rows_per_frame, video_reference,
+        ReferenceLimits, RequestPlan, Target, VideoTask, Vision, audio_clip, canvas, check_request,
+        cover_crop, latent_frames, plan_request, reference_image_size, rows_per_frame,
+        video_reference,
     };
 
     /// The shared planning vectors, generated from the diffusers reference.
@@ -1640,20 +1622,42 @@ pub(super) mod tests {
         ProcessorConfig::deserialize(&fixture["vision"]).unwrap()
     }
 
-    /// The canvases of the vectors' accepted requests: what a deployment that
-    /// prepares them all serves.
-    pub(in crate::serving::video) fn served_canvases() -> Vec<Canvas> {
-        let mut canvases = Vec::new();
+    /// The canvases of the vectors' accepted requests, as a deployment that
+    /// prepares them all declares them. A `t2va` or `ref2va` request's named
+    /// ratio names its canvas; a canvas only the canvas rule produces (an
+    /// `auto` or `fl2va` target) is declared under its own size.
+    pub(in crate::serving::video) fn served_canvases() -> Vec<ServedCanvas> {
+        let mut served: Vec<ServedCanvas> = Vec::new();
         for case in fixture()["requests"].as_array().unwrap() {
-            if let Some(expected) = case.get("expected") {
-                let size = size(&expected["canvas"]);
-                if !canvases.contains(&size) {
-                    canvases.push(size);
-                }
+            let Some(expected) = case.get("expected") else {
+                continue;
+            };
+            let canvas = size(&expected["canvas"]);
+            let target = &case["target"];
+            let short_edge = target["short_edge"].as_u64().unwrap() as u32;
+            let named = target["aspect_ratio"].as_str().unwrap();
+            let aspect_ratio = if named == "auto" || case["task"] == "fl2va" {
+                format!("{}:{}", canvas.width, canvas.height)
+            } else {
+                named.to_owned()
+            };
+            if !served
+                .iter()
+                .any(|s| s.short_edge == short_edge && s.aspect_ratio == aspect_ratio)
+            {
+                served.push(ServedCanvas {
+                    short_edge,
+                    aspect_ratio,
+                    canvas,
+                });
             }
         }
-        canvases
+        served
     }
+
+    /// The output frame rate of the reference pipeline the vectors come
+    /// from.
+    pub(in crate::serving::video) const FRAME_RATE: u32 = 24;
 
     /// Limits that serve every task and duration the model does, at the
     /// canvases of the vectors.
@@ -1661,7 +1665,15 @@ pub(super) mod tests {
         PlanLimits {
             tasks: vec![VideoTask::T2va, VideoTask::Fl2va, VideoTask::Ref2va],
             max_video_seconds: 15.0,
+            frame_rate: FRAME_RATE,
             canvases: served_canvases(),
+            // The checkpoint's documented limits.
+            reference_limits: ReferenceLimits {
+                images: 9,
+                videos: 3,
+                audios: 3,
+                total: 12,
+            },
             // The fixture's cases follow the released pipeline.
             references: ReferenceConfig::RELEASED,
         }
@@ -2037,7 +2049,7 @@ pub(super) mod tests {
                 frames: 48,
                 soundtrack: None,
             };
-            video_reference(&facts, 0.0, 124, &vision, config)
+            video_reference(&facts, 0.0, 124, FRAME_RATE, &vision, config)
                 .unwrap()
                 .0
                 .canvas
@@ -2090,7 +2102,7 @@ pub(super) mod tests {
         }
     }
 
-    /// Reference videos resample to 24 fps, honour the start offset, keep a
+    /// Reference videos resample to the output rate, honour the start offset, keep a
     /// whole VAE window, and sample the reference's 2 fps vision blocks.
     #[test]
     fn reference_videos_match_the_reference() {
@@ -2100,8 +2112,14 @@ pub(super) mod tests {
             let facts = video_facts(case);
             let start = case["start_seconds"].as_f64().unwrap();
             let frames = case["num_frames"].as_u64().unwrap() as u32;
-            let planned =
-                video_reference(&facts, start, frames, &vision, &ReferenceConfig::RELEASED);
+            let planned = video_reference(
+                &facts,
+                start,
+                frames,
+                FRAME_RATE,
+                &vision,
+                &ReferenceConfig::RELEASED,
+            );
             if case.get("error").is_some() {
                 assert!(planned.is_err(), "{case}");
                 continue;
@@ -2139,6 +2157,7 @@ pub(super) mod tests {
                 &audio_facts(case),
                 case["start_seconds"].as_f64().unwrap(),
                 case["num_frames"].as_u64().unwrap() as u32,
+                FRAME_RATE,
             )
             .unwrap();
             assert_eq!(audio_json(&clip), case["clip"], "{case}");
@@ -2193,6 +2212,15 @@ pub(super) mod tests {
         }
     }
 
+    /// The canvas a deployment declares for a short edge and aspect ratio.
+    fn served(short_edge: u32, aspect_ratio: &str, width: u32, height: u32) -> ServedCanvas {
+        ServedCanvas {
+            short_edge,
+            aspect_ratio: aspect_ratio.to_owned(),
+            canvas: Canvas { width, height },
+        }
+    }
+
     const FIVE_SECONDS: Target<'static> = Target {
         short_edge: 768,
         aspect_ratio: "auto",
@@ -2206,10 +2234,7 @@ pub(super) mod tests {
         let fixture = fixture();
         let vision = vision(&fixture);
         let limits = PlanLimits {
-            canvases: vec![Canvas {
-                width: 1344,
-                height: 768,
-            }],
+            canvases: vec![served(768, "16:9", 1344, 768)],
             ..limits()
         };
         let plan =
@@ -2234,7 +2259,11 @@ pub(super) mod tests {
         let vision = vision(&fixture);
         let canvas = |width, height| Canvas { width, height };
         let served = PlanLimits {
-            canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
+            canvases: vec![
+                served(768, "16:9", 1344, 768),
+                served(480, "21:9", 992, 416),
+                served(480, "16:9", 832, 480),
+            ],
             ..limits()
         };
         assert_eq!(served.short_edges(), vec![768, 480]);
@@ -2290,6 +2319,54 @@ pub(super) mod tests {
         };
         let error = super::check_request(VideoTask::T2va, &ten_seconds, &[], &limits).unwrap_err();
         assert_eq!(error.field(), Some(RequestField::TargetDuration));
+    }
+
+    /// A `ref2va` request carries at most the references its denoiser
+    /// declares, of each kind and in all.
+    #[test]
+    fn reference_counts_are_bounded_by_the_declared_limits() {
+        let limits = PlanLimits {
+            reference_limits: ReferenceLimits {
+                images: 2,
+                videos: 1,
+                audios: 1,
+                total: 3,
+            },
+            ..limits()
+        };
+        let reference = |condition_type| ConditionSpec {
+            condition_type,
+            role: ConditionRole::Reference,
+            frame_index: None,
+            start_seconds: None,
+        };
+        let image = reference(ConditionType::Image);
+        let video = reference(ConditionType::Video);
+        let audio = reference(ConditionType::Audio);
+        let check = |conditions: &[ConditionSpec]| {
+            super::check_request(VideoTask::Ref2va, &FIVE_SECONDS, conditions, &limits)
+        };
+
+        assert!(check(&[image.clone(), image.clone(), video.clone()]).is_ok());
+        for (conditions, bound) in [
+            (vec![image.clone(); 3], "at most 2 image"),
+            (
+                vec![image.clone(), video.clone(), video.clone()],
+                "at most 1 video",
+            ),
+            (
+                vec![image.clone(), audio.clone(), audio.clone()],
+                "at most 1 audio",
+            ),
+            (
+                vec![image.clone(), image.clone(), video.clone(), audio.clone()],
+                "at most 3 reference",
+            ),
+        ] {
+            let error = check(&conditions).unwrap_err();
+            assert_eq!(error.field(), Some(RequestField::Conditions));
+            assert!(error.to_string().contains(bound), "{bound}: {error}");
+        }
     }
 
     /// A task outside the placed denoiser's set is rejected first.

@@ -42,6 +42,7 @@ from uniserve.model import (
     Condition,
     ConditionRole,
     LatentInput,
+    ReferenceLimits,
     VideoDenoiser,
 )
 from uniserve.nn import ColumnParallelLinear, RotaryEmbedding
@@ -50,11 +51,10 @@ from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
 from .conditioning import Conditioner
 from .config import (
-    NAMED_ASPECT_RATIOS,
+    NAMED_CANVASES,
     DenoiserConfig,
     DenseAttention,
     SparseAttention,
-    canvas,
     rule_canvases,
 )
 from .inputs import (
@@ -83,7 +83,9 @@ from .packing import (
     video_latent_frames,
 )
 from .processing import (
+    MAX_AUDIO_REFERENCES,
     MAX_IMAGE_REFERENCES,
+    MAX_REFERENCES,
     MAX_VIDEO_REFERENCES,
     REFERENCE_IMAGE_SHORT_EDGE,
 )
@@ -197,18 +199,16 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         )
 
     @property
-    def canvases(self) -> tuple[image.Config, ...]:
+    def canvases(self) -> Mapping[tuple[int, str], image.Config]:
         """Canvases a deployment may prepare layouts for.
 
         A checkpoint that generates only some canvases offers those; one
         that follows the canvas rule offers every named aspect ratio's
-        canvas.
+        canvas at the rule's short edge.
         """
         if self.config.canvases is not None:
             return self.config.canvases
-        return tuple(
-            dict.fromkeys(canvas(*ratio) for ratio in NAMED_ASPECT_RATIOS)
-        )
+        return NAMED_CANVASES
 
     @property
     def tasks(self) -> tuple[str, ...]:
@@ -219,19 +219,30 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         # Only ``t2va`` generates from the prompt alone.
         return "t2va" in self.config.tasks
 
+    @property
+    def max_references(self) -> ReferenceLimits:
+        """The reference counts the checkpoint documents for ``ref2va``."""
+        if "ref2va" not in self.config.tasks:
+            return ReferenceLimits()
+        return ReferenceLimits(
+            images=MAX_IMAGE_REFERENCES,
+            videos=MAX_VIDEO_REFERENCES,
+            audios=MAX_AUDIO_REFERENCES,
+            total=MAX_REFERENCES,
+        )
+
     def max_conditions(
         self, num_frames: int, canvas: image.Config
     ) -> tuple[Condition, ...]:
         """The largest condition set the checkpoint documents for a request.
 
-        A ``ref2va`` request carries up to nine image and three video
-        references, twelve references in all: nine images of the largest
-        reference raster, the checkpoint's 2048-pixel short edge at 4:1,
-        and three videos of the generated length with their soundtracks, on
-        the canvas of the canvas rule where a video packs the most rows. A
-        network that packs keyframes also holds the two keyframes of
-        ``canvas``, which are all an ``fl2va`` request carries. A
-        text-to-video network takes no conditions.
+        A ``ref2va`` request carries up to ``max_references``: nine images of
+        the largest reference raster, the checkpoint's 2048-pixel short edge
+        at 4:1, and three videos of the generated length with their
+        soundtracks, on the canvas of the canvas rule where a video packs
+        the most rows. A network that packs keyframes also holds the two
+        keyframes of ``canvas``, which are all an ``fl2va`` request carries.
+        A text-to-video network takes no conditions.
         """
         tasks = set(self.config.tasks)
         if not tasks & {"fl2va", "ref2va"}:
@@ -288,10 +299,11 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             ),
             key=rows,
         )
+        limits = self.max_references
         return (
             *keyframes,
-            *(still,) * MAX_IMAGE_REFERENCES,
-            *(clip,) * MAX_VIDEO_REFERENCES,
+            *(still,) * limits.images,
+            *(clip,) * limits.videos,
         )
 
     @property
@@ -336,9 +348,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 rows.
         """
         canvases = self.config.canvases
-        if canvases is not None and canvas not in canvases:
+        if canvases is not None and canvas not in canvases.values():
             raise ValueError(
-                f"this H3 checkpoint generates only {canvases}, not {canvas}"
+                "this H3 checkpoint generates only "
+                f"{tuple(canvases.values())}, not {canvas}"
             )
         segments = condition_segments(tuple(conditions), canvas)
         tasks = self.config.tasks

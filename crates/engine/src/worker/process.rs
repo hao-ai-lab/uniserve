@@ -275,7 +275,8 @@ impl Default for WorkerProcessArgs {
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
             video_text_capacities: None,
-            video_frame_sizes: None,
+            video_resolutions: None,
+            video_aspect_ratios: None,
             canvas_sampling: None,
             flashinfer_workspace_size: Self::DEFAULT_FLASHINFER_WORKSPACE_SIZE,
             flashinfer_use_tensor_core: None,
@@ -517,7 +518,11 @@ impl WorkerProcessArgs {
             "video_text_capacities".into(),
             json!(self.video_text_capacities),
         );
-        fields.insert("video_frame_sizes".into(), json!(self.video_frame_sizes));
+        fields.insert("video_resolutions".into(), json!(self.video_resolutions));
+        fields.insert(
+            "video_aspect_ratios".into(),
+            json!(self.video_aspect_ratios),
+        );
         fields.insert(
             "canvas_sampling".into(),
             serde_json::to_value(self.canvas_sampling)?,

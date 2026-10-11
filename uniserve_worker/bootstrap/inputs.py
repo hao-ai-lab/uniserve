@@ -119,13 +119,9 @@ def _max_frames(model: nn.Module, config: WorkerConfig) -> int:
 def _canvases(
     denoiser: VideoDenoiser, config: WorkerConfig
 ) -> tuple[image.Config, ...]:
-    """Canvases the deployment prepares: its own, or the denoiser's."""
-    return (
-        tuple(
-            image.Config(height, width)
-            for height, width in config.video_frame_sizes
-        )
-        or denoiser.canvases
+    """Canvases the deployment prepares: its selection of the denoiser's."""
+    return denoiser.select_canvases(
+        config.video_resolutions, config.video_aspect_ratios
     )
 
 
@@ -174,7 +170,8 @@ def media_builder(model: nn.Module, config: WorkerConfig):
     counts start at ``min_video_seconds`` converted the same way; the text
     budget is ``max_model_len``, divided into
     ``video_text_capacities``. The deployment prepares the canvases of
-    ``video_frame_sizes``, or the denoiser's own without any.
+    ``video_resolutions`` at ``video_aspect_ratios``, or every canvas the
+    denoiser generates without any.
 
     Returns:
         The builder, or ``None`` for a model without a ``VideoDenoiser``.
@@ -182,8 +179,8 @@ def media_builder(model: nn.Module, config: WorkerConfig):
     Raises:
         ValueError: The model has a ``VideoDenoiser`` but no
             ``VideoPostprocessor`` to supply its frame rate, either
-            capability is ambiguous, or the denoiser does not offer a
-            canvas of ``video_frame_sizes``.
+            capability is ambiguous, or the denoiser does not generate a
+            canvas the deployment names (``VideoDenoiser.select_canvases``).
     """
     denoiser = video_denoiser(model, config)
     if denoiser is None:
@@ -203,8 +200,5 @@ def media_builder(model: nn.Module, config: WorkerConfig):
         else round(config.min_video_seconds * output.frame_rate),
         text_capacities=config.video_text_capacities,
         condition_rows=condition_capacity(model, denoiser, config),
-        canvases=tuple(
-            image.Config(height, width)
-            for height, width in config.video_frame_sizes
-        ),
+        canvases=_canvases(denoiser, config),
     )

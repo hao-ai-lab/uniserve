@@ -268,10 +268,38 @@ impl WorkerEndpoint {
     }
 }
 
+/// A canvas a deployment serves, with the request fields that select it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedCanvas {
+    /// `target.short_edge`: the resolution class, in pixels.
+    pub short_edge: u32,
+    /// `target.aspect_ratio`: the display ratio as `W:H`.
+    pub aspect_ratio: String,
+    /// The raster this pair selects.
+    pub canvas: uniserve_core::Canvas,
+}
+
+/// Most references of each kind one request may carry.
+///
+/// `total` bounds all kinds together, keyframes not counted; a video's
+/// soundtrack counts with the video, and `audios` bounds the audio references
+/// that are not one. A denoiser that takes no references declares zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceLimits {
+    /// Image references.
+    pub images: u32,
+    /// Video references, with or without soundtrack.
+    pub videos: u32,
+    /// Audio references that are not a video's soundtrack.
+    pub audios: u32,
+    /// References of every kind.
+    pub total: u32,
+}
+
 /// What the video denoiser a deployment places serves.
 ///
-/// The denoiser fixes its schedule; the tasks and canvases bound what
-/// admission accepts.
+/// The denoiser fixes its schedule; the tasks, canvases and reference limits
+/// bound what a request may ask for.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoDenoiserInfo {
     /// Task names the denoiser serves, in canonical order.
@@ -283,9 +311,17 @@ pub struct VideoDenoiserInfo {
     pub video_shift: f64,
     /// Shift of the audio schedule.
     pub audio_shift: f64,
-    /// The only canvases the deployment serves: those it prepares.
+    /// Frame rate, in frames per second, of every video the deployment
+    /// generates: the output clock durations and reference videos are
+    /// counted on.
+    pub frame_rate: u32,
+    /// The only canvases the deployment serves: those it prepares, in the
+    /// order its operator selected them.
     #[serde(default)]
-    pub canvases: Vec<uniserve_core::Canvas>,
+    pub canvases: Vec<ServedCanvas>,
+    /// References one request may carry.
+    #[serde(default)]
+    pub references: ReferenceLimits,
 }
 
 impl VideoDenoiserInfo {
@@ -296,7 +332,8 @@ impl VideoDenoiserInfo {
     }
 
     /// Checks that tasks are named once each, the schedule has an endpoint
-    /// and positive finite shifts, and every canvas is positive.
+    /// and positive finite shifts, and every canvas is a positive raster
+    /// selected by its own `(short_edge, aspect_ratio)` pair.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -312,10 +349,26 @@ impl VideoDenoiserInfo {
             "a video denoiser schedule needs points and positive shifts"
         );
         ensure_valid!(
+            self.frame_rate > 0,
+            "a video denoiser declares no frame rate"
+        );
+        ensure_valid!(
+            self.canvases.iter().all(|served| {
+                served.short_edge > 0
+                    && !served.aspect_ratio.is_empty()
+                    && served.canvas.width > 0
+                    && served.canvas.height > 0
+            }),
+            "a video denoiser declares an empty canvas"
+        );
+        ensure_valid!(
             self.canvases
                 .iter()
-                .all(|canvas| canvas.width > 0 && canvas.height > 0),
-            "a video denoiser declares an empty canvas"
+                .map(|served| (served.short_edge, served.aspect_ratio.as_str()))
+                .collect::<HashSet<_>>()
+                .len()
+                == self.canvases.len(),
+            "a video denoiser declares a canvas name twice"
         );
         Ok(())
     }

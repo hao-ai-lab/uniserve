@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from uniserve.model import ReferenceLimits
 from uniserve_worker.protocol.call import CallKind, MediaCall
 from uniserve_worker.protocol.tensor import OutputInfo
 from uniserve_worker.protocol.transfer import WorkerEndpoint
@@ -141,19 +142,46 @@ class ComponentInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class ServedCanvas:
+    """A canvas a deployment serves and the request fields that select it.
+
+    Mirrors the Rust ``ServedCanvas``: ``short_edge`` is the resolution
+    class in pixels (``target.short_edge``), ``aspect_ratio`` the display
+    ratio as ``W:H`` (``target.aspect_ratio``).
+    """
+
+    short_edge: int
+    aspect_ratio: str
+    width: int
+    height: int
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "short_edge": self.short_edge,
+            "aspect_ratio": self.aspect_ratio,
+            "canvas": {"width": self.width, "height": self.height},
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class VideoDenoiserInfo:
     """What the video denoiser a deployment places serves.
 
     Mirrors the Rust ``VideoDenoiserInfo``. ``schedule_points`` counts the
-    fixed schedule's sigma points, the clean endpoint included; ``canvases``
-    lists the only canvases the deployment serves, those it prepares.
+    fixed schedule's sigma points, the clean endpoint included;
+    ``frame_rate`` is the frame rate of every video, the clock durations and
+    reference videos are counted on; ``canvases`` lists the only canvases the
+    deployment serves, those it prepares; ``references`` states the
+    references one request may carry.
     """
 
     tasks: tuple[str, ...]
     schedule_points: int
     video_shift: float
     audio_shift: float
-    canvases: tuple[tuple[int, int], ...] = ()
+    frame_rate: int
+    canvases: tuple[ServedCanvas, ...] = ()
+    references: ReferenceLimits = ReferenceLimits()
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -161,10 +189,14 @@ class VideoDenoiserInfo:
             "schedule_points": self.schedule_points,
             "video_shift": self.video_shift,
             "audio_shift": self.audio_shift,
-            "canvases": [
-                {"width": width, "height": height}
-                for width, height in self.canvases
-            ],
+            "frame_rate": self.frame_rate,
+            "canvases": [canvas.to_mapping() for canvas in self.canvases],
+            "references": {
+                "images": self.references.images,
+                "videos": self.references.videos,
+                "audios": self.references.audios,
+                "total": self.references.total,
+            },
         }
 
 

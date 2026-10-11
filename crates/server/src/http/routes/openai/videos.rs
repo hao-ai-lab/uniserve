@@ -335,7 +335,7 @@ pub(crate) async fn videos_create(
         completed_at: None,
         expires_at: None,
         seconds: prepared.duration_seconds,
-        actual_seconds: f64::from(sampling.num_frames) / f64::from(crate::serving::VIDEO_FPS),
+        actual_seconds: prepared.actual_seconds,
         num_frames: sampling.num_frames,
         size: format!("{}x{}", prepared.canvas.width, prepared.canvas.height),
         status: "queued",

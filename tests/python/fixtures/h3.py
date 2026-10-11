@@ -3,7 +3,6 @@
 from dataclasses import replace
 
 from uniserve.diffusion import BlockGrid, RungGrid, UniformGrid
-from uniserve.media import image
 from uniserve_models.minimax_h3 import (
     Config,
     DenoiserConfig,
@@ -17,7 +16,7 @@ from uniserve_models.minimax_h3.config import DMD_CANVASES
 from uniserve_models.minimax_h3.encoder import TextEncoderConfig
 
 # The 768p 16:9 canvas, one FastH3 DMD exports generate.
-WIDE = image.Config(768, 1344)
+WIDE = DMD_CANVASES[(768, "16:9")]
 # Released audio scheduler shift.
 AUDIO_SHIFT = 3.0
 

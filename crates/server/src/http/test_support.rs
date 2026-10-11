@@ -99,13 +99,26 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             schedule_points: 5,
             video_shift: 12.0,
             audio_shift: 3.0,
-            canvases: crate::serving::video::plan::NAMED_ASPECT_RATIOS
-                .iter()
-                .map(|&(width, height)| {
-                    crate::serving::video::plan::canvas(f64::from(width), f64::from(height))
-                        .unwrap()
-                })
-                .collect(),
+            frame_rate: 24,
+            canvases: [
+                ("21:9", 1536, 672),
+                ("16:9", 1344, 768),
+                ("4:3", 1024, 768),
+                ("1:1", 768, 768),
+                ("3:4", 768, 1024),
+                ("9:16", 768, 1344),
+            ]
+            .into_iter()
+            .map(
+                |(aspect_ratio, width, height)| uniserve_engine::ServedCanvas {
+                    short_edge: 768,
+                    aspect_ratio: aspect_ratio.to_owned(),
+                    canvas: uniserve_core::Canvas { width, height },
+                },
+            )
+            .collect(),
+            // A text-to-video denoiser takes no references.
+            references: Default::default(),
         },
         ProcessorConfig {
             patch_size: 16,

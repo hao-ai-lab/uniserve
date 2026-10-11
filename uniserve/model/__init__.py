@@ -9,6 +9,7 @@ from .denoiser import (
     ConditionRole,
     Denoiser,
     ImageDenoiser,
+    ReferenceLimits,
     VideoDenoiser,
     VideoSize,
 )
@@ -71,6 +72,7 @@ __all__ = [
     "Denoiser",
     "ImageDenoiser",
     "VideoDenoiser",
+    "ReferenceLimits",
     "VideoSize",
     "Condition",
     "ConditionRole",
