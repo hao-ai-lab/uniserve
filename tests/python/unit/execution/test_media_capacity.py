@@ -17,6 +17,7 @@ from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
 from uniserve_models.minimax_h3 import Model
 from uniserve_models.minimax_h3 import config as h3_config
+from uniserve_models.minimax_h3.config import DMD_CANVASES, NAMED_CANVASES
 from uniserve_models.minimax_h3.processing import REFERENCE_IMAGE_SHORT_EDGE
 from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
@@ -27,28 +28,11 @@ pytestmark = pytest.mark.unit
 ADMITTED_FRAMES = tuple(107 + 17 * index for index in range(16))
 
 # The default FastH3 deployment's canvases: 768p 16:9 and 9:16.
-TALL = image.Config(1344, 768)
+TALL = DMD_CANVASES[(768, "9:16")]
 SERVED = (WIDE, TALL)
 
-# FastH3's (height, width) training buckets: 21:9, 16:9, 4:3, 1:1, 3:4 and
-# 9:16 at 768p, then at 480p.
-BUCKETS = tuple(
-    image.Config(height, width)
-    for height, width in (
-        (672, 1536),
-        (768, 1344),
-        (768, 1024),
-        (768, 768),
-        (1024, 768),
-        (1344, 768),
-        (416, 992),
-        (480, 832),
-        (480, 640),
-        (480, 480),
-        (640, 480),
-        (832, 480),
-    )
-)
+# FastH3's training buckets: every named aspect ratio at 768p, then at 480p.
+BUCKETS = tuple(DMD_CANVASES.values())
 
 
 def _enlarged_image(width: int, height: int) -> image.Config:
@@ -219,18 +203,10 @@ def test_every_named_canvas_has_layouts_that_fit_the_slot_storage():
         min_frames=96,
         text_capacities=(1024, 4096),
     )
-    canvases = {(canvas.width, canvas.height) for canvas in builder.canvases}
-    assert canvases == {
-        (1536, 672),
-        (1344, 768),
-        (1024, 768),
-        (768, 768),
-        (768, 1024),
-        (768, 1344),
-    }
+    assert set(builder.canvases) == set(NAMED_CANVASES.values())
     layouts = builder.layouts()
     assert layouts[0] == builder.maximum
-    assert len(layouts) == len(canvases) * len(ADMITTED_FRAMES) * 2
+    assert len(layouts) == len(builder.canvases) * len(ADMITTED_FRAMES) * 2
     capacity = builder.capacity_buffers()
     maximum = denoiser.workspace_buffers(builder.maximum)
     for layout in layouts:

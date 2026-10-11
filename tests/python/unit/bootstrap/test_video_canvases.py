@@ -10,6 +10,7 @@ from tests.python.fixtures.launch import worker_args
 from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.media import image
 from uniserve_models.minimax_h3 import Model
+from uniserve_models.minimax_h3.config import DMD_CANVASES, NAMED_CANVASES
 from uniserve_worker.bootstrap.inputs import media_builder
 from uniserve_worker.bootstrap.report import video_denoiser_info
 from uniserve_worker.config.execution import WorkerConfig
@@ -59,17 +60,15 @@ def test_blank_names_are_refused(names, tmp_path):
 def test_the_worker_prepares_the_named_canvases_resolution_major(model):
     builder = media_builder(model, _config(("480p", "768p"), ("21:9", "1:1")))
     # 480p's 21:9 bucket is the training table's, not a rescaled 768p one.
-    served = (
-        image.Config(416, 992),
-        image.Config(480, 480),
-        image.Config(672, 1536),
-        image.Config(768, 768),
+    served = tuple(
+        DMD_CANVASES[name]
+        for name in ((480, "21:9"), (480, "1:1"), (768, "21:9"), (768, "1:1"))
     )
     assert builder.canvases == served
     assert {layout.canvas for layout in builder.layouts()} == set(served)
     # A training bucket the deployment did not name is not admitted.
     with pytest.raises(ValueError):
-        builder.size(124, 64, image.Config(768, 1344))
+        builder.size(124, 64, DMD_CANVASES[(768, "16:9")])
 
 
 def test_a_deployment_that_names_nothing_prepares_every_canvas(model):
@@ -83,9 +82,11 @@ def test_the_handshake_declares_each_canvas_with_its_names(model):
         media_builder(model, config).denoiser,
         canvases=media_builder(model, config).canvases,
     )
+    names = [(768, "16:9"), (480, "16:9")]
     assert [
-        (c.short_edge, c.aspect_ratio, c.width, c.height) for c in info.canvases
-    ] == [(768, "16:9", 1344, 768), (480, "16:9", 832, 480)]
+        ((c.short_edge, c.aspect_ratio), image.Config(c.height, c.width))
+        for c in info.canvases
+    ] == [(name, DMD_CANVASES[name]) for name in names]
 
 
 @pytest.mark.parametrize(
@@ -115,7 +116,7 @@ def test_the_released_base_checkpoint_generates_768p_only():
     served = media_builder(
         base, _config(("768p",), ("16:9",), deployment_components=placed)
     )
-    assert served.canvases == (image.Config(768, 1344),)
+    assert served.canvases == (NAMED_CANVASES[(768, "16:9")],)
     with pytest.raises(ValueError, match="generates only"):
         media_builder(
             base, _config(("480p",), ("16:9",), deployment_components=placed)

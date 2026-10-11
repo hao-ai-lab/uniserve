@@ -8,9 +8,9 @@ from tests.python.fixtures.h3 import (
     fasth3_config,
 )
 from tests.python.fixtures.worker_config import cpu_worker_config
-from uniserve.media import image
 from uniserve.model import ReferenceLimits
 from uniserve_models.minimax_h3 import Model
+from uniserve_models.minimax_h3.config import DMD_CANVASES, NAMED_CANVASES
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import media_builder, video_denoiser
 from uniserve_worker.bootstrap.report import video_denoiser_info
@@ -44,6 +44,14 @@ def _declared(info) -> tuple[tuple[int, str, int, int], ...]:
     )
 
 
+def _trained(canvases) -> tuple[tuple[int, str, int, int], ...]:
+    """A checkpoint's canvases as (short edge, aspect ratio, width, height)."""
+    return tuple(
+        (edge, ratio, canvas.width, canvas.height)
+        for (edge, ratio), canvas in canvases.items()
+    )
+
+
 @pytest.fixture(scope="module")
 def base():
     with torch.device("meta"):
@@ -68,14 +76,7 @@ def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
     # rule's canvas of every named aspect ratio at 768p.
     assert (info.tasks, info.schedule_points) == (("t2va", "fl2va"), 50)
     assert (info.video_shift, info.audio_shift) == (12.0, 3.0)
-    assert _declared(info) == (
-        (768, "21:9", 1536, 672),
-        (768, "16:9", 1344, 768),
-        (768, "4:3", 1024, 768),
-        (768, "1:1", 768, 768),
-        (768, "3:4", 768, 1024),
-        (768, "9:16", 768, 1344),
-    )
+    assert _declared(info) == _trained(NAMED_CANVASES)
 
     # It takes no references.
     assert info.references == ReferenceLimits()
@@ -108,22 +109,10 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
     assert info.schedule_points == 5
     # Without a deployment's selection, every training bucket: 21:9, 16:9,
     # 4:3, 1:1, 3:4 and 9:16 at 768p, then at 480p.
-    assert _declared(info) == (
-        (768, "21:9", 1536, 672),
-        (768, "16:9", 1344, 768),
-        (768, "4:3", 1024, 768),
-        (768, "1:1", 768, 768),
-        (768, "3:4", 768, 1024),
-        (768, "9:16", 768, 1344),
-        (480, "21:9", 992, 416),
-        (480, "16:9", 832, 480),
-        (480, "4:3", 640, 480),
-        (480, "1:1", 480, 480),
-        (480, "3:4", 480, 640),
-        (480, "9:16", 480, 832),
-    )
-    served = (image.Config(480, 832), image.Config(1344, 768))
-    assert _declared(video_denoiser_info(denoiser, canvases=served)) == (
-        (480, "16:9", 832, 480),
-        (768, "9:16", 768, 1344),
-    )
+    assert _declared(info) == _trained(DMD_CANVASES)
+    # A deployment's selection is declared in the order it prepares them.
+    chosen = {
+        name: DMD_CANVASES[name] for name in ((480, "16:9"), (768, "9:16"))
+    }
+    declared = video_denoiser_info(denoiser, canvases=tuple(chosen.values()))
+    assert _declared(declared) == _trained(chosen)
