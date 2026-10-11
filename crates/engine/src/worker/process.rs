@@ -220,7 +220,7 @@ impl Default for WorkerProcessArgs {
             // row reserve a runtime keeps outside it.
             max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
                 + crate::scheduler::MAX_FLOW_PREFIX_ROWS) as u32,
-            attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,
+            attention_backend: "auto".into(),
             capability_groups: Vec::new(),
             transfer: Default::default(),
             load_format: "auto".to_string(),
@@ -464,10 +464,7 @@ impl WorkerProcessArgs {
         );
         fields.insert("kv_memory_fraction".into(), json!(self.kv_storage_fraction));
         fields.insert("kv_token_capacity".into(), json!(self.kv_token_capacity));
-        fields.insert(
-            "attention_backend".into(),
-            json!(self.attention_backend.as_name()),
-        );
+        fields.insert("attention_backend".into(), json!(self.attention_backend));
         fields.insert("block_size".into(), json!(self.block_size));
         fields.insert("max_batch_calls".into(), json!(self.max_batch_calls));
         fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));

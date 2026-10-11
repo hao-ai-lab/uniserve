@@ -2250,7 +2250,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         block_size: Some(16),
         max_batch_calls: 256,
         max_batch_tokens: 256,
-        attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
+        attention_backend: "torch".into(),
         // `publisher` is the worker id `SlowShmPublication` names as the
         // source of its segment.
         transfer: uniserve_engine::TransferConfig::parse("publisher->worker=shm")?,
@@ -3139,7 +3139,7 @@ fn rank_group_args(
         block_size: Some(16),
         max_batch_calls: 256,
         max_batch_tokens: 256,
-        attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
+        attention_backend: "torch".into(),
         transfer: Default::default(),
         ..config
     }
@@ -3193,7 +3193,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "kv_cache_dtype": null,
     "kv_memory_fraction": 0.7,
     "kv_token_capacity": 4096,
-    "attention_backend": "torch_sdpa",
+    "attention_backend": "torch",
     "block_size": 16,
     "max_batch_calls": 8,
     "max_batch_tokens": 256,

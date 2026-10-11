@@ -113,7 +113,7 @@ fn main() -> anyhow::Result<()> {
         block_size: Some(256),
         max_batch_calls: 32,
         max_batch_tokens: 8192,
-        attention_backend: uniserve_engine::AttentionBackend::Auto,
+        attention_backend: "auto".into(),
         transfer: Default::default(),
         ..worker_config
     })?;
