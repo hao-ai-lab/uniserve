@@ -205,24 +205,44 @@ def select_prefill_captures(
     return tuple(buckets)
 
 
+def default_decode_graph_batch_sizes(max_rows):
+    """Return the decode batch sizes captured when a launch names none.
+
+    Every size up to 32, then steps of 8 that double at each power of two
+    from 128 (16 from 256, 32 from 512, ...), so a batch's padding stays
+    under a sixteenth of its bucket beyond 128 rows; ``max_rows`` itself is
+    the last size, so every batch up to it has a bucket.
+    """
+    sizes = []
+    size = 1
+    while size < max_rows:
+        sizes.append(size)
+        # The step is 8 times the largest power of two within size // 128.
+        size += 1 if size < 32 else 8 << max(0, (size // 128).bit_length() - 1)
+    sizes.append(max_rows)
+    return tuple(sizes)
+
+
 def decode_captures(config, *, max_rows, row_units, num_units):
     """Select the decode batch sizes a CUDA text entry captures at startup.
 
-    ``config`` is the ``WorkerConfig``. A configured size is kept when it is
-    positive, at most ``max_rows``, and its rows fit the KV pool's
-    allocatable units: capturing ``rows`` decode rows stages one page of
-    every cache group per row (``row_units`` units) on the ``num_units``
-    pool, whose unit zero is the sentinel. The sizes keep their configured
-    order. Empty when the graph policy is off, which leaves decode calls
-    eager.
+    ``config`` is the ``WorkerConfig``. Every decode row holds at least one
+    page of every cache group, and capturing ``rows`` rows stages one page of
+    every group per row (``row_units`` units) on the ``num_units`` pool,
+    whose unit zero is the sentinel, so no call holds more rows than
+    ``max_rows`` or the pool allows. The sizes are
+    ``config.decode_graph_batch_sizes`` up to that bound, or, when the launch
+    names none, ``default_decode_graph_batch_sizes`` of it, which covers
+    every call the worker admits. They keep their configured order. Empty
+    when the graph policy is off, which leaves decode calls eager.
     """
     if config.graph_policy == "off":
         return ()
-    return tuple(
-        value
-        for value in config.decode_graph_batch_sizes
-        if 0 < value <= max_rows and value * row_units < num_units
-    )
+    rows = min(max_rows, (num_units - 1) // row_units)
+    sizes = config.decode_graph_batch_sizes
+    if sizes is None:
+        sizes = default_decode_graph_batch_sizes(rows)
+    return tuple(value for value in sizes if 0 < value <= rows)
 
 
 def prefill_captures(
@@ -238,19 +258,20 @@ def prefill_captures(
     """Select the prefill buckets a CUDA text entry captures at startup.
 
     ``config`` is the ``WorkerConfig``: its ``prefill_graph_token_sizes``
-    and the fixed ``DEFAULT_PREFILL_GRAPH_ROW_BUCKETS`` size the buckets up to
-    ``max_rows`` rows and ``max_tokens`` tokens, the most one staged call
-    holds, keeping those whose batches fit the unit ``pool`` (see
-    ``select_prefill_captures``). Causal text is always captured, with
-    embedding replacement when the lane has an ``image_builder`` (every
-    prefill of such a lane replaces embeddings); a model whose image
-    processor declares ``feature_injection`` also appends non-causal image
-    feature rows and mixed text/image contexts, which replace embeddings.
-    Mixed contexts carry device causal flags through graph replay and are
-    captured only when the attention provider accepts that representation
-    (its ``device_causality`` capability).
-    The graphs evaluate
-    hidden states when the deployment's prefill calls select outputs
+    size the token buckets up to ``max_tokens`` tokens, the most one staged
+    call holds. The row buckets are the fixed
+    ``DEFAULT_PREFILL_GRAPH_ROW_BUCKETS`` below ``max_rows``, then one that
+    holds ``max_rows`` rows and the padding sequence, so every batch the call
+    bound admits has a bucket. Buckets whose batches do not fit the unit
+    ``pool`` are left out (see ``select_prefill_captures``). Causal text is
+    always captured, with embedding replacement when the lane has an
+    ``image_builder`` (every prefill of such a lane replaces embeddings); a
+    model whose image processor declares ``feature_injection`` also appends
+    non-causal image feature rows and mixed text/image contexts, which
+    replace embeddings. Mixed contexts carry device causal flags through
+    graph replay and are captured only when the attention provider accepts
+    that representation (its ``device_causality`` capability). The graphs
+    evaluate hidden states when the deployment's prefill calls select outputs
     (``prefill_outputs``) and only write the K/V cache otherwise. Empty when
     the graph policy is off or prefill graphs are disabled, which leaves
     prefill calls eager.
@@ -268,9 +289,20 @@ def prefill_captures(
         variants += ((False, True),)
         if device_causality:
             variants += ((None, True),)
+    # A bucket holds its batch's rows plus one padding sequence, so the last
+    # bucket is one row beyond ``max_rows``. Padding rows are empty, which
+    # makes a wide row bucket as cheap as a narrow one.
+    row_sizes = (
+        *(
+            size
+            for size in DEFAULT_PREFILL_GRAPH_ROW_BUCKETS
+            if size <= max_rows
+        ),
+        max_rows + 1,
+    )
     return select_prefill_captures(
         config.prefill_graph_token_sizes,
-        DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
+        row_sizes,
         max_rows=max_rows,
         max_tokens=max_tokens,
         variants=variants,

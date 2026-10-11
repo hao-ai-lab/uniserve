@@ -129,7 +129,8 @@ pub struct WorkerProcessArgs {
     pub lanes: Vec<LaneConfig>,
     /// Module graph coverage policy: off, auto, or full.
     pub graph_policy: String,
-    /// Optional decode batch sizes selected for CUDA graph capture.
+    /// Optional decode batch sizes selected for CUDA graph capture; absent,
+    /// the worker captures every size up to the rows a call may hold.
     pub decode_graph_batch_sizes: Option<String>,
     /// Whether every prefill call replays a CUDA graph captured at
     /// startup; without it prefill runs eagerly, for debugging.

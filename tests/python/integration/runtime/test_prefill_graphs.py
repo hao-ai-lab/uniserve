@@ -6,9 +6,11 @@ DiffusionGemma model with the released checkpoints' attention shapes, whose
 sliding tables start after retired pages, replays of causal text chunks,
 non-causal image-block rows and 256-token commit rows return the outputs and
 write the KV of eager execution of the same calls, and a replayed call copies
-no device value to the host. A prefill or decode call no captured graph holds
-runs eagerly and returns the outputs a graph run of its rows returns. On
-pools of few units, whose cache groups have pages of different sizes, startup
+no device value to the host. A worker captures prefill buckets and decode
+sizes up to the calls it admits, so every call it admits replays a graph; a
+call no captured graph holds, such as a decode call beyond the sizes a launch
+names, runs eagerly and returns the outputs a graph run of its rows returns.
+On pools of few units, whose cache groups have pages of different sizes, startup
 captures every prefill bucket a batch the pool holds selects, and each
 replays. A worker whose prefills select no output replays graphs that only
 write the K/V cache, and leaves the cache of the eager pass that evaluates
@@ -407,13 +409,13 @@ def _qwen_checkpoint(root):
 
 
 @torch.inference_mode()
-def test_prefill_calls_no_captured_graph_holds_run_eagerly(tmp_path):
-    """A prefill no captured graph holds runs eagerly with the same outputs.
+def test_prefill_graphs_hold_every_admitted_row_count(tmp_path):
+    """Every prefill the worker admits replays a graph, one no graph holds not.
 
-    Forty admitted calls exceed the 31 rows the widest prefill bucket holds,
-    and the text-only model captured no graph for non-causal rows. A call of
-    31 rows replays a graph; a call of 35 rows and a non-causal call run
-    eagerly, and the 35 rows' first 31 outputs equal the replay's.
+    Forty admitted calls exceed the 31 rows of the fixed row buckets, so the
+    worker also captures a bucket for 40 rows. Calls of 31, 35 and 40 rows
+    replay graphs and return the same rows alike; the text-only model
+    captured no graph for non-causal rows, which run eagerly.
     """
     _qwen_checkpoint(tmp_path)
     model = models.load_model(
@@ -441,7 +443,7 @@ def test_prefill_calls_no_captured_graph_holds_run_eagerly(tmp_path):
 
         manager = worker.kv_cache
         manager.block_tables.install(
-            tuple((slot, 0, 0, (slot,), 16) for slot in range(1, 36))
+            tuple((slot, 0, 0, (slot,), 16) for slot in range(1, 41))
         )
 
         def rows(count, *, causal=True):
@@ -456,12 +458,14 @@ def test_prefill_calls_no_captured_graph_holds_run_eagerly(tmp_path):
         assert replayed.stats.cuda_graph_replays == 1
         assert len(replayed.materialize().values) == 31
 
-        wide = _call(worker.runner, manager, rows(35))
-        assert wide.stats.cuda_graph_replays == 0
-        assert wide.stats.cuda_graph_runtime_mode_counts == {"eager": 1}
-        assert len(wide.materialize().values) == 35
-        for actual, expected in zip(_outputs(wide), _outputs(replayed)):
-            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        for count in (35, 40):
+            wide = _call(worker.runner, manager, rows(count))
+            assert wide.stats.cuda_graph_replays == 1
+            assert len(wide.materialize().values) == count
+            for actual, expected in zip(_outputs(wide), _outputs(replayed)):
+                torch.testing.assert_close(
+                    actual, expected, rtol=2e-2, atol=2e-2
+                )
 
         non_causal = _call(worker.runner, manager, rows(2, causal=False))
         assert non_causal.stats.cuda_graph_replays == 0
@@ -592,6 +596,51 @@ def test_decode_calls_no_captured_graph_holds_run_eagerly(tmp_path):
         assert len(wide.materialize().values) == capacity + 1
         for actual, expected in zip(_outputs(wide), _outputs(replayed)):
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@torch.inference_mode()
+def test_default_decode_graphs_hold_the_most_rows_admitted(tmp_path):
+    """A launch naming no decode sizes captures one for its largest call.
+
+    A hundred admitted calls fall between the default sizes' steps of eight,
+    so the largest decode call of a hundred rows still replays a graph.
+    """
+    _qwen_checkpoint(tmp_path)
+    model = models.load_model(
+        models.read_config(tmp_path), device="cuda:0"
+    ).model
+    config = cpu_worker_config(
+        device="cuda:0",
+        block_size=16,
+        max_total_tokens=4096,
+        max_model_len=32,
+        max_batch_calls=100,
+        max_batch_tokens=128,
+        max_request_pool_size=100,
+        prefill_graph_token_sizes=(16,),
+    )
+    with Worker(
+        model,
+        worker_config=config,
+        sampling_group=Communicator(device=torch.device("cuda:0")),
+        tokenizer=None,
+        queue_depth=2,
+    ) as worker:
+        worker.warmup()
+
+        manager = worker.kv_cache
+        manager.block_tables.install(
+            tuple((slot, 0, 0, (slot,), 16) for slot in range(1, 101))
+        )
+        rows = _rows(
+            tuple(torch.tensor([slot % 30 + 1]) for slot in range(100)),
+            prefix=0,
+            selections=(TokenSelection.LAST_LOGITS,) * 100,
+            mode=ForwardMode.DECODE,
+        )
+        output = _call(worker.runner, manager, rows)
+        assert output.stats.cuda_graph_replays == 1
+        assert len(output.materialize().values) == 100
 
 
 @SM100

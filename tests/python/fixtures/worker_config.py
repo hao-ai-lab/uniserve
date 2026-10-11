@@ -10,7 +10,6 @@ from uniserve.runtime.backends.attention.flashinfer import (
 from uniserve_worker.bootstrap.cache import DEFAULT_BLOCK_SIZE
 from uniserve_worker.bootstrap.capacity import DEFAULT_NUM_UNITS_FALLBACK
 from uniserve_worker.config.execution import (
-    DEFAULT_DECODE_GRAPH_BATCH_SIZES,
     DEFAULT_FLOW_GRAPH_BATCH_SIZES,
     DEFAULT_FLOW_GRAPH_SHAPES,
     DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
@@ -45,7 +44,7 @@ def cpu_worker_config(**overrides: Any) -> WorkerConfig:
         "mem_fraction_static": 0.70,
         "lanes": (),
         "graph_policy": "auto",
-        "decode_graph_batch_sizes": DEFAULT_DECODE_GRAPH_BATCH_SIZES,
+        "decode_graph_batch_sizes": None,
         "prefill_cuda_graph": True,
         "prefill_outputs": True,
         "prefill_graph_token_sizes": DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
