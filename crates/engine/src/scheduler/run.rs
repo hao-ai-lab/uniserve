@@ -121,7 +121,8 @@ impl Scheduler {
         )
     }
 
-    /// Constructs an engine loop and infers its runtime family from worker capabilities.
+    /// Constructs an engine loop whose generation limits follow from the
+    /// workers' capabilities rather than from a model description.
     ///
     /// Fails when the executor exposes an invalid aggregate capacity view.
     pub fn with_config(
@@ -131,70 +132,51 @@ impl Scheduler {
     ) -> anyhow::Result<Self> {
         let info = executor.info().runtime_info()?;
 
-        // Without text decode, token-canvas denoising makes the runtime
-        // block-diffusion and latent preparation makes it diffusion-only;
-        // otherwise any denoising, vision-encoding, or latent-encoding
-        // capability makes the runtime unified multimodal; everything else is
-        // autoregressive.
+        // Without text decode, token-canvas denoising serves canvas readouts
+        // over prompts that may carry encoded images, and latent preparation
+        // serves video diffusion, which needs no generation feature. Otherwise
+        // any denoising, vision-encoding, or latent-encoding capability serves
+        // interleaved text and images from unbounded limits, and everything
+        // else serves text. `with_model_limits` clamps the result to the
+        // worker-reported capacities.
         let calls = &info.supported_calls;
         let decodes = calls.contains(&CallKind::Forward(ForwardMode::Decode));
-        let family = if calls.contains(&CallKind::Forward(ForwardMode::TokenDenoising)) && !decodes
-        {
-            RuntimeFamily::BlockDiffusion
-        } else if calls.contains(&CallKind::Media(MediaCall::LatentPreparation)) && !decodes {
-            RuntimeFamily::Diffusion
-        } else if calls.contains(&CallKind::Media(MediaCall::Denoising))
-            || (calls.contains(&CallKind::Media(MediaCall::VisionEncoding))
-                || calls.contains(&CallKind::Media(MediaCall::LatentEncoding)))
-        {
-            RuntimeFamily::Umm
-        } else {
-            RuntimeFamily::Ar
-        };
+        let generation_limits =
+            if calls.contains(&CallKind::Forward(ForwardMode::TokenDenoising)) && !decodes {
+                uniserve_core::GenerationLimits {
+                    features: uniserve_core::GenerationFeatures::TOKEN_DENOISING
+                        | uniserve_core::GenerationFeatures::VISION_ENCODE,
+                    latent_downsample: 1,
+                    max_vit_grid_tokens: u32::MAX,
+                    max_vision_feature_bytes: 256 << 20,
+                    max_cfg_branches: 1,
+                    encoder_cache_entries: 256,
+                    ..Default::default()
+                }
+            } else if calls.contains(&CallKind::Media(MediaCall::LatentPreparation)) && !decodes {
+                uniserve_core::GenerationLimits {
+                    latent_downsample: 1,
+                    max_cfg_branches: 1,
+                    ..Default::default()
+                }
+            } else if calls.contains(&CallKind::Media(MediaCall::Denoising))
+                || calls.contains(&CallKind::Media(MediaCall::VisionEncoding))
+                || calls.contains(&CallKind::Media(MediaCall::LatentEncoding))
+            {
+                unbounded_umm_generation_limits()
+            } else {
+                uniserve_core::GenerationLimits {
+                    features: uniserve_core::GenerationFeatures::UNDERSTANDING,
+                    latent_downsample: 1,
+                    max_cfg_branches: 1,
+                    ..Default::default()
+                }
+            };
 
-        Self::with_config_for_family(executor, ctrl, config, family)
-    }
-
-    /// Constructs an engine loop for an explicit runtime family.
-    ///
-    /// Fails when the executor exposes an invalid aggregate capacity view.
-    pub fn with_config_for_family(
-        executor: Box<dyn Executor>,
-        ctrl: SpecialTokenIds,
-        config: SchedulerConfig,
-        family: RuntimeFamily,
-    ) -> anyhow::Result<Self> {
-        // Unified runtimes start from unbounded limits; `with_model_limits`
-        // clamps them to the worker-reported capacities.
-        let generation_limits = match family {
-            RuntimeFamily::Umm => unbounded_umm_generation_limits(),
-            // Canvas readouts over prompts that may carry encoded images.
-            RuntimeFamily::BlockDiffusion => uniserve_core::GenerationLimits {
-                features: uniserve_core::GenerationFeatures::TOKEN_DENOISING
-                    | uniserve_core::GenerationFeatures::VISION_ENCODE,
-                latent_downsample: 1,
-                max_vit_grid_tokens: u32::MAX,
-                max_vision_feature_bytes: 256 << 20,
-                max_cfg_branches: 1,
-                encoder_cache_entries: 256,
-                ..Default::default()
-            },
-            RuntimeFamily::Ar | RuntimeFamily::Diffusion => uniserve_core::GenerationLimits {
-                features: if family == RuntimeFamily::Ar {
-                    uniserve_core::GenerationFeatures::UNDERSTANDING
-                } else {
-                    uniserve_core::GenerationFeatures::empty()
-                },
-                latent_downsample: 1,
-                max_cfg_branches: 1,
-                ..Default::default()
-            },
-        };
         Self::with_model_limits(
             executor,
             ctrl,
             config,
-            family,
             uniserve_core::ModelDtype::BFloat16,
             generation_limits,
         )
@@ -209,7 +191,6 @@ impl Scheduler {
         executor: Box<dyn Executor>,
         ctrl: SpecialTokenIds,
         mut config: SchedulerConfig,
-        family: RuntimeFamily,
         model_dtype: uniserve_core::ModelDtype,
         generation_limits: uniserve_core::GenerationLimits,
     ) -> anyhow::Result<Self> {
@@ -301,7 +282,6 @@ impl Scheduler {
             },
             info,
             generation_limits,
-            family,
             ctrl,
             waiting: VecDeque::new(),
             waiting_media: VecDeque::new(),

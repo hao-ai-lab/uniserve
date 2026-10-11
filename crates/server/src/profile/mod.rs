@@ -187,13 +187,11 @@ pub enum ModelParameters {
     SenseNova(SenseNovaProfile),
     /// Bagel image, prompt, and generation settings.
     Bagel(BagelProfile),
-    /// MiniMax-H3 duration limit. What the placed denoiser serves (tasks,
+    /// MiniMax-H3 video generation. What the placed denoiser serves (tasks,
     /// schedule, canvases) belongs to the loaded worker, whose startup
-    /// handshake reports it.
-    MiniMaxH3 {
-        /// Maximum requested duration in seconds, before frame alignment.
-        max_video_seconds: f64,
-    },
+    /// handshake reports it, and the duration capacity to the deployment's
+    /// engine settings.
+    MiniMaxH3,
     /// DiffusionGemma canvas, control-token, image, and sampler settings.
     DiffusionGemma(DiffusionGemmaProfile),
 }
@@ -207,13 +205,10 @@ pub struct ModelConfig {
     pub parameters: ModelParameters,
     /// Checkpoint defaults applied only to omitted request fields.
     pub sampling_defaults: SamplingDefaults,
-    /// Combined input/output token ceiling from metadata and configuration.
-    ///
-    /// `InputProcessor::new` replaces it with
-    /// `WorkerCapabilities::max_model_tokens`, which `build_state` in the crate
-    /// root computes as the smaller of this value and the started engine's
-    /// `max_model_len`.
-    pub max_model_tokens: Option<u32>,
+    /// Combined input/output token ceiling: the configured `--max-model-len`,
+    /// else the checkpoint's own bound. `build_state` in the crate root passes
+    /// it to the workers, and request preprocessing enforces it.
+    pub max_model_len: u32,
     /// Tokenizer-config `eos_token` resolved through the vocabulary.
     ///
     /// `special_token_ids` in the crate root places it first in the engine's
@@ -233,8 +228,9 @@ impl ModelConfig {
     /// the checkpoint's safetensors header (see
     /// `BagelProfile::read_max_latent_size`), and DiffusionGemma its canvas,
     /// image, and sampler settings (see `DiffusionGemmaProfile::resolve`). A
-    /// configured `max_model_tokens` takes precedence over the checkpoint's
-    /// `max_position_embeddings`.
+    /// configured `max_model_len` takes precedence over the checkpoint's
+    /// `max_position_embeddings`, and
+    /// `EngineSettings::DEFAULT_MAX_MODEL_LEN` applies when neither is set.
     ///
     /// # Errors
     ///
@@ -248,7 +244,7 @@ impl ModelConfig {
         served_name: &str,
         model: &str,
         files: &ResolvedModelFiles,
-        max_model_tokens: Option<u32>,
+        max_model_len: Option<u32>,
         tokenizer: &HuggingFaceTokenizer,
     ) -> assets::Result<Self> {
         let model_config = load_model_config(files.config_path.as_deref())?;
@@ -298,7 +294,9 @@ impl ModelConfig {
             served_name: served_name.to_owned(),
             parameters,
             sampling_defaults: generation_defaults(&generation_config),
-            max_model_tokens: max_model_tokens.or(model_config.max_position_embeddings()),
+            max_model_len: max_model_len
+                .or(model_config.max_position_embeddings())
+                .unwrap_or(crate::EngineSettings::DEFAULT_MAX_MODEL_LEN),
             primary_eos_token_id,
             eos_token_ids,
         })
@@ -309,7 +307,7 @@ impl ModelConfig {
     /// A pipeline checkpoint has no root generation or tokenizer metadata, so
     /// the result carries no sampling defaults and no EOS tokens. Its
     /// denoising step count belongs to the loaded numerical plan, which the
-    /// worker handshake binds. `max_model_tokens` overrides the family's prompt
+    /// worker handshake binds. `max_model_len` overrides the family's prompt
     /// bound.
     ///
     /// # Errors
@@ -319,14 +317,11 @@ impl ModelConfig {
     pub fn from_pipeline(
         model_id: &str,
         description: ModelDescription,
-        max_video_seconds: f64,
-        max_model_tokens: Option<u32>,
+        max_model_len: Option<u32>,
     ) -> assets::Result<Self> {
-        let (parameters, default_max_model_tokens) = match description {
+        let (parameters, default_max_model_len) = match description {
             // MiniMax H3's text encoder serves prompts of up to 16,384 tokens.
-            ModelDescription::MiniMaxH3 => {
-                (ModelParameters::MiniMaxH3 { max_video_seconds }, 16_384)
-            }
+            ModelDescription::MiniMaxH3 => (ModelParameters::MiniMaxH3, 16_384),
             ModelDescription::Qwen3
             | ModelDescription::SenseNova
             | ModelDescription::Bagel
@@ -341,7 +336,7 @@ impl ModelConfig {
             served_name: model_id.to_owned(),
             parameters,
             sampling_defaults: SamplingDefaults::default(),
-            max_model_tokens: Some(max_model_tokens.unwrap_or(default_max_model_tokens)),
+            max_model_len: max_model_len.unwrap_or(default_max_model_len),
             primary_eos_token_id: None,
             eos_token_ids: BTreeSet::new(),
         })
@@ -353,7 +348,7 @@ impl ModelConfig {
             ModelParameters::Qwen3 => ModelDescription::Qwen3,
             ModelParameters::SenseNova(_) => ModelDescription::SenseNova,
             ModelParameters::Bagel(_) => ModelDescription::Bagel,
-            ModelParameters::MiniMaxH3 { .. } => ModelDescription::MiniMaxH3,
+            ModelParameters::MiniMaxH3 => ModelDescription::MiniMaxH3,
             ModelParameters::DiffusionGemma(_) => ModelDescription::DiffusionGemma,
         }
     }
@@ -524,7 +519,7 @@ mod tests {
                 resolved_config(description.id(), model_type).await;
             let profile = profile.unwrap();
             assert_eq!(profile.description(), description);
-            assert_eq!(profile.max_model_tokens, Some(4096));
+            assert_eq!(profile.max_model_len, 4096);
             assert_eq!(profile.sampling_defaults.max_output_tokens, Some(512));
             match profile.parameters {
                 ModelParameters::Qwen3 => assert_eq!(description, ModelDescription::Qwen3),
@@ -559,7 +554,7 @@ mod tests {
                     );
                     assert!(profile.image_generation.feedback_source.is_some());
                 }
-                ModelParameters::MiniMaxH3 { .. } => {
+                ModelParameters::MiniMaxH3 => {
                     assert_eq!(description, ModelDescription::MiniMaxH3);
                 }
                 ModelParameters::DiffusionGemma(_) => {
@@ -577,10 +572,9 @@ mod tests {
         );
         assert_eq!(ModelDescription::from_model_type("minimax_h3"), None);
 
-        let profile =
-            ModelConfig::from_pipeline("h3", ModelDescription::MiniMaxH3, 15.0, None).unwrap();
+        let profile = ModelConfig::from_pipeline("h3", ModelDescription::MiniMaxH3, None).unwrap();
         assert_eq!(profile.description(), ModelDescription::MiniMaxH3);
-        assert_eq!(profile.max_model_tokens, Some(16_384));
+        assert_eq!(profile.max_model_len, 16_384);
     }
 
     /// A Bagel latent position table whose rows do not form a square grid
@@ -665,7 +659,6 @@ mod tests {
             .render_prompt_ids(
                 &tokenizer,
                 GenerationConstraint::Default,
-                false,
                 "draw a lighthouse",
                 None,
                 None,

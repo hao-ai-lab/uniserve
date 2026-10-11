@@ -131,12 +131,11 @@ impl ServingRuntime {
         &self,
         request_id: &ServeRequestId,
         index: usize,
-        mut request: GenerationRequest,
+        request: GenerationRequest,
     ) -> Result<Vec<f32>, SystemOneError> {
         let external = format!("{request_id}-{index}");
-        request.request_id = self
-            .engine
-            .register_request(external.clone(), None)
+        self.engine
+            .register_request(external.clone(), false)
             .map_err(|error| SystemOneError::Server(error.to_string()))?;
         let mut events = self
             .engine
@@ -200,8 +199,9 @@ fn readout_request(prompt: &ReadoutPrompt, images: &[media::ImageInput]) -> Gene
     let (token_ids, inputs) = engine_images(&prompt.token_ids, &prompt.images, images);
 
     GenerationRequest {
-        // `ServingRuntime::readout` replaces it with the registered id.
-        request_id: RequestId(0),
+        // `EngineClient` stamps the identifier it reserved for the readout at
+        // submission.
+        request_id: RequestId::default(),
         prompt_token_ids: token_ids,
         negative_prompt_token_ids: Vec::new(),
         multimodal_inputs: MultimodalInputs { images: inputs },

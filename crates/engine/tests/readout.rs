@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use uniserve_core::{
     CachePolicy, EngineCoreOutput, FinishReason, GenerationConstraint, GenerationRequest,
     ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageInput, ImageParams,
-    MultimodalInputs, ReadoutRow, ReadoutSlot, RejectionKind, Request, RequestId, SamplingParams,
+    MultimodalInputs, ReadoutRow, ReadoutSlot, RejectionKind, RequestId, SamplingParams,
 };
 use uniserve_engine::{
     BatchEvent, ComponentConfig, EngineHandle, EventRx, ExecutionBatch, Scheduler, SchedulerConfig,
@@ -130,9 +130,7 @@ impl Running {
     }
 
     fn submit(&self, request: GenerationRequest) -> EventRx {
-        self.handle
-            .submit(Request::BlockDiffusion(request))
-            .unwrap()
+        self.handle.submit(request).unwrap()
     }
 
     /// Stops the scheduler and returns every batch it submitted, in order.
@@ -784,12 +782,8 @@ fn a_ready_canvas_pass_runs_before_waiting_prefill() {
     let handle = EngineHandle::new(tx);
     let short = readout_request(7, prompt(16, 1000), vec![row(32, &[(1, &[60])])]);
     let long = readout_request(8, prompt(200, 3000), vec![row(32, &[(1, &[61])])]);
-    let short_events = handle
-        .submit(Request::BlockDiffusion(short.clone()))
-        .unwrap();
-    let long_events = handle
-        .submit(Request::BlockDiffusion(long.clone()))
-        .unwrap();
+    let short_events = handle.submit(short.clone()).unwrap();
+    let long_events = handle.submit(long.clone()).unwrap();
     let thread = thread::spawn(move || scheduler.run(rx));
     assert_answered(&events(short_events), &short);
     assert_answered(&events(long_events), &long);
@@ -817,35 +811,25 @@ fn a_ready_canvas_pass_runs_before_waiting_prefill() {
     );
 }
 
-/// A block-diffusion runtime refuses requests of another family, and a
-/// generating request it cannot decode.
+/// A block-diffusion runtime refuses a generating request it cannot decode.
 #[test]
 fn a_block_diffusion_runtime_serves_only_readouts() {
     let running = Running::start(readout_worker(), SchedulerConfig::default());
-    let autoregressive = readout_request(9, prompt(8, 1000), Vec::new());
-    let refused = events(
-        running
-            .handle
-            .submit(Request::Ar(autoregressive.clone()))
-            .unwrap(),
-    );
     let mut generating = readout_request(10, prompt(8, 1000), Vec::new());
     generating.max_und_tokens = 4;
-    let undecodable = events(running.submit(generating));
+    let answer = events(running.submit(generating));
     running.stop();
 
-    for answer in [refused, undecodable] {
-        assert!(
-            matches!(
-                answer.last(),
-                Some(EngineCoreOutput::Rejected {
-                    kind: RejectionKind::Invalid,
-                    ..
-                })
-            ),
-            "{answer:?}"
-        );
-    }
+    assert!(
+        matches!(
+            answer.last(),
+            Some(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
+                ..
+            })
+        ),
+        "{answer:?}"
+    );
 }
 
 /// With room for two batches in flight, a readout's canvas pass is queued

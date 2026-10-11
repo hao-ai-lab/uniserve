@@ -4,9 +4,9 @@
 //! reserves an engine `RequestId` for an external identifier before
 //! preprocessing, so duplicates are refused early and control commands can
 //! reach a request that is still being prepared. `submit_generation` or
-//! `submit_media` then claims that registration and hands the request to one
-//! engine core; the returned `EventRx` releases the claim when its stream ends
-//! or it is dropped.
+//! `submit_media` then stamps the request with that identifier, claims the
+//! registration and hands the request to one engine core; the returned
+//! `EventRx` releases the claim when its stream ends or it is dropped.
 //!
 //! A data-parallel deployment runs one engine core per replica
 //! (`EngineCore::replicas`), each with its own scheduler, KV cache and
@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::error::{Error, Result};
-use uniserve_core::{GenerationLimits, ModelDtype, Request, RequestId, RuntimeFamily};
+use uniserve_core::{GenerationLimits, Request, RequestId};
 use uniserve_engine::{EngineCore, EventRx, Executor, SubmitError};
 
 /// In-process engine client owned by the server layer.
@@ -138,27 +138,12 @@ impl EngineClient {
         Self::from_cores(cores)
     }
 
-    /// Starts an engine over an executor and explicit command waker.
-    pub fn connect_with_executor_and_waker(
-        config: uniserve_engine::EngineConfig,
-        executor: Box<dyn Executor>,
-        command_waker: uniserve_core::CommandWaker,
-    ) -> Result<Self> {
-        let core =
-            EngineCore::with_executor_and_waker(config, executor, command_waker).map_err(|e| {
-                Error::ClientClosed {
-                    message: format!("failed to start the UniServe engine: {e:?}"),
-                }
-            })?;
-        Self::from_cores(vec![core])
-    }
-
     /// Wraps initialized engine cores with request tracking and periodic
     /// statistics export.
     ///
-    /// The replicas must serve the same model under the same limits, since a
-    /// request is validated once against the client's limits and may land on
-    /// any replica; a mismatch fails. One export task per core publishes a
+    /// The replicas' workers must report the same generation limits and
+    /// denoising schedule, since a request is prepared once against the
+    /// client's and may land on any replica; a mismatch fails. One export task per core publishes a
     /// scheduler-stats snapshot every second under that core's engine index,
     /// matching `engine_count`. Each task holds only a weak reference to its
     /// core, so it does not keep the engine alive and exits on the first tick
@@ -170,16 +155,11 @@ impl EngineClient {
             message: "an engine client needs at least one engine core".to_string(),
         })?;
         for core in &cores[1..] {
-            if core.model_name() != first.model_name()
-                || core.max_model_len() != first.max_model_len()
-                || core.generation_limits() != first.generation_limits()
-                || core.model_dtype() != first.model_dtype()
-                || core.runtime_family() != first.runtime_family()
+            if core.generation_limits() != first.generation_limits()
                 || core.info().denoise_steps() != first.info().denoise_steps()
-                || core.supports_token_sampling() != first.supports_token_sampling()
             {
                 return Err(Error::ClientClosed {
-                    message: "data-parallel replicas serve different models or limits".to_string(),
+                    message: "data-parallel replicas report different limits".to_string(),
                 });
             }
         }
@@ -237,11 +217,6 @@ impl EngineClient {
         self.cores.len()
     }
 
-    /// Returns the maximum supported model context length.
-    pub fn max_model_len(&self) -> u32 {
-        self.first().max_model_len()
-    }
-
     /// Returns worker-advertised generation limits.
     pub fn generation_limits(&self) -> GenerationLimits {
         self.first().generation_limits()
@@ -260,62 +235,46 @@ impl EngineClient {
         self.first().media_lane_units(call)
     }
 
-    /// Returns whether the worker supports token sampling calls.
-    pub fn supports_token_sampling(&self) -> bool {
-        self.first().supports_token_sampling()
-    }
-
-    /// Returns the worker's effective model dtype.
-    pub fn model_dtype(&self) -> ModelDtype {
-        self.first().model_dtype()
-    }
-
-    /// Returns the allocatable paged-KV units the schedulers plan against,
-    /// summed over the replicas.
-    pub fn total_kv_units(&self) -> u64 {
-        self.cores
-            .iter()
-            .map(|core| u64::from(core.info().kv_usable_units()))
-            .sum()
-    }
-
     /// Returns whether the engine can accept requests: whether any replica's
     /// core is alive. Requests route only to live replicas.
     pub fn is_healthy(&self) -> bool {
         self.cores.iter().any(|core| !core.is_dead())
     }
 
-    /// Reserves a unique request ID before preprocessing. The caller must submit
-    /// the returned ID or complete its decoded-response lifecycle on failure.
+    /// Reserves a unique engine request ID for `external_request_id` before
+    /// preprocessing. Submission under the same external identifier stamps the
+    /// request with it; a caller that does not submit completes its
+    /// decoded-response lifecycle instead.
     ///
     /// Returns `Error::DuplicateRequestId` when a live request already holds
-    /// `external_request_id`. With `output_identity`, the registration also
+    /// `external_request_id`. With `track_lifecycle`, the registration also
     /// carries per-request lifecycle statistics. Identifiers come from the
     /// first core's allocator alone, so they are unique across the replicas.
     pub fn register_request(
         &self,
         external_request_id: String,
-        output_identity: Option<crate::serving::ModelEventIdentity>,
-    ) -> Result<RequestId> {
+        track_lifecycle: bool,
+    ) -> Result<()> {
         let rid = self.first().next_request_id();
         if !self
             .requests
-            .register(external_request_id.clone().into(), rid, output_identity)
+            .register(external_request_id.clone().into(), rid, track_lifecycle)
         {
             return Err(Error::DuplicateRequestId {
                 request_id: external_request_id,
             });
         }
-        Ok(rid)
+        Ok(())
     }
 
-    /// Submits the owned tokenized request under its previously reserved identity.
+    /// Submits the owned tokenized request under the engine identifier
+    /// reserved for `external_request_id`, which replaces the request's own.
     ///
     /// # Errors
     ///
     /// - `Error::UnknownRequestId` or `Error::DuplicateRequestId` when the
-    ///   registration cannot be claimed (see `RequestRegistry::claim_submission`).
-    /// - `Error::ClientClosed` when the runtime family is `Diffusion`.
+    ///   registration cannot be claimed (see `RequestRegistry::reserved_id` and
+    ///   `RequestRegistry::claim_submission`).
     /// - `Error::Submit` when the engine refuses the request.
     ///
     /// Every error after a successful claim releases the claim again through
@@ -325,41 +284,23 @@ impl EngineClient {
     pub async fn submit_generation(
         &self,
         external_request_id: String,
-        request: uniserve_core::GenerationRequest,
+        mut request: uniserve_core::GenerationRequest,
     ) -> Result<EventRx> {
-        let rid = request.request_id;
-        let request = match self.first().runtime_family() {
-            RuntimeFamily::Ar => Request::Ar(request),
-            RuntimeFamily::Umm => Request::Umm(request),
-            RuntimeFamily::BlockDiffusion => Request::BlockDiffusion(request),
-            RuntimeFamily::Diffusion => {
-                self.requests.claim_submission(&external_request_id, rid)?;
-                self.requests.release_engine(&external_request_id, rid);
-                return Err(Error::ClientClosed {
-                    message: "text generation is unavailable for a diffusion runtime".to_string(),
-                });
-            }
-        };
-        self.submit(external_request_id, rid, request)
+        let rid = self.requests.reserved_id(&external_request_id)?;
+        request.request_id = rid;
+        self.submit(external_request_id, rid, request.into())
     }
 
     /// Submits one terminal media request and returns its event receiver.
     ///
-    /// Fails like `submit_generation`, except that `Error::ClientClosed` is
-    /// returned when the runtime family is not `Diffusion`.
+    /// Fails like `submit_generation`.
     pub async fn submit_media(
         &self,
         external_request_id: String,
-        request: uniserve_core::DiffusionRequest,
+        mut request: uniserve_core::DiffusionRequest,
     ) -> Result<EventRx> {
-        let rid = request.request_id;
-        if self.first().runtime_family() != RuntimeFamily::Diffusion {
-            self.requests.claim_submission(&external_request_id, rid)?;
-            self.requests.release_engine(&external_request_id, rid);
-            return Err(Error::ClientClosed {
-                message: "diffusion generation is unavailable for this runtime".to_string(),
-            });
-        }
+        let rid = self.requests.reserved_id(&external_request_id)?;
+        request.request_id = rid;
         self.submit(external_request_id, rid, Request::Diffusion(request))
     }
 
@@ -509,10 +450,11 @@ mod tests {
 
         let constraint = GenerationConstraint::UndOnly;
         let policy = ImageGenerationConfig::default();
+        client
+            .register_request("req-text".to_string(), false)
+            .expect("reserve request");
         let generation = GenerationRequest {
-            request_id: client
-                .register_request("req-text".to_string(), None)
-                .expect("reserve request"),
+            request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: Default::default(),
             negative_prompt_token_ids: Vec::new(),
@@ -565,10 +507,10 @@ mod tests {
         client.shutdown().await.expect("shutdown engine");
     }
 
-    /// A text request of `rid` that generates until the simulator's EOS.
-    fn text_request(rid: uniserve_core::RequestId) -> GenerationRequest {
+    /// A text request that generates until the simulator's EOS.
+    fn text_request() -> GenerationRequest {
         GenerationRequest {
-            request_id: rid,
+            request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: Default::default(),
             negative_prompt_token_ids: Vec::new(),
@@ -606,15 +548,13 @@ mod tests {
         // Both requests are submitted before either stream is read, so the
         // first is still in flight when the second is routed.
         let mut streams = Vec::new();
-        let mut ids = Vec::new();
         for name in ["first", "second"] {
-            let rid = client
-                .register_request(name.to_string(), None)
+            client
+                .register_request(name.to_string(), false)
                 .expect("reserve request");
-            ids.push(rid);
             streams.push(
                 client
-                    .submit_generation(name.to_string(), text_request(rid))
+                    .submit_generation(name.to_string(), text_request())
                     .await
                     .expect("submit request"),
             );
@@ -645,10 +585,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(served.iter().map(|ids| ids.len()).sum::<usize>(), 2);
         assert!(served.iter().all(|ids| ids.len() == 1));
-        assert!(
-            ids.iter()
-                .all(|id| served.iter().any(|ids| ids.contains(id)))
-        );
     }
 
     #[tokio::test]
@@ -675,10 +611,11 @@ mod tests {
             }],
             sample_feedback_continuation: true,
         };
+        client
+            .register_request("req-image".to_string(), false)
+            .expect("reserve request");
         let request = GenerationRequest {
-            request_id: client
-                .register_request("req-image".to_string(), None)
-                .expect("reserve request"),
+            request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3],
             multimodal_inputs: Default::default(),
             negative_prompt_token_ids: Vec::new(),

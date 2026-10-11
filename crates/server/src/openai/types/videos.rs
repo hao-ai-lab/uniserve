@@ -44,7 +44,8 @@ pub struct VideoCondition {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VideoTarget {
-    /// Short edge of the canvas in pixels; only 768 is served.
+    /// Short edge of the canvas in pixels; the deployment serves the short
+    /// edges `GET /v1/capabilities` reports.
     pub short_edge: u32,
     /// `auto` or `W:H`.
     pub aspect_ratio: String,

@@ -22,11 +22,11 @@ use uniserve_core::{
 };
 
 use crate::profile::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
-use crate::serving::chat::{ChatOutputProcessor, Gemma4ChatOutputProcessor};
+use crate::serving::chat::{ChatOutputProcessor, ChatRequest, Gemma4ChatOutputProcessor};
 use crate::serving::text::TextDecodeOptions;
 use crate::serving::{
-    InputProcessor, OutputProcessorPolicy, PromptInput, SamplingConfig, ServeError, ServeRequestId,
-    StopConfig, TokenizeError, media,
+    InputProcessor, OutputProcessorPolicy, SamplingConfig, ServeError, ServeRequestId, StopConfig,
+    TokenizeError, media,
 };
 
 /// Splits a prompt whose images stand as soft-token runs into the engine's
@@ -171,24 +171,19 @@ impl InputProcessor {
     ///
     /// # Errors
     ///
-    /// Returns `TokenizeError::Invalid` for a text prompt, an image with no
-    /// area, request text that encodes image tokens of its own, or a prompt
-    /// that leaves no room for one canvas; chat validation, rendering,
-    /// tokenizer, and parser construction errors propagate.
+    /// Returns `TokenizeError::Invalid` for an image with no area, request
+    /// text that encodes image tokens of its own, or a prompt that leaves no
+    /// room for one canvas; chat validation, rendering, tokenizer, and parser
+    /// construction errors propagate.
     pub(super) fn preprocess_diffusion_gemma_input(
         &self,
         profile: &DiffusionGemmaProfile,
-        prompt: PromptInput,
+        mut chat: ChatRequest,
         images: &[media::ImageInput],
         sampling: &SamplingConfig,
         generation: &mut GenerationRequest,
         decode: &mut TextDecodeOptions,
     ) -> Result<OutputProcessorPolicy, TokenizeError> {
-        let PromptInput::Chat(mut chat) = prompt else {
-            return Err(TokenizeError::Invalid(
-                "DiffusionGemma generates replies to chat prompts only".to_owned(),
-            ));
-        };
         chat.decode_options = decode.clone();
         chat.validate()?;
         let processor = Gemma4ChatOutputProcessor::new(
@@ -197,8 +192,7 @@ impl InputProcessor {
             self.parse_reasoning,
         )?;
         let rendered = self
-            .renderer
-            .as_ref()
+            .chat_renderer()
             .ok_or(crate::serving::chat::Error::MissingChatTemplate)?
             .render(&chat)?;
         let rendered = self.tokenizer.encode(&rendered, false)?;
@@ -217,7 +211,7 @@ impl InputProcessor {
         // Canvases occupy whole blocks of positions after the prompt, so the
         // reply may use only the whole canvases that fit the context.
         let prompt_len = u32::try_from(expanded.len()).unwrap_or(u32::MAX);
-        let max_model_len = self.config.max_model_tokens();
+        let max_model_len = self.config.max_model_len;
         let canvas = profile.canvas_length;
         let room = max_model_len.saturating_sub(prompt_len) / canvas * canvas;
         if room == 0 {
@@ -276,7 +270,7 @@ mod tests {
     use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
     use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
     use crate::serving::{
-        FinishStatus, InputProcessor, RequestOutput, ServedSamplingControl, ServingRuntime,
+        FinishStatus, InputProcessor, RequestOutput, RequestRenderer, ServingRuntime,
     };
     use futures::StreamExt;
     use tokenizers::models::bpe::{BPE, Vocab};
@@ -349,7 +343,7 @@ mod tests {
             served_name: "sim-model".to_string(),
             parameters: ModelParameters::DiffusionGemma(profile),
             sampling_defaults: SamplingDefaults::default(),
-            max_model_tokens: Some(4096),
+            max_model_len: 4096,
             primary_eos_token_id: None,
             eos_token_ids: BTreeSet::new(),
         };
@@ -357,7 +351,6 @@ mod tests {
         let mut worker = SimEngine::new();
         worker.set_text_len(TEXT_LEN);
         let mut config = EngineConfig::sim("sim-model");
-        config.runtime_family = model.runtime_family();
         config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
         let client = Arc::new(
             EngineClient::connect_with_executor(config, Box::new(SimExecutor::new(worker)))
@@ -366,7 +359,7 @@ mod tests {
         let processor = InputProcessor::new(
             model,
             Arc::clone(&tokenizer),
-            Some(
+            RequestRenderer::Chat(
                 HfChatRenderer::new(
                     Some("{{ messages[0].content }}".to_string()),
                     HashMap::new(),
@@ -376,10 +369,7 @@ mod tests {
             ),
             crate::serving::WorkerCapabilities {
                 limits: client.generation_limits(),
-                sampling_controls: ServedSamplingControl::ALL.to_vec(),
-                max_model_tokens: 4096,
             },
-            None,
             false,
         )
         .unwrap();

@@ -94,7 +94,7 @@ use uniserve_core::{
     PositionLogprobs, Request, SharedMedia, TokenLogprob,
 };
 use uniserve_core::{ImageIngestStep, RejectionKind, UnitId, encoder_cache_key};
-use uniserve_core::{RequestId, RuntimeFamily};
+use uniserve_core::RequestId;
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
@@ -349,7 +349,7 @@ struct PendingMedia {
 /// Permissive unified-multimodal limits for a scheduler built without
 /// model-derived limits.
 ///
-/// `Scheduler::with_config_for_family` uses them for `RuntimeFamily::Umm`, and
+/// `Scheduler::with_config` uses them for workers with media capabilities, and
 /// `EngineConfig::sim` uses them as its default. Construction intersects them
 /// with worker-reported capacities (`resolve_generation_limits` in `run`), so
 /// the effective bounds come from the loaded workers. A serving deployment
@@ -382,7 +382,6 @@ pub struct Scheduler {
     /// Aggregate capacity view of the loaded workers.
     info: WorkerInfo,
     generation_limits: uniserve_core::GenerationLimits,
-    family: RuntimeFamily,
     ctrl: SpecialTokenIds,
     /// Token requests awaiting admission, in admission order: arrival order,
     /// or priority then arrival under the priority policy.
@@ -435,17 +434,6 @@ impl Scheduler {
     fn invariant_broken(&mut self, invariant: &str) {
         tracing::error!(invariant, "scheduler invariant broken; stopping the engine");
         self.fatal = true;
-    }
-
-    /// Determines whether this service's configured model accepts a request family.
-    const fn accepts_family(&self, family: RuntimeFamily) -> bool {
-        matches!(
-            (self.family, family),
-            (RuntimeFamily::Ar, RuntimeFamily::Ar)
-                | (RuntimeFamily::Diffusion, RuntimeFamily::Diffusion)
-                | (RuntimeFamily::Umm, RuntimeFamily::Ar | RuntimeFamily::Umm)
-                | (RuntimeFamily::BlockDiffusion, RuntimeFamily::BlockDiffusion)
-        )
     }
 }
 

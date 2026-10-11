@@ -38,14 +38,6 @@ pub enum Error {
     /// Sampling controls violate the engine sampling contract.
     #[error("invalid sampling parameters: {0}")]
     InvalidSampling(#[from] uniserve_core::SamplingParamsError),
-    /// A requested log-probability count falls outside the accepted range.
-    #[error("{field} must be non-negative or -1, got {value}")]
-    InvalidLogprobCount {
-        /// Invalid request field.
-        field: &'static str,
-        /// Rejected field value.
-        value: i32,
-    },
     /// The minimum generation length exceeds the maximum generation length.
     #[error("min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})")]
     MinTokensExceedsMaximum {

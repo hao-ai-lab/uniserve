@@ -84,30 +84,15 @@ impl Scheduler {
 
     /// Applies one command; returns true on shutdown.
     ///
-    /// A submission whose request family the runtime does not serve is
-    /// rejected here; every other submission is validated by `enqueue` or
-    /// `enqueue_media`, which report their own rejections.
+    /// Every submission is validated by `enqueue` or `enqueue_media`, which
+    /// refuse what the loaded workers cannot serve and report their own
+    /// rejections.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
-            Command::Submit { request, event_tx } => {
-                if !self.accepts_family(request.family()) {
-                    let _ = event_tx.send(EngineCoreOutput::Rejected {
-                        kind: RejectionKind::Invalid,
-                        message: format!(
-                            "request family {:?} does not match the {:?} runtime",
-                            request.family(),
-                            self.family
-                        ),
-                    });
-                } else {
-                    match *request {
-                        Request::Ar(request)
-                        | Request::Umm(request)
-                        | Request::BlockDiffusion(request) => self.enqueue(request, event_tx),
-                        Request::Diffusion(request) => self.enqueue_media(request, event_tx, now()),
-                    }
-                }
-            }
+            Command::Submit { request, event_tx } => match *request {
+                Request::Generation(request) => self.enqueue(*request, event_tx),
+                Request::Diffusion(request) => self.enqueue_media(request, event_tx, now()),
+            },
             Command::Cancel(request_id) => self.mark_cancelled(request_id, false),
             Command::Acknowledge {
                 request_id,

@@ -486,9 +486,7 @@ impl EngineHandle {
         // Stop-string matching happens in the frontend decoder, which
         // acknowledges each token it has checked.
         let awaits_decoder = match &request {
-            Request::Ar(request) | Request::Umm(request) | Request::BlockDiffusion(request) => {
-                !request.stop_strings.is_empty()
-            }
+            Request::Generation(request) => !request.stop_strings.is_empty(),
             Request::Diffusion(_) => false,
         };
         let (event_tx, event_rx) = event_channel_with_waker(

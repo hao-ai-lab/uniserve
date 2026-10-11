@@ -113,7 +113,7 @@ async fn check_checkpoint(variable: &str, quantized: bool) {
 
     // Checkpoint facts the server serves from.
     assert_eq!(config.description(), ModelDescription::DiffusionGemma);
-    assert_eq!(config.max_model_tokens, Some(262_144));
+    assert_eq!(config.max_model_len, 262_144);
     assert_eq!(config.eos_token_ids, BTreeSet::from([1, 50, 106]));
     let ModelParameters::DiffusionGemma(profile) = &config.parameters else {
         unreachable!("the description is DiffusionGemma");

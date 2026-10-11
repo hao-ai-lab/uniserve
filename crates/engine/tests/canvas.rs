@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use uniserve_core::{
     CachePolicy, CanvasSampling, EngineCoreOutput, FinishReason, GenerationConstraint,
     GenerationRequest, ImageGenerationConfig, ImageParams, MultimodalInputs, RejectionKind,
-    Request, RequestId, SamplingParams,
+    RequestId, SamplingParams,
 };
 use uniserve_engine::{
     BatchEvent, EngineHandle, EventRx, ExecutionBatch, Scheduler, SchedulerConfig, SimEngine,
@@ -104,9 +104,7 @@ impl Running {
     }
 
     fn submit(&self, request: GenerationRequest) -> EventRx {
-        self.handle
-            .submit(Request::BlockDiffusion(request))
-            .unwrap()
+        self.handle.submit(request).unwrap()
     }
 
     /// Stops the scheduler and returns every batch it submitted, in order.
@@ -625,8 +623,8 @@ fn a_waiting_prompt_is_prefilled_while_a_block_denoises() {
         Scheduler::with_config(Box::new(executor), SpecialTokenIds::default(), config).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
-    let generating_events = handle.submit(Request::BlockDiffusion(generating)).unwrap();
-    let waiting_events = handle.submit(Request::BlockDiffusion(waiting)).unwrap();
+    let generating_events = handle.submit(generating).unwrap();
+    let waiting_events = handle.submit(waiting).unwrap();
     let thread = thread::spawn(move || scheduler.run(rx));
     assert_eq!(
         published_blocks(&events(generating_events)),
