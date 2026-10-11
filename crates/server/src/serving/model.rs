@@ -36,7 +36,7 @@ use crate::serving::chat::{
 };
 use crate::serving::input::{OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions};
 use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
-use crate::serving::video::plan::VisionConfig;
+use crate::serving::video::plan::ProcessorConfig;
 use crate::serving::video::{ProcessedVideo, VideoService};
 use crate::serving::{Result, ServeError};
 
@@ -98,7 +98,7 @@ pub(crate) enum LoadedRenderer {
     Chat(Box<HfChatRenderer>),
     /// A video pipeline's conditioner vision processor geometry; the video
     /// service built from the denoiser handshake plans requests against it.
-    Video(VisionConfig),
+    Video(ProcessorConfig),
 }
 
 /// What renders the served model's API requests into engine requests.
@@ -168,7 +168,7 @@ impl ModelConfig {
                 for name in ["preprocessor_config.json", "video_preprocessor_config.json"] {
                     processor.push(pipeline.component_file("processor", name).await?);
                 }
-                let vision = VisionConfig::read(&processor[0], &processor[1])
+                let vision = ProcessorConfig::read(&processor[0], &processor[1])
                     .map_err(|error| ModelResolutionError::MediaContract(format!("{error:#}")))?;
                 let model =
                     Self::from_pipeline(&served_name, description, config.engine.max_model_len)?;

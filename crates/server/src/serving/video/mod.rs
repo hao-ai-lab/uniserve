@@ -44,7 +44,7 @@ use std::fmt;
 use crate::openai::ApiError;
 use crate::profile::tokenizer::DynTokenizer;
 
-use plan::{ConditionSpec, PlanLimits, RequestPlan, Target, VisionConfig};
+use plan::{ConditionSpec, PlanLimits, ProcessorConfig, RequestPlan, Target};
 use presentation::Presentation;
 use probe::MediaProber;
 use sources::{FetchedMedia, MediaFetcher};
@@ -195,7 +195,7 @@ pub struct ProcessedVideoRequest {
 pub struct VideoProcessor {
     fetcher: MediaFetcher,
     prober: MediaProber,
-    vision: VisionConfig,
+    vision: ProcessorConfig,
     limits: PlanLimits,
     tokenizer: DynTokenizer,
 }
@@ -206,7 +206,7 @@ impl VideoProcessor {
     pub fn new(
         fetcher: MediaFetcher,
         prober: MediaProber,
-        vision: VisionConfig,
+        vision: ProcessorConfig,
         limits: PlanLimits,
         tokenizer: DynTokenizer,
     ) -> Self {

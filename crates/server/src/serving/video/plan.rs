@@ -329,9 +329,9 @@ pub struct VisionGrid {
 ///
 /// Read from the checkpoint's `processor/preprocessor_config.json` and
 /// `processor/video_preprocessor_config.json` with
-/// [`VisionConfig::read`].
+/// [`ProcessorConfig::read`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VisionConfig {
+pub struct ProcessorConfig {
     /// Pixels per patch side.
     pub patch_size: u32,
     /// Frames merged into one temporal patch.
@@ -362,7 +362,7 @@ struct ProcessorSize {
     longest_edge: u64,
 }
 
-impl VisionConfig {
+impl ProcessorConfig {
     /// Reads a checkpoint's image processor config
     /// (`processor/preprocessor_config.json`) and video processor config
     /// (`processor/video_preprocessor_config.json`).
@@ -1001,7 +1001,7 @@ pub fn video_reference(
     media: &VideoFacts,
     start_seconds: f64,
     frames: u32,
-    vision: &VisionConfig,
+    vision: &ProcessorConfig,
     config: &ReferenceConfig,
 ) -> Result<(VideoClip, VideoVision), String> {
     // Display sizes stay far below 2^53, so the conversions are exact.
@@ -1472,7 +1472,7 @@ fn plan_keyframe(
     size: Canvas,
     order: usize,
     task: VideoTask,
-    vision: &VisionConfig,
+    vision: &ProcessorConfig,
 ) -> Result<ConditionPlan, VideoInputError> {
     let position = if condition.frame_index == Some(0) {
         FramePosition::First
@@ -1509,7 +1509,7 @@ fn plan_reference(
     condition: &ConditionSpec,
     media: &MediaFacts,
     frames: u32,
-    vision: &VisionConfig,
+    vision: &ProcessorConfig,
     config: &ReferenceConfig,
 ) -> Result<ConditionPlan, VideoInputError> {
     let reject = |error: String| VideoInputError::condition(index, error);
@@ -1563,7 +1563,7 @@ pub fn plan_request(
     target: &Target<'_>,
     conditions: &[ConditionSpec],
     media: &[MediaFacts],
-    vision: &VisionConfig,
+    vision: &ProcessorConfig,
     limits: &PlanLimits,
 ) -> Result<RequestPlan, VideoInputError> {
     if media.len() != conditions.len() {
@@ -1626,8 +1626,8 @@ pub(super) mod tests {
     use super::super::probe::{AudioFacts, FrameRate, ImageFacts, MediaFacts, VideoFacts};
     use super::{
         AudioClip, Canvas, ConditionPlan, ConditionRole, ConditionSpec, ConditionType,
-        FramePosition, KeyframeFit, PlanLimits, Prepared, ReferenceConfig, RequestPlan, Target,
-        VideoTask, Vision, VisionConfig, audio_clip, canvas, check_request, cover_crop,
+        FramePosition, KeyframeFit, PlanLimits, Prepared, ProcessorConfig, ReferenceConfig,
+        RequestPlan, Target, VideoTask, Vision, audio_clip, canvas, check_request, cover_crop,
         latent_frames, plan_request, reference_image_size, rows_per_frame, video_reference,
     };
 
@@ -1639,8 +1639,8 @@ pub(super) mod tests {
         .unwrap()
     }
 
-    pub(in crate::serving::video) fn vision(fixture: &Value) -> VisionConfig {
-        VisionConfig::deserialize(&fixture["vision"]).unwrap()
+    pub(in crate::serving::video) fn vision(fixture: &Value) -> ProcessorConfig {
+        ProcessorConfig::deserialize(&fixture["vision"]).unwrap()
     }
 
     /// Limits that serve every task, duration and canvas the model does.
@@ -1753,7 +1753,7 @@ pub(super) mod tests {
 
         pub(in crate::serving::video) fn plan(
             &self,
-            vision: &VisionConfig,
+            vision: &ProcessorConfig,
         ) -> Result<RequestPlan, super::super::VideoInputError> {
             check_request(self.task, &self.target(), &self.conditions, &limits())?;
             plan_request(

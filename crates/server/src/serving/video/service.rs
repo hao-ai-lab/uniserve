@@ -22,7 +22,7 @@ use uniserve_engine::VideoDenoiserInfo;
 use super::plan::{
     self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_ASPECT_RATIO,
     MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES,
-    MIN_ASPECT_RATIO, NAMED_ASPECT_RATIOS, PlanLimits, ReferenceConfig, Target, VisionConfig,
+    MIN_ASPECT_RATIO, NAMED_ASPECT_RATIOS, PlanLimits, ProcessorConfig, ReferenceConfig, Target,
 };
 use super::probe::{MediaProber, ProbeConfig};
 use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
@@ -74,7 +74,7 @@ impl VideoService {
     /// the media fetcher cannot be built.
     pub fn new(
         denoiser: VideoDenoiserInfo,
-        vision: VisionConfig,
+        vision: ProcessorConfig,
         max_video_seconds: f64,
         latent_encoding_lane: u32,
         media: &VideoMediaSettings,

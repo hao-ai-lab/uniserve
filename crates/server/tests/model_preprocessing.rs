@@ -24,7 +24,7 @@ use uniserve_server::serving::media::{
     ImageFetchError, ImageFetchPolicy, ImageFetcher, ImageInput, ImageListError,
 };
 use uniserve_server::serving::video::VideoService;
-use uniserve_server::serving::video::plan::VisionConfig;
+use uniserve_server::serving::video::plan::ProcessorConfig;
 use uniserve_server::serving::{
     InputProcessor, RequestRenderer, ResponseOptions, ServeRequestId, chat_image_urls,
 };
@@ -73,7 +73,7 @@ fn video_service(
 ) -> VideoService {
     VideoService::new(
         denoiser,
-        VisionConfig {
+        ProcessorConfig {
             patch_size: 16,
             temporal_patch_size: 2,
             merge_size: 2,
