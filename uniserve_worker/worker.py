@@ -653,7 +653,6 @@ class Worker:
             startup.callback(self.buffer_pool.close)
 
             self.tensor_store = TensorStore(
-                capacity=arena.tensor_store,
                 byte_capacity=arena.device_product_bytes,
                 max_entry_bytes=max(1, int(info.encoder_entry_bytes)),
                 devices=owner_devices,

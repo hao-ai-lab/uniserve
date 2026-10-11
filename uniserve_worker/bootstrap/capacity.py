@@ -71,14 +71,8 @@ from uniserve_worker.storage.kv_cache import KVCacheManager
 from uniserve_worker.storage.latent_pool import LatentPool
 from uniserve_worker.storage.tensor_store import (
     TensorStore,
-    device_product_capacity_bytes,
 )
 
-# ``ArenaCapacity.tensor_store`` allows this many generic persistent products
-# per call slot of the arena, plus ``_DEVICE_PRODUCT_RETIREMENT_BATCHES``
-# further batches of ``max_batch_calls`` calls.
-_DEVICE_PRODUCTS_PER_CALL = 6
-_DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
 # Upper bound on the reads ``ArenaCapacity.transfer_tickets`` lets a rank
 # keep in flight for its queued calls; see ``request_tensor_arena_capacity``
 # for the floor a request-tensor rank keeps above it.
@@ -87,6 +81,9 @@ _MAX_TRANSFER_ENTRIES = 256
 _HOST_LANE_INFLIGHT = 256
 # Relay-arena bytes budgeted per (request slot, relay lane) row across one
 # device's ``TensorStore`` relay arenas.
+# FIXME: A relay arena exists per (dtype, field) of the scalar outputs the
+# engine's calls declare, which the worker does not learn before its
+# capacity is reported. Derive this row size from those outputs.
 _REQUEST_RELAY_ROW_BYTES = 18
 # Relay lanes beyond the unresolved-call window. ``Worker.__init__`` builds
 # ``TensorStore`` with ``relay_depth = max_unresolved_calls + 1`` to match.
@@ -528,12 +525,10 @@ class ArenaCapacity:
     All budgets are for one worker arena.
 
     Attributes:
-        tensor_store: ``TensorStore`` capacity in resident generic persistent
-            products per device.
-        device_product_bytes: Device bytes of ``TensorStore``'s scalar
-            product backing plus its request-relay arenas, summed over the
-            worker's devices for a token worker and sized for one device for
-            a request-tensor worker; also the store's relay byte bound.
+        device_product_bytes: Device bytes of ``TensorStore``'s request-relay
+            arenas, summed over the worker's devices for a token worker and
+            sized for one device for a request-tensor worker; also the
+            store's relay byte bound.
         transfer_bytes: Byte budget of the rank's ``TransferCapacity``, which
             ``Worker.__init__`` scales further for request-tensor workers.
         transfer_tickets: Read tickets of the rank's ``TransferCapacity``.
@@ -541,7 +536,6 @@ class ArenaCapacity:
             except on a rank holding host components, which runs one task.
     """
 
-    tensor_store: int
     device_product_bytes: int
     transfer_bytes: int
     transfer_tickets: int
@@ -589,9 +583,6 @@ def request_tensor_arena_capacity(
     # resident request's concurrent artifact imports when those are more.
     slots = max(depth * max_calls, state_slots * int(concurrent_imports))
     unresolved_window = request_tensor_window(depth, state_slots)
-    tensor_store = _DEVICE_PRODUCTS_PER_CALL * (
-        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_calls
-    )
     # Relay arenas index one-based request slots directly, so they hold one
     # extra row.
     relay_bytes = (
@@ -600,11 +591,7 @@ def request_tensor_arena_capacity(
         * _REQUEST_RELAY_ROW_BYTES
     )
     return ArenaCapacity(
-        tensor_store=tensor_store,
-        device_product_bytes=(
-            device_product_capacity_bytes(tensor_store, 1, max_value_bytes=1)
-            + relay_bytes
-        ),
+        device_product_bytes=relay_bytes,
         transfer_bytes=max(1, state_slots * product_bytes_per_request),
         # Read tickets bound the reads in flight: a ticket returns when its
         # read retires, and a batch whose imports need more than are free
@@ -709,10 +696,6 @@ def model_arena_capacity(
         1,
     )
 
-    device_product_slots = (
-        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_calls
-    )
-    tensor_store = _DEVICE_PRODUCTS_PER_CALL * device_product_slots
     device_count = len(
         {
             str(worker_config.device),
@@ -721,14 +704,9 @@ def model_arena_capacity(
     )
     # Resident images and tensor products borrow scheduler-assigned storage
     # from BufferPool, whose complete grant ``build_worker_layout`` counts.
-    # TensorStore owns scalar backing and request relays separately, with
-    # relay arenas on each device.
-    device_product_bytes = device_product_capacity_bytes(
-        tensor_store,
-        device_count,
-        max_value_bytes=1,
-    )
-    device_product_bytes += (
+    # TensorStore owns only its request relays, with relay arenas on each
+    # device.
+    device_product_bytes = (
         (int(worker_config.max_request_pool_size) + 1)
         * (call_window(depth, max_calls) + _REQUEST_RELAY_RETIREMENT_LANES)
         * _REQUEST_RELAY_ROW_BYTES
@@ -736,7 +714,6 @@ def model_arena_capacity(
     )
 
     return ArenaCapacity(
-        tensor_store=tensor_store,
         device_product_bytes=device_product_bytes,
         transfer_bytes=max_transfer_bytes * transfer_tickets,
         transfer_tickets=transfer_tickets,

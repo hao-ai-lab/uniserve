@@ -23,7 +23,6 @@ import os
 import sys
 import threading
 import uuid
-from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cache
@@ -139,10 +138,6 @@ class _CudaSource:
             self.retirement.set_result(None)
 
 
-# Fabric-exported allocations one transport keeps mapped for its reads.
-_FABRIC_IMPORTS = 256
-
-
 class CudaVmmTransport(Transport):
     """Device publications a consumer imports by their shareable handle.
 
@@ -220,11 +215,11 @@ class CudaVmmTransport(Transport):
             name="uniserve-cuda-read",
             event_pool=event_pool,
         )
-        # Byte mappings of fabric-exported allocations this rank has read,
-        # least recently read first (`_fabric_import`).
-        self._fabric_imports: OrderedDict[
+        # Byte mappings of fabric-exported allocations this rank has read
+        # (`_fabric_import`), kept until the transport closes.
+        self._fabric_imports: dict[
             tuple[str, str, bytes, int], torch.Tensor
-        ] = OrderedDict()
+        ] = {}
         self._fabric_import_lock = threading.Lock()
 
         with _endpoint_lock:
@@ -245,9 +240,9 @@ class CudaVmmTransport(Transport):
         therefore kept for later reads of the same allocation. A fabric
         handle names one physical allocation for as long as any import holds
         it, so a kept mapping never aliases another allocation; it does keep
-        an allocation its producer has released alive until it is dropped.
-        At most `_FABRIC_IMPORTS` are kept, the least recently read dropped
-        first, and a read's views retain their mapping beyond that.
+        an allocation its producer has released alive until the transport
+        closes. Producers publish from their fixed arenas and pools, so the
+        set of mappings is bounded by those allocations.
         """
         import torch
         from uniserve_kernels.peer_storage import import_handle
@@ -261,7 +256,6 @@ class CudaVmmTransport(Transport):
         with self._fabric_import_lock:
             mapped = self._fabric_imports.get(key)
             if mapped is not None:
-                self._fabric_imports.move_to_end(key)
                 return mapped
         imported = import_handle(
             torch.empty(0, dtype=torch.uint8, device=device),
@@ -272,9 +266,6 @@ class CudaVmmTransport(Transport):
             # Another read thread may have imported the same allocation
             # meanwhile; the first mapping kept serves both.
             mapped = self._fabric_imports.setdefault(key, imported)
-            self._fabric_imports.move_to_end(key)
-            while len(self._fabric_imports) > _FABRIC_IMPORTS:
-                self._fabric_imports.popitem(last=False)
         return mapped
 
     def _descriptor_grants(self) -> DescriptorGrants:

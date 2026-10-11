@@ -37,7 +37,6 @@ def _startup(monkeypatch: pytest.MonkeyPatch, *, held: int, reserved: int):
     )
     # No product is resident yet, so every product byte is still pending.
     store = TensorStore(
-        capacity=1,
         buffer_pool=BufferPool(byte_capacity=16, devices=("cpu",)),
     )
     return config, store
