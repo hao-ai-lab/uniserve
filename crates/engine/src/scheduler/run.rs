@@ -280,10 +280,6 @@ impl Scheduler {
             Ordering::Relaxed,
         );
 
-        // Environment switches select scheduling behavior without changing the
-        // model capabilities.
-        let denoise_step_burst = denoise_step_burst_from_env();
-
         // Runtime state remains single-owner; executors receive immutable batch
         // inputs assembled from these queues and request records.
         Ok(Self {
@@ -314,7 +310,6 @@ impl Scheduler {
             running_media: HashMap::new(),
             retiring_requests: HashMap::new(),
             transfer_capacity,
-            denoise_step_burst,
             latent_dtype,
             engine_id: 1,
             next_product_generation: 1,

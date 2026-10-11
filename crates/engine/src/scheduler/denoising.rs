@@ -2,8 +2,8 @@
 //!
 //! Image generation inside a text request and the video pipeline keep their
 //! own lifecycles, but both advance a trajectory the same way: latent
-//! preparation opens it at step zero, denoising calls cover consecutive
-//! intervals of its fixed schedule, and the worker reports the steps it has
+//! preparation opens it at step zero, each denoising call covers the next
+//! step of its fixed schedule, and the worker reports the steps it has
 //! accepted. [`Denoising`] owns that progress for both.
 
 use uniserve_worker_ipc::{CallId, LatentParams, MediaCall, RequestKey, TensorRef};
@@ -94,19 +94,9 @@ impl Denoising {
             })
     }
 
-    /// Returns the next interval, as its start and step count, of at most
-    /// `burst` steps once `scheduled` steps are submitted, or `None` when
-    /// every step is.
-    ///
-    /// A `burst` of zero still yields one-step intervals.
-    pub(crate) fn next(&self, scheduled: u32, burst: u32) -> Option<(u32, u32)> {
-        let remaining = self.steps.saturating_sub(scheduled);
-        (remaining > 0).then(|| (scheduled, burst.max(1).min(remaining)))
-    }
-
-    /// Returns whether an interval ends the trajectory.
-    pub(crate) const fn ends(&self, start: u32, count: u32) -> bool {
-        start.saturating_add(count) == self.steps
+    /// Returns whether the denoising call covering `step` ends the trajectory.
+    pub(crate) const fn ends(&self, step: u32) -> bool {
+        step.saturating_add(1) == self.steps
     }
 
     /// Returns whether a worker's accepted step count completes an interval.
@@ -116,8 +106,8 @@ impl Denoising {
 
     /// Returns the parameters of one call on this trajectory.
     ///
-    /// Preparation and decoding calls cover no steps; a denoising call covers
-    /// `count` steps from `start`.
+    /// Preparation and decoding calls cover no steps (`count` zero); a
+    /// denoising call covers the one step at `start`.
     pub(crate) fn params(
         request_key: RequestKey,
         call_id: CallId,

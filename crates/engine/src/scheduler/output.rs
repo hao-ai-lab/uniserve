@@ -689,18 +689,17 @@ impl Scheduler {
                 self.finish(id, FinishReason::Completed);
             }
             CallKind::Media(MediaCall::Denoising) => {
-                // Publish every newly committed step exactly once, including steps
-                // coalesced into a single worker completion. `bounds.max_tokens`
-                // is the call's step count, so subtracting it from the reported
-                // total gives the steps completed before this call. Step
-                // numbers saturate at `u16::MAX` to fit the event fields.
+                // Publish the newly committed step exactly once. A denoising
+                // call covers one step, so the steps completed before it are
+                // one fewer than the reported total. Step numbers saturate at
+                // `u16::MAX` to fit the event fields.
                 let Some(st) = self.running.get(&id) else {
                     return;
                 };
                 let (image_id, h, w, steps, prev_sd) = {
                     let prev = record
                         .num_completed_steps
-                        .saturating_sub(call.bounds.max_tokens)
+                        .saturating_sub(1)
                         .min(u32::from(u16::MAX)) as u16;
                     (
                         st.image_id,

@@ -61,12 +61,12 @@ impl Scheduler {
         batches
     }
 
-    /// Charges actual token work, including each denoising step and CFG branch.
+    /// Charges actual token work, including each CFG branch of a denoising step.
     ///
-    /// A denoising call costs its latent units times its guidance branches
-    /// times its step count, which it declares as `bounds.max_tokens`; it
-    /// costs nothing once its request has left `running`. A verify call costs
-    /// its input tokens plus one, and every other call its `max_tokens` bound.
+    /// A denoising call costs its latent units times its guidance branches;
+    /// it costs nothing once its request has left `running`. A verify call
+    /// costs its input tokens plus one, and every other call its `max_tokens`
+    /// bound.
     fn computation_token_cost(&self, call: &Call) -> usize {
         match call.code {
             CallKind::Media(MediaCall::Denoising) => {
@@ -76,7 +76,6 @@ impl Scheduler {
                 usize::try_from(self.worker_image_latent_units_for(state).max(1))
                     .unwrap_or(usize::MAX)
                     .saturating_mul(usize::from(state.req.image.cfg_branch_count().max(1)))
-                    .saturating_mul(call.bounds.max_tokens.max(1) as usize)
             }
             CallKind::Forward(ForwardMode::Verify) => 1 + call.input_token_ids.len(),
             _ => call.bounds.max_tokens as usize,
@@ -1175,13 +1174,9 @@ impl Scheduler {
                 self.fatal = true;
                 return None;
             };
-            // A denoising call declares its planned step count as its token
-            // bound; the interval repeats it for the worker.
-            let step_count = if call.code == CallKind::Media(MediaCall::Denoising) {
-                call.bounds.max_tokens
-            } else {
-                0
-            };
+            // A denoising call covers one step; latent preparation and
+            // image decoding cover none.
+            let step_count = u32::from(call.code == CallKind::Media(MediaCall::Denoising));
             latent = Some(Denoising::params(
                 call.request_key,
                 call.call_id,
@@ -1552,14 +1547,13 @@ impl Scheduler {
                 })
             }
             Phase::DenoiseGen => {
-                // Each scheduled interval consumes only the remaining model steps.
-                // Accepted completion remains separately tracked on the request.
+                // Each call covers the next step of the schedule, and none
+                // is planned once every step is submitted. Accepted
+                // completion remains separately tracked on the request.
                 let st = self.running.get(&id)?;
-                let scheduled = self.num_scheduled_denoise_steps(id)?;
-                let (_, count) = st
-                    .denoising
-                    .next(scheduled, u32::from(self.denoise_step_burst))?;
-                let denoise_step_count = u16::try_from(count).ok()?;
+                if self.num_scheduled_denoise_steps(id)? >= st.denoising.steps() {
+                    return None;
+                }
                 let conditioning = self.kv_conditioning(id)?;
                 let latent = self
                     .pending_output(id, |call| call.latent_output.as_ref())
@@ -1570,7 +1564,6 @@ impl Scheduler {
                         &scheduler.generation_limits,
                         scheduler.latent_dtype,
                         request,
-                        denoise_step_count,
                         conditioning,
                         latent,
                     )

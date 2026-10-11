@@ -1035,7 +1035,7 @@ impl Scheduler {
 
         // A video request advances its ladder one step per call.
         let step = self.scheduled_steps(id, &state.denoising);
-        let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step, 1);
+        let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step);
         let units = state.graph.condition_units();
         let visual_round = media_call == MediaCall::LatentEncoding
             && state.scheduled_condition_units < units.len() as u32;
@@ -2378,16 +2378,13 @@ impl Scheduler {
     ///
     /// Mirrors the per-kind counts of `call_output_bound`, which charges a
     /// call once it is in flight, for the kinds `peek_next_call_variant`
-    /// predicts; a denoising call is budgeted at `denoise_step_burst` steps.
+    /// predicts.
     pub(super) fn next_output_bound(&self, id: RequestId) -> usize {
         match self.peek_next_call_variant(id) {
             Some(
                 CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode),
             ) => 4,
-            Some(CallKind::Media(MediaCall::Denoising)) => {
-                usize::from(self.denoise_step_burst).saturating_add(2)
-            }
-            Some(CallKind::Media(MediaCall::ImageDecoding)) => 3,
+            Some(CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding)) => 3,
             Some(_) | None => 2,
         }
     }

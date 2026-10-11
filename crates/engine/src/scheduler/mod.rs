@@ -74,7 +74,6 @@ pub(crate) use crate::executor::{
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-use std::env;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -115,8 +114,6 @@ use graph::{VideoGraph, product};
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
 use output::RequestOutput;
 
-/// Number of denoising steps planned for one scheduling burst by default.
-pub(crate) const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
 /// Upper bound on concurrently reserved transfer calls. Construction clamps
 /// the executor's `queue_depth * max_batch_calls` to between one and this
 /// value to form `Scheduler::transfer_capacity`.
@@ -144,9 +141,6 @@ const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
 /// results before ready decode work takes precedence over further prefill
 /// (`Scheduler::select_batch_kind`).
 const PREFILL_WINDOW_CREDITS: usize = 2;
-/// Environment variable overriding `DEFAULT_DENOISE_STEP_BURST`; a missing,
-/// unparsable, or zero value selects the default.
-const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
 
 /// Builds a validated image-completion event from a base64 PNG payload.
 ///
@@ -404,8 +398,6 @@ pub struct Scheduler {
     /// Maximum number of transfer calls holding a reservation at once
     /// (`Inflight::num_pending_transfers`).
     transfer_capacity: usize,
-    /// Maximum denoising steps one call covers.
-    denoise_step_burst: u16,
     /// IPC dtype of image latents, mapped from the model dtype by
     /// `worker_float_dtype`.
     latent_dtype: Option<DType>,
@@ -605,20 +597,10 @@ fn call_output_bound(code: CallKind, bounds: &uniserve_worker_ipc::Bounds) -> us
             .saturating_mul(2)
             .saturating_add(2),
         CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,
-        CallKind::Media(MediaCall::Denoising) => (bounds.max_tokens as usize).saturating_add(2),
         CallKind::Media(MediaCall::VideoDecoding) => 2,
-        CallKind::Media(MediaCall::ImageDecoding) => 3,
+        CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding) => 3,
         _ => 2,
     }
-}
-
-/// Reads the denoising burst size from the environment.
-fn denoise_step_burst_from_env() -> u16 {
-    env::var(DENOISE_STEP_BURST_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u16>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_DENOISE_STEP_BURST)
 }
 
 /// Returns the number of classifier-free-guidance branches.

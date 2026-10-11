@@ -879,12 +879,11 @@ pub(super) fn plan_diffusion_prepare(
     finish_plan(request, call, 0)
 }
 
-/// Plans an exact denoising interval against its input latent and conditioning tensors.
+/// Plans one denoising step against its input latent and conditioning tensors.
 pub(super) fn plan_diffusion_step(
     limits: &uniserve_core::GenerationLimits,
     latent_dtype: Option<DType>,
     request: &GenerationRequest,
-    step_count: u16,
     conditioning: BufferId,
     latent: TensorRef,
 ) -> Result<Call, PlanningError> {
@@ -892,7 +891,6 @@ pub(super) fn plan_diffusion_step(
         return Err(PlanningError::GenerationBranchDisabled);
     }
     let mut call = computation(request, CallKind::Media(MediaCall::Denoising));
-    call.bounds.max_tokens = u32::from(step_count.max(1));
     call.kv_input = Some(conditioning);
     call.latent_input = Some(latent);
     call.latent_output = Some(latent_output(

@@ -47,7 +47,7 @@ pub struct SchedulerConfig {
     pub max_batch: usize,
     /// Token budget of one generation scheduling pass. Each selected call is
     /// charged its token work, which for a denoising call covers its latent
-    /// units, guidance branches, and steps.
+    /// units and guidance branches.
     pub max_num_batched_tokens: usize,
     /// Maximum concurrently running requests, token and media together.
     pub max_num_seqs: usize,
