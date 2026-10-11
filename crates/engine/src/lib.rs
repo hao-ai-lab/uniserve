@@ -25,6 +25,7 @@ mod sim;
 /// Scheduler-owned allocation of worker storage; only its `OutOfStorage`
 /// error is public.
 pub mod storage;
+mod warmup;
 mod worker;
 
 pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank, WorkerRole};

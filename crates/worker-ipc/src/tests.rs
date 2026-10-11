@@ -1630,6 +1630,21 @@ fn worker_info_round_trips() {
                 },
             ],
         }],
+        image_warmups: vec![
+            ImageWarmup {
+                height: 512,
+                width: 768,
+                cfg_text_scale: 4.0,
+                cfg_img_scale: 1.0,
+            },
+            ImageWarmup {
+                height: 1024,
+                width: 1024,
+                cfg_text_scale: 4.0,
+                cfg_img_scale: 2.0,
+            },
+        ],
+        canvas_step_rows: 6,
         ..Default::default()
     };
     // Python startup metadata crosses the serde mapping boundary before

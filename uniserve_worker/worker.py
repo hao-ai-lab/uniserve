@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
+from dataclasses import replace
 from functools import partial
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Self
@@ -66,7 +67,7 @@ from uniserve_worker.bootstrap.model_loader import (
     prepare_worker_model,
 )
 from uniserve_worker.bootstrap.report import build_worker_layout
-from uniserve_worker.bootstrap.warmup import warmup_requests
+from uniserve_worker.bootstrap.warmup import canvas_step_rows, image_warmups
 from uniserve_worker.config.execution import (
     WorkerConfig,
     graph_storage_budget_bytes,
@@ -766,6 +767,19 @@ class Worker:
             if self.media_mux is not None:
                 startup.callback(self.media_mux.close)
 
+            # The shapes the flow and canvas runtimes were prepared for, which
+            # the engine warms with real requests once the workers report.
+            self._layout = replace(
+                layout,
+                info=replace(
+                    info,
+                    image_warmups=image_warmups(runner, info),
+                    canvas_step_rows=canvas_step_rows(
+                        runner, self.canvas_slots is not None
+                    ),
+                ),
+            )
+
         except BaseException as error:
             # Releasing partially started owners could wait on device work
             # or peers and replace this error with a stall, so keep them
@@ -815,11 +829,12 @@ class Worker:
     def warmup(self) -> None:
         """Prepare numerical execution once without serving requests.
 
-        A numerical worker binds its graph storage budgets, warms and
-        captures its runners, and drives synthetic requests through
-        `warmup_requests`; a codec-slot rank checks that its media codecs
+        A numerical worker binds its graph storage budgets and warms and
+        captures its runners; a codec-slot rank checks that its media codecs
         load. Startup is then sealed and resident storage is checked
-        against the device grants. Successful warmup is retained, so a later
+        against the device grants. The engine then warms the serving path
+        with real requests of the shapes `WorkerInfo.image_warmups` and
+        `canvas_step_rows` state. Successful warmup is retained, so a later
         call (including the one in `run`) returns immediately.
 
         Errors from warmup, capture and the storage checks propagate. The
@@ -827,8 +842,8 @@ class Worker:
         binding or service failure.
 
         Raises:
-            RuntimeError: The worker is closed, a batch was already
-                submitted, or startup left a request resident.
+            RuntimeError: The worker is closed or a batch was already
+                submitted.
         """
         self._require_open()
         if self._warmed_up:
@@ -881,25 +896,11 @@ class Worker:
             self.runner.capture(
                 tokenizer=self.tokenizer, latents=self.latent_pool
             )
-            warmup_requests(self)
         # A host rank is ready once its codecs load, so a missing codec
         # surfaces here and not under a request.
         if self.codec_slot:
             require_media_codecs(VIDEO_CODEC, AUDIO_CODEC)
         self.runner.complete_startup()
-
-        # Startup scenarios must release their requests before service
-        # admission.
-        if self.requests.request_ids():
-            raise RuntimeError("startup completed with resident requests")
-
-        # Warmup batches advance the executor's batch id and collective
-        # sequence. The executor rejects a non-increasing batch id at
-        # admission and, on a multi-rank worker, a non-increasing collective
-        # sequence at launch, so reset both to accept the engine's first
-        # batch.
-        self.executor._last_batch_id = -1
-        self.executor._last_collective_seq = -1
         check_startup_storage(
             self.worker_config,
             self._layout.arena.device_product_bytes,

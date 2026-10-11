@@ -228,6 +228,30 @@ class VideoDenoiserInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageWarmup:
+    """One image shape this rank's flow runtime is prepared for.
+
+    Mirrors the Rust ``ImageWarmup``. The engine runs one request of
+    ``height`` by ``width`` pixels at these guidance scales through its
+    scheduler before it serves, so each captured guidance-branch count has
+    run through the serving path.
+    """
+
+    height: int
+    width: int
+    cfg_text_scale: float
+    cfg_img_scale: float
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "height": self.height,
+            "width": self.width,
+            "cfg_text_scale": self.cfg_text_scale,
+            "cfg_img_scale": self.cfg_img_scale,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerInfo:
     """Describes a worker’s capabilities, topology, and resource bounds.
 
@@ -245,6 +269,11 @@ class WorkerInfo:
         transfer_tickets: Transfer entries this rank's transport holds in
             flight at once; the engine keeps no more transfer calls reserved
             than the narrowest rank holds.
+        image_warmups: Image shapes this rank's flow runtime is prepared for,
+            each of which the engine warms with a real request.
+        canvas_step_rows: Canvas rows one sampler chunk of this rank's token
+            denoiser covers, every row count of which the engine warms; zero
+            when it generates no canvases.
     """
 
     endpoint: WorkerEndpoint
@@ -270,6 +299,8 @@ class WorkerInfo:
     media_components: dict[MediaCall, str] = field(default_factory=dict)
     # What the deployment's video denoiser serves; ``None`` without one.
     video_denoiser: VideoDenoiserInfo | None = None
+    image_warmups: tuple[ImageWarmup, ...] = ()
+    canvas_step_rows: int = 0
 
     @property
     def latent_capacity_units(self) -> int:
@@ -311,6 +342,10 @@ class WorkerInfo:
             "max_unresolved_calls": self.max_unresolved_calls,
             "host_lane_capacity": self.host_lane_capacity,
             "transfer_tickets": self.transfer_tickets,
+            "image_warmups": [
+                shape.to_mapping() for shape in self.image_warmups
+            ],
+            "canvas_step_rows": self.canvas_step_rows,
         }
 
 

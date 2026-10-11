@@ -751,7 +751,9 @@ impl EngineCore {
                 expert_parallel: None,
                 ..config.clone()
             };
-            cores.push(Self::assemble(replica_config, Box::new(executor), waker)?);
+            let core = Self::assemble(replica_config.clone(), Box::new(executor), waker)?;
+            crate::warmup::warm(&core, &replica_config)?;
+            cores.push(core);
         }
         Ok(cores)
     }

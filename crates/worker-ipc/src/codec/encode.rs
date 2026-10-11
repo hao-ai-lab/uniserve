@@ -1375,6 +1375,24 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             },
         )
     });
+    let image_warmups = {
+        let values = v
+            .image_warmups
+            .iter()
+            .map(|shape| {
+                fbs::ImageWarmup::create(
+                    b,
+                    &fbs::ImageWarmupArgs {
+                        height: shape.height,
+                        width: shape.width,
+                        cfg_text_scale: shape.cfg_text_scale,
+                        cfg_img_scale: shape.cfg_img_scale,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        Some(b.create_vector(&values))
+    };
     fbs::WorkerInfo::create(
         b,
         &fbs::WorkerInfoArgs {
@@ -1396,6 +1414,8 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             host_lane_capacity: v.host_lane_capacity,
             transfer_tickets: v.transfer_tickets,
             video_denoiser,
+            image_warmups,
+            canvas_step_rows: v.canvas_step_rows,
         },
     )
 }

@@ -419,6 +419,15 @@ impl ExecutorInfo {
         let flow = routed(CallKind::Media(MediaCall::Denoising));
         merged.latent_page_units = flow.map_or(0, |info| info.latent_page_units);
         merged.latent_pages = flow.map_or(0, |info| info.latent_pages);
+        // The flow runtime's captured shapes are the denoising pool's, and a
+        // canvas chunk is the widest any worker's token denoiser steps.
+        merged.image_warmups = flow.map_or_else(Vec::new, |info| info.image_warmups.clone());
+        merged.canvas_step_rows = self
+            .workers
+            .iter()
+            .map(|(_, info)| info.canvas_step_rows)
+            .max()
+            .unwrap_or(0);
         merged.buffer_pool_bytes = self
             .workers
             .iter()

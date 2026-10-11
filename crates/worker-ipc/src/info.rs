@@ -261,6 +261,42 @@ impl WorkerEndpoint {
     }
 }
 
+/// An image shape a worker's flow runtime is prepared for.
+///
+/// The engine runs one image request of `height` by `width` pixels at these
+/// guidance scales before it serves, so every guidance-branch count the
+/// worker captured has run through the serving path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageWarmup {
+    /// Output height in pixels.
+    pub height: u32,
+    /// Output width in pixels.
+    pub width: u32,
+    /// Classifier-free guidance scale of the text condition.
+    pub cfg_text_scale: f32,
+    /// Classifier-free guidance scale of the image condition.
+    pub cfg_img_scale: f32,
+}
+
+impl ImageWarmup {
+    /// Checks that the shape names a nonempty raster at positive finite
+    /// guidance scales.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.height > 0 && self.width > 0,
+            "an image warmup shape is empty"
+        );
+        ensure_valid!(
+            self.cfg_text_scale.is_finite()
+                && self.cfg_text_scale > 0.0
+                && self.cfg_img_scale.is_finite()
+                && self.cfg_img_scale > 0.0,
+            "an image warmup guidance scale is not positive"
+        );
+        Ok(())
+    }
+}
+
 /// A canvas a deployment serves, with the request fields that select it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServedCanvas {
@@ -443,6 +479,15 @@ pub struct WorkerInfo {
     /// What the deployment's video denoiser serves, when the model has one.
     #[serde(default)]
     pub video_denoiser: Option<VideoDenoiserInfo>,
+    /// Image shapes this rank's flow runtime is prepared for, each of which
+    /// the engine warms with a batch of real requests before serving.
+    #[serde(default)]
+    pub image_warmups: Vec<ImageWarmup>,
+    /// Canvas rows one sampler chunk of this rank's token denoiser covers,
+    /// which the engine warms every row count of; zero when it generates no
+    /// canvases.
+    #[serde(default)]
+    pub canvas_step_rows: u32,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
     /// Whether this rank's device exports a fabric allocation handle.
@@ -561,6 +606,9 @@ impl WorkerInfo {
         if let Some(video) = &self.video_denoiser {
             video.validate()?;
         }
+        for warmup in &self.image_warmups {
+            warmup.validate()?;
+        }
         ensure_valid!(
             self.max_batch_calls > 0
                 && self.max_batch_tokens > 0
@@ -602,6 +650,8 @@ impl Default for WorkerInfo {
         Self {
             media_components: Default::default(),
             video_denoiser: None,
+            image_warmups: Vec::new(),
+            canvas_step_rows: 0,
             fabric_handles: false,
             endpoint: WorkerEndpoint {
                 node: "simulation".into(),

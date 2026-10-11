@@ -1209,6 +1209,21 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             components
         },
         video_denoiser: info.video_denoiser().map(video_denoiser_from_table),
+        image_warmups: info
+            .image_warmups()
+            .map(|shapes| {
+                shapes
+                    .iter()
+                    .map(|shape| crate::ImageWarmup {
+                        height: shape.height(),
+                        width: shape.width(),
+                        cfg_text_scale: shape.cfg_text_scale(),
+                        cfg_img_scale: shape.cfg_img_scale(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        canvas_step_rows: info.canvas_step_rows(),
     };
     info.validate()?;
     Ok(info)
