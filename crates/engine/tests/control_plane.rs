@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
-use uniserve_worker_ipc::{Call, CallKind, ForwardMode, MediaCall};
+use uniserve_worker_ipc::{Call, CallKind, ForwardMode, MediaCall, TransferMode};
 
 use uniserve_core::{EngineCoreOutput, FinishReason};
 use uniserve_core::{
@@ -597,14 +597,13 @@ fn scheduler_clamps_max_batch_to_worker_info() {
     assert_eq!(sched.config().max_batch, 3);
 }
 
-/// Serves eight concurrent eight-token generations on a simulator whose
-/// workers report `prefill` and `decode` call bounds (zero for none), and
-/// returns the call count of every prefill batch and every decode batch the
-/// scheduler submitted, after checking that every request finished.
-fn forward_batch_calls(prefill: u32, decode: u32) -> (Vec<usize>, Vec<usize>) {
+/// Prefill and decode batches hold at most the calls the workers report one
+/// batch may hold: eight concurrent prompts prefill three at a time and still
+/// all finish.
+#[test]
+fn forward_batches_hold_at_most_the_workers_batch_calls() {
     let mut sim = SimEngine::new();
-    sim.mut_info_for_test().max_prefill_calls = prefill;
-    sim.mut_info_for_test().max_decode_calls = decode;
+    sim.mut_info_for_test().max_batch_calls = 3;
     let mut executor = SimExecutor::new(sim);
     let dispatched = executor.observe();
     let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
@@ -656,41 +655,14 @@ fn forward_batch_calls(prefill: u32, decode: u32) -> (Vec<usize>, Vec<usize>) {
             _ => {}
         }
     }
-    (prefill_calls, decode_calls)
-}
-
-/// Prefill batches hold at most the calls the workers' captured prefill
-/// graphs hold, while decode batches keep the worker's call bound: eight
-/// concurrent prompts prefill three at a time and still all finish, and their
-/// decode steps share batches wider than three.
-#[test]
-fn prefill_batches_hold_at_most_the_calls_prefill_graphs_hold() {
-    let (prefill_calls, decode_calls) = forward_batch_calls(3, 0);
     assert!(
         prefill_calls.iter().all(|&calls| calls <= 3),
         "prefill batches {prefill_calls:?}"
     );
     assert_eq!(prefill_calls.iter().sum::<usize>(), 8);
     assert!(
-        decode_calls.iter().any(|&calls| calls > 3),
-        "decode batches {decode_calls:?}"
-    );
-}
-
-/// Decode batches hold at most the calls the workers' captured decode graphs
-/// hold, while prefill batches keep the worker's call bound: eight concurrent
-/// generations decode three at a time and still all finish, and their
-/// prompts share batches wider than three.
-#[test]
-fn decode_batches_hold_at_most_the_calls_decode_graphs_hold() {
-    let (prefill_calls, decode_calls) = forward_batch_calls(0, 3);
-    assert!(
         !decode_calls.is_empty() && decode_calls.iter().all(|&calls| calls <= 3),
         "decode batches {decode_calls:?}"
-    );
-    assert!(
-        prefill_calls.iter().any(|&calls| calls > 3),
-        "prefill batches {prefill_calls:?}"
     );
 }
 
@@ -2051,6 +2023,94 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
     assert_eq!(
         signatures[0], signatures[1],
         "device continuation must preserve the depth-one direct-trigger oracle"
+    );
+}
+
+/// Serves four concurrent requests that open their image branches on the
+/// same step, on a simulator whose worker reports `transfer_tickets`, and
+/// returns how many KV publication calls each submitted batch carried, after
+/// checking that every request finished.
+fn kv_publish_batch_calls(transfer_tickets: u32) -> Vec<usize> {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1_000_000);
+    sim.mut_info_for_test().transfer_tickets = transfer_tickets;
+    let mut executor = SimExecutor::new(sim);
+    let dispatched = executor.observe();
+    let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let mut receivers = (1..=4u64)
+        .map(|id| {
+            let request = with_trigger(
+                generation_request(
+                    RequestId(id),
+                    text_input(vec![1, 2, 3]),
+                    SamplingParams {
+                        logit_bias: vec![(2222, 1000.0)],
+                        ..Default::default()
+                    },
+                    ImageParams {
+                        steps: 2,
+                        ..Default::default()
+                    },
+                    GenerationConstraint::Default,
+                    12,
+                ),
+                ImageTrigger::Token { token_id: 2222 },
+            );
+            handle.submit(request).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut finished = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while finished < receivers.len() && Instant::now() < deadline {
+        for receiver in &mut receivers {
+            while let Ok(event) = receiver.try_recv() {
+                if let EngineCoreOutput::Finished { reason, .. } = event {
+                    assert_ne!(reason, FinishReason::Error);
+                    finished += 1;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.shutdown();
+    let _ = jh.join();
+    assert_eq!(finished, receivers.len(), "every request finishes");
+
+    dispatched
+        .try_iter()
+        .filter_map(|event| match event {
+            BatchEvent::Submitted(batch) => Some(
+                batch
+                    .requests
+                    .iter()
+                    .filter(|(call, _)| call.kind == CallKind::Transfer(TransferMode::KvPublish))
+                    .count(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The scheduler keeps no more transfer calls reserved than the transfer
+/// entries the workers report: with one entry, concurrent requests publish
+/// their KV one call at a time and still all finish, while a wider report
+/// lets the same requests share a batch.
+#[test]
+fn transfer_calls_in_flight_stay_within_the_workers_tickets() {
+    let narrow = kv_publish_batch_calls(1);
+    assert!(
+        narrow.iter().sum::<usize>() >= 4 && narrow.iter().all(|&calls| calls <= 1),
+        "publication calls per batch {narrow:?}"
+    );
+
+    let wide = kv_publish_batch_calls(1024);
+    assert!(
+        wide.iter().any(|&calls| calls > 1),
+        "publication calls per batch {wide:?}"
     );
 }
 

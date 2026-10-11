@@ -207,15 +207,6 @@ class WorkerInfo:
     Attributes:
         max_batch_calls: Maximum calls in one batch.
         max_batch_tokens: Maximum text tokens represented in one batch.
-        max_prefill_calls: Maximum calls in one prefill batch, the rows the
-            worker's captured prefill graphs hold; a prefill batch no graph
-            holds fails. Zero leaves prefill batches bounded by
-            ``max_batch_calls`` alone, as when they run eagerly.
-        max_decode_calls: Maximum calls in one decode batch, the rows the
-            worker's largest captured decode graph holds, fewer when the KV
-            pool cannot hold a page of every cache group for more rows; a
-            decode batch no graph holds fails. Zero leaves decode batches
-            bounded by ``max_batch_calls`` alone, as when they run eagerly.
         request_slots: Number of resident request slots.
         latent_page_units: Model-defined units stored in one latent page.
         latent_pages: Physical latent pages, including the reserved sentinel
@@ -223,6 +214,9 @@ class WorkerInfo:
         buffer_pool_bytes: Persistent buffer-pool capacity in bytes.
         max_unresolved_calls: Maximum unresolved calls per request.
         host_lane_capacity: Concurrent host-lane tasks this rank admits.
+        transfer_tickets: Transfer entries this rank's transport holds in
+            flight at once; the engine keeps no more transfer calls reserved
+            than the narrowest rank holds.
     """
 
     endpoint: WorkerEndpoint
@@ -236,10 +230,9 @@ class WorkerInfo:
     buffer_pool_bytes: int
     max_unresolved_calls: int
     host_lane_capacity: int
+    transfer_tickets: int
     encoder_cache_entries: int = 0
     encoder_entry_bytes: int = 0
-    max_prefill_calls: int = 0
-    max_decode_calls: int = 0
     components: tuple[ComponentInfo, ...] = ()
     # Whether this rank's device exports a handle another host can import.
     # A descriptor handle reaches only this host, so the engine refuses a
@@ -278,8 +271,6 @@ class WorkerInfo:
             "supported_calls": [value.value for value in self.supported_calls],
             "max_batch_calls": self.max_batch_calls,
             "max_batch_tokens": self.max_batch_tokens,
-            "max_prefill_calls": self.max_prefill_calls,
-            "max_decode_calls": self.max_decode_calls,
             "request_slots": self.request_slots,
             "kv_cache": None
             if self.kv_cache is None
@@ -291,6 +282,7 @@ class WorkerInfo:
             "encoder_entry_bytes": self.encoder_entry_bytes,
             "max_unresolved_calls": self.max_unresolved_calls,
             "host_lane_capacity": self.host_lane_capacity,
+            "transfer_tickets": self.transfer_tickets,
         }
 
 

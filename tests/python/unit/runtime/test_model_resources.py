@@ -230,6 +230,20 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
     )
 
 
+def test_worker_reports_a_transfer_entry_per_queued_call() -> None:
+    depth = 3
+    layout = build_worker_layout(
+        TEST_MODEL,
+        TEST_WORKER_CONFIG,
+        image_processor=image_processor(),
+        queue_depth=depth,
+    )
+
+    queued_calls = depth * TEST_WORKER_CONFIG.max_batch_calls
+    assert layout.info.transfer_tickets == queued_calls
+    assert layout.info.host_lane_capacity == queued_calls
+
+
 @pytest.mark.parametrize(
     "worker_config",
     [

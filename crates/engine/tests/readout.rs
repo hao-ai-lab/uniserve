@@ -575,12 +575,12 @@ fn a_context_prefill_writes_every_image_it_reaches() {
     assert_eq!(forward.seq_lens, vec![4, 9, 17, 24, 32]);
 }
 
-/// The worker's prefill graph limit bounds numerical segments, even when one
-/// request's context has more segments than the graph can hold.
+/// The rows a worker stages per call bound numerical segments, even when one
+/// request's context has more segments than a call can hold.
 #[test]
-fn image_contexts_respect_the_workers_prefill_row_capacity() {
+fn image_contexts_respect_the_workers_staged_row_capacity() {
     let mut sim = readout_worker();
-    sim.mut_info_for_test().max_prefill_calls = 3;
+    sim.mut_info_for_test().max_batch_calls = 3;
     let running = Running::start(sim, SchedulerConfig::default());
     let requests: Vec<_> = (0..8u64)
         .map(|index| {

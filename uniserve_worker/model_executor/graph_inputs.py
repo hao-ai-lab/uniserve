@@ -3,13 +3,13 @@
 Text calls replay graphs captured at configured bucket shapes. Selection
 (``text_shape``) picks a bucket for a staged batch, ``pad_text`` widens the
 batch's views of the runner's fixed staging to that bucket and makes the
-padding inert. Decode buckets capture the call together with
-graph-capturable greedy decoding (``capture_batch``/``replay_batch``);
-prefill buckets capture the backbone's hidden states alone
-(``capture_hidden``/``replay_hidden``), and the runner selects each row's
-logits or hidden rows from them after the replay. The ``select_*`` helpers
-turn configured sizes into the capture shapes ``ModelExecutor`` prepares at
-startup.
+padding inert; a batch no bucket holds runs eagerly. Decode buckets capture
+the call together with graph-capturable greedy decoding
+(``capture_batch``/``replay_batch``); prefill buckets capture the backbone's
+hidden states alone (``capture_hidden``/``replay_hidden``), and the runner
+selects each row's logits or hidden rows from them after the replay. The
+``select_*`` helpers turn configured sizes into the capture shapes
+``ModelExecutor`` prepares at startup.
 """
 
 from __future__ import annotations
@@ -171,10 +171,10 @@ def select_prefill_captures(
     pool is sized. A bucket serves batches of at least its ``live_rows``
     rows and more tokens than the next smaller token bucket of its row
     count; a bucket for which even the smallest such batch holds more units
-    than the pool is left out, since the engine never forms a batch it
-    serves. A row count's first token bucket serves batches of one token
-    per row, whose pages fit whenever ``live_rows`` rows fit, so the row
-    buckets, and the prefill row bound they report, are unchanged.
+    than the pool is left out, since no batch the pool holds selects it.
+    A row count's first token bucket serves batches of one token per row,
+    whose pages fit whenever ``live_rows`` rows fit, so the row buckets are
+    unchanged.
     """
     buckets: list[PrefillShape] = []
     sizes = {int(value) for value in token_sizes if value <= max_tokens}
@@ -277,18 +277,6 @@ def prefill_captures(
         outputs=config.prefill_outputs,
         pool=pool,
     )
-
-
-def prefill_rows(shapes, *, max_rows):
-    """Return the most rows one prefill call may hold with ``shapes``.
-
-    A bucket serves batches with fewer rows than it pads to, so the bound is
-    one less than the widest bucket, at most ``max_rows``. None without
-    shapes, when prefill calls run eagerly and only ``max_rows`` applies.
-    """
-    if not shapes:
-        return None
-    return min(max_rows, max(shape.row_bucket for shape in shapes) - 1)
 
 
 def bind_attention(static, live):

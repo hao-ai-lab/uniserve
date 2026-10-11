@@ -1185,8 +1185,6 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             .unwrap_or_default(),
         max_batch_calls: info.max_batch_calls(),
         max_batch_tokens: info.max_batch_tokens(),
-        max_prefill_calls: info.max_prefill_calls(),
-        max_decode_calls: info.max_decode_calls(),
         request_slots: info.request_slots(),
         kv_cache: info.kv_cache().map(kv_cache_from_table).transpose()?,
         latent_page_units: info.latent_page_units(),
@@ -1196,6 +1194,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
         encoder_entry_bytes: info.encoder_entry_bytes(),
         max_unresolved_calls: info.max_unresolved_calls(),
         host_lane_capacity: info.host_lane_capacity(),
+        transfer_tickets: info.transfer_tickets(),
         media_components: {
             let mut components = std::collections::BTreeMap::new();
             if let Some(bindings) = info.media_components() {

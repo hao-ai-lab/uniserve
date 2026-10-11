@@ -1412,27 +1412,13 @@ class ModelExecutor:
                     if lane is None
                     else min(max_rows, lane.max_batch_calls or max_rows)
                 )
-                # Graph pools exist only on CUDA, where every decode call
-                # replays a captured bucket; a lane with none can serve no
-                # decode call there.
+                # Graph pools exist only on CUDA; a decode or prefill call
+                # no captured bucket holds runs eagerly.
                 decode = (
                     tuple(value for value in decode_sizes if value <= rows)
                     if ForwardMode.DECODE in kinds and target.type == "cuda"
                     else ()
                 )
-                if (
-                    ForwardMode.DECODE in kinds
-                    and target.type == "cuda"
-                    and config.graph_policy != "off"
-                    and not decode
-                ):
-                    raise ValueError(
-                        f"no configured decode graph size fits {rows} rows "
-                        f"and a KV pool of {kv_cache.num_units} units, "
-                        f"whose rows hold {kv_cache.row_units} units each"
-                    )
-                # Graph pools exist only on CUDA, where every prefill call
-                # replays a captured bucket.
                 prefill = (
                     prefill_captures(
                         config,
