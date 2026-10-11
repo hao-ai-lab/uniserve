@@ -35,7 +35,7 @@ impl EngineClient {
         }
     }
 
-    /// Cancels one request at the consumer's acknowledged output prefix.
+    /// Cancels one request.
     ///
     /// See `EngineClient::cancel` for how an unsubmitted or unknown request is
     /// handled.

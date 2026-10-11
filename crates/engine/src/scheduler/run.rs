@@ -294,7 +294,6 @@ impl Scheduler {
                 reserved_encoder_entries: 0,
                 request_pool: RequestPool::new(info.request_slots as usize),
                 latent_pool: LatentPool::new(info.latent_pages, info.latent_page_units),
-                reserved_units: 0,
                 buffer_pool: BufferPool::new(info.buffer_pool_bytes),
                 media_storage,
                 encoder_buffers: HashMap::new(),

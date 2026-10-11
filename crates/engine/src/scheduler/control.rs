@@ -4,10 +4,10 @@
 //! here. Cancelling a queued request finishes it at once. A running request
 //! records a terminal intent and closes only after every submitted call has
 //! resolved: a media request with nothing in flight finishes immediately, and
-//! `reap_cancellations` finishes the rest once their calls drain. The
-//! acknowledgement commands keep the scheduler's view of the frontend decoder
-//! (`RequestOutput::tokens_acked` and `decoder_boundaries`) in step, and
-//! `abort_all_requests` ends every request when the control loop stops.
+//! `reap_cancellations` finishes the rest once their calls drain.
+//! Acknowledgements resolve the stop-string decisions a request awaits
+//! (`RequestOutput::decoder_boundaries`), and `abort_all_requests` ends every
+//! request when the control loop stops.
 
 use super::*;
 
@@ -108,19 +108,13 @@ impl Scheduler {
                     }
                 }
             }
-            Command::Cancel {
-                request_id,
-                output_token_count,
-            } => self.mark_cancelled(request_id, false, output_token_count),
+            Command::Cancel(request_id) => self.mark_cancelled(request_id, false),
             Command::Acknowledge {
                 request_id,
                 output_token_count,
             } => self.acknowledge_output(request_id, output_token_count),
-            Command::StopAt {
-                request_id,
-                output_token_count,
-            } => self.mark_stopped(request_id, output_token_count),
-            Command::Abort(id) => self.mark_cancelled(id, true, None),
+            Command::Stop(request_id) => self.mark_stopped(request_id),
+            Command::Abort(id) => self.mark_cancelled(id, true),
             Command::Shutdown => return true,
         }
         false
@@ -160,16 +154,10 @@ impl Scheduler {
     /// A queued request finishes here with `Aborted` or `Cancelled`. A running
     /// media request records the reason, keeping an earlier terminal intent,
     /// and finishes here only when none of its calls are in flight. A running
-    /// token request records the reason as its terminal intent and is finished
-    /// by `reap_cancellations` once its calls drain; an `output_token_count`
-    /// beyond the tokens already sent schedules an error finish instead.
-    /// Unknown requests are ignored.
-    pub(super) fn mark_cancelled(
-        &mut self,
-        id: RequestId,
-        abort: bool,
-        output_token_count: Option<usize>,
-    ) {
+    /// token request drops its pending decoder decisions, records the reason
+    /// as its terminal intent and is finished by `reap_cancellations` once its
+    /// calls drain. Unknown requests are ignored.
+    pub(super) fn mark_cancelled(&mut self, id: RequestId, abort: bool) {
         if let Some(submission) = self.remove_waiting_media(id) {
             let reason = if abort {
                 FinishReason::Aborted
@@ -205,13 +193,6 @@ impl Scheduler {
             return;
         }
         if let Some(st) = self.running.get_mut(&id) {
-            if let Some(output_token_count) = output_token_count {
-                if output_token_count > st.output.tokens_sent {
-                    self.finish_after_inflight(id, FinishReason::Error, None);
-                    return;
-                }
-                st.output.tokens_acked = output_token_count;
-            }
             st.output.decoder_boundaries.clear();
             st.terminal_intent = if abort {
                 TerminalIntent::Finish(FinishReason::Aborted)
@@ -236,60 +217,38 @@ impl Scheduler {
         }
     }
 
-    /// Releases output capacity for prefixes accepted by the frontend decoder.
+    /// Resolves the decoder decisions a prefix accepted by the frontend
+    /// decoder covers.
     ///
-    /// Acknowledging the current count is a no-op. A count below the current
-    /// acknowledgement or above the tokens already sent finishes the request
-    /// with an error once its in-flight calls drain. Otherwise every decoder
-    /// boundary the new prefix covers is resolved, which may apply a finish
-    /// deferred on those decisions. Requests that are not running are ignored.
+    /// Every decoder boundary within the first `output_token_count` public
+    /// tokens is resolved, which releases scheduling held on those decisions
+    /// and may apply a finish deferred on them. Requests that are not running
+    /// are ignored.
     pub(super) fn acknowledge_output(&mut self, id: RequestId, output_token_count: usize) {
-        let Some(current) = self.running.get(&id).map(|state| state.output.tokens_acked) else {
+        let Some(state) = self.running.get_mut(&id) else {
             return;
         };
-        if current == output_token_count {
-            return;
-        }
-        if output_token_count < current {
-            self.finish_after_inflight(id, FinishReason::Error, None);
-            return;
-        }
-
-        if let Some(state) = self.running.get_mut(&id) {
-            if output_token_count > state.output.tokens_sent {
-                self.finish_after_inflight(id, FinishReason::Error, None);
-                return;
-            }
-            state.output.tokens_acked = output_token_count;
-            while state
-                .output
-                .decoder_boundaries
-                .front()
-                .is_some_and(|count| *count <= output_token_count)
-            {
-                state.output.decoder_boundaries.pop_front();
-            }
+        while state
+            .output
+            .decoder_boundaries
+            .front()
+            .is_some_and(|count| *count <= output_token_count)
+        {
+            state.output.decoder_boundaries.pop_front();
         }
         self.finish_pending_if_idle(id);
     }
 
-    /// Stops a running token request at the prefix where the frontend decoder
-    /// matched a stop string.
+    /// Stops a running token request whose frontend decoder matched a stop
+    /// string.
     ///
-    /// Records that prefix as acknowledged, drops pending decoder decisions,
-    /// and sets a `Stop` terminal intent that `reap_cancellations` applies once
-    /// the request's calls drain. A count above the tokens already sent
-    /// instead finishes the request with an error once its in-flight calls
-    /// drain. Requests that are not running are ignored.
-    pub(super) fn mark_stopped(&mut self, id: RequestId, output_token_count: usize) {
+    /// Drops pending decoder decisions and sets a `Stop` terminal intent that
+    /// `reap_cancellations` applies once the request's calls drain. Requests
+    /// that are not running are ignored.
+    pub(super) fn mark_stopped(&mut self, id: RequestId) {
         let Some(state) = self.running.get_mut(&id) else {
             return;
         };
-        if output_token_count > state.output.tokens_sent {
-            self.finish_after_inflight(id, FinishReason::Error, None);
-            return;
-        }
-        state.output.tokens_acked = output_token_count;
         state.output.decoder_boundaries.clear();
         state.terminal_intent = TerminalIntent::Finish(FinishReason::Stop);
     }

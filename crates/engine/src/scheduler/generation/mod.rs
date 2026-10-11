@@ -1600,7 +1600,6 @@ pub(crate) struct RequestState {
     pub(super) generated_token_ids: Vec<u32>,
     /// Tokens since the last model round boundary, used by suffix-trigger matching.
     pub(super) round_token_ids: Vec<u32>,
-    pub(super) text_tokens_since_image: usize,
     /// Host image bytes retained only while artifact-based feedback needs them.
     pub(super) feedback_image_b64: Option<String>,
     /// False after a completed computation creates state unavailable from the input.

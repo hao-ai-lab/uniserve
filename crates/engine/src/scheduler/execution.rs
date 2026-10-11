@@ -2677,7 +2677,6 @@ impl Scheduler {
                             self.invariant_broken("a submitted media write keeps its input range");
                             return;
                         };
-                        state.encoded_video_units += range.max_units;
                         state.encoded_ready.insert(range.cursor, range.max_units);
                         if let Some((_, product)) = state.decoded_units.remove(&range.cursor) {
                             consumed_products.push(product);

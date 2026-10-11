@@ -170,7 +170,6 @@ impl Scheduler {
             prefix_published: Vec::new(),
             generated_token_ids: Vec::new(),
             round_token_ids: Vec::new(),
-            text_tokens_since_image: 0,
             feedback_image_b64: None,
             replayable: true,
             encoder_cache_pins: Vec::new(),
@@ -682,7 +681,6 @@ impl Scheduler {
                 denoising: Denoising::new(steps),
                 scheduled_decode_units: 0,
                 scheduled_encode_units: 0,
-                encoded_video_units: 0,
                 audio_decoding_scheduled: false,
                 audio_encoding_scheduled: false,
                 audio_encoded: false,
@@ -943,7 +941,6 @@ impl Scheduler {
                     // with an error if a table covers fewer than `tokens`
                     // tokens.
                     self.ensure_request_capacity(id, 0, tokens);
-                    self.storage.reserved_units += need;
                     continue;
                 }
             } else {

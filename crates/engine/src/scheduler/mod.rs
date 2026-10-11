@@ -303,7 +303,6 @@ struct MediaFlowState {
     denoising: Denoising,
     scheduled_decode_units: u32,
     scheduled_encode_units: u32,
-    encoded_video_units: u32,
     audio_decoding_scheduled: bool,
     audio_encoding_scheduled: bool,
     audio_encoded: bool,
