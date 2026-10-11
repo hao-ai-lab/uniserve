@@ -28,7 +28,7 @@ from uniserve.sampling import (
     sample_categorical,
     sample_top_k,
 )
-from uniserve.sampling.top_k import top_k_candidates
+from uniserve.sampling.top_k import serves_top_k, top_k_candidates
 from uniserve.tensors import adjacent_view
 from uniserve_worker.errors import (
     invalid_descriptor,
@@ -297,8 +297,8 @@ def _fused_top_k(task: SamplingMetadata, vocab: int) -> int:
     The compiled sampler applies temperature, top-p, and min-p within an
     exact top-k candidate set. It supports no penalties, allowed-token
     restriction, suppression, logit bias, typical-p, or drafts, and this
-    path is taken only for CUDA logits. The ``top_k <= 128`` and
-    ``top_k < vocab`` bounds match the ones ``sample_top_k`` itself enforces.
+    path is taken only for CUDA logits. ``serves_top_k`` states which widths
+    ``sample_top_k`` serves.
     """
     if task.logits.device.type != "cuda":
         return 0
@@ -317,9 +317,7 @@ def _fused_top_k(task: SamplingMetadata, vocab: int) -> int:
         or task.suppress
         or parameters.logit_bias
         or float(parameters.typical_p) < 1.0
-        or top_k <= 0
-        or top_k > 128
-        or top_k >= vocab
+        or not serves_top_k(top_k, vocab)
     ):
         return 0
     return top_k

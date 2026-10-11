@@ -16,6 +16,16 @@ _SamplingKernel = Callable[
 ]
 
 
+def serves_top_k(top_k: int, vocab_size: int) -> bool:
+    """Report whether :func:`sample_top_k` serves a top-k width.
+
+    A width must keep a strict subset of the vocabulary: zero disables the
+    filter and a width at or above the vocabulary keeps every token, so the
+    general sampler handles both.
+    """
+    return 0 < top_k < vocab_size
+
+
 def top_k_candidates(
     logits: torch.Tensor, top_k: int, top_p: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -139,7 +149,7 @@ def sample_top_k(
     parameters: torch.Tensor,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Draw from unpenalized rows with an exact top-k candidate bound up to 128.
+    """Draw from unpenalized rows with an exact top-k candidate bound.
 
     ``parameters`` is a floating [rows, 3] matrix of temperature, top-p,
     and min-p. The caller routes penalty-bearing rows to the general sampler.
@@ -150,7 +160,7 @@ def sample_top_k(
         raise ValueError(
             "top-k sampling requires temperature, top-p, and min-p columns"
         )
-    if not 0 < int(top_k) <= 128 or int(top_k) >= int(logits.shape[1]):
+    if not serves_top_k(int(top_k), int(logits.shape[1])):
         raise ValueError(
             "top-k sampling requires an exact top-k candidate bound"
         )
