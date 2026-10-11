@@ -30,7 +30,7 @@ import torch
 from uniserve.tensors import concatenate_views
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution.batch import BatchState
-from uniserve_worker.execution.output import PendingOutput, logprob_entries
+from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.execution.transfer import _release_locators
 from uniserve_worker.profiling import _forward_stats, record_component
 from uniserve_worker.protocol.batch import TensorPublication
@@ -120,25 +120,6 @@ def commit_batch(
                     raise invalid_descriptor(
                         "KV publication differs from its declared output"
                     )
-
-            # The bound covers score values and prompt-position counts; framing
-            # is owned by the single IPC result message, not by stored products.
-            # Each entry is one 12-byte ``TokenLogprob`` of the IPC schema and
-            # each reported row adds 4 bytes, the same costs the engine's
-            # ``logprob_result_bytes`` uses to size ``max_completion_bytes``.
-            logprob_bytes = (
-                0
-                if outcome.token.logprob_range is None
-                else 4
-                + 12 * logprob_entries(outcome, outcome.token.logprob_range)
-            ) + sum(
-                4 + 12 * logprob_entries(outcome, span)
-                for span in outcome.token.prompt_logprob_ranges
-            )
-            if logprob_bytes > call.bounds.max_completion_bytes:
-                raise invalid_descriptor(
-                    "logprob result exceeds its registered completion capacity"
-                )
 
             reports_output = config.rank == model_runner.output_rank(
                 call.component

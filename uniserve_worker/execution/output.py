@@ -217,23 +217,6 @@ def sampled_tokens(record: PendingOutput) -> tuple[int, ...]:
     return (*draft[:accepted], token)
 
 
-def logprob_entries(record: PendingOutput, span: tuple[int, int, int]) -> int:
-    """Return the number of score entries one logprob row can report.
-
-    The count is the sampled entry plus the row's top-k count plus its
-    explicitly requested token ids. `uniserve_worker.execution.commit` uses it
-    to bound the logprob payload against `max_completion_bytes`.
-    """
-    if record._buffer is None:
-        raise RuntimeError("logprob output lost its pinned range")
-    offset, count, index = span
-    rows, counts, requested_ids, _max_count, _max_requested = (
-        record._buffer.logprob_layouts[(offset, count)]
-    )
-    local = rows.index(index)
-    return 1 + counts[local] + len(requested_ids[local])
-
-
 def create_outputs(
     requests: RequestPool,
     calls: Sequence[Call],
