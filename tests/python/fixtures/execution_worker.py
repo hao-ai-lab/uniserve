@@ -8,7 +8,10 @@ from typing import Any
 
 import torch
 
-from tests.python.fixtures.worker_config import stub_worker_config
+from tests.python.fixtures.worker_config import (
+    cpu_worker_config,
+    stub_worker_config,
+)
 from uniserve.distributed.mesh import Communicator
 from uniserve.processing import FlowPrompt
 from uniserve_models.stub import Model, image_processor
@@ -54,7 +57,7 @@ def execution_worker(
             encoder_cache_entries=int(encoder_cache_entries),
         )
     policy = (
-        WorkerConfig(
+        cpu_worker_config(
             graph_policy="off",
             prefill_cuda_graph=False,
             flow_graph_batch_sizes=(1,),

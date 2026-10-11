@@ -16,12 +16,12 @@ def test_aborted_worker_returns_before_device_work_and_preserves_its_storage():
         import torch
         from tests.python.fixtures.encoding import Model
         from tests.python.fixtures.execution_worker import execution_worker
-        from uniserve_worker.config.execution import WorkerConfig
+        from tests.python.fixtures.worker_config import cpu_worker_config
 
         try:
             worker = execution_worker(
                 Model().to("cuda:0"), device="cuda:0",
-                execution=WorkerConfig(
+                execution=cpu_worker_config(
                     graph_policy="full", model_dtype="float32",
                 ),
             )

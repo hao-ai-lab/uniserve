@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 from tests.python.fixtures.launch import worker_args
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve_worker.bootstrap.launch import WorkerIpcEndpoint, run_worker
 from uniserve_worker.protocol.call import ForwardMode
 from uniserve_worker.protocol.identity import CallId
@@ -247,10 +248,10 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
         token_call,
     )
     from tests.python.fixtures.execution_worker import execution_worker
-    from uniserve_worker.config.execution import LaneConfig, WorkerConfig
+    from uniserve_worker.config.execution import LaneConfig
     from uniserve_worker.protocol.call import CALL_KINDS, CallStatus
 
-    policy = WorkerConfig(
+    policy = cpu_worker_config(
         prefill_cuda_graph=False,
         graph_policy="off",
         lanes=(

@@ -20,51 +20,6 @@ from pathlib import Path
 
 from uniserve_worker.config.deployment import WorkerProcessArgs
 
-# Keys ``read_launch_descriptor`` requires the descriptor to carry. A launch
-# that omits one is a contract violation rather than something to paper over
-# with a local default.
-REQUIRED_FIELDS = (
-    "registration_address",
-    "channel_transport",
-    "acknowledgment_slot",
-    "host_slots",
-    "products_cross_hosts",
-    "worker_id",
-    "queue_depth",
-    "ipc_payload_cap",
-    "model",
-    "device",
-    "rank",
-    "local_rank",
-    "world_size",
-    "components",
-    "deployment_components",
-    "transfer_backends",
-    "publish_backends",
-    "rendezvous_address",
-    "rendezvous_listen_fd",
-    "attention_backend",
-    "block_size",
-    "max_batch_calls",
-    "max_batch_tokens",
-    "max_request_pool_size",
-    "max_model_len",
-    "max_video_seconds",
-    "max_condition_rows",
-    "ffmpeg",
-    "model_dtype",
-    "quantization_config",
-    "mem_fraction_static",
-    "graph_policy",
-    "prefill_cuda_graph",
-    "flashinfer_workspace_size",
-    "flashinfer_decode_backend",
-    "flashinfer_prefill_backend",
-    "flashinfer_disable_split_kv",
-    "load_format",
-    "no_model",
-)
-
 
 def create_worker_cli_parser() -> argparse.ArgumentParser:
     """Build the worker launch parser over identity and the descriptor."""
@@ -82,11 +37,13 @@ def read_launch_descriptor(path: Path) -> Namespace:
     """Load one launch descriptor into the namespace the config consumes.
 
     The descriptor's keys become the namespace's attributes unchanged; value
-    validation belongs to ``WorkerProcessArgs.from_namespace``.
+    validation belongs to ``WorkerProcessArgs.from_namespace``, which reads
+    every key it needs directly: the engine writes every launch value, so a
+    descriptor that omits one is a launch contract violation.
 
     Raises:
-        ValueError: The file cannot be read, is not valid JSON, is not a JSON
-            object, or omits a key in ``REQUIRED_FIELDS``.
+        ValueError: The file cannot be read, is not valid JSON, or is not a
+            JSON object.
     """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -101,9 +58,6 @@ def read_launch_descriptor(path: Path) -> Namespace:
     if not isinstance(payload, dict):
         raise ValueError("launch descriptor must be a JSON object")
 
-    missing = [name for name in REQUIRED_FIELDS if name not in payload]
-    if missing:
-        raise ValueError(f"launch descriptor omits {sorted(missing)}")
     return Namespace(**payload)
 
 

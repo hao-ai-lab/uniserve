@@ -16,7 +16,6 @@ default for a device whose budget has not been set.
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -35,6 +34,8 @@ from uniserve_worker.protocol.call import (
 
 __all__ = [
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
+    "DEFAULT_FLOW_GRAPH_BATCH_SIZES",
+    "DEFAULT_FLOW_GRAPH_SHAPES",
     "DEFAULT_GRAPH_STORAGE_FRACTION",
     "DEFAULT_PREFILL_GRAPH_ROW_BUCKETS",
     "DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS",
@@ -164,6 +165,11 @@ DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
     16384,
 )
 
+# Batch sizes and canvas shapes, as (height, width) pixels, at which image
+# denoising calls are captured when the launch names none.
+DEFAULT_FLOW_GRAPH_BATCH_SIZES = (1, 2, 3, 4)
+DEFAULT_FLOW_GRAPH_SHAPES = ((1152, 2048), (2048, 1152))
+
 # Row (request) buckets for captured prefill graphs. They are not
 # configurable: ``ModelExecutor`` and bootstrap capacity planning read them
 # directly.
@@ -289,18 +295,19 @@ class LaneConfig:
                 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class WorkerConfig:
     """Canonical rank configuration for model execution.
 
     Also configures bounded runtime resources. ``worker_config_from_namespace``
-    sets the launch fields; bootstrap later derives others with
-    ``dataclasses.replace``. For example, model loading resizes the batch and
-    request-slot bounds of a model with a ``VideoDecoder`` and clears its KV
-    capacity, attention backend and generation device; capacity fitting on a
+    sets every launch field from the launch descriptor, whose producer owns
+    the defaults, so a launch field has none here; bootstrap later derives
+    the remaining fields with ``dataclasses.replace``. For example, model
+    loading resizes the batch and request-slot bounds of a model with a
+    ``VideoDecoder`` and clears its KV capacity, attention backend and
+    generation device; capacity fitting on a
     CUDA device sets ``pool_storage_bytes`` from the device storage grant and
-    may shrink the request-slot and batch bounds; a ``kv_cache_dtype`` in
-    the quantization config overrides the launch value; and an unset
+    may shrink the request-slot and batch bounds; and an unset
     ``block_size`` is resolved from the model's cache layers and attention
     kernels (``bootstrap.cache.resolve_page_size``) before the unit pool is
     planned.
@@ -322,24 +329,25 @@ class WorkerConfig:
     off runs image denoising eagerly, for debugging.
     """
 
-    device: str = "cpu"
-    rank: int = 0
-    world_size: int = 1
-    role: str = "model"
+    device: str
+    rank: int
+    world_size: int
+    role: str
     # How an expert-parallel replica exchanges tokens at every expert layer:
-    # "alltoall" (NVLink all-to-all around the grouped expert kernel) or
-    # "megamoe" (the fused MegaMoE kernel, NVFP4 experts).
-    expert_exchange: str = "alltoall"
-    expert_microbatches: int = 1
+    # "alltoall" (NVLink all-to-all around the grouped expert kernel),
+    # "megamoe" (the fused MegaMoE kernel, NVFP4 experts), "deepep" or
+    # "dwdp"; None without expert parallelism.
+    expert_exchange: str | None
+    expert_microbatches: int
     # Tokens per KV page of the cache group with the widest token rows; None
     # until resolved.
     block_size: int | None = None
     max_total_tokens: int | None = None
     attention_backend: str | None = None
-    max_batch_calls: int = 1024
-    max_batch_tokens: int = 8192
-    max_model_len: int = 16384
-    max_video_seconds: float = 15.0
+    max_batch_calls: int
+    max_batch_tokens: int
+    max_model_len: int
+    max_video_seconds: float
     # Most denoiser rows a video request's conditions may take. It bounds the
     # condition products a video worker provisions; zero provisions none, as
     # a deployment serving text-to-video alone does. None provisions the
@@ -348,68 +356,58 @@ class WorkerConfig:
     # ``bootstrap.model_loader.loaded_worker_config`` states those rows here.
     max_condition_rows: int | None = None
     # The ffmpeg executable the media reader decodes reference videos with.
-    ffmpeg: str = "ffmpeg"
+    ffmpeg: str
     # Shortest duration the server admits, which bounds the frame counts the
     # worker provisions from below; ``None`` provisions every frame count
     # the model generates up to the capacity.
     min_video_seconds: float | None = None
     # Text capacities, in prompt tokens, of the denoiser's layouts; empty
     # selects ``MediaBuilder``'s default spacing.
-    video_text_capacities: tuple[int, ...] = ()
+    video_text_capacities: tuple[int, ...]
     # Canvases, as (height, width) pixels, a video deployment prepares and
     # admits; empty prepares the denoiser's own (``VideoDenoiser.canvases``).
-    video_frame_sizes: tuple[tuple[int, int], ...] = ()
+    video_frame_sizes: tuple[tuple[int, int], ...]
     # Names of every component any worker group of the deployment places;
     # it selects which of a checkpoint's video denoisers the deployment
     # serves.
-    deployment_components: tuple[str, ...] = ()
+    deployment_components: tuple[str, ...]
     # Block-diffusion sampling of every canvas the deployment generates; None
     # when it generates none. Generating canvases keep the argmax history
     # its stability threshold needs and run their steps with exactly it.
     canvas_sampling: CanvasSampling | None = None
-    max_request_pool_size: int = 128
+    max_request_pool_size: int
     encoder_cache_entries: int = 256
     generation_device: str | None = None
     min_request_pool_size: int = 1
     pool_storage_bytes: int | None = None
-    model_dtype: str = "bfloat16"
+    model_dtype: str
     kv_cache_dtype: str | None = None
-    mem_fraction_static: float = 0.70
-    lanes: tuple[LaneConfig, ...] = ()
-    graph_policy: str = "auto"
-    decode_graph_batch_sizes: tuple[int, ...] = DEFAULT_DECODE_GRAPH_BATCH_SIZES
-    prefill_cuda_graph: bool = True
+    mem_fraction_static: float
+    lanes: tuple[LaneConfig, ...]
+    graph_policy: str
+    decode_graph_batch_sizes: tuple[int, ...]
+    prefill_cuda_graph: bool
     # Whether any prefill call of the deployment selects logits or hidden
     # states. A deployment whose prompts only condition token-denoising
     # canvases writes the K/V cache alone.
-    prefill_outputs: bool = True
-    prefill_graph_token_sizes: tuple[int, ...] = (
-        DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
-    )
-    flow_cuda_graph: bool = True
-    flow_graph_batch_sizes: tuple[int, ...] = (1, 2, 3, 4)
-    flow_graph_shapes: tuple[tuple[int, int], ...] = (
-        (1152, 2048),
-        (2048, 1152),
-    )
-    flashinfer: FlashInferConfig = FlashInferConfig()
+    prefill_outputs: bool
+    prefill_graph_token_sizes: tuple[int, ...]
+    flow_cuda_graph: bool
+    flow_graph_batch_sizes: tuple[int, ...]
+    flow_graph_shapes: tuple[tuple[int, int], ...]
+    flashinfer: FlashInferConfig
 
     def __post_init__(self) -> None:
-        """Validate topology, device identity, batch bounds and dtypes.
+        """Validate the device identity and the bounds the worker derives.
+
+        The launch producer validates the launch values it owns; the worker
+        states only what it alone knows (its device and world) and the
+        capacities capacity fitting derives or shrinks.
 
         Raises:
             WorkerError: With the invalid-descriptor code, naming the first
                 violated constraint.
         """
-        if self.graph_policy not in {"off", "auto", "full"}:
-            raise invalid_descriptor("graph policy must be off, auto, or full")
-        if self.role not in {"model", "experts"}:
-            raise invalid_descriptor("worker role must be model or experts")
-        if (
-            type(self.expert_microbatches) is not int
-            or self.expert_microbatches < 1
-        ):
-            raise invalid_descriptor("expert microbatches must be at least one")
         if not self.device:
             raise invalid_descriptor("worker device must be named")
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
@@ -427,45 +425,11 @@ class WorkerConfig:
             or self.max_batch_calls < 1
             or self.max_batch_tokens < 1
             or self.max_model_len < 1
-            or self.max_request_pool_size < 1
             or self.encoder_cache_entries < 1
         ):
             raise invalid_descriptor(
                 "worker configuration capacities must be positive"
             )
-        if (
-            not math.isfinite(self.max_video_seconds)
-            or self.max_video_seconds <= 0
-        ):
-            raise invalid_descriptor(
-                "video duration capacity must be finite and positive"
-            )
-        if self.max_condition_rows is not None and self.max_condition_rows < 0:
-            raise invalid_descriptor(
-                "video condition capacity must not be negative"
-            )
-        if not self.ffmpeg:
-            raise invalid_descriptor("the media reader needs an ffmpeg path")
-        if self.min_video_seconds is not None and not (
-            math.isfinite(self.min_video_seconds)
-            and 0 < self.min_video_seconds <= self.max_video_seconds
-        ):
-            raise invalid_descriptor(
-                "shortest video duration must lie within the capacity"
-            )
-        if any(value < 1 for value in self.video_text_capacities):
-            raise invalid_descriptor("video text capacities must be positive")
-        if not 0 < self.mem_fraction_static <= 1:
-            raise invalid_descriptor("mem_fraction_static must be in (0, 1]")
-        if self.model_dtype not in {"float16", "bfloat16", "float32"}:
-            raise invalid_descriptor("worker model dtype is unsupported")
-        if self.kv_cache_dtype is not None and self.kv_cache_dtype not in {
-            "float16",
-            "bfloat16",
-            "float32",
-            "float8_e4m3fn",
-        }:
-            raise invalid_descriptor("worker KV dtype is unsupported")
 
 
 def worker_config_from_namespace(
@@ -473,31 +437,27 @@ def worker_config_from_namespace(
 ) -> WorkerConfig:
     """Resolve the rank execution and resource configuration.
 
+    The launch descriptor carries every launch value, so this states no
+    default for one. A graph catalog the descriptor leaves unset resolves to
+    the worker's own catalog, which only the worker knows.
+
     Args:
         namespace: Parsed launch descriptor fields.
         device: The rank device, already normalized by the caller.
         generation_device: The separate generation-tower device, if any.
 
     Returns:
-        The launch-time configuration; fields the descriptor does not carry
-        keep their ``WorkerConfig`` defaults.
+        The launch-time configuration.
 
     Raises:
-        ValueError: If a descriptor value fails to parse or is out of range.
+        ValueError: If a descriptor value fails to parse.
         WorkerError: If the assembled configuration violates a
             ``WorkerConfig`` invariant.
     """
-    expert_parallel = getattr(namespace, "expert_parallel", None) or {}
-    microbatches = getattr(namespace, "expert_microbatches", 1)
-    if type(microbatches) is not int or microbatches < 1:
-        raise ValueError("expert_microbatches must be a positive integer")
-    if microbatches > 1 and not expert_parallel.get("attention_ranks", 0):
-        raise ValueError("expert microbatches require disaggregated experts")
+    expert_parallel = namespace.expert_parallel or {}
+    exchange = expert_parallel.get("exchange")
     prefill_tokens = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
-    if (
-        expert_parallel
-        and expert_parallel.get("exchange", "alltoall") == "alltoall"
-    ):
+    if exchange == "alltoall":
         # Each local shape also captures larger transfer capacities. Bound
         # that product with geometric small buckets and 512-token spacing
         # thereafter; the default catalog's maximum padding gap stays 512,
@@ -519,63 +479,53 @@ def worker_config_from_namespace(
         rank=int(namespace.rank),
         world_size=int(namespace.world_size),
         generation_device=generation_device,
-        block_size=_positive_optional_int(namespace.block_size),
+        block_size=_optional_int(namespace.block_size),
         max_batch_calls=int(namespace.max_batch_calls),
         max_batch_tokens=int(namespace.max_batch_tokens),
-        # The engine sizes the request pool from its running-request limit.
         max_request_pool_size=int(namespace.max_request_pool_size),
         max_model_len=int(namespace.max_model_len),
         max_video_seconds=float(namespace.max_video_seconds),
-        max_condition_rows=None
-        if namespace.max_condition_rows is None
-        else int(namespace.max_condition_rows),
+        max_condition_rows=_optional_int(namespace.max_condition_rows),
         ffmpeg=str(namespace.ffmpeg),
-        min_video_seconds=_optional_float(
-            getattr(namespace, "min_video_seconds", None)
-        ),
+        min_video_seconds=_optional_float(namespace.min_video_seconds),
         video_text_capacities=_parse_positive_int_csv(
-            getattr(namespace, "video_text_capacities", None), default=()
+            namespace.video_text_capacities, default=()
         ),
         video_frame_sizes=_parse_image_shapes(
-            getattr(namespace, "video_frame_sizes", None),
-            default=(),
-            name="video frame sizes",
+            namespace.video_frame_sizes, default=(), name="video frame sizes"
         ),
         deployment_components=tuple(
             str(name) for name in namespace.deployment_components
         ),
-        canvas_sampling=_canvas_sampling(
-            getattr(namespace, "canvas_sampling", None)
-        ),
-        max_total_tokens=_positive_optional_int(namespace.max_total_tokens),
+        canvas_sampling=_canvas_sampling(namespace.canvas_sampling),
+        max_total_tokens=_optional_int(namespace.max_total_tokens),
         attention_backend=str(namespace.attention_backend),
         model_dtype=str(namespace.model_dtype),
-        kv_cache_dtype=_none_if_empty(namespace.kv_cache_dtype),
-        mem_fraction_static=_storage_fraction(
-            float(namespace.mem_fraction_static),
-            "mem_fraction_static",
-        ),
-        lanes=_parse_lanes(getattr(namespace, "lane", ())),
-        graph_policy=getattr(namespace, "graph_policy", "auto"),
+        kv_cache_dtype=namespace.kv_cache_dtype,
+        mem_fraction_static=float(namespace.mem_fraction_static),
+        lanes=_parse_lanes(namespace.lane),
+        graph_policy=str(namespace.graph_policy),
         decode_graph_batch_sizes=_parse_positive_int_csv(
             namespace.decode_graph_batch_sizes,
             default=DEFAULT_DECODE_GRAPH_BATCH_SIZES,
         ),
         prefill_cuda_graph=bool(namespace.prefill_cuda_graph),
-        prefill_outputs=bool(getattr(namespace, "prefill_outputs", True)),
-        expert_exchange=str(expert_parallel.get("exchange", "alltoall")),
-        expert_microbatches=microbatches,
-        role=str(getattr(namespace, "role", "model")),
-        flow_cuda_graph=bool(getattr(namespace, "flow_cuda_graph", True)),
+        prefill_outputs=bool(namespace.prefill_outputs),
+        expert_exchange=exchange,
+        expert_microbatches=int(namespace.expert_microbatches),
+        role=str(namespace.role),
+        flow_cuda_graph=bool(namespace.flow_cuda_graph),
         prefill_graph_token_sizes=_parse_positive_int_csv(
             namespace.prefill_graph_token_sizes,
             default=prefill_tokens,
         ),
         flow_graph_batch_sizes=_parse_positive_int_csv(
             namespace.flow_graph_batch_sizes,
-            default=(1, 2, 3, 4),
+            default=DEFAULT_FLOW_GRAPH_BATCH_SIZES,
         ),
-        flow_graph_shapes=_parse_image_shapes(namespace.flow_graph_shapes),
+        flow_graph_shapes=_parse_image_shapes(
+            namespace.flow_graph_shapes, default=DEFAULT_FLOW_GRAPH_SHAPES
+        ),
         flashinfer=FlashInferConfig(
             workspace_size=int(namespace.flashinfer_workspace_size),
             use_tensor_core=_parse_optional_bool(
@@ -583,31 +533,15 @@ def worker_config_from_namespace(
             ),
             decode_backend=str(namespace.flashinfer_decode_backend),
             prefill_backend=str(namespace.flashinfer_prefill_backend),
-            decode_split_tile_size=_positive_optional_int(
+            decode_split_tile_size=_optional_int(
                 namespace.flashinfer_decode_split_tile_size
             ),
-            prefill_split_tile_size=_positive_optional_int(
+            prefill_split_tile_size=_optional_int(
                 namespace.flashinfer_prefill_split_tile_size
             ),
             disable_split_kv=bool(namespace.flashinfer_disable_split_kv),
         ),
     )
-
-
-def _none_if_empty(value: object | None) -> str | None:
-    """Strip an optional string setting, keeping ``None`` as unset.
-
-    Raises:
-        ValueError: If the value is present but blank.
-    """
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        raise ValueError(
-            "an explicitly provided string setting must not be empty"
-        )
-    return text
 
 
 def _canvas_sampling(value: object | None) -> CanvasSampling | None:
@@ -624,32 +558,9 @@ def _optional_float(value: object | None) -> float | None:
     return None if value is None else float(cast(Any, value))
 
 
-def _positive_optional_int(value: object | None) -> int | None:
-    """Parse an optional positive integer capacity."""
-    if value is None:
-        return None
-    parsed = int(cast(Any, value))
-    if parsed <= 0:
-        raise ValueError(
-            "optional integer tuning values must be positive when set"
-        )
-    return parsed
-
-
-def _storage_fraction(value: float, name: str) -> float:
-    """Validate a per-process static memory fraction.
-
-    The fraction is a share of each device's total memory, which
-    ``device_storage_budget`` also bounds by the memory free at startup, so
-    any finite value in (0, 1] is meaningful; one grants the whole device.
-    The engine checks the same range before it launches a rank.
-
-    Raises:
-        ValueError: If the value is not finite or lies outside (0, 1].
-    """
-    if not math.isfinite(value) or not 0.0 < value <= 1.0:
-        raise ValueError(f"{name} must be finite and in (0, 1]")
-    return value
+def _optional_int(value: object | None) -> int | None:
+    """Parse an optional integer setting, keeping ``None`` as unset."""
+    return None if value is None else int(cast(Any, value))
 
 
 def _parse_positive_int_csv(
@@ -680,7 +591,7 @@ def _parse_positive_int_csv(
 def _parse_image_shapes(
     raw: object | None,
     *,
-    default: tuple[tuple[int, int], ...] = ((1152, 2048), (2048, 1152)),
+    default: tuple[tuple[int, int], ...],
     name: str = "flow graph shapes",
 ) -> tuple[tuple[int, int], ...]:
     """Parse comma-separated ``HEIGHTxWIDTH`` image shapes, in pixels.

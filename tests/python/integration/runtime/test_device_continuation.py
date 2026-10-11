@@ -15,8 +15,8 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.sampling import SamplingParams
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.protocol.call import (
     CallStatus,
     ForwardMode,
@@ -38,7 +38,7 @@ pytestmark = [
 def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
     graphs, finish_policy
 ) -> None:
-    policy = WorkerConfig(
+    policy = cpu_worker_config(
         graph_policy="full" if graphs else "off",
         prefill_cuda_graph=False,
         decode_graph_batch_sizes=(2,),

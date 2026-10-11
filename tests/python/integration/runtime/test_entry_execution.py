@@ -21,11 +21,12 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.encoding import Model as EncodedModel
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.transport import make_transport
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image, video
 from uniserve.runtime import EventPool
 from uniserve_worker.config.deployment import ComponentConfig, ParallelConfig
-from uniserve_worker.config.execution import LaneConfig, WorkerConfig
+from uniserve_worker.config.execution import LaneConfig
 from uniserve_worker.errors import InputError
 from uniserve_worker.execution import media
 from uniserve_worker.execution.model_executor import ModelExecutor
@@ -116,7 +117,7 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
     )
     runner = ModelExecutor(
         DecodedModel(DecoderConfig(window=25)),
-        WorkerConfig(rank=rank, world_size=4),
+        cpu_worker_config(rank=rank, world_size=4),
         bindings={"reconstruction": binding},
     )
     try:
@@ -193,7 +194,7 @@ def test_audio_decoding_ranks_reconstruct_contiguous_unit_runs(
         )
         runner = ModelExecutor(
             model,
-            WorkerConfig(rank=rank, world_size=len(ranks)),
+            cpu_worker_config(rank=rank, world_size=len(ranks)),
             bindings={"audio_decoder": binding},
             entry_points=audio_entry_points(AUDIO_CONFIG),
         )
@@ -236,7 +237,7 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(
     runners = [
         ModelExecutor(
             model,
-            WorkerConfig(device=device),
+            cpu_worker_config(device=device),
             bindings=_encoder_bindings(model, components, device),
         )
         for _ in range(2)
@@ -294,7 +295,7 @@ def test_module_call_statistics_count_the_call_without_tokens():
     )
     runner = ModelExecutor(
         model,
-        WorkerConfig(device="cpu"),
+        cpu_worker_config(device="cpu"),
         bindings=_encoder_bindings(model, components),
     )
     try:
@@ -328,7 +329,7 @@ def test_conditioning_executes_only_on_its_declared_pipeline_stage(rank):
     )
     runner = ModelExecutor(
         model,
-        WorkerConfig(rank=rank, world_size=2),
+        cpu_worker_config(rank=rank, world_size=2),
         bindings={"conditioner": binding},
     )
     try:
@@ -490,7 +491,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
 ):
     device = "cpu" if execution_device == "cpu" else "cuda:0"
     model = EncodedModel().to(device)
-    execution = WorkerConfig(
+    execution = cpu_worker_config(
         graph_policy="off",
         lanes=(
             LaneConfig(
@@ -651,7 +652,7 @@ def test_text_entry_stages_successive_bounded_inputs(device):
     model = EncodedModel().to(device)
     runner = ModelExecutor(
         model,
-        WorkerConfig(device=device, max_model_len=16),
+        cpu_worker_config(device=device, max_model_len=16),
         bindings=_encoder_bindings(
             model, (("text_encoder", ComponentConfig((0,))),), device
         ),
@@ -688,7 +689,7 @@ def test_worker_reports_text_bounds_and_executes_dense_attention_without_kv():
     )
     with execution_worker(
         model,
-        execution=WorkerConfig(
+        execution=cpu_worker_config(
             max_model_len=16, graph_policy="off", model_dtype="float32"
         ),
         components=components,
@@ -777,7 +778,7 @@ def test_decoder_graphs_share_backing_and_match_eager_decoding():
     graphs, eager = (
         ModelExecutor(
             model,
-            WorkerConfig(device=device, graph_policy=policy),
+            cpu_worker_config(device=device, graph_policy=policy),
             bindings=_encoder_bindings(model, components, device),
         )
         for policy in ("auto", "off")

@@ -2,13 +2,14 @@
 
 The engine writes one JSON launch descriptor per rank, and
 ``uniserve_worker.bootstrap.cli`` reads it into an ``argparse.Namespace``.
-``WorkerProcessArgs.from_namespace`` validates that namespace once and resolves
-it into immutable values, so later bootstrap stages consume typed fields and
-never reparse descriptor text. Values this module rejects raise
-``ValueError``, which the launch adapter reports as a usage error before the
-worker starts; a value that passes these checks but violates a
-``WorkerConfig`` invariant raises ``WorkerError`` from
-``WorkerConfig.__post_init__`` instead.
+``WorkerProcessArgs.from_namespace`` resolves that namespace once into
+immutable values, so later bootstrap stages consume typed fields and never
+reparse descriptor text. The command line and the engine validate the launch
+values they own before they write the descriptor; this module checks only what
+the worker alone knows, such as its device and the transports it can bind.
+Values it rejects raise ``ValueError``, which the launch adapter reports as a
+usage error before the worker starts; a value that violates a ``WorkerConfig``
+invariant raises ``WorkerError`` from ``WorkerConfig.__post_init__`` instead.
 
 ``SequenceConfig``, ``ParallelConfig`` and ``ComponentConfig`` mirror the
 component declarations in the ``uniserve-core`` crate's ``parallel`` module:
@@ -19,7 +20,6 @@ rejected.
 from __future__ import annotations
 
 import argparse
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from math import prod
@@ -325,11 +325,7 @@ def parse_components(
             lies outside the process world.
     """
     if role == "experts":
-        if value:
-            raise ValueError("expert workers have no request components")
         return ()
-    if not value:
-        raise ValueError("component configuration must not be empty")
 
     components = []
     for name, component in sorted(value.items()):
@@ -448,33 +444,20 @@ class WorkerProcessArgs:
             WorkerError: If execution settings that pass these checks violate
                 a ``WorkerConfig`` invariant.
         """
-        role = str(getattr(namespace, "role", "model"))
+        role = str(namespace.role)
         expert_parallel = _expert_parallel(namespace)
-        if role == "experts" and (
-            expert_parallel is None
-            or not expert_parallel.attention_ranks
-            or expert_parallel.rank < expert_parallel.attention_ranks
-        ):
-            raise ValueError(
-                "expert workers require a disaggregated expert union"
-            )
         device = _normalize_device(namespace.device, option="--device")
-        generation_device = _parse_mesh(
-            str(namespace.mesh or ""),
-            device=device,
-        )
+        generation_device = _parse_mesh(namespace.mesh, device=device)
         backends = _parse_transfer_backends(namespace.transfer_backends)
         publication_backends = _parse_transfer_backends(
             namespace.publish_backends
         )
         model_path = str(namespace.model or "").strip()
 
-        _validate_scalars(namespace)
-
         # ``no_model`` builds the stub model, which serves synthetic outputs.
         use_stub_model = bool(namespace.no_model)
         if not use_stub_model and not model_path:
-            raise ValueError("--model is required for a model worker")
+            raise ValueError("a model worker requires its model path")
 
         if not set(publication_backends).issubset(backends):
             raise ValueError("publication backends must be bound transports")
@@ -519,54 +502,6 @@ class WorkerProcessArgs:
         )
 
 
-def _validate_scalars(namespace: argparse.Namespace) -> None:
-    """Validate positive capacities and scalar process settings.
-
-    Raises:
-        ValueError: If a value is out of range; the message names the launch
-            option.
-    """
-    positive_fields = {
-        "--max-batch-calls": namespace.max_batch_calls,
-        "--max-batch-tokens": namespace.max_batch_tokens,
-        "--max-request-pool-size": namespace.max_request_pool_size,
-        "--queue-depth": namespace.queue_depth,
-        "--ipc-payload-cap": namespace.ipc_payload_cap,
-        "--world-size": namespace.world_size,
-        "--max-model-len": namespace.max_model_len,
-        "--flashinfer-workspace-size": namespace.flashinfer_workspace_size,
-    }
-    for option, value in positive_fields.items():
-        if int(value) <= 0:
-            raise ValueError(f"{option} must be positive")
-    if (
-        namespace.max_total_tokens is not None
-        and int(namespace.max_total_tokens) <= 0
-    ):
-        raise ValueError("--max-total-tokens must be positive when provided")
-
-    # The capacity resolves to frames at 24 frames per second, rounded half
-    # to even as the server rounds a request's duration. The server admits
-    # capacities within its video API range; the worker only requires one
-    # that covers at least one frame and fits a u32 once the model's native
-    # windows extend it by up to 16 frames.
-    max_video_seconds = float(namespace.max_video_seconds)
-    if not math.isfinite(max_video_seconds) or max_video_seconds <= 0:
-        raise ValueError(
-            "--max-video-seconds must resolve to a supported frame count"
-        )
-    max_video_frames = round(max_video_seconds * 24.0)
-    if max_video_frames < 1 or max_video_frames > 2**32 - 17:
-        raise ValueError(
-            "--max-video-seconds must resolve to a supported frame count"
-        )
-
-    if int(namespace.rank) < 0 or int(namespace.rank) >= int(
-        namespace.world_size
-    ):
-        raise ValueError("--rank must satisfy 0 <= rank < world-size")
-
-
 def _load_config(namespace: argparse.Namespace) -> IOConfig:
     """Separate the serialized reader selector into format and loading mode.
 
@@ -590,91 +525,45 @@ def _load_config(namespace: argparse.Namespace) -> IOConfig:
         mode=mode,
         download_dir=_optional_path(namespace.download_dir),
         num_threads=namespace.load_threads,
-        checksum_manifest=_optional_path(namespace.checksum_manifest),
     )
 
 
-def _parse_mesh(
-    value: str,
-    *,
-    device: str,
-) -> str | None:
-    """Parse and validate a named device-mesh declaration.
+def _parse_mesh(value: object | None, *, device: str) -> str | None:
+    """Resolve the generation device a ``--worker-mesh`` declaration names.
 
-    The declaration is a comma-separated list of ``key=value`` entries; keys
-    compare case-insensitively with ``_`` and ``-`` equivalent. ``tower`` is
-    the only supported key.
+    The declaration is ``tower=gen:<device>``: the text tower runs on the rank
+    device, and model loading places the flow route, denoiser, and image
+    decoder modules on ``<device>``, which must differ from it.
 
     Returns:
-        The generation device selected by a ``tower`` entry, or ``None`` when
-        the declaration is empty.
+        The generation device, or ``None`` when the declaration is empty.
+
+    Raises:
+        ValueError: The declaration is not ``tower=gen:<device>`` or names the
+            rank device.
     """
-    text = value.strip()
-    if not text:
+    text = _optional_text(value)
+    if text is None:
         return None
 
-    generation_device: str | None = None
-    seen: set[str] = set()
-    for raw_entry in text.split(","):
-        entry = raw_entry.strip()
-        if not entry or "=" not in entry:
-            raise ValueError(
-                f"invalid --mesh entry {raw_entry!r}; expected key=value"
-            )
-
-        key, value = (part.strip() for part in entry.split("=", 1))
-        normalized_key = key.replace("_", "-").lower()
-        if normalized_key in seen:
-            raise ValueError(f"duplicate --mesh key {key!r}")
-        seen.add(normalized_key)
-
-        if normalized_key == "tower":
-            generation_device = _parse_expert_device(value, device=device)
-        else:
-            raise ValueError(f"unknown --mesh key {key!r}")
-
-    return generation_device
-
-
-def _parse_expert_device(value: str, *, device: str) -> str:
-    """Resolve the generation device of a ``tower`` mesh entry.
-
-    The value has the form ``text:<device>;gen:<device>``. The text tower
-    always runs on the rank device, so ``text`` may be omitted and, when
-    given, must name that device. ``gen`` is required and must name a
-    different device; model loading places the flow route, denoiser, and image
-    decoder modules there.
-    """
-    parameters: dict[str, str] = {}
-    for raw_part in value.split(";"):
-        part = raw_part.strip()
-        name, separator, target = part.partition(":")
-        normalized_name = name.strip().lower()
-        if (
-            not separator
-            or normalized_name not in {"text", "gen"}
-            or not target.strip()
-        ):
-            raise ValueError("tower params must use text:<device>;gen:<device>")
-        if normalized_name in parameters:
-            raise ValueError(f"duplicate tower params {normalized_name!r}")
-        parameters[normalized_name] = target.strip()
-
-    if "gen" not in parameters:
-        raise ValueError("tower params requires gen:<device>")
-
-    understanding_device = _normalize_device(
-        parameters.get("text") or device, option="--mesh tower text"
-    )
-    if understanding_device != device:
-        raise ValueError("text expert device must match the Worker rank device")
+    key, _, selection = text.partition("=")
+    name, _, target = selection.partition(":")
+    if (
+        key.strip().lower() != "tower"
+        or name.strip().lower() != "gen"
+        or not target.strip()
+    ):
+        raise ValueError(
+            f"--worker-mesh must be tower=gen:<device>, got {text!r}"
+        )
 
     generation_device = _normalize_device(
-        parameters["gen"], option="--mesh tower gen"
+        target.strip(), option="--worker-mesh tower gen"
     )
-    if understanding_device == generation_device:
-        raise ValueError("tower text and gen devices must be different")
-
+    if generation_device == device:
+        raise ValueError(
+            "--worker-mesh tower gen must name a device other than the rank's"
+        )
     return generation_device
 
 
@@ -728,25 +617,15 @@ def _rendezvous(namespace: argparse.Namespace) -> Rendezvous | None:
 
     The process that spawns the group's first rank, the engine or the
     launcher of that rank's host, binds the store's socket before the rank
-    exists and the rank inherits it, so the store's port is never free while
-    the rank starts. A first rank without the socket would bind the port
-    itself and could lose it to another process, so the descriptor must name
-    one for that rank and for no other.
+    exists and the descriptor names it for that rank alone, so the store's
+    port is never free while the rank starts.
     """
     address = _optional_text(namespace.rendezvous_address)
-    listen_fd = namespace.rendezvous_listen_fd
     if address is None:
-        if listen_fd is not None:
-            raise ValueError("a rendezvous socket requires its address")
         return None
 
-    first = int(namespace.rank) == 0
-    if first and listen_fd is None:
-        raise ValueError("the first rank must inherit its rendezvous socket")
-    if not first and listen_fd is not None:
-        raise ValueError("only the first rank inherits a rendezvous socket")
-
     host, _, port = address.rpartition(":")
+    listen_fd = namespace.rendezvous_listen_fd
     return Rendezvous(
         host=host,
         port=int(port),
@@ -761,77 +640,20 @@ def _expert_parallel(
 
     The descriptor's optional ``expert_parallel`` object carries ``rank``,
     ``size``, leading ``attention_ranks``, the store ``address``, and for
-    rank 0 only the inherited ``listen_fd``. ``exchange`` selects the
-    transport in ``WorkerConfig``. Worker-local ranks are consecutive in
-    the union and keep their independent component meshes.
-
-    Raises:
-        ValueError: The object is malformed, the rank lies outside a world of
-            at least two replicas, the group has more than one rank, or the
-            store socket is missing on rank 0 or present on another rank.
+    the world's rank 0 only the inherited ``listen_fd``. ``exchange`` selects
+    the transport in ``WorkerConfig``. The engine places the world and
+    validates its shape before it launches a rank.
     """
-    value = getattr(namespace, "expert_parallel", None)
+    value = namespace.expert_parallel
     if value is None:
         return None
-    if not isinstance(value, Mapping) or set(value) != {
-        "rank",
-        "size",
-        "attention_ranks",
-        "address",
-        "listen_fd",
-        "exchange",
-    }:
-        raise ValueError(
-            "expert_parallel must carry rank, size, attention_ranks, address, "
-            "listen_fd and exchange"
-        )
-    if value["exchange"] not in ("alltoall", "megamoe", "dwdp", "deepep"):
-        raise ValueError(
-            f"unknown expert exchange {value['exchange']!r}; expected "
-            "alltoall, megamoe, dwdp or deepep"
-        )
 
-    rank, size = value["rank"], value["size"]
-    if type(rank) is not int or type(size) is not int or size < 2:
-        raise ValueError("an expert-parallel world spans at least two ranks")
-    if not 0 <= rank < size:
-        raise ValueError("expert-parallel rank must satisfy 0 <= rank < size")
-    attention = value["attention_ranks"]
-    if type(attention) is not int or not 0 <= attention < size:
-        raise ValueError("attention ranks must leave at least one expert rank")
-    start = rank - int(namespace.rank)
-    stop = start + int(namespace.world_size)
-    if start < 0 or stop > size or start < attention < stop:
-        raise ValueError(
-            "worker ranks must fit within one role in the expert union"
-        )
-    if bool(attention) and (
-        value["exchange"] not in {"deepep", "megamoe"}
-        or (rank >= attention)
-        != (getattr(namespace, "role", "model") == "experts")
-    ):
-        raise ValueError(
-            "disaggregated role or expert exchange disagrees with placement"
-        )
-    if not attention and (
-        int(namespace.world_size) != 1 or value["exchange"] == "deepep"
-    ):
-        raise ValueError(
-            "an expert-parallel replica joins its world with its only rank"
-        )
-
-    address, listen_fd = value["address"], value["listen_fd"]
-    if not isinstance(address, str) or ":" not in address:
-        raise ValueError("expert-parallel store address must be host:port")
-    if (rank == 0) != (listen_fd is not None):
-        raise ValueError(
-            "exactly the expert-parallel world's rank 0 serves its store"
-        )
-    host, _, port = address.rpartition(":")
+    host, _, port = str(value["address"]).rpartition(":")
+    listen_fd = value["listen_fd"]
     return ExpertParallelLaunch(
-        rank=rank,
-        size=size,
-        attention_ranks=attention,
+        rank=int(value["rank"]),
+        size=int(value["size"]),
+        attention_ranks=int(value["attention_ranks"]),
         rendezvous=Rendezvous(
             host=host,
             port=int(port),

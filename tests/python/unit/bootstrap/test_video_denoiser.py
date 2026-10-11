@@ -7,6 +7,7 @@ from tests.python.fixtures.h3 import (
     base_config,
     fasth3_config,
 )
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.media import image
 from uniserve_models.minimax_h3 import Model
 from uniserve_worker.bootstrap.components import media_components
@@ -27,7 +28,7 @@ _HOST = (
 
 
 def _config(*placed: str) -> WorkerConfig:
-    return WorkerConfig(
+    return cpu_worker_config(
         device="cpu",
         max_model_len=1024,
         max_video_seconds=5.0,
@@ -83,7 +84,7 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
     with torch.device("meta"):
         model = Model(fasth3_config())
     # One candidate needs no deployment to name it.
-    denoiser = video_denoiser(model, WorkerConfig(device="cpu"))
+    denoiser = video_denoiser(model, cpu_worker_config(device="cpu"))
     info = video_denoiser_info(denoiser)
     assert info.tasks == ("t2va",)
     assert info.schedule_points == 5

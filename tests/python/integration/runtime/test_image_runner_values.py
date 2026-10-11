@@ -15,6 +15,7 @@ from tests.python.fixtures.checkpoints import (
     load_bagel,
     sensenova_checkpoint,
 )
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image
 from uniserve.model import TextSize
@@ -23,7 +24,6 @@ from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.capacity import input_buffer_config
 from uniserve_worker.config.deployment import ComponentConfig
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.diffusion import (
     flow_rows,
     image_state,
@@ -138,7 +138,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             torch.device("cuda:0"),
         )
     }
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         generation_device=generation_device,
         attention_backend="torch",
@@ -398,7 +398,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             "model", placement, group, mesh, torch.device("cuda:0")
         )
     }
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         attention_backend="torch",
         block_size=16,

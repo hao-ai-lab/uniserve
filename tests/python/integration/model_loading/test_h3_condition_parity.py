@@ -45,6 +45,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file
 
 from tests.python.fixtures.h3_conditions import published, recorded_request
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.diffusion import normal_noise
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.execution import DenoisingRunner
@@ -54,7 +55,6 @@ from uniserve.runtime import ExecutionContext, TensorBuffers
 from uniserve_models import loading as models
 from uniserve_models.minimax_h3 import DenoiserInput, processing, weight_config
 from uniserve_worker.config.deployment import ComponentConfig, ParallelConfig
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution import media
 from uniserve_worker.execution.conditions import condition_latents
 from uniserve_worker.execution.model_executor import ModelExecutor
@@ -181,7 +181,7 @@ class _Worker:
             device=DEVICE,
             weights=weight_config(source.model, preset="quality"),
         ).model
-        config = WorkerConfig(
+        config = cpu_worker_config(
             device=str(DEVICE),
             max_model_len=text,
             max_video_seconds=seconds,

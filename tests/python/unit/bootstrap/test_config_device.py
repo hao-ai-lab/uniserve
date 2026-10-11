@@ -10,24 +10,21 @@ from uniserve_worker.protocol.call import ForwardMode
 pytestmark = pytest.mark.unit
 
 
-@pytest.mark.parametrize(
-    "mesh", ["tower=gen:cuda:1", "tower=text:cuda;gen:cuda:1"]
-)
-def test_flow_component_device_is_resolved_with_the_rank_device(mesh, tmp_path):
+def test_flow_component_device_is_resolved_with_the_rank_device(tmp_path):
     config = worker_args(
         tmp_path,
         max_batch_tokens=8192,
         device="cuda:0",
-        mesh=mesh,
+        mesh="tower=gen:cuda:1",
     )
     assert config.execution.device == "cuda:0"
     assert config.execution.generation_device == "cuda:1"
 
 
 @pytest.mark.parametrize(
-    "mesh", ["tower=text:cuda:2;gen:cuda:1", "tower=gen:cuda"]
+    "mesh", ["tower=gen:cuda", "tower=text:cuda:0;gen:cuda:1", "gen:cuda:1"]
 )
-def test_expert_devices_reject_inconsistent_rank_or_repeated_devices(
+def test_a_generation_device_is_named_once_and_differs_from_the_rank_device(
     mesh, tmp_path
 ):
     with pytest.raises(SystemExit):
@@ -39,31 +36,12 @@ def test_expert_devices_reject_inconsistent_rank_or_repeated_devices(
         )
 
 
-def test_storage_fraction_may_grant_the_whole_device(tmp_path) -> None:
-    # The fraction is a share of each device's total storage that the grant
-    # also bounds by the storage free at startup, so one is a valid share.
-    config = worker_args(tmp_path, mem_fraction_static=1.0)
-
-    assert config.execution.mem_fraction_static == 1.0
-
-
-@pytest.mark.parametrize(
-    "fraction", [0.0, -0.5, 1.5, float("nan"), float("inf")]
-)
-def test_storage_fraction_outside_the_unit_interval_is_refused(
-    fraction, tmp_path
-) -> None:
-    with pytest.raises(SystemExit):
-        worker_args(tmp_path, mem_fraction_static=fraction)
-
-
 @pytest.mark.parametrize(
     ("device", "mesh", "option"),
     [
         ("gpu0", None, "--device"),
         ("cuda:x", None, "--device"),
-        ("cuda:0", "tower=text:cpu:x;gen:cuda:1", "--mesh tower text"),
-        ("cuda:0", "tower=gen:bogus", "--mesh tower gen"),
+        ("cuda:0", "tower=gen:bogus", "--worker-mesh tower gen"),
     ],
 )
 def test_a_malformed_device_string_is_a_usage_error(

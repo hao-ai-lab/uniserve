@@ -39,10 +39,10 @@ from tests.python.fixtures.h3_conditions import (
     recorded_request,
     vision_encoder,
 )
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve_models import loading as models
 from uniserve_worker.config.deployment import ComponentConfig, ParallelConfig
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.conditions import (
     condition_units,
     encode_tracks,
@@ -102,7 +102,7 @@ def _runner(checkpoint: Path, modules, placed) -> ModelExecutor:
     """
     source = models.read_config(checkpoint, modules=frozenset(modules))
     model = models.load_model(source, device=DEVICE).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device=DEVICE,
         max_model_len=8192,
         max_video_seconds=15.0,

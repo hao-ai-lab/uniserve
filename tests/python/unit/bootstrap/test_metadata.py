@@ -11,6 +11,7 @@ import torch
 from safetensors.torch import save_file
 
 from tests.python.fixtures.model_metadata import neo_metadata
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.loading import Config as IOConfig
 from uniserve_models import bagel
 from uniserve_worker.protocol.worker_info import KvGroupKind
@@ -109,13 +110,12 @@ def test_h3_worker_advertises_bounded_media_products():
         supported_calls,
     )
     from uniserve_worker.bootstrap.outputs import resolve_outputs
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.protocol.call import MediaCall, TransferMode
 
     with torch.device("meta"):
         model = Model(fasth3_config())
     # The deployment serves 768p 16:9 and 9:16.
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
         max_model_len=65,
         max_video_seconds=1.0,
@@ -313,7 +313,6 @@ def test_sensenova_reader_rejects_sliding_window_attention(tmp_path):
 def test_text_worker_reports_exact_cache_capacity(storage):
     from uniserve_models.qwen3 import Config, Model
     from uniserve_worker.bootstrap.report import build_worker_layout
-    from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
         model = Model(
@@ -340,7 +339,7 @@ def test_text_worker_reports_exact_cache_capacity(storage):
                 mlp_only_layers=(),
             )
         ).to(dtype=torch.bfloat16)
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
         block_size=64,
         max_total_tokens=256,
@@ -379,7 +378,6 @@ def test_h3_media_units_follow_each_request_canvas():
         ComponentConfig,
         ParallelConfig,
     )
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.model_executor.component_binding import (
         ComponentBinding,
@@ -390,7 +388,7 @@ def test_h3_media_units_follow_each_request_canvas():
 
     with torch.device("meta"):
         model = Model(base_config())
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
         max_model_len=65,
         max_video_seconds=5.0,
@@ -461,11 +459,10 @@ def test_h3_audio_product_holds_the_decoded_track(seconds, frames):
     from uniserve_models.minimax_h3 import Model
     from uniserve_models.minimax_h3.packing import audio_latent_frames
     from uniserve_worker.bootstrap.outputs import resolve_outputs
-    from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
         model = Model(fasth3_config())
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
         max_model_len=65,
         max_video_seconds=seconds,
@@ -493,11 +490,10 @@ def test_h3_video_capacity_rounds_half_frames_to_even():
     from uniserve_models.minimax_h3 import Model
     from uniserve_models.minimax_h3.packing import video_latent_frames
     from uniserve_worker.bootstrap.outputs import resolve_outputs
-    from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
         model = Model(fasth3_config())
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
         max_model_len=65,
         max_video_seconds=5.1875,
@@ -528,12 +524,11 @@ def test_a_deployment_without_condition_capacity_serves_the_largest_set():
     from uniserve_models.minimax_h3 import Model
     from uniserve_worker.bootstrap.inputs import media_builder
     from uniserve_worker.bootstrap.model_loader import loaded_worker_config
-    from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
         model = Model(base_config())
         text_only = Model(fasth3_config())
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
         max_model_len=4096,
         max_video_seconds=5.0,

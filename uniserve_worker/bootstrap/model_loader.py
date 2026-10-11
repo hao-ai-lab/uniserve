@@ -54,7 +54,7 @@ from uniserve_worker.config.deployment import (
     WorkerProcessArgs,
 )
 from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.errors import unsupported_setup
 from uniserve_worker.model_executor.component_binding import (
     Call,
     ComponentBinding,
@@ -72,8 +72,7 @@ class WorkerModel:
             components have no numerical calls, it is the weight-less
             meta-device description.
         config: The execution configuration. For a checkpoint model it is
-            resolved by ``loaded_worker_config``, and a numerical worker also
-            applies the launch's ``kv_cache_dtype`` override.
+            resolved by ``loaded_worker_config``.
         tokenizer: The loaded tokenizer; ``None`` for the stub model, on a
             host worker, or for a checkpoint without one.
         image_processor: The model's image preprocessing, if any.
@@ -200,8 +199,7 @@ def _weight_config(source, options, execution) -> weights.Config:
     generic formats, applied to every module; or, with no selector, the
     checkpoint's own weights. ``ignored_layers`` then maps each listed module
     path to no quantization, and the dtype comes from
-    ``execution.model_dtype``. ``kv_cache_dtype`` is accepted here but applied
-    by ``load_worker_model``.
+    ``execution.model_dtype``.
 
     Raises:
         ValueError: An unknown key, both ``mode`` and ``quant_method``,
@@ -216,7 +214,6 @@ def _weight_config(source, options, execution) -> weights.Config:
         "quant_method",
         "components",
         "ignored_layers",
-        "kv_cache_dtype",
     }
     if unknown:
         raise ValueError(
@@ -446,14 +443,6 @@ def load_worker_model(
     worker_config = loaded_worker_config(
         model, config.execution, config.ipc.queue_depth
     )
-
-    # ``kv_cache_dtype`` in the launch's quantization_config overrides the
-    # KV storage dtype; ``_weight_config`` accepts the key but ignores it.
-    override = config.model.quantization_config.get("kv_cache_dtype")
-    if override is not None:
-        if not isinstance(override, str):
-            raise invalid_descriptor("worker KV dtype is unsupported")
-        worker_config = replace(worker_config, kv_cache_dtype=override)
 
     logger.info("loaded numerical model %s", type(model).__qualname__)
     return WorkerModel(

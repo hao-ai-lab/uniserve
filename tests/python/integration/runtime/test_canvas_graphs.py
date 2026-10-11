@@ -35,6 +35,7 @@ import torch
 import torch.multiprocessing as mp
 
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
+from tests.python.fixtures.worker_config import cpu_worker_config
 from tests.python.integration.runtime.test_prefill_graphs import (
     NATIVE_TEXT,
     NATIVE_VISION,
@@ -55,7 +56,6 @@ from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
 )
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import ResourceError
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.input_batch import (
@@ -150,7 +150,7 @@ def _worker(
         model = torch.nn.ModuleList(
             module for module in model.modules() if isinstance(module, FusedMoE)
         )
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device=device,
         model_dtype="bfloat16",
         block_size=16,

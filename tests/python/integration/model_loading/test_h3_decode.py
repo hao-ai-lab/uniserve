@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.h3 import WIDE
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.media import video
 from uniserve.runtime import (
     ExecutionContext,
@@ -26,7 +27,6 @@ from uniserve_models.minimax_h3.packing import (
 )
 from uniserve_worker.bootstrap.distributed import initialize_components
 from uniserve_worker.config.deployment import ComponentConfig
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.media import decode_video_unit
 from uniserve_worker.execution.model_executor import ModelExecutor
 
@@ -73,7 +73,7 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
         ).model
         runner = ModelExecutor(
             model,
-            WorkerConfig(
+            cpu_worker_config(
                 device="cuda:0",
                 model_dtype="bfloat16",
                 max_model_len=64,

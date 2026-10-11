@@ -26,6 +26,7 @@ import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.distributed import Communicator
 from uniserve.loading import weights
 from uniserve.math import ceil_div
@@ -36,7 +37,6 @@ from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
 )
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import ResourceError
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.graph_inputs import (
@@ -103,7 +103,7 @@ def _diffusion_gemma_worker(
         device="cuda:0",
         weights=weights.Config(dtype=torch.bfloat16),
     ).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         model_dtype="bfloat16",
         block_size=16,
@@ -420,7 +420,7 @@ def test_sealed_prefill_rejects_calls_no_captured_graph_holds(tmp_path):
     model = models.load_model(
         models.read_config(tmp_path), device="cuda:0"
     ).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         block_size=16,
         max_total_tokens=4096,
@@ -484,7 +484,7 @@ def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
     model = models.load_model(
         models.read_config(tmp_path), device="cuda:0"
     ).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         block_size=16,
         max_total_tokens=96,
@@ -546,7 +546,7 @@ def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
         models.read_config(tmp_path), device="cuda:0"
     ).model
     sizes = (1, 2, 4, 8, 16)
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         block_size=16,
         max_total_tokens=96,

@@ -110,8 +110,6 @@ pub struct WorkerProcessArgs {
     pub download_dir: Option<std::path::PathBuf>,
     /// Optional number of concurrent checkpoint reader threads.
     pub load_threads: Option<u32>,
-    /// Optional manifest of checkpoint file checksums.
-    pub checksum_manifest: Option<std::path::PathBuf>,
     /// Numeric data type used by model parameters and activations.
     pub model_dtype: uniserve_core::ModelDtype,
     /// WorkerGroup-specific quantization policy.

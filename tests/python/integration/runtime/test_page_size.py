@@ -6,9 +6,9 @@ import pytest
 import torch
 
 from tests.python.fixtures.hybrid import hybrid_model
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.runtime.backends.attention import resolve
 from uniserve_worker.bootstrap.cache import plan_cache, resolve_page_size
-from uniserve_worker.config.execution import WorkerConfig
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -18,7 +18,7 @@ def test_hybrid_page_size_serves_every_attention_group():
         dtype=torch.bfloat16, heads=((16, 8, 256), (16, 2, 512))
     )
     backend = resolve("auto", device=torch.device("cuda:0"))
-    config = resolve_page_size(model, WorkerConfig(device="cuda"), backend)
+    config = resolve_page_size(model, cpu_worker_config(device="cuda"), backend)
 
     # Full-attention rows occupy half the bytes. A 64-token base page
     # would give them 128-token pages, beyond their native reader's limit.
@@ -37,7 +37,7 @@ def test_uniform_page_size_keeps_the_largest_supported_base():
     )
     config = resolve_page_size(
         model,
-        WorkerConfig(device="cuda"),
+        cpu_worker_config(device="cuda"),
         resolve("auto", device=torch.device("cuda:0")),
     )
 

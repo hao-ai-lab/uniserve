@@ -11,6 +11,7 @@ import torch
 import torch.multiprocessing as mp
 
 from tests.python.fixtures.checkpoints import qwen_moe_checkpoint
+from tests.python.fixtures.worker_config import cpu_worker_config
 from tests.python.integration.runtime.test_prefill_graphs import _call
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.nn.moe import FusedMoE
@@ -25,7 +26,6 @@ from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
 )
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.protocol.call import ForwardMode
@@ -162,7 +162,7 @@ def _run(rank, local_rank, rendezvous, root, graphs, attention_tp, replicas):
         experts=(rank, 2 * attention_ranks, rendezvous),
     ) as groups:
         metadata = models.read_config(root)
-        config = WorkerConfig(
+        config = cpu_worker_config(
             rank=rank % attention_tp,
             world_size=attention_tp,
             device=str(device),

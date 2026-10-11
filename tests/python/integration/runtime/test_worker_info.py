@@ -8,11 +8,14 @@ import pytest
 from torch import nn
 
 from tests.python.fixtures.execution_worker import execution_worker
-from tests.python.fixtures.worker_config import stub_worker_config
+from tests.python.fixtures.worker_config import (
+    cpu_worker_config,
+    stub_worker_config,
+)
 from uniserve.nn.moe import FusedMoE
 from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.report import build_worker_layout
-from uniserve_worker.config.execution import LaneConfig, WorkerConfig
+from uniserve_worker.config.execution import LaneConfig
 from uniserve_worker.protocol.call import CALL_KINDS, ForwardMode
 
 pytestmark = pytest.mark.integration
@@ -22,7 +25,7 @@ def test_expert_participant_advertises_no_request_work() -> None:
     """A collective peer is distinct from a request admission target."""
     model = nn.ModuleList([FusedMoE(4, 256, 128, top_k=2, activation="silu")])
     info = build_worker_layout(
-        model, WorkerConfig(role="experts", graph_policy="off")
+        model, cpu_worker_config(role="experts", graph_policy="off")
     ).info
     assert info.supported_calls == ()
     assert info.components == ()
@@ -69,7 +72,7 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (
     for grant in (None, 1 << 40):
         worker = execution_worker(
             worker_id="encoder-0",
-            execution=WorkerConfig(
+            execution=cpu_worker_config(
                 graph_policy="off",
                 prefill_cuda_graph=False,
                 flow_graph_batch_sizes=(1,),
