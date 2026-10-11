@@ -665,13 +665,14 @@ pub(crate) struct WorkerProcessOptions {
     pub flow_graph_batch_sizes: Option<String>,
     #[arg(long, hide = true)]
     pub flow_graph_shapes: Option<String>,
-    /// Text capacities, in prompt tokens, of the video denoiser's layouts,
-    /// as an increasing comma-separated list whose last entry holds
-    /// `--max-model-len`, e.g. `1024,4096,16384`. Startup prepares every
-    /// admitted duration at every capacity, and a request evaluates in the
-    /// smallest capacity that holds its prompt; fewer capacities shorten
-    /// startup and lower resident memory, finer ones pad less. Defaults to
-    /// 1024 tokens, then steps of 2048 tokens.
+    /// Text capacities, in prompt tokens, of the video denoiser's layouts
+    /// below `--max-model-len`, as a comma-separated list, e.g. `1024,4096`.
+    /// `--max-model-len` is always the largest capacity, so a list holds no
+    /// entry above it. Startup prepares every admitted duration at every
+    /// capacity, and a request evaluates in the smallest capacity that holds
+    /// its prompt; fewer capacities shorten startup and lower resident
+    /// memory, finer ones pad less. Defaults to 1024 tokens, then steps of
+    /// 2048 tokens.
     #[arg(long)]
     pub video_text_capacities: Option<String>,
     /// `ffmpeg` executable the media reader decodes reference videos with.

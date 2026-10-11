@@ -116,7 +116,7 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--expert-microbatches` | `1` | Independent microbatches; values above one require dedicated experts |
 | `--max-video-seconds` | `15` | Longest admitted clip, from 4 to 15 seconds |
 | `--max-model-len` | The checkpoint's `max_position_embeddings`; 16384 prompt tokens for a MiniMax-H3 pipeline; 8192 when neither exists | Context-length ceiling |
-| `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities prepared at startup |
+| `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities below `--max-model-len`, the largest capacity, prepared at startup |
 | `--max-running-requests` | `128`, clamped to worker capacity | Scheduler active-request bound |
 | `--max-queued-requests` | Unbounded | Requests the scheduler holds waiting or with undelivered events before it rejects a submission as overloaded |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |

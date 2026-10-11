@@ -414,7 +414,7 @@ def test_component_bindings_release_cancelled_requests(
         # Two text capacities bound the startup capture of every admitted
         # duration; the requests below exercise both.
         "--video-text-capacities",
-        "1024,16384",
+        "1024",
         # One and two device layouts hold the whole denoiser on each of their
         # ranks and split the 15-second sequence over fewer of them, so their
         # warmup reaches a larger share of the device than the four-device
@@ -543,7 +543,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         # Two text capacities bound the startup capture of every admitted
         # duration.
         "--video-text-capacities",
-        "1024,16384",
+        "1024",
         # Full-duration decoder graphs need a larger static grant on H200
         # alongside BF16 weights and two resident request slots.
         "--mem-fraction-static",
