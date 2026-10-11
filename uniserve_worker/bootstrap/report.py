@@ -27,6 +27,7 @@ from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.media import image
 from uniserve.model import (
+    AudioDecoder,
     CausalLM,
     PatchEncoder,
     VideoDenoiser,
@@ -624,6 +625,7 @@ def video_denoiser_info(
     denoiser: VideoDenoiser,
     *,
     frame_rate: int,
+    audio_sample_rate: int,
     canvases: tuple[image.Config, ...] = (),
 ) -> VideoDenoiserInfo:
     """Describe what the deployment's video denoiser serves.
@@ -635,7 +637,9 @@ def video_denoiser_info(
     the short edge and aspect ratio that select it. The references are the
     most one request may carry (``VideoDenoiser.max_references``), and
     ``frame_rate`` is the model's output frame rate
-    (``VideoPostprocessor.frame_rate``).
+    (``VideoPostprocessor.frame_rate``) and ``audio_sample_rate`` its audio
+    rate (``AudioDecoder.sample_rate``), zero for a model without an audio
+    decoder.
     """
     # The denoiser names each of its canvases once.
     names = {size: name for name, size in denoiser.canvases.items()}
@@ -647,6 +651,7 @@ def video_denoiser_info(
         video_shift=float(shifts["video"]),
         audio_shift=float(shifts["audio"]),
         frame_rate=frame_rate,
+        audio_sample_rate=audio_sample_rate,
         canvases=tuple(
             ServedCanvas(*names[canvas], canvas.width, canvas.height)
             for canvas in served
@@ -680,6 +685,7 @@ def _request_tensor_worker_layout(
     plan = latent_pool_plan(model, worker_config)
     builder = media_builder(model, worker_config)
     output = capability(model, VideoPostprocessor)
+    audio = capability(model, AudioDecoder)
 
     arena = model_arena_capacity(
         model,
@@ -718,6 +724,7 @@ def _request_tensor_worker_layout(
         video_denoiser=video_denoiser_info(
             builder.denoiser,
             frame_rate=output.frame_rate,
+            audio_sample_rate=0 if audio is None else audio.sample_rate,
             canvases=builder.canvases,
         ),
         host_lane_capacity=1 if host else int(arena.host_lane_inflight),

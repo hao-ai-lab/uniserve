@@ -69,6 +69,7 @@ fn base_denoiser() -> VideoDenoiserInfo {
         video_shift: 12.0,
         audio_shift: 3.0,
         frame_rate: 24,
+        audio_sample_rate: 32_000,
         canvases: [
             ("21:9", 1536, 672),
             ("16:9", 1344, 768),
@@ -737,6 +738,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         video_shift: 10.0,
         audio_shift: 3.0,
         frame_rate: 24,
+        audio_sample_rate: 32_000,
         canvases: vec![
             served(768, "16:9", 1344, 768),
             served(480, "21:9", 992, 416),
@@ -963,8 +965,7 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
                 "size": format!("{width}x{height}"),
                 "steps": 4,
                 "seed": 17,
-                "guidance_scale": 7.5,
-                "n": 1
+                "guidance_scale": 7.5
             }))
             .unwrap();
         let (generation, _) = processor

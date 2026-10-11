@@ -29,11 +29,9 @@ REQUEST_PAGES = 8
 SAMPLE_ALIGNMENT = 256
 
 #: Default text capacities, in prompt tokens: a first rung, then steps of
-#: ``TEXT_CAPACITY_STEP`` up to the prompt capacity. A request's layout holds
-#: at most one step of padding rows beyond its prompt's tiles. Padding rows
-#: cost GEMM work, about 2% of a 4-5 second step per 1024 rows on 4 x GB200
-#: under Ulysses-4, so the first rung spares prompts of up to 1024 tokens
-#: that padding.
+#: ``TEXT_CAPACITY_STEP`` below the prompt capacity, which is always the last
+#: capacity. A request's layout holds at most one step of padding rows beyond
+#: its prompt's tiles, and a short prompt pads to the first rung only.
 TEXT_CAPACITY_FIRST = 1024
 TEXT_CAPACITY_STEP = 2048
 
@@ -153,9 +151,10 @@ class MediaBuilder:
 
         Admitted frame counts are the legal counts from ``min_frames`` up to
         ``max_frames`` rounded up to complete native windows. Text
-        capacities are prompt token counts; the largest must hold
-        ``max_text_tokens``, and without any they are ``TEXT_CAPACITY_FIRST``
-        and then steps of ``TEXT_CAPACITY_STEP`` up to it.
+        capacities are prompt token counts below ``max_text_tokens``, which
+        is always the largest capacity; without any they are
+        ``TEXT_CAPACITY_FIRST`` and then steps of ``TEXT_CAPACITY_STEP``.
+        A listed capacity equal to ``max_text_tokens`` repeats the largest.
         ``condition_rows`` is the packed condition rows a request may bring,
         zero for a worker that serves no conditions. ``canvases`` are the
         canvases the deployment prepares and admits, distinct members of
@@ -165,7 +164,7 @@ class MediaBuilder:
         Raises:
             ValueError: No frame count or canvas is admitted, a canvas
                 repeats or is not one the denoiser offers, a text
-                capacity is not positive or none holds ``max_text_tokens``,
+                capacity is not positive or exceeds ``max_text_tokens``,
                 or the condition capacity is negative or exceeds what the
                 denoiser takes (``VideoDenoiser.condition_layout``).
         """
@@ -214,15 +213,19 @@ class MediaBuilder:
         reference = max(self.canvases, key=storage)
         self.maximum = self._size(frames, max_text_tokens, reference)
 
-        requested = tuple(int(value) for value in text_capacities) or (
+        listed = tuple(int(value) for value in text_capacities)
+        if (
+            min(listed, default=1) < 1
+            or max(listed, default=0) > max_text_tokens
+        ):
+            raise ValueError(
+                "text capacities must be positive and not exceed the prompt "
+                "capacity"
+            )
+        below = listed or (
             TEXT_CAPACITY_FIRST,
             *range(TEXT_CAPACITY_STEP, max_text_tokens, TEXT_CAPACITY_STEP),
-            max_text_tokens,
         )
-        if min(requested) < 1 or max(requested) < max_text_tokens:
-            raise ValueError(
-                "text capacities must be positive and hold the prompt capacity"
-            )
         # Each capacity is the text region of the layout that holds it,
         # capped at the one that holds the prompt capacity.
         largest = denoiser.layout_size(self.maximum).num_text_tokens
@@ -235,7 +238,7 @@ class MediaBuilder:
                             self._size(frames, value, reference)
                         ).num_text_tokens,
                     )
-                    for value in requested
+                    for value in (*below, max_text_tokens)
                 }
             )
         )

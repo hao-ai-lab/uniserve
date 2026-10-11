@@ -13,7 +13,10 @@ from uniserve_models.minimax_h3 import Model
 from uniserve_models.minimax_h3.config import DMD_CANVASES, NAMED_CANVASES
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import media_builder, video_denoiser
-from uniserve_worker.bootstrap.report import video_denoiser_info
+from uniserve_worker.bootstrap.report import (
+    build_worker_layout,
+    video_denoiser_info,
+)
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.protocol.call import MediaCall
 
@@ -73,6 +76,7 @@ def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
     info = video_denoiser_info(
         video_denoiser(base, _config("transformer")),
         frame_rate=base.video_postprocessor.frame_rate,
+        audio_sample_rate=base.audio_decoder.sample_rate,
     )
     # The worker executes both tasks of the t2va/fl2va DiT on the released
     # schedule: 50 sigma points, video shift 12, audio shift 3, the canvas
@@ -90,6 +94,7 @@ def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
     reference = video_denoiser_info(
         video_denoiser(base, _config("transformer_ref")),
         frame_rate=base.video_postprocessor.frame_rate,
+        audio_sample_rate=base.audio_decoder.sample_rate,
     )
     assert reference.tasks == ("ref2va",)
     assert reference.references == ReferenceLimits(
@@ -109,7 +114,9 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
     # One candidate needs no deployment to name it.
     denoiser = video_denoiser(model, cpu_worker_config(device="cpu"))
     info = video_denoiser_info(
-        denoiser, frame_rate=model.video_postprocessor.frame_rate
+        denoiser,
+        frame_rate=model.video_postprocessor.frame_rate,
+        audio_sample_rate=model.audio_decoder.sample_rate,
     )
     assert info.tasks == ("t2va",)
     assert info.schedule_points == 5
@@ -123,6 +130,22 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
     declared = video_denoiser_info(
         denoiser,
         frame_rate=model.video_postprocessor.frame_rate,
+        audio_sample_rate=model.audio_decoder.sample_rate,
         canvases=tuple(chosen.values()),
     )
     assert _declared(declared) == _trained(chosen)
+
+
+def test_a_worker_reports_the_audio_rate_of_its_model(base):
+    config = cpu_worker_config(
+        device="cpu",
+        max_model_len=1024,
+        max_video_seconds=5.0,
+        deployment_components=(*_HOST, "transformer"),
+        max_request_pool_size=2,
+        max_batch_calls=2,
+    )
+    declared = build_worker_layout(base, config, queue_depth=6).info
+    assert declared.video_denoiser.audio_sample_rate == (
+        base.audio_decoder.sample_rate
+    )

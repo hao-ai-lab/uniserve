@@ -170,7 +170,9 @@ class VideoDenoiserInfo:
     Mirrors the Rust ``VideoDenoiserInfo``. ``schedule_points`` counts the
     fixed schedule's sigma points, the clean endpoint included;
     ``frame_rate`` is the frame rate of every video, the clock durations and
-    reference videos are counted on; ``canvases`` lists the only canvases the
+    reference videos are counted on; ``audio_sample_rate`` is the rate of the
+    audio generated with each video, zero when the model generates none;
+    ``canvases`` lists the only canvases the
     deployment serves, those it prepares; ``references`` states the
     references one request may carry.
     """
@@ -180,6 +182,7 @@ class VideoDenoiserInfo:
     video_shift: float
     audio_shift: float
     frame_rate: int
+    audio_sample_rate: int
     canvases: tuple[ServedCanvas, ...] = ()
     references: ReferenceLimits = ReferenceLimits()
 
@@ -190,6 +193,7 @@ class VideoDenoiserInfo:
             "video_shift": self.video_shift,
             "audio_shift": self.audio_shift,
             "frame_rate": self.frame_rate,
+            "audio_sample_rate": self.audio_sample_rate,
             "canvases": [canvas.to_mapping() for canvas in self.canvases],
             "references": {
                 "images": self.references.images,

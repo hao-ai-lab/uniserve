@@ -1371,6 +1371,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 video_shift: value.video_shift,
                 audio_shift: value.audio_shift,
                 frame_rate: value.frame_rate,
+                audio_sample_rate: value.audio_sample_rate,
                 canvases,
                 references,
             },

@@ -219,7 +219,6 @@ def test_sensenova_public_production_lineage(
                 json={
                     "model": SERVED_MODEL,
                     "prompt": "A blue square.",
-                    "n": 1,
                     "steps": 1,
                     "seed": 7,
                 },

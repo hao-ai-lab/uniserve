@@ -406,6 +406,7 @@ mod tests {
     use super::{BagelProfile, ModelConfig, ModelDescription, ModelParameters};
     use crate::profile::assets::ResolvedModelFiles;
     use crate::profile::assets::checkpoint::bf16_safetensors;
+    use crate::profile::omni::sensenova::SenseNovaProfile;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
 
     const SPECIAL_TOKENS: &[&str] = &[
@@ -688,6 +689,54 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(1026)]
         );
+    }
+
+    /// The generation limits bound the KV tokens of every image a profile
+    /// admits: the largest input image, the feedback of each canvas, and, for
+    /// SenseNova, the grid of each fixed bucket.
+    #[tokio::test]
+    async fn generation_limits_cover_every_image_the_profiles_admit() {
+        let (_directory, _tokenizer, config) = resolved_config("sensenova", "neo_chat").await;
+        let ModelParameters::SenseNova(profile) = config.unwrap().parameters else {
+            unreachable!()
+        };
+        let limits = profile.runtime_limits(uniserve_core::ModelDtype::BFloat16);
+        for (width, height) in [(8192, 8192), (2048, 2048), (512, 512), (4096, 1024)] {
+            let ingest = profile
+                .image_encoders_for_dimensions(width, height, 1)
+                .unwrap();
+            assert!(ingest[0].num_kv_tokens.unwrap() <= limits.max_vit_grid_tokens);
+        }
+        for bucket in &profile.resolution_policy.buckets {
+            let feedback = profile
+                .image_generation_for_dimensions(bucket.width, bucket.height)
+                .unwrap();
+            assert!(
+                feedback.feedback_encoders[0].num_kv_tokens.unwrap() <= limits.max_vit_grid_tokens
+            );
+            let units = u64::from(bucket.width / SenseNovaProfile::LATENT_DOWNSAMPLE)
+                * u64::from(bucket.height / SenseNovaProfile::LATENT_DOWNSAMPLE);
+            assert!(units <= u64::from(limits.max_vae_grid_tokens));
+        }
+
+        let (_directory, _tokenizer, config) = resolved_config("bagel", "bagel").await;
+        let ModelParameters::Bagel(profile) = config.unwrap().parameters else {
+            unreachable!()
+        };
+        let limits = BagelProfile::runtime_limits(uniserve_core::ModelDtype::BFloat16);
+        for (width, height) in [(8192, 8192), (1024, 1024), (1024, 512), (3000, 2000)] {
+            let ingest = profile
+                .image_encoders_for_dimensions(width, height, 1)
+                .unwrap();
+            assert!(ingest[0].num_kv_tokens.unwrap() <= limits.max_vae_grid_tokens);
+            assert!(ingest[1].num_kv_tokens.unwrap() <= limits.max_vit_grid_tokens);
+            let feedback = profile
+                .image_generation_for_dimensions(width, height)
+                .unwrap();
+            assert!(
+                feedback.feedback_encoders[0].num_kv_tokens.unwrap() <= limits.max_vae_grid_tokens
+            );
+        }
     }
 
     /// SenseNova input images share one pixel budget per request, so an

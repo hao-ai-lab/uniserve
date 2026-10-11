@@ -206,14 +206,16 @@ table ReferenceLimits {
 /// What a deployment's video denoiser serves: its tasks, its fixed schedule
 /// (sigma points including the clean endpoint, and the per-modality shifts),
 /// the frame rate of every video it generates, in frames per second, the
-/// canvases it prepares and accepts, in the order the deployment selected
-/// them, and the references a request may carry.
+/// sample rate of the audio it generates with a video (zero when it generates
+/// none), the canvases it prepares and accepts, in the order the deployment
+/// selected them, and the references a request may carry.
 table VideoDenoiserInfo {
   tasks:[string];
   schedule_points:uint;
   video_shift:double;
   audio_shift:double;
   frame_rate:uint;
+  audio_sample_rate:uint;
   canvases:[ServedCanvas];
   references:ReferenceLimits;
 }

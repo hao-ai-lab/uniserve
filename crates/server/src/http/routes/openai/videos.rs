@@ -22,13 +22,15 @@
 //! `media_body` streams from it without gathering the video into one buffer.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::openai::VideoGenerationRequest;
 use crate::openai::serve_error_to_api;
+use crate::serving::RequestOutput;
+use crate::serving::video::artifact::{ArtifactCollector, VideoStreamError};
 use crate::serving::video::service::REQUEST_FIELDS;
-use crate::serving::{FinishStatus, RequestOutput};
 use axum::Extension;
 use axum::body::Body;
 use axum::extract::State;
@@ -66,12 +68,9 @@ pub(crate) async fn videos_sync(
 
     // The synchronous endpoint consumes lifecycle events until the runtime
     // confirms completion and supplies exactly one artifact descriptor.
-    // Acceptance, usage, scheduling, and progress events are ignored; any other
-    // event, including `Cancelled` and `Aborted`, is answered as an
-    // incompatible runtime event.
-    let mut artifact = None;
+    let mut collector = ArtifactCollector::default();
     let mut clock = StageClock::default();
-    loop {
+    let artifact = loop {
         let event = match stream.next().await.transpose() {
             Ok(event) => event,
             Err(error) => return serve_error_to_api(error).into_response(),
@@ -79,46 +78,12 @@ pub(crate) async fn videos_sync(
         if let Some(event) = &event {
             clock.observe(event);
         }
-        match event {
-            Some(RequestOutput::Artifact(value)) => artifact = Some(value),
-            Some(RequestOutput::Finished {
-                reason: FinishStatus::Stop { .. },
-                ..
-            }) => break,
-            Some(RequestOutput::Finished { reason, .. }) => {
-                return ApiError::server_error(format!(
-                    "video generation ended without an artifact: {reason:?}"
-                ))
-                .into_response();
-            }
-            Some(RequestOutput::Rejected { kind, message, .. }) => {
-                return ApiError::rejected(kind, message).into_response();
-            }
-            Some(RequestOutput::Failed { message, .. }) => {
-                return ApiError::server_error(message).into_response();
-            }
-            Some(
-                RequestOutput::Accepted { .. }
-                | RequestOutput::Usage { .. }
-                | RequestOutput::Scheduled { .. }
-                | RequestOutput::MediaProgress { .. },
-            ) => {}
-            Some(_) => {
-                return ApiError::server_error(
-                    "video runtime emitted an incompatible event".to_string(),
-                )
-                .into_response();
-            }
-            None => {
-                return ApiError::server_error("video generation task stopped".to_string())
-                    .into_response();
+        if let ControlFlow::Break(outcome) = collector.push(event) {
+            match outcome {
+                Ok(artifact) => break artifact,
+                Err(error) => return synchronous_error(error).into_response(),
             }
         }
-    }
-
-    let Some(artifact) = artifact else {
-        return ApiError::server_error("video generation produced no artifact".to_string())
-            .into_response();
     };
 
     let length = artifact.media.len();
@@ -358,7 +323,7 @@ pub(crate) async fn videos_create(
     tokio::spawn(async move {
         let mut clock = StageClock::default();
         let result = async {
-            let mut artifact = None;
+            let mut collector = ArtifactCollector::default();
             let mut cancelled = false;
             loop {
                 // Cancellation (from `VideoJobs::delete` or `cancel_all`) is
@@ -379,7 +344,7 @@ pub(crate) async fn videos_create(
                 if let Some(event) = &event {
                     clock.observe(event);
                 }
-                match event {
+                match &event {
                     // Scheduling is reported as the `encoding` phase; later
                     // phases arrive as `MediaProgress`.
                     Some(RequestOutput::Scheduled { .. }) => {
@@ -388,53 +353,13 @@ pub(crate) async fn videos_create(
                     Some(RequestOutput::MediaProgress {
                         phase,
                         completed_steps,
-                    }) => state.videos.progress(&id, &phase, completed_steps),
-                    Some(RequestOutput::Artifact(value)) => {
-                        artifact = Some(value.media);
-                    }
-                    Some(RequestOutput::Finished {
-                        reason: FinishStatus::Stop { .. },
-                        ..
-                    }) => {
-                        return artifact.ok_or(VideoFailure {
-                            code: "missing_artifact",
-                            message: "generation completed without an artifact".to_owned(),
-                        });
-                    }
-                    Some(RequestOutput::Finished { reason, .. }) => {
-                        return Err(VideoFailure {
-                            code: "generation_terminated",
-                            message: format!("generation ended: {reason:?}"),
-                        });
-                    }
-                    // A rejection reports the error code the synchronous
-                    // route answers the same rejection with.
-                    Some(RequestOutput::Rejected { kind, message, .. }) => {
-                        let error = ApiError::rejected(kind, message);
-                        return Err(VideoFailure {
-                            code: error.code(),
-                            message: error.to_error_response().error.message,
-                        });
-                    }
-                    Some(RequestOutput::Failed { message, .. }) => {
-                        return Err(VideoFailure { code: "generation_failed", message });
-                    }
-                    Some(RequestOutput::Cancelled { .. } | RequestOutput::Aborted { .. }) => {
-                        return Err(VideoFailure { code: "generation_terminated", message: "video generation cancelled".to_owned() });
-                    }
-                    Some(RequestOutput::Accepted { .. } | RequestOutput::Usage { .. }) => {}
-                    None => {
-                        return Err(VideoFailure {
-                            code: "generation_stopped",
-                            message: "video runtime closed before completion".to_owned(),
-                        });
-                    }
-                    _ => {
-                        return Err(VideoFailure {
-                            code: "invalid_runtime_event",
-                            message: "video runtime emitted an incompatible event".to_owned(),
-                        });
-                    }
+                    }) => state.videos.progress(&id, phase, *completed_steps),
+                    _ => {}
+                }
+                if let ControlFlow::Break(outcome) = collector.push(event) {
+                    return outcome
+                        .map(|artifact| artifact.media)
+                        .map_err(job_failure);
                 }
             }
         }
@@ -447,6 +372,75 @@ pub(crate) async fn videos_create(
     });
 
     (StatusCode::OK, axum::Json(record)).into_response()
+}
+
+/// Answers a stream that ended without an artifact as the synchronous route's
+/// error.
+fn synchronous_error(error: VideoStreamError) -> ApiError {
+    match error {
+        VideoStreamError::Rejected { kind, message } => ApiError::rejected(kind, message),
+        VideoStreamError::Failed { message } => ApiError::server_error(message),
+        VideoStreamError::Ended { reason } => ApiError::server_error(format!(
+            "video generation ended without an artifact: {reason:?}"
+        )),
+        VideoStreamError::MissingArtifact => {
+            ApiError::server_error("video generation produced no artifact".to_string())
+        }
+        // The synchronous route answers a cancellation as it answers any
+        // event a video generation never carries.
+        VideoStreamError::MultipleArtifacts
+        | VideoStreamError::Cancelled
+        | VideoStreamError::Incompatible => {
+            ApiError::server_error("video runtime emitted an incompatible event".to_string())
+        }
+        VideoStreamError::Closed => {
+            ApiError::server_error("video generation task stopped".to_string())
+        }
+    }
+}
+
+/// Records a stream that ended without an artifact as the failure of a job.
+fn job_failure(error: VideoStreamError) -> crate::video_jobs::VideoFailure {
+    use crate::video_jobs::VideoFailure;
+
+    let failure = |code, message: &str| VideoFailure {
+        code,
+        message: message.to_owned(),
+    };
+    match error {
+        // A rejection reports the error code the synchronous route answers
+        // the same rejection with.
+        VideoStreamError::Rejected { kind, message } => {
+            let error = ApiError::rejected(kind, message);
+            VideoFailure {
+                code: error.code(),
+                message: error.to_error_response().error.message,
+            }
+        }
+        VideoStreamError::Failed { message } => VideoFailure {
+            code: "generation_failed",
+            message,
+        },
+        VideoStreamError::Ended { reason } => VideoFailure {
+            code: "generation_terminated",
+            message: format!("generation ended: {reason:?}"),
+        },
+        VideoStreamError::Cancelled => {
+            failure("generation_terminated", "video generation cancelled")
+        }
+        VideoStreamError::MissingArtifact => failure(
+            "missing_artifact",
+            "generation completed without an artifact",
+        ),
+        VideoStreamError::MultipleArtifacts | VideoStreamError::Incompatible => failure(
+            "invalid_runtime_event",
+            "video runtime emitted an incompatible event",
+        ),
+        VideoStreamError::Closed => failure(
+            "generation_stopped",
+            "video runtime closed before completion",
+        ),
+    }
 }
 
 /// Times one generation's phases from its runtime events.
@@ -510,8 +504,8 @@ fn missing_video() -> Response {
         .into_response()
 }
 
-/// Lists every retained job, newest first. The list is returned whole (at most
-/// `MAX_VIDEO_JOBS` records), so `has_more` is always `false`.
+/// Lists every retained job, newest first. The store's retention bounds the
+/// records, so the list is returned whole and `has_more` is always `false`.
 pub(crate) async fn videos_list(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(
         serde_json::json!({"object": "list", "data": state.videos.list(), "has_more": false}),

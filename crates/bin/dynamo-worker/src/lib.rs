@@ -22,6 +22,7 @@
 //! UniServe's own HTTP listener is never started.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,20 +41,19 @@ use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use uniserve_core::{MediaKind, VideoTask};
-use uniserve_engine::{
-    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    SchedulingPolicy, WorkerConfig, WorkerProcessArgs,
-};
+use uniserve_engine::{DEFAULT_MAX_BATCH, SchedulingPolicy, WorkerConfig, WorkerProcessArgs};
 use uniserve_server::{
     AppState, Config, EngineSettings, HttpListenerMode, ModelDescription,
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
-    serving::{FinishStatus, MAX_VIDEO_SECONDS, RequestOutput, ServeRequestId, video_frame_count},
+    serving::{
+        MAX_VIDEO_SECONDS, ServeRequestId,
+        video::artifact::{ArtifactCollector, VideoStreamError},
+    },
 };
 
 // The served canvases come from `--video-resolutions` and
 // `--video-aspect-ratios`, as for `uniserve serve`; the loaded checkpoint
 // determines the step count.
-const H3_AUDIO_SAMPLE_RATE: i32 = 32_000;
 /// The duration of a Dynamo request that omits `seconds`, at most the
 /// deployment's capacity.
 const DEFAULT_SECONDS: f64 = 5.0;
@@ -249,10 +249,10 @@ impl DynamoFastH3Engine {
         let config = Config {
             engine: EngineSettings {
                 max_batch: DEFAULT_MAX_BATCH,
-                max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
+                max_num_batched_tokens: None,
                 max_num_seqs: self.args.max_running_requests,
                 max_num_waiting: None,
-                long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
+                long_prefill_threshold: None,
                 prefix_cache: true,
                 scheduler_policy: SchedulingPolicy::Fcfs,
                 max_model_len: Some(self.args.max_model_len),
@@ -361,6 +361,7 @@ impl RawEngine for DynamoFastH3Engine {
         let served_model_name = self.args.served_model_name.clone();
         let response_format = prepared.response_format;
         let frame_rate = outputs.frame_rate;
+        let audio_sample_rate = outputs.audio_sample_rate;
 
         // Unless stopped, the stream yields exactly one item: the response
         // object, or the error that ended the request. A Dynamo stop or
@@ -368,8 +369,8 @@ impl RawEngine for DynamoFastH3Engine {
         // without an item; abort failures are ignored.
         Ok(Box::pin(async_stream::stream! {
             let started_at = Instant::now();
-            let mut artifact = None;
-            loop {
+            let mut collector = ArtifactCollector::default();
+            let artifact = loop {
                 // `biased` polls the stop and shutdown signals first, so they
                 // take precedence over an event that is ready at the same time.
                 let event = tokio::select! {
@@ -384,51 +385,23 @@ impl RawEngine for DynamoFastH3Engine {
                     }
                     event = events.next() => event,
                 };
-                match event {
-                    Some(Ok(RequestOutput::Artifact(value))) => {
-                        if artifact.replace(value).is_some() {
-                            yield Err(engine_error("UniServe produced multiple media artifacts"));
-                            return;
-                        }
-                    }
-                    Some(Ok(RequestOutput::Finished { reason: FinishStatus::Stop { .. }, .. })) => break,
-                    Some(Ok(RequestOutput::Finished { reason, .. })) => {
-                        yield Err(engine_error(format!("video generation ended without an artifact: {reason:?}")));
-                        return;
-                    }
-                    Some(Ok(RequestOutput::Rejected { kind, message, .. })) => {
-                        yield Err(api_error(uniserve_server::openai::ApiError::rejected(kind, message)));
-                        return;
-                    }
-                    Some(Ok(RequestOutput::Failed { message, .. })) => {
-                        yield Err(engine_error(message));
-                        return;
-                    }
-                    // Lifecycle, usage and progress events have no place in
-                    // the single non-streaming response.
-                    Some(Ok(
-                        RequestOutput::Accepted { .. }
-                        | RequestOutput::Usage { .. }
-                        | RequestOutput::Scheduled { .. }
-                        | RequestOutput::MediaProgress { .. },
-                    )) => {}
-                    Some(Ok(_)) => {
-                        yield Err(engine_error("UniServe emitted an incompatible event"));
-                        return;
-                    }
+                let event = match event {
                     Some(Err(error)) => {
                         yield Err(api_error(serve_error_to_api(error)));
                         return;
                     }
-                    None => {
-                        yield Err(engine_error("UniServe generation stream stopped"));
-                        return;
+                    Some(Ok(event)) => Some(event),
+                    None => None,
+                };
+                if let ControlFlow::Break(outcome) = collector.push(event) {
+                    match outcome {
+                        Ok(artifact) => break artifact,
+                        Err(error) => {
+                            yield Err(stream_error(error));
+                            return;
+                        }
                     }
                 }
-            }
-            let Some(artifact) = artifact else {
-                yield Err(engine_error("UniServe produced no media artifact"));
-                return;
             };
             if artifact.media_kind != MediaKind::Video || artifact.content_type != "video/mp4" {
                 yield Err(engine_error(format!(
@@ -443,6 +416,7 @@ impl RawEngine for DynamoFastH3Engine {
                 response_format,
                 artifact.media.as_bytes(),
                 frame_rate,
+                audio_sample_rate,
                 started_at.elapsed(),
             ));
         }))
@@ -511,10 +485,10 @@ enum ResponseFormat {
 }
 
 /// Dynamo's `nvext` video extensions. `prepare_request` accepts only the
-/// fields FastH3 can honor: `seed` at any non-negative value, and `fps` and
-/// `num_frames` only at the values FastH3 runs with. The checkpoint fixes the
-/// denoising schedule, so `num_inference_steps` is refused like the other
-/// controls FastH3 does not take.
+/// fields FastH3 can honor, `seed` at any non-negative value. The checkpoint
+/// fixes the denoising schedule and the frame rate, and the duration states
+/// the frame count, so `num_inference_steps`, `fps` and `num_frames` are
+/// refused like the other controls FastH3 does not take.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VideoNvExt {
@@ -552,9 +526,8 @@ struct PreparedRequest {
 /// both when they name the same raster; omitted, it is the deployment's
 /// default. Its resolution class names the target's short edge.
 /// Omitted fields default to seed 0, a `url` response, and 5 seconds, capped
-/// at `max_video_seconds`. `nvext.num_frames` is only checked against the
-/// aligned frame count of `seconds`; UniServe derives the frame count from
-/// the target duration again when it prepares the request.
+/// at `max_video_seconds`; the video service bounds it and derives the frame
+/// count when it plans the target.
 /// Every refusal is an invalid-argument error.
 fn prepare_request(
     value: Value,
@@ -613,13 +586,11 @@ fn prepare_request(
         .select(short_edge, aspect_ratio.as_deref())
         .map_err(invalid_argument)?;
 
-    // `seconds` is an integer in Dynamo's API; the server's duration contract
-    // bounds it and derives the frame count `nvext.num_frames` must match.
+    // `seconds` is an integer in Dynamo's API; the video service refuses one
+    // outside the deployment's duration range when it plans the target.
     let seconds = request
         .seconds
         .map_or_else(|| DEFAULT_SECONDS.min(max_video_seconds), f64::from);
-    let frames = video_frame_count(seconds, max_video_seconds, outputs.frame_rate)
-        .map_err(invalid_argument)?;
     let nvext = request.nvext.unwrap_or_default();
     reject_present("nvext.annotations", nvext.annotations.as_ref())?;
     reject_present("nvext.negative_prompt", nvext.negative_prompt.as_ref())?;
@@ -630,20 +601,8 @@ fn prepare_request(
     reject_present("nvext.guidance_scale", nvext.guidance_scale.as_ref())?;
     reject_present("nvext.boundary_ratio", nvext.boundary_ratio.as_ref())?;
     reject_present("nvext.guidance_scale_2", nvext.guidance_scale_2.as_ref())?;
-    if nvext
-        .fps
-        .is_some_and(|fps| fps != outputs.frame_rate as i32)
-    {
-        return Err(invalid_argument(format!(
-            "nvext.fps must be {}",
-            outputs.frame_rate
-        )));
-    }
-    if nvext.num_frames.is_some_and(|value| value != frames as i32) {
-        return Err(invalid_argument(format!(
-            "nvext.num_frames must be {frames} for {seconds} seconds"
-        )));
-    }
+    reject_present("nvext.fps", nvext.fps.as_ref())?;
+    reject_present("nvext.num_frames", nvext.num_frames.as_ref())?;
     // Dynamo's seed is signed and UniServe's unsigned.
     let seed = match nvext.seed {
         Some(seed) if seed < 0 => return Err(invalid_argument("nvext.seed must not be negative")),
@@ -701,6 +660,9 @@ struct Outputs {
     rasters: Vec<Raster>,
     /// Frames per second of every generated video.
     frame_rate: u32,
+    /// Sample rate, in Hz, of the audio muxed into each video; `None` for a
+    /// deployment that generates no audio.
+    audio_sample_rate: Option<i32>,
 }
 
 impl Outputs {
@@ -736,6 +698,7 @@ impl Outputs {
         Ok(Self {
             rasters,
             frame_rate,
+            audio_sample_rate: audio_sample_rate(capabilities),
         })
     }
 
@@ -818,6 +781,36 @@ impl Outputs {
     }
 }
 
+/// Reads the sample rate, in Hz, of the audio muxed into each video from a
+/// deployment's capabilities; `None` for a deployment that generates no audio.
+fn audio_sample_rate(capabilities: &Value) -> Option<i32> {
+    capabilities["audio_sample_rate"]
+        .as_i64()
+        .filter(|rate| *rate > 0)
+        .and_then(|rate| i32::try_from(rate).ok())
+}
+
+/// Maps a video stream that ended without an artifact to Dynamo's error type.
+fn stream_error(error: VideoStreamError) -> DynamoError {
+    match error {
+        VideoStreamError::Rejected { kind, message } => {
+            api_error(uniserve_server::openai::ApiError::rejected(kind, message))
+        }
+        VideoStreamError::Failed { message } => engine_error(message),
+        VideoStreamError::Ended { reason } => engine_error(format!(
+            "video generation ended without an artifact: {reason:?}"
+        )),
+        VideoStreamError::MissingArtifact => engine_error("UniServe produced no media artifact"),
+        VideoStreamError::MultipleArtifacts => {
+            engine_error("UniServe produced multiple media artifacts")
+        }
+        VideoStreamError::Cancelled | VideoStreamError::Incompatible => {
+            engine_error("UniServe emitted an incompatible event")
+        }
+        VideoStreamError::Closed => engine_error("UniServe generation stream stopped"),
+    }
+}
+
 fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> {
     match value {
         Some(_) => Err(invalid_argument(format!(
@@ -831,15 +824,16 @@ fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> 
 /// `NvVideosResponse`.
 ///
 /// The MP4 is embedded in the response: `Url` returns it as a `data:` URL and
-/// `B64Json` as bare base64. `fps` is the deployment's frame rate and
-/// `audio_sample_rate` the fixed FastH3 contract, not values read from the
-/// artifact.
+/// `B64Json` as bare base64. `fps` and `audio_sample_rate` are the rates the
+/// deployment declares, not values read from the artifact; the sample rate is
+/// null for a deployment that generates no audio.
 fn video_response(
     id: &str,
     model: &str,
     response_format: ResponseFormat,
     media: &[u8],
     frame_rate: u32,
+    audio_sample_rate: Option<i32>,
     elapsed: Duration,
 ) -> Value {
     let encoded = base64::engine::general_purpose::STANDARD.encode(media);
@@ -859,7 +853,7 @@ fn video_response(
             "url": url,
             "b64_json": b64_json,
             "fps": frame_rate,
-            "audio_sample_rate": H3_AUDIO_SAMPLE_RATE,
+            "audio_sample_rate": audio_sample_rate,
         }],
         "inference_time_s": elapsed.as_secs_f64(),
     })
@@ -960,7 +954,7 @@ mod tests {
             "prompt": "A stream in a forest",
             "seconds": 5,
             "response_format": "b64_json",
-            "nvext": {"fps": 24, "num_frames": 124, "seed": 1000}
+            "nvext": {"seed": 1000}
         })
     }
 
@@ -1086,8 +1080,7 @@ mod tests {
         }
     }
 
-    // Each request carries one field or value FastH3 does not support. With
-    // the default 5 seconds, `num_frames` must be 124, so 120 is refused.
+    // Each request carries one field or value FastH3 does not support.
     #[test]
     fn unsupported_control_is_rejected() {
         for request in [
@@ -1095,10 +1088,9 @@ mod tests {
             json!({"model":"FastH3", "prompt":"x", "stream":true}),
             json!({"model":"FastH3", "prompt":"x", "size":"832x480"}),
             json!({"model":"FastH3", "prompt":"x", "nvext":{"seed":-1}}),
-            json!({"model":"FastH3", "prompt":"x", "nvext":{"num_frames":120}}),
+            json!({"model":"FastH3", "prompt":"x", "nvext":{"fps":24}}),
+            json!({"model":"FastH3", "prompt":"x", "nvext":{"num_frames":124}}),
             json!({"model":"FastH3", "prompt":"x", "nvext":{"num_inference_steps":4}}),
-            json!({"model":"FastH3", "prompt":"x", "seconds":3}),
-            json!({"model":"FastH3", "prompt":"x", "seconds":16}),
             json!({"model":"FastH3", "prompt":"x", "extra_args":{"media_passthrough":{"foo":1}}}),
         ] {
             assert!(prepare_request(request, "FastH3", 15.0, &default_outputs()).is_err());
@@ -1113,10 +1105,12 @@ mod tests {
             ResponseFormat::B64Json,
             b"mp4",
             24,
+            Some(32_000),
             Duration::from_millis(1_500),
         );
         assert_eq!(response["data"][0]["b64_json"], "bXA0");
         assert!(response["data"][0]["url"].is_null());
+        assert_eq!(response["data"][0]["audio_sample_rate"], 32_000);
         assert_eq!(response["inference_time_s"], 1.5);
 
         let response = video_response(
@@ -1125,8 +1119,20 @@ mod tests {
             ResponseFormat::Url,
             b"mp4",
             24,
+            None,
             Duration::ZERO,
         );
         assert_eq!(response["data"][0]["url"], "data:video/mp4;base64,bXA0");
+        assert!(response["data"][0]["audio_sample_rate"].is_null());
+    }
+
+    #[test]
+    fn the_audio_rate_is_the_one_the_deployment_declares() {
+        assert_eq!(
+            audio_sample_rate(&json!({"audio_sample_rate": 32_000})),
+            Some(32_000)
+        );
+        assert_eq!(audio_sample_rate(&json!({"audio_sample_rate": 0})), None);
+        assert_eq!(audio_sample_rate(&json!({})), None);
     }
 }

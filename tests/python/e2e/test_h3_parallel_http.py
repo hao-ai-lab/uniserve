@@ -174,7 +174,8 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
         ("tensor2_ulysses4", "balanced", grouping, 2)
         for grouping in ("split", "mixed")
     ]
-    # A single admitted request still needs the worker's two state slots.
+    # The worker's two state slots follow its queue depth, not the number of
+    # admitted requests, so one admitted request still leaves two.
     + [("ulysses4", "quality", "whole", 1)],
 )
 def test_component_bindings_release_cancelled_requests(
@@ -399,14 +400,8 @@ def test_component_bindings_release_cancelled_requests(
         ),
         "--queue-depth",
         "6",
-        "--max-batch",
-        "2",
         "--max-running-requests",
         str(max_running_requests),
-        "--max-num-batched-tokens",
-        "2",
-        "--chunked-prefill-size",
-        "1",
         "--max-model-len",
         "16384",
         "--max-video-seconds",
@@ -414,7 +409,7 @@ def test_component_bindings_release_cancelled_requests(
         # Two text capacities bound the startup capture of every admitted
         # duration; the requests below exercise both.
         "--video-text-capacities",
-        "1024,16384",
+        "1024",
         # One and two device layouts hold the whole denoiser on each of their
         # ranks and split the 15-second sequence over fewer of them, so their
         # warmup reaches a larger share of the device than the four-device
@@ -543,7 +538,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         # Two text capacities bound the startup capture of every admitted
         # duration.
         "--video-text-capacities",
-        "1024,16384",
+        "1024",
         # Full-duration decoder graphs need a larger static grant on H200
         # alongside BF16 weights and two resident request slots.
         "--mem-fraction-static",

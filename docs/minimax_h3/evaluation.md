@@ -25,6 +25,8 @@ export UNISERVE_FAST_H3_NVFP4_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 
 The `gb200-8` suites start the head on `rank-0`; start `uniserve-host` on `rank-1` for each server the suite starts, as in [Two hosts](minimax_h3.md#two-hosts).
 
+The `gb200-4-bf16-w1-w2` suite of the same profile runs the W1 and W2 workloads of [MiniMax-H3 workloads](#minimax-h3-workloads) on FastH3 8-Step V2, on the `gb200-4-bf16` deployment.
+
 ## H200
 
 These use `FastVideo/FastVideo-FastH3-8-Step-V2` at revision `3da2ddfe1954d9cda4c05b643dc0f26007a655c5`, the evaluator's synthesized prompts with seed 1000, full graphs, `--mem-fraction-static 0.92` and `NCCL_CUMEM_HOST_ENABLE=1`. Latency is the mean ± SD of three requests at concurrency one after one warmup; the DP8 points use eight warmups and 16 requests at concurrency eight.
@@ -72,7 +74,7 @@ export UNISERVE_MINIMAX_H3_FFMPEG=/workspace/tools/ffmpeg-8.1.2/bin
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-w3
 ```
 
-The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF`, and the Hugging Face cache supplies the base revision it pins. The `gb200-4-reference` and `gb200-4-omniref` servers enlarge references to their encoding size (`--mm-processor-kwargs '{"enlarge_references":true}'`), the sizing of the released pipeline and of the SGLang and FastVideo baselines W4 and W5 are compared with. The two-host SGLang suites, `sglang-gb200-8` and `sglang-gb200-8-reference`, need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`, the address of `rank-0`, and the reference suite also `UNISERVE_MINIMAX_H3_SHARED_SCRATCH`, a directory both hosts mount.
+The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF`, and the Hugging Face cache supplies the base revision it pins. The `gb200-4-reference` and `gb200-4-omniref` servers enlarge references to their encoding size (`--mm-processor-kwargs '{"enlarge_references":true}'`), the sizing of the released pipeline and of the SGLang and FastVideo baselines W4 and W5 are compared with. The two-host SGLang suites, `sglang-gb200-8` and `sglang-gb200-8-reference`, need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`, the address of `rank-0`, and the reference suite also `UNISERVE_MINIMAX_H3_SHARED_SCRATCH`, a directory both hosts mount.
 
 ## OmniRef reference compositions
 
@@ -94,7 +96,7 @@ A request's packed sequence is its prompt, which carries every visual reference'
 
 The matrix is measured under both reference sizings (`enlarge_references` of `--mm-processor-kwargs`). The `gb200-8-omniref-refs` suite serves the default: a reference keeps its own size unless it exceeds its encoding size. Every image of the matrix has a short edge below 2048 pixels, so each is as many prompt tokens and condition rows as its own 32-pixel patches, 3,600 for the 2560×1440 subject and 576 to 2,025 for a square, and every reference video is larger than its canvas and scales down to it; the largest cell, `ref-full-15s`, packs 189,830 rows. The `gb200-8-omniref-refs-enlarged` suite enlarges each image to its 2048-pixel short edge, 7,296 prompt tokens and condition rows at 16:9 and 4,096 when square, as the released pipeline and SGLang do; its largest cell packs 236,294 rows.
 
-A point sends one warmup at seed 42 and three measured requests one at a time, seeds 0 to 2. One deployment across two four-GB200 hosts (`ulysses8-reference-two-node.json`) serves every cell of a suite, with a text capacity for each cell's prompt and the condition rows of `full`: `--max-video-seconds 15 --max-model-len 24576 --video-text-capacities 4096,7168,8192,9216,10240,12288,15360,24576 --max-condition-rows 56192` by default, and `--max-model-len 48128 --video-text-capacities 4096,7168,8192,10240,14336,15360,22528,37888,48128 --max-condition-rows 79104 --mm-processor-kwargs '{"enlarge_references":true}'` for the enlarged suite.
+A point sends one warmup at seed 42 and three measured requests one at a time, seeds 0 to 2. One deployment across two four-GB200 hosts (`ulysses8-reference-two-node.json`) serves every cell of a suite, with a text capacity for each cell's prompt and the condition rows of `full`: `--max-video-seconds 15 --max-model-len 24576 --video-text-capacities 4096,7168,8192,9216,10240,12288,15360 --max-condition-rows 56192` by default, and `--max-model-len 48128 --video-text-capacities 4096,7168,8192,10240,14336,15360,22528,37888 --max-condition-rows 79104 --mm-processor-kwargs '{"enlarge_references":true}'` for the enlarged suite.
 
 ```bash
 export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastVideo-FastH3-Omni-8-Step-V1

@@ -55,16 +55,20 @@ pub enum HttpListenerMode {
 pub struct EngineSettings {
     /// Maximum calls assembled into one forward batch.
     pub max_batch: usize,
-    /// Maximum number of tokens scheduled in one engine step.
-    pub max_num_batched_tokens: usize,
+    /// Maximum number of tokens scheduled in one engine step; `None` is
+    /// [`DEFAULT_MAX_NUM_BATCHED_TOKENS`]. A video pipeline schedules no
+    /// token batches and refuses a value.
+    pub max_num_batched_tokens: Option<usize>,
     /// Maximum number of concurrently running requests.
     pub max_num_seqs: usize,
     /// Most requests the scheduler holds waiting, or finished with
     /// undelivered events, before it rejects a submission as overloaded;
     /// `None` queues without bound.
     pub max_num_waiting: Option<usize>,
-    /// Per-request token ceiling for one prefill chunk.
-    pub long_prefill_threshold: usize,
+    /// Per-request token ceiling for one prefill chunk; `None` is
+    /// [`DEFAULT_LONG_PREFILL_THRESHOLD`]. A video pipeline prefills no
+    /// prompt chunks and refuses a value.
+    pub long_prefill_threshold: Option<usize>,
     /// Reuse and retain prompt KV prefixes across requests. Per-request cache
     /// policy can further restrict this deployment-wide setting.
     pub prefix_cache: bool,
@@ -109,10 +113,10 @@ impl Default for EngineSettings {
     fn default() -> Self {
         Self {
             max_batch: DEFAULT_MAX_BATCH,
-            max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
+            max_num_batched_tokens: None,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             max_num_waiting: None,
-            long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
+            long_prefill_threshold: None,
             prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
@@ -341,10 +345,46 @@ impl Config {
     }
 }
 
+/// The token bounds of a deployment's scheduler, resolved for its model
+/// family by [`EngineSettings::token_budgets`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokenBudgets {
+    pub(crate) max_num_batched_tokens: usize,
+    pub(crate) long_prefill_threshold: usize,
+}
+
 impl EngineSettings {
     /// Final fallback context length used when neither the CLI nor the loaded
     /// model exposes a `max_model_len`.
     pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
+
+    /// Resolves the token budgets of a token model or, with `pipeline`, a
+    /// video pipeline.
+    ///
+    /// A video pipeline schedules requests, not token batches, and its worker
+    /// reads no token budget, so a configured one is refused instead of
+    /// being ignored.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `pipeline` is set and a token budget or prefill chunk size
+    /// is configured.
+    pub(crate) fn token_budgets(&self, pipeline: bool) -> Result<TokenBudgets> {
+        anyhow::ensure!(
+            !pipeline
+                || (self.max_num_batched_tokens.is_none() && self.long_prefill_threshold.is_none()),
+            "--max-num-batched-tokens and --chunked-prefill-size bound token batches, \
+             which a video pipeline does not schedule; remove them"
+        );
+        Ok(TokenBudgets {
+            max_num_batched_tokens: self
+                .max_num_batched_tokens
+                .unwrap_or(DEFAULT_MAX_NUM_BATCHED_TOKENS),
+            long_prefill_threshold: self
+                .long_prefill_threshold
+                .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),
+        })
+    }
 
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`
@@ -364,7 +404,7 @@ impl EngineSettings {
         );
         anyhow::ensure!(self.max_batch > 0, "max_batch must be greater than 0");
         anyhow::ensure!(
-            self.max_num_batched_tokens > 0,
+            self.max_num_batched_tokens != Some(0),
             "max_num_batched_tokens must be greater than 0"
         );
         anyhow::ensure!(self.max_num_seqs > 0, "max_num_seqs must be greater than 0");
@@ -397,6 +437,37 @@ mod tests {
     fn default_config_validates() {
         let config = Config::default();
         assert!(config.validate().is_ok());
+    }
+
+    /// Token budgets bound token batches, which a video pipeline never forms.
+    #[test]
+    fn a_video_pipeline_refuses_token_budgets() {
+        for settings in [
+            EngineSettings {
+                max_num_batched_tokens: Some(2),
+                ..EngineSettings::default()
+            },
+            EngineSettings {
+                long_prefill_threshold: Some(1),
+                ..EngineSettings::default()
+            },
+        ] {
+            assert!(settings.token_budgets(true).is_err());
+            assert!(settings.token_budgets(false).is_ok());
+        }
+    }
+
+    #[test]
+    fn unset_token_budgets_take_the_engine_defaults() {
+        for pipeline in [true, false] {
+            assert_eq!(
+                EngineSettings::default().token_budgets(pipeline).unwrap(),
+                TokenBudgets {
+                    max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
+                    long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
+                }
+            );
+        }
     }
 
     #[test]

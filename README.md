@@ -116,13 +116,13 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--expert-microbatches` | `1` | Independent microbatches; values above one require dedicated experts |
 | `--max-video-seconds` | `15` | Longest admitted clip, from 4 to 15 seconds |
 | `--max-model-len` | The checkpoint's `max_position_embeddings`; 16384 prompt tokens for a MiniMax-H3 pipeline; 8192 when neither exists | Context-length ceiling |
-| `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities prepared at startup |
+| `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities below `--max-model-len`, the largest capacity, prepared at startup |
 | `--max-running-requests` | `128`, clamped to worker capacity | Scheduler active-request bound |
 | `--max-queued-requests` | Unbounded | Requests the scheduler holds waiting or with undelivered events before it rejects a submission as overloaded |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
 | `--block-size` | Chosen by the worker | Tokens per KV page of the widest cache group, supported by every cache group's attention readers |
-| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |
-| `--chunked-prefill-size` | `8192` | Per-request prefill bound |
+| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget; a video pipeline refuses it |
+| `--chunked-prefill-size` | `8192` | Per-request prefill bound; a video pipeline refuses it |
 | `--mem-fraction-static` | `0.70` | Each rank's share of device memory for weights and KV cache |
 | `--graph-policy` | `auto` | CUDA graph policy: `auto`, `full`, or `off` |
 | `--quantization-config` | `{}`, the `quality` preset | Precision preset or per-component overrides |

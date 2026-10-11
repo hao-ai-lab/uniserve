@@ -23,7 +23,7 @@ artifact_root = "artifacts/minimax_h3/fasth3-measurements"
 [servers.gb200-4-bf16]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4.json", "--max-running-requests", "2", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-4-bf16.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -135,7 +135,7 @@ videos_per_second = "higher"
 [servers.gb200-4-nvfp4]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4.json", "--max-running-requests", "2", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16"]
 
 [servers.gb200-4-nvfp4.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -247,7 +247,7 @@ videos_per_second = "higher"
 [servers.gb200-8-bf16-latency]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8-two-node.json", "--max-running-requests", "2", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-8-bf16-latency.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -275,7 +275,7 @@ videos_per_second = "higher"
 [servers.gb200-8-bf16-throughput]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2-two-node.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2-two-node.json", "--max-running-requests", "4", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-8-bf16-throughput.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -388,7 +388,7 @@ videos_per_second = "higher"
 [servers.gb200-8-nvfp4-latency]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8-two-node.json", "--max-running-requests", "2", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off"]
 
 [servers.gb200-8-nvfp4-latency.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -416,7 +416,7 @@ videos_per_second = "higher"
 [servers.gb200-8-nvfp4-throughput]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2-two-node.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2-two-node.json", "--max-running-requests", "4", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0"]
 
 [servers.gb200-8-nvfp4-throughput.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -529,7 +529,7 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-bf16-latency]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8.json", "--max-running-requests", "2", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [benchmarks.rtx-pro-6000-8-bf16-latency]
 server = "rtx-pro-6000-8-bf16-latency"
@@ -554,7 +554,7 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-bf16-throughput]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2.json", "--max-running-requests", "4", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c1]
 server = "rtx-pro-6000-8-bf16-throughput"
@@ -664,7 +664,7 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-nvfp4-latency]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8.json", "--max-running-requests", "2", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240"]
 
 [benchmarks.rtx-pro-6000-8-nvfp4-latency]
 server = "rtx-pro-6000-8-nvfp4-latency"
@@ -689,7 +689,7 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-nvfp4-throughput]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2.json", "--max-running-requests", "4", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240"]
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c1]
 server = "rtx-pro-6000-8-nvfp4-throughput"
@@ -796,8 +796,62 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
+# W1 and W2 of uniserve_eval/minimax_h3.toml on the same deployment: 8 and 4
+# requests at one at a time. The requests state no schedule: the server serves
+# the checkpoint's, 9 sigma points (8 DMD forwards) with shifts 10 and 3.
+[benchmarks.gb200-4-bf16-w1]
+server = "gb200-4-bf16"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-bf16-w1.video]
+task = "t2va"
+aspect_ratio = "16:9"
+
+[benchmarks.gb200-4-bf16-w1.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
+
+[benchmarks.gb200-4-bf16-w1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-bf16-w2]
+server = "gb200-4-bf16"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-bf16-w2.video]
+task = "t2va"
+aspect_ratio = "16:9"
+
+[benchmarks.gb200-4-bf16-w2.load]
+num_prompts = 4
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
+
+[benchmarks.gb200-4-bf16-w2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
 [suites.gb200-4-bf16]
 points = ["gb200-4-bf16-latency", "gb200-4-bf16-throughput-c1", "gb200-4-bf16-throughput-c2", "gb200-4-bf16-throughput-c4", "gb200-4-bf16-throughput-c8"]
+
+[suites.gb200-4-bf16-w1-w2]
+points = ["gb200-4-bf16-w1", "gb200-4-bf16-w2"]
 
 [suites.gb200-4-nvfp4]
 points = ["gb200-4-nvfp4-latency", "gb200-4-nvfp4-throughput-c1", "gb200-4-nvfp4-throughput-c2", "gb200-4-nvfp4-throughput-c4", "gb200-4-nvfp4-throughput-c8"]

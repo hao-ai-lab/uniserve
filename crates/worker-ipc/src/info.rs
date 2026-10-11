@@ -315,6 +315,9 @@ pub struct VideoDenoiserInfo {
     /// generates: the output clock durations and reference videos are
     /// counted on.
     pub frame_rate: u32,
+    /// Sample rate, in Hz, of the audio track generated with each video; zero
+    /// for a deployment that generates none.
+    pub audio_sample_rate: u32,
     /// The only canvases the deployment serves: those it prepares, in the
     /// order its operator selected them.
     #[serde(default)]

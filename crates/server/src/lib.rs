@@ -83,11 +83,11 @@ fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
 ///
 /// # Errors
 ///
-/// Fails when the model assets cannot be resolved, when the per-run call
-/// bound (`max_batch`) or `max_num_batched_tokens`
-/// does not fit the worker's `u32` fields, when the engine fails to start, or
-/// when the model description cannot be bound to the capabilities the engine
-/// reports.
+/// Fails when the model assets cannot be resolved, when a token budget is
+/// configured for a video pipeline, when the per-run call bound (`max_batch`)
+/// or `max_num_batched_tokens` does not fit the worker's `u32` fields, when
+/// the engine fails to start, or when the model description cannot be bound
+/// to the capabilities the engine reports.
 pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let LoadedModel {
         config: mut model_config,
@@ -122,9 +122,12 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     // Media workers keep the resident request slots their queue depth
     // pipelines even when admission permits fewer requests. Keep their
     // configured batch capacity independent.
+    let budgets = config
+        .engine
+        .token_budgets(model_config.description().is_pipeline())?;
     let max_batch_calls = u32::try_from(config.engine.max_batch.max(1))
         .context("max_batch exceeds the worker field width")?;
-    let max_batch_tokens = u32::try_from(config.engine.max_num_batched_tokens)
+    let max_batch_tokens = u32::try_from(budgets.max_num_batched_tokens)
         .context("max_num_batched_tokens exceeds the worker field width")?;
 
     let worker_process = WorkerProcessArgs {
@@ -152,10 +155,10 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let engine_config = EngineConfig {
         generation_limits,
         max_batch: config.engine.max_batch,
-        max_num_batched_tokens: config.engine.max_num_batched_tokens,
+        max_num_batched_tokens: budgets.max_num_batched_tokens,
         max_num_seqs: config.engine.max_num_seqs,
         max_num_waiting: config.engine.max_num_waiting,
-        long_prefill_threshold: config.engine.long_prefill_threshold,
+        long_prefill_threshold: budgets.long_prefill_threshold,
         prefix_cache: config.engine.prefix_cache,
         scheduler_policy: config.engine.scheduler_policy,
         workers: config.engine.workers.clone(),

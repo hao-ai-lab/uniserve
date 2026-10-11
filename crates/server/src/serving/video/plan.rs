@@ -1294,16 +1294,16 @@ fn check_conditions(
         let audios = count(|kind| kind == ConditionType::Audio);
         let videos = count(|kind| matches!(kind, ConditionType::Video | ConditionType::VideoAudio));
         let declared = &limits.reference_limits;
-        for (kind, found, limit) in [
-            ("image", images, declared.images),
-            ("video", videos, declared.videos),
-            ("audio", audios, declared.audios),
-            ("reference", references().count(), declared.total),
+        for (what, found, limit) in [
+            ("image references", images, declared.images),
+            ("video references", videos, declared.videos),
+            ("audio references", audios, declared.audios),
+            ("references", references().count(), declared.total),
         ] {
             if found > limit as usize {
                 return Err(VideoInputError::invalid(
                     RequestField::Conditions,
-                    format!("at most {limit} {kind} references, got {found}"),
+                    format!("at most {limit} {what}, got {found}"),
                 ));
             }
         }

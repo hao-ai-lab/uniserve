@@ -85,6 +85,7 @@ def test_the_handshake_declares_each_canvas_with_its_names(model):
     info = video_denoiser_info(
         builder.denoiser,
         frame_rate=model.video_postprocessor.frame_rate,
+        audio_sample_rate=model.audio_decoder.sample_rate,
         canvases=builder.canvases,
     )
     names = [(768, "16:9"), (480, "16:9")]
