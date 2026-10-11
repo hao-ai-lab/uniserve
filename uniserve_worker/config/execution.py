@@ -4,12 +4,10 @@ Bootstrap resolves these stable execution settings before model materialization
 and passes the immutable value into every configured subsystem.
 
 The module also owns the default CUDA graph capture buckets and the storage
-reservations for captured graphs: ``graph_padding_block_count`` derives the KV
-pages that graph padding may occupy from the default buckets, and
-``graph_storage_budget_bytes`` sizes the device share for retained graph
-executables. Capacity planning in ``uniserve_worker.bootstrap.report``
-reserves both before it sizes the request pool, and
-``uniserve_worker.model_executor.graph_storage`` uses the graph budget as the
+reservation for captured graphs: ``graph_storage_budget_bytes`` sizes the
+device share for retained graph executables. Capacity planning in
+``uniserve_worker.bootstrap.report`` reserves it before it sizes the request
+pool, and ``uniserve_worker.model_executor.graph_storage`` uses it as the
 default for a device whose budget has not been set.
 """
 
@@ -46,7 +44,6 @@ __all__ = [
     "DEFAULT_GRAPH_STORAGE_FRACTION",
     "DEFAULT_PREFILL_GRAPH_ROW_BUCKETS",
     "DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS",
-    "graph_padding_block_count",
     "graph_storage_budget_bytes",
     "LaneConfig",
     "WorkerConfig",
@@ -181,32 +178,6 @@ DEFAULT_FLOW_GRAPH_SHAPES = ((1152, 2048), (2048, 1152))
 # configurable: ``ModelExecutor`` and bootstrap capacity planning read them
 # directly.
 DEFAULT_PREFILL_GRAPH_ROW_BUCKETS = (8, 16, 32)
-
-
-def graph_padding_block_count(block_size: int) -> int:
-    """Return the most KV pages that padding a captured graph input can add.
-
-    A decode batch padded up to the next captured batch size gains at most one
-    token per padding row, and a prefill padded up to the next token bucket
-    gains at most the widest gap between buckets. The count is derived from
-    the default buckets, not from the sizes a ``WorkerConfig`` configures.
-    """
-    block_size = max(1, int(block_size))
-    decode_tokens = max(DEFAULT_DECODE_GRAPH_BATCH_SIZES) - 1
-
-    # The largest gap between consecutive prefill buckets is the most padding a
-    # rounded-up prefill graph ever appends to a real token count.
-    prefill_tokens = max(
-        current - previous
-        for previous, current in zip(
-            (0, *DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS[:-1]),
-            DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
-            strict=True,
-        )
-    )
-    max_padding_tokens = max(decode_tokens, prefill_tokens)
-    return (max_padding_tokens + block_size - 1) // block_size
-
 
 # Captured graphs hold their storage for as long as they are retained, so the
 # executable set owns a fixed share of the device rather than growing with the
@@ -388,17 +359,17 @@ class WorkerConfig:
     kernels (``bootstrap.cache.resolve_page_size``) before the unit pool is
     planned.
 
-    Graphs: ``graph_policy`` ``"off"`` disables every graph. Otherwise every
+    Graphs: ``graph_policy`` ``"off"`` disables every graph. Otherwise a
     decode call on a CUDA device replays a graph captured at startup for one
     of the ``decode_graph_batch_sizes`` whose rows' pages fit the KV pool,
-    and with ``prefill_cuda_graph`` every prefill call replays a graph
-    captured over ``prefill_graph_token_sizes`` token buckets. A call no
-    captured graph holds fails, and the worker reports the rows its graphs
-    hold so the engine never forms one. Turning ``prefill_cuda_graph`` off
-    runs prefill eagerly, for debugging. Without ``prefill_outputs`` the
-    deployment's prefill calls select no output (``TokenSelection.CACHE``):
-    their graphs only write the K/V cache, and a prefill call that selects
-    logits or hidden states has no graph.
+    and with ``prefill_cuda_graph`` a prefill call replays a graph captured
+    over ``prefill_graph_token_sizes`` token buckets. A call no captured
+    graph holds runs eagerly, as every call does with the graphs off.
+    Turning ``prefill_cuda_graph`` off runs prefill eagerly, for debugging.
+    Without ``prefill_outputs`` the deployment's prefill calls select no
+    output (``TokenSelection.CACHE``): their graphs only write the K/V
+    cache, and a prefill call that selects logits or hidden states has no
+    graph.
     ``flow_cuda_graph`` (on by default) captures image denoising calls at
     the ``flow_graph_shapes`` and ``flow_graph_batch_sizes`` combinations
     and replays those whose exact input signature was captured; turning it
@@ -535,9 +506,7 @@ def worker_config_from_namespace(
     if exchange == "alltoall":
         # Each local shape also captures larger transfer capacities. Bound
         # that product with geometric small buckets and 512-token spacing
-        # thereafter; the default catalog's maximum padding gap stays 512,
-        # within the same KV padding allocation as independent replicas.
-        # An explicit launch catalog still takes precedence below.
+        # thereafter. An explicit launch catalog still takes precedence below.
         prefill_tokens = (
             4,
             8,

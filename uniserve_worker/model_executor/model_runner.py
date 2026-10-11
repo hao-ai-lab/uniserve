@@ -9,8 +9,9 @@ serves two call paths:
   ``InputBuffers``, and ``run_batch`` replays a graph bucket selected by
   ``select_graph_shape`` or runs eagerly. Buckets are captured during startup
   through ``capture_batch``; once ``ModelExecutor.complete_startup`` seals
-  the runner, no batch graph is captured, and a batch whose configured
-  bucket is not resident fails instead of running eagerly.
+  the runner, no batch graph is captured, and a batch whose selected
+  configured bucket is not resident fails instead of running eagerly. A
+  batch no configured bucket holds runs eagerly.
 - Standalone invocations: ``execute_model`` evaluates one module call from
   ``ModelExecutor.run_module``. When graph pools exist, startup captures a
   graph per exact input signature on first use; once startup is sealed, a
@@ -505,10 +506,8 @@ class ModelRunner(Execution, ABC):
 
         Raises:
             CUDAGraphError: After startup, a configured text bucket that
-                the batch selects is not resident, or a text runner with
-                prefill graphs has no bucket for a non-decode batch; before
-                startup, capturing a missing text bucket can also fail with
-                it.
+                the batch selects is not resident; before startup, capturing
+                a missing text bucket can also fail with it.
         """
         with self.context.activate():
             return self._run_batch(

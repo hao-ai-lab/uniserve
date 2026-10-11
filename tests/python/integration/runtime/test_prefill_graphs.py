@@ -6,14 +6,13 @@ DiffusionGemma model with the released checkpoints' attention shapes, whose
 sliding tables start after retired pages, replays of causal text chunks,
 non-causal image-block rows and 256-token commit rows return the outputs and
 write the KV of eager execution of the same calls, and a replayed call copies
-no device value to the host. After startup, a prefill or decode call no
-captured graph holds fails instead of running eagerly, and the worker
-reports the most rows its prefill and decode graphs hold, at most the rows
-its KV unit pool holds a page of each cache group for. On pools of few
-units, whose cache groups have pages of different sizes, startup captures
-every prefill bucket a batch the pool holds selects, and each replays. A
-worker whose prefills select no output replays graphs that only write the
-K/V cache, and leaves the cache of the eager pass that evaluates outputs.
+no device value to the host. A prefill or decode call no captured graph holds
+runs eagerly and returns the outputs a graph run of its rows returns. On
+pools of few units, whose cache groups have pages of different sizes, startup
+captures every prefill bucket a batch the pool holds selects, and each
+replays. A worker whose prefills select no output replays graphs that only
+write the K/V cache, and leaves the cache of the eager pass that evaluates
+outputs.
 """
 
 from __future__ import annotations
@@ -37,7 +36,6 @@ from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
 )
-from uniserve_worker.errors import ResourceError
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.graph_inputs import (
     prefill_captures,
@@ -409,13 +407,13 @@ def _qwen_checkpoint(root):
 
 
 @torch.inference_mode()
-def test_sealed_prefill_rejects_calls_no_captured_graph_holds(tmp_path):
-    """After startup, a prefill no captured graph holds fails, writing no KV.
+def test_prefill_calls_no_captured_graph_holds_run_eagerly(tmp_path):
+    """A prefill no captured graph holds runs eagerly with the same outputs.
 
-    Forty admitted calls exceed the 31 rows the widest prefill bucket holds;
-    the worker reports that bound, replays a graph for 31 rows, and rejects
-    35 rows, and non-causal rows its text-only model captured no graph for,
-    without running them.
+    Forty admitted calls exceed the 31 rows the widest prefill bucket holds,
+    and the text-only model captured no graph for non-causal rows. A call of
+    31 rows replays a graph; a call of 35 rows and a non-causal call run
+    eagerly, and the 35 rows' first 31 outputs equal the replay's.
     """
     _qwen_checkpoint(tmp_path)
     model = models.load_model(
@@ -440,7 +438,6 @@ def test_sealed_prefill_rejects_calls_no_captured_graph_holds(tmp_path):
         queue_depth=2,
     ) as worker:
         worker.warmup()
-        assert worker.info.max_prefill_calls == 31
 
         manager = worker.kv_cache
         manager.block_tables.install(
@@ -455,19 +452,21 @@ def test_sealed_prefill_rejects_calls_no_captured_graph_holds(tmp_path):
                 causal=causal,
             )
 
-        output = _call(worker.runner, manager, rows(31))
-        assert output.stats.cuda_graph_replays == 1
-        assert len(output.materialize().values) == 31
+        replayed = _call(worker.runner, manager, rows(31))
+        assert replayed.stats.cuda_graph_replays == 1
+        assert len(replayed.materialize().values) == 31
 
-        before = _cache_values(manager)
-        for rejected in (rows(35), rows(2, causal=False)):
-            with pytest.raises(ResourceError, match="no prefill graph"):
-                _call(worker.runner, manager, rejected)
-        torch.cuda.synchronize()
-        for actual, expected in zip(
-            _cache_values(manager), before, strict=True
-        ):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        wide = _call(worker.runner, manager, rows(35))
+        assert wide.stats.cuda_graph_replays == 0
+        assert wide.stats.cuda_graph_runtime_mode_counts == {"eager": 1}
+        assert len(wide.materialize().values) == 35
+        for actual, expected in zip(_outputs(wide), _outputs(replayed)):
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+        non_causal = _call(worker.runner, manager, rows(2, causal=False))
+        assert non_causal.stats.cuda_graph_replays == 0
+        assert non_causal.stats.cuda_graph_runtime_mode_counts == {"eager": 1}
+        assert len(non_causal.materialize().values) == 2
 
 
 @torch.inference_mode()
@@ -477,8 +476,8 @@ def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
     Every row of a prefill call holds a page of the model's one cache
     group, so a 96-token unit pool holds fewer rows than the configured
     prefill buckets would. Startup captures every prefill graph within the
-    pool, the worker reports the rows its allocatable units hold, and a
-    prefill of that many rows replays a graph.
+    pool, and a prefill of as many rows as the allocatable units hold replays
+    a graph.
     """
     _qwen_checkpoint(tmp_path)
     model = models.load_model(
@@ -507,7 +506,6 @@ def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
         # pool holds fewer rows than the 31 the widest bucket would.
         allocatable = worker.info.kv_cache.num_units - 1
         assert allocatable < 31
-        assert worker.info.max_prefill_calls == allocatable
 
         manager = worker.kv_cache
         manager.block_tables.install(
@@ -531,14 +529,14 @@ def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
 
 
 @torch.inference_mode()
-def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
-    """Decode capacity follows the unit pool; wider decode calls fail.
+def test_decode_calls_no_captured_graph_holds_run_eagerly(tmp_path):
+    """Captured decode sizes follow the unit pool; wider calls run eagerly.
 
     Decode graphs of up to 16 rows are configured, and capturing one stages
     a page of the model's one cache group per row on the unit pool, whose
-    96 tokens hold fewer. The worker reports the largest configured size its
-    allocatable units hold, replays a graph for a decode call of that many
-    rows, and rejects one more row without running it.
+    96 tokens hold fewer. A decode call of the largest size its allocatable
+    units hold replays a graph; one more row runs eagerly, and the shared
+    rows' outputs equal the replay's.
     """
     _qwen_checkpoint(tmp_path)
     model = models.load_model(
@@ -566,18 +564,14 @@ def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
         worker.warmup()
         # Unit zero is the pool's sentinel; each row stages one unit.
         allocatable = worker.info.kv_cache.num_units - 1
-        capacity = worker.info.max_decode_calls
-        assert capacity == max(size for size in sizes if size <= allocatable)
+        capacity = max(size for size in sizes if size <= allocatable)
         assert capacity < max(sizes)
+        assert capacity + 1 <= allocatable
 
-        # Each row owns one unit; the row beyond the capacity shares one,
-        # which its rejected call never reaches.
+        # Each row owns one unit.
         manager = worker.kv_cache
         manager.block_tables.install(
-            tuple(
-                (slot, 0, 0, ((slot - 1) % allocatable + 1,), 16)
-                for slot in range(1, capacity + 2)
-            )
+            tuple((slot, 0, 0, (slot,), 16) for slot in range(1, capacity + 2))
         )
 
         def rows(count):
@@ -588,18 +582,16 @@ def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
                 mode=ForwardMode.DECODE,
             )
 
-        output = _call(worker.runner, manager, rows(capacity))
-        assert output.stats.cuda_graph_replays == 1
-        assert len(output.materialize().values) == capacity
+        replayed = _call(worker.runner, manager, rows(capacity))
+        assert replayed.stats.cuda_graph_replays == 1
+        assert len(replayed.materialize().values) == capacity
 
-        before = _cache_values(manager)
-        with pytest.raises(ResourceError, match="no decode graph"):
-            _call(worker.runner, manager, rows(capacity + 1))
-        torch.cuda.synchronize()
-        for actual, expected in zip(
-            _cache_values(manager), before, strict=True
-        ):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        wide = _call(worker.runner, manager, rows(capacity + 1))
+        assert wide.stats.cuda_graph_replays == 0
+        assert wide.stats.cuda_graph_runtime_mode_counts == {"eager": 1}
+        assert len(wide.materialize().values) == capacity + 1
+        for actual, expected in zip(_outputs(wide), _outputs(replayed)):
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @SM100

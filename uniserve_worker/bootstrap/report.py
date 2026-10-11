@@ -71,7 +71,6 @@ from uniserve_worker.bootstrap.outputs import resolve_outputs
 from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.config.execution import (
     WorkerConfig,
-    graph_padding_block_count,
     graph_storage_budget_bytes,
 )
 from uniserve_worker.errors import unsupported_setup
@@ -257,12 +256,6 @@ def build_worker_layout(
         fabric_handles=_exports_fabric_handles(worker_config.device),
         max_batch_calls=max_calls,
         max_batch_tokens=max_tokens,
-        max_prefill_calls=min(layout.info.max_prefill_calls, max_calls)
-        if layout.info.max_prefill_calls
-        else 0,
-        max_decode_calls=min(layout.info.max_decode_calls, max_calls)
-        if layout.info.max_decode_calls
-        else 0,
         components=tuple(
             ComponentInfo(name, outputs.get(name, ())) for name, _ in components
         ),
@@ -286,8 +279,8 @@ def _token_worker_layout(
     pages of its storage grant (``pool_storage_bytes``) left after every
     fixed allocation on the primary device: the buffer pool and its share of
     the device products, the latent pool and input staging placed there,
-    block tables, decode state, KV import workspaces, graph padding pages and
-    the graph storage budget. A CUDA device requires that grant; another
+    block tables, decode state, KV import workspaces and the graph storage
+    budget. A CUDA device requires that grant; another
     device without one takes ``derive_runtime_kv_capacity``'s default page
     count. A configured capacity is checked against the grant when one is
     given.
@@ -331,10 +324,6 @@ def _token_worker_layout(
 
     capacity = None
     kv_cache = None
-    # Zero leaves prefill and decode calls bounded by the batch call bound
-    # alone, as when they run eagerly; captured graphs lower them below.
-    max_prefill_calls = max_decode_calls = 0
-    prefills_on_cuda = decodes_on_cuda = False
     unresolved_window = call_window(
         int(queue_depth), int(worker_config.max_batch_calls)
     )
@@ -398,9 +387,7 @@ def _token_worker_layout(
         assert planes is not None and input_config is not None
         from uniserve_worker.model_executor.canvas_runner import CanvasRunner
         from uniserve_worker.model_executor.graph_inputs import (
-            decode_captures,
             prefill_captures,
-            prefill_rows,
         )
         from uniserve_worker.protocol.call import ForwardMode, MediaCall
 
@@ -408,8 +395,6 @@ def _token_worker_layout(
         # this rank owns and each lane serving it, including the prefill row
         # widening for captured graphs. The worker-wide row and token bounds
         # are used here, so the reservation covers lanes with narrower bounds.
-        # The rows those prefill graphs hold bound every prefill call the
-        # engine forms.
         max_rows = min(
             worker_config.max_batch_calls, worker_config.max_request_pool_size
         )
@@ -439,14 +424,6 @@ def _token_worker_layout(
                     if not selected:
                         continue
                     fields = input_config
-                    decodes_on_cuda |= (
-                        ForwardMode.DECODE in selected
-                        and torch.device(target).type == "cuda"
-                    )
-                    prefills_on_cuda |= (
-                        ForwardMode.PREFILL in selected
-                        and torch.device(target).type == "cuda"
-                    )
                     if (
                         ForwardMode.PREFILL in selected
                         and torch.device(target).type == "cuda"
@@ -564,7 +541,6 @@ def _token_worker_layout(
         )
         resident_copies, co_resident_units = _kv_residency_shape(
             worker_config,
-            page_shapes=page_shapes,
             unit_bytes=unit_bytes,
             co_resident_bytes=fixed_bytes[worker_config.device],
         )
@@ -590,38 +566,6 @@ def _token_worker_layout(
             capacity = replace(capacity, num_units=int(units.item()))
         kv_cache = cache_info(text, planes, num_units=capacity.num_units)
 
-        # Prefill and decode calls on a CUDA device replay graphs whose rows'
-        # pages fit the granted pool. The rows the widest graphs hold bound
-        # every prefill and decode call the engine forms. The staging above
-        # was sized before the pool, for the rows of every configured bucket.
-        row_units = sum(group.units_per_page for group in planes.groups)
-        pool_rows = (capacity.num_units - 1) // row_units
-        if prefills_on_cuda:
-            max_prefill_calls = (
-                prefill_rows(
-                    prefill_captures(
-                        worker_config,
-                        max_rows=min(max_rows, pool_rows),
-                        max_tokens=input_config.max_text_tokens,
-                        image_builder=flow is not None,
-                        feature_injection=image_processor is not None
-                        and image_processor.feature_injection is not None,
-                        device_causality=True,
-                        pool=(page_shapes, capacity.num_units - 1),
-                    ),
-                    max_rows=min(max_rows, pool_rows),
-                )
-                or 0
-            )
-        if decodes_on_cuda:
-            sizes = decode_captures(
-                worker_config,
-                max_rows=max_rows,
-                row_units=row_units,
-                num_units=capacity.num_units,
-            )
-            max_decode_calls = max(sizes, default=0)
-
     # ``build_worker_layout`` replaces the supported calls and media routes
     # with the placement's narrowed values.
     supported = (
@@ -643,8 +587,6 @@ def _token_worker_layout(
         endpoint=endpoint,
         supported_calls=supported,
         max_batch_calls=int(worker_config.max_batch_calls),
-        max_prefill_calls=max_prefill_calls,
-        max_decode_calls=max_decode_calls,
         max_batch_tokens=int(worker_config.max_batch_tokens),
         request_slots=int(worker_config.max_request_pool_size),
         kv_cache=kv_cache,
@@ -784,7 +726,6 @@ def _request_tensor_worker_layout(
 def _kv_residency_shape(
     worker_config: WorkerConfig,
     *,
-    page_shapes: tuple[tuple[int, int], ...],
     unit_bytes: int,
     co_resident_bytes: int,
 ) -> tuple[int, int]:
@@ -793,14 +734,9 @@ def _kv_residency_shape(
     Returns:
         ``(resident_copies, co_resident_units)`` for
         ``derive_runtime_kv_capacity``: one resident KV pool, and the units
-        of the graph padding pages of every group plus the graph storage
-        budget and ``co_resident_bytes``, each of the latter rounded up to
-        whole units.
+        of the graph storage budget and ``co_resident_bytes``, each rounded
+        up to whole units.
     """
-    padding_units = sum(
-        graph_padding_block_count(page_tokens) * units_per_page
-        for page_tokens, units_per_page in page_shapes
-    )
     # Captured executables are held for the worker's lifetime, so they occupy
     # the same static budget as the KV pools and are reserved before the
     # request pool is sized.
@@ -811,4 +747,4 @@ def _kv_residency_shape(
     )
     fixed_owner_units = ceil_div(max(0, int(co_resident_bytes)), size)
 
-    return 1, padding_units + graph_units + fixed_owner_units
+    return 1, graph_units + fixed_owner_units

@@ -1384,8 +1384,6 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             host_lane_capacity: v.host_lane_capacity,
             transfer_tickets: v.transfer_tickets,
             video_denoiser,
-            max_prefill_calls: v.max_prefill_calls,
-            max_decode_calls: v.max_decode_calls,
         },
     )
 }
