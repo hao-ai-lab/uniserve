@@ -164,9 +164,6 @@ convention = "google"
 
 [tool.mypy]
 # Use the invoking Python version so installed dependency stubs match CI's runtime.
-# Source of truth for the type-check scope. Must match the explicit paths
-# passed by CI (.github/workflows/ci.yml) and the justfile `lint` target
-# (`mypy uniserve uniserve_models uniserve_worker uniserve_eval`) so bare/editor invocations agree with CI.
 files = ["uniserve", "uniserve_models", "uniserve_worker", "uniserve_eval"]
 warn_unused_configs = true
 warn_redundant_casts = true
@@ -178,7 +175,6 @@ ignore_missing_imports = true
 [tool.pyright]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
-# Keep aligned with [tool.mypy].files and the CI/justfile type-check scope.
 include = ["uniserve", "uniserve_models", "uniserve_worker", "uniserve_eval"]
 exclude = ["refs", "target", ".venv"]
 reportMissingImports = "warning"

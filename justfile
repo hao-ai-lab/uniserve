@@ -24,7 +24,7 @@ bench-build:
 lint: fmt clippy
     {{python}} -m ruff check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernels/src tests
     {{python}} -m ruff format --check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernels/src tests
-    {{python}} -m mypy uniserve uniserve_models uniserve_worker uniserve_eval
+    {{python}} -m mypy
 
 # Fast Python tests (CPU only)
 test-python-fast:

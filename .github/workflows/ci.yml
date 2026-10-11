@@ -53,6 +53,6 @@ jobs:
       - run: uv sync --locked --python 3.12 --extra dev --extra test --extra bench
       - run: .venv/bin/python -m ruff check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernels/src tests
       - run: .venv/bin/python -m ruff format --check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernels/src tests
-      - run: .venv/bin/python -m mypy uniserve uniserve_models uniserve_worker uniserve_eval
+      - run: .venv/bin/python -m mypy
       - run: .venv/bin/python -m pytest -m "unit and not gpu"
       - run: .venv/bin/python -m pytest -m "integration and not gpu"
