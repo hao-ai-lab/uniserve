@@ -19,11 +19,9 @@ sweeps them.
 from __future__ import annotations
 
 import concurrent.futures
-import logging
 import os
 import sys
 import threading
-import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -72,8 +70,6 @@ from uniserve_worker.transport.vmm_pool import (
 
 if TYPE_CHECKING:
     import torch
-
-_LOG = logging.getLogger(__name__)
 
 
 @cache
@@ -203,16 +199,6 @@ class CudaVmmTransport(Transport):
         # Whether a publication has to state readiness without an interprocess
         # event, which only a consumer on another host requires.
         self._cross_host_consumers = bool(cross_host_consumers)
-        # What publishing costs this rank. A crossing publication drains the
-        # producer's stream, because a consumer on another host can wait on no
-        # fence this rank records, and that wait is on the batch's critical
-        # path. The payloads are counted with it, since the cost of a crossing
-        # is only interpretable against what it carries.
-        self._published = 0
-        self._payload_bytes = 0
-        self._largest_payload = 0
-        self._synchronize_seconds = 0.0
-        self._longest_synchronize = 0.0
         # Publications whose fence has drained but whose consumers have not all
         # acknowledged. Their chunks are held until reap() finds them settled.
         self._unacknowledged: list[_CudaSource] = []
@@ -498,17 +484,8 @@ class CudaVmmTransport(Transport):
             # still gates the source's release on this rank.
             interprocess = not self._cross_host_consumers
             if not interprocess:
-                started = time.perf_counter()
                 with profile_range("vmm_publish_synchronize"):
                     torch.cuda.current_stream(first.device).synchronize()
-                waited = time.perf_counter() - started
-                self._synchronize_seconds += waited
-                self._longest_synchronize = max(
-                    self._longest_synchronize, waited
-                )
-            self._published += 1
-            self._payload_bytes += nbytes
-            self._largest_payload = max(self._largest_payload, nbytes)
             event = self._events.acquire(
                 first.device, interprocess=interprocess
             )
@@ -855,21 +832,6 @@ class CudaVmmTransport(Transport):
         return retirement
 
     def close(self) -> None:
-        if self._published:
-            _LOG.info(
-                "cuda_vmm transport retired: published=%d crossing=%s "
-                "payload_total=%d payload_mean=%d payload_max=%d "
-                "synchronize_ms_total=%.3f synchronize_ms_max=%.3f "
-                "synchronize_ms_mean=%.3f",
-                self._published,
-                self._cross_host_consumers,
-                self._payload_bytes,
-                self._payload_bytes // self._published,
-                self._largest_payload,
-                self._synchronize_seconds * 1e3,
-                self._longest_synchronize * 1e3,
-                self._synchronize_seconds * 1e3 / self._published,
-            )
         try:
             self._reads.close()
         finally:
