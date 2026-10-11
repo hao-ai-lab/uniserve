@@ -773,7 +773,7 @@ impl Outputs {
                 self.aspect_ratios().join(", ")
             ));
         }
-        self.0
+        self.rasters
             .iter()
             .find(|raster| raster.short_edge == short_edge && raster.aspect_ratio == aspect_ratio)
             .ok_or_else(|| format!("no canvas is served for {short_edge}p {aspect_ratio}"))
@@ -781,14 +781,14 @@ impl Outputs {
 
     /// Returns the served raster with exactly these pixel dimensions.
     fn find_size(&self, width: u32, height: u32) -> Option<&Raster> {
-        self.0
+        self.rasters
             .iter()
             .find(|raster| raster.width == width && raster.height == height)
     }
 
     /// Served rasters as `WIDTHxHEIGHT`, the default first.
     fn sizes(&self) -> Vec<String> {
-        self.0
+        self.rasters
             .iter()
             .map(|raster| format!("{}x{}", raster.width, raster.height))
             .collect()
@@ -974,13 +974,15 @@ mod tests {
             "16:9": {"width": 1344, "height": 768},
             "9:16": {"width": 768, "height": 1344},
         }});
-        check_fasth3(&capabilities(json!(["t2va"]), sizes)).unwrap()
+        check_fasth3(&capabilities(json!(["t2va"]), sizes))
+            .unwrap_or_else(|error| panic!("the default deployment was refused: {error}"))
     }
 
     #[test]
     fn only_fasth3_deployments_are_served() {
         let sizes = json!({"768": {"16:9": {"width": 1344, "height": 768}}});
-        let outputs = check_fasth3(&capabilities(json!(["t2va"]), sizes.clone())).unwrap();
+        let outputs = check_fasth3(&capabilities(json!(["t2va"]), sizes.clone()))
+            .unwrap_or_else(|error| panic!("a FastH3 deployment was refused: {error}"));
         assert_eq!(outputs.sizes(), ["1344x768"]);
         // A base checkpoint serves more tasks.
         assert!(check_fasth3(&capabilities(json!(["t2va", "fl2va"]), sizes.clone())).is_err());
@@ -1016,7 +1018,8 @@ mod tests {
                 "21:9": {"width": 992, "height": 416},
             },
         });
-        let outputs = check_fasth3(&capabilities(json!(["t2va"]), sizes)).unwrap();
+        let outputs = check_fasth3(&capabilities(json!(["t2va"]), sizes))
+            .unwrap_or_else(|error| panic!("trained canvases were refused: {error}"));
         let prepare = |request: Value| prepare_request(request, "FastH3", 15.0, &outputs);
         for (size, short_edge, aspect_ratio) in
             [("1344x768", 768, "16:9"), ("992x416", 480, "21:9")]
