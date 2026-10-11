@@ -87,7 +87,9 @@ class TransformerLayer(nn.Module):
             )
             self.post_attention_norms[route] = RMSNorm(hidden, eps)
             # The reference module computes ``act_fn(gate) * up`` in the
-            # activation dtype, rounding after each operation.
+            # activation dtype, rounding after each operation. On the real
+            # checkpoint the whole network lands as close to its float32
+            # forward with per-operation gating as with single rounding.
             self.mlps[route] = GatedMLP(
                 hidden,
                 config.intermediate_size,
