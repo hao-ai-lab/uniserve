@@ -59,7 +59,7 @@ from uniserve_worker.execution import media
 from uniserve_worker.execution.conditions import condition_latents
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.component_binding import ComponentBinding
-from uniserve_worker.protocol.batch import DiffusionParams, NewRequest
+from uniserve_worker.protocol.batch import DiffusionSamplingParams, NewRequest
 from uniserve_worker.protocol.identity import RequestKey
 from uniserve_worker.protocol.video import VideoAdmission, VideoTask
 from uniserve_worker.storage.latent_pool import LatentPool
@@ -294,7 +294,7 @@ def test_conditioned_request_computes_the_model_first_step(
     admission = NewRequest(
         RequestKey(1, 0, 0),
         request_pool_idx=1,
-        diffusion=DiffusionParams(
+        diffusion=DiffusionSamplingParams(
             plan.num_frames,
             len(runner.video_decoder.frame_slices(plan.num_frames)),
             SEED,

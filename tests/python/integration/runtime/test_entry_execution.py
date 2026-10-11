@@ -35,7 +35,7 @@ from uniserve_worker.protocol.batch import (
     Batch,
     BufferAllocation,
     DecodeRange,
-    DiffusionParams,
+    DiffusionSamplingParams,
     NewRequest,
     Start,
     TensorPublication,
@@ -537,7 +537,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
                 NewRequest(
                     key,
                     request_pool_idx=1,
-                    diffusion=DiffusionParams(
+                    diffusion=DiffusionSamplingParams(
                         22, 3, 1000, width=1344, height=768
                     ),
                     video=VideoAdmission(
@@ -740,7 +740,7 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
         admission = NewRequest(
             key,
             request_pool_idx=1,
-            diffusion=DiffusionParams(22, 3, 1000, width=1344, height=768),
+            diffusion=DiffusionSamplingParams(22, 3, 1000, width=1344, height=768),
             video=VideoAdmission(VideoTask.T2VA, text_tags=(1, 1, 1)),
             prompt_token_ids=(3, 8, 1),
         )

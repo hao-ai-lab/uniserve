@@ -156,7 +156,10 @@ impl RequestTypes {
         records.insert("BufferAllocation", class(&module, "BufferAllocation")?);
         records.insert("NewRequest", class(&module, "NewRequest")?);
         records.insert("GenerationParams", class(&module, "GenerationParams")?);
-        records.insert("DiffusionParams", class(&module, "DiffusionParams")?);
+        records.insert(
+            "DiffusionSamplingParams",
+            class(&module, "DiffusionSamplingParams")?,
+        );
         records.insert("TensorPublication", class(&module, "TensorPublication")?);
         let module = py.import("uniserve_worker.protocol.video")?;
         for name in [
@@ -1009,7 +1012,7 @@ fn diffusion_params_to_py<'py>(
     dict.set_item(intern!(py, "seed"), diffusion.seed)?;
     dict.set_item(intern!(py, "width"), diffusion.width)?;
     dict.set_item(intern!(py, "height"), diffusion.height)?;
-    construct(py, "DiffusionParams", &dict)
+    construct(py, "DiffusionSamplingParams", &dict)
 }
 
 /// Converts sampling controls into the worker's typed parameters.

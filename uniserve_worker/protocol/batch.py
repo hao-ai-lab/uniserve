@@ -137,7 +137,7 @@ class GenerationParams:
 
 
 @dataclass(frozen=True, slots=True)
-class DiffusionParams:
+class DiffusionSamplingParams:
     """Effective diffusion bounds and seed resolved by model preprocessing.
 
     Mirrors the Rust `DiffusionSamplingParams`.
@@ -187,7 +187,7 @@ class NewRequest:
     # keyed ``ar`` on the wire.
     generation: GenerationParams | None = None
     image: call.ImageParams | None = None
-    diffusion: DiffusionParams | None = None
+    diffusion: DiffusionSamplingParams | None = None
     # Prompt tokens; required (non-empty) for diffusion requests.
     prompt_token_ids: tuple[int, ...] = ()
     # Number of input images the request carries. Model preprocessing may
