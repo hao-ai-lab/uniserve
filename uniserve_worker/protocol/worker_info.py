@@ -58,14 +58,14 @@ class KvGroupKind(StrEnum):
 class KvGroup:
     """Describe one cache group of a worker's KV unit pool.
 
-    A logical page of the group holds ``page_tokens`` tokens of every layer
+    A logical page of the group holds ``block_size`` tokens of every layer
     in the group and occupies ``units_per_page`` units of the pool.
 
     Attributes:
         kind: History retention policy of the group.
         window: With `KvGroupKind.SLIDING_WINDOW`, the history tokens any
             reader of the group needs. Encoded only for a sliding window.
-        page_tokens: Tokens per logical page; a power of two.
+        block_size: Tokens per logical page; a power of two.
         units_per_page: Units one logical page occupies.
         layer_ids: Global cache-layer ids of this rank's layers in the
             group, in column order.
@@ -77,7 +77,7 @@ class KvGroup:
 
     kind: KvGroupKind
     window: int
-    page_tokens: int
+    block_size: int
     units_per_page: int
     layer_ids: tuple[int, ...]
     num_kv_heads: int
@@ -92,7 +92,7 @@ class KvGroup:
             kind.update(window=self.window)
         return {
             "kind": kind,
-            "page_tokens": self.page_tokens,
+            "block_size": self.block_size,
             "units_per_page": self.units_per_page,
             "layer_ids": list(self.layer_ids),
             "num_kv_heads": self.num_kv_heads,

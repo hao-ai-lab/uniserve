@@ -74,14 +74,14 @@ def scratch_tables(
     for length in lengths:
         row = []
         for shape in cache.shapes:
-            pages = max(1, -(-int(length) // shape.page_tokens))
+            pages = max(1, -(-int(length) // shape.block_size))
             count = pages * shape.units_per_page
             row.append(
                 GroupTable(
                     shape,
                     0,
                     tuple(units[cursor : cursor + count]),
-                    pages * shape.page_tokens,
+                    pages * shape.block_size,
                 )
             )
             cursor += count
@@ -232,7 +232,7 @@ def capture_lengths(
 ) -> tuple[int, ...]:
     """Return the row lengths of the startup batch that captures ``shape``.
 
-    ``pages`` holds ``(page_tokens, units_per_page)`` of every cache group
+    ``pages`` holds ``(block_size, units_per_page)`` of every cache group
     and ``units`` the unit pool's allocatable units, which the batch's pages
     fit. The batch numbers the bucket's ``live_rows`` rows, or more when a
     row, which holds at most ``row_tokens`` (the most one request appends in
@@ -278,9 +278,9 @@ def _spread(
     """Spread ``tokens`` over ``rows`` rows in the fewest pages of each group.
 
     A group whose pages ``tokens`` overfills at one page per row needs
-    ``ceil(tokens / page_tokens)`` pages, which it reaches when every row but
+    ``ceil(tokens / block_size)`` pages, which it reaches when every row but
     one holds whole pages; the others need one page per row, which they
-    reach when no row exceeds their page. Page sizes are powers of two, so
+    reach when no row exceeds their page. Block sizes are powers of two, so
     the overfilled groups' pages are the smaller ones and divide the largest
     of them, the step: every row holds whole steps up to the smallest other
     page, and the last row also holds the remainder below one step. Returns
@@ -334,7 +334,7 @@ def prepare_prefill(
     if cache is None:
         raise ValueError("prefill capture requires the worker KV cache")
     pages = tuple(
-        (group.page_tokens, group.units_per_page) for group in cache.shapes
+        (group.block_size, group.units_per_page) for group in cache.shapes
     )
     units = cache.num_units - 1
     for shape in sorted(

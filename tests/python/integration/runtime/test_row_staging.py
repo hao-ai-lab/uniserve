@@ -7,7 +7,7 @@ one unit pool (six numerical tables, as DiffusionGemma has), its staging
 equals the layout the tables define: every installed page of a full table
 and, for a windowed table, the pages from the first one the row's first
 query reaches back to through its last query; write addresses at
-``unit * page_tokens + offset``, or -1 for rows that do not write. Padding
+``unit * block_size + offset``, or -1 for rows that do not write. Padding
 the call to a graph bucket leaves its live rows unchanged. The calls
 cover appending rows, mixed appending and read-only rows, read-only
 non-causal rows, rows whose windowed tables retired their first pages, and
@@ -53,7 +53,7 @@ def _install(manager, generator):
         extent = generator.randint(1, 96)
         extents[slot] = extent
         for group, shape in enumerate(tables.groups):
-            pages = ceil_div(extent, shape.page_tokens)
+            pages = ceil_div(extent, shape.block_size)
             start = (
                 generator.randint(0, max(0, pages - 2))
                 if shape.window is not None
@@ -145,7 +145,7 @@ def _expected(rows, manager):
                     end = min(
                         end,
                         ceil_div(
-                            row.seq_len + row.query_tokens, shape.page_tokens
+                            row.seq_len + row.query_tokens, shape.block_size
                         ),
                     )
                 units = table.row(position)
@@ -154,10 +154,10 @@ def _expected(rows, manager):
                 )
                 firsts.append(first)
                 for token in range(row.seq_len, row.seq_len + row.query_tokens):
-                    page = token // shape.page_tokens - table.start_page
+                    page = token // shape.block_size - table.start_page
                     writes.append(
-                        table.row(position)[page] * shape.page_tokens
-                        + token % shape.page_tokens
+                        table.row(position)[page] * shape.block_size
+                        + token % shape.block_size
                         if row.write_kv
                         else -1
                     )
@@ -176,7 +176,7 @@ def _expected(rows, manager):
                 [[*units, *(0,) * (width - len(units))] for units in staged],
                 dtype=torch.int32,
             )
-            values[number, "block_size"] = shape.page_tokens
+            values[number, "block_size"] = shape.block_size
             values[number, "start"] = (
                 None
                 if shape.window is None

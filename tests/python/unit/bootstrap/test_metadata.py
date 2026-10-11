@@ -368,7 +368,7 @@ def test_text_worker_reports_exact_cache_capacity(storage):
     assert cache.num_units == 4
     (group,) = cache.groups
     assert group.kind is KvGroupKind.FULL
-    assert (group.page_tokens, group.units_per_page) == (64, 1)
+    assert (group.block_size, group.units_per_page) == (64, 1)
     assert group.layer_ids == (0, 1)
     assert group.total_kv_heads == group.num_kv_heads == 2
     assert group.kv_head_offset == 0

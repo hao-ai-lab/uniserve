@@ -703,12 +703,12 @@ def model_arena_capacity(
 def units_for_tokens(pages: Sequence[tuple[int, int]], tokens: int) -> int:
     """Return the units whole pages of ``tokens`` tokens occupy in every group.
 
-    ``pages`` holds each group's ``(page_tokens, units_per_page)``; each group
+    ``pages`` holds each group's ``(block_size, units_per_page)``; each group
     counts the whole pages ``tokens`` fills, rounded down.
     """
     return sum(
-        int(tokens) // int(page_tokens) * int(units_per_page)
-        for page_tokens, units_per_page in pages
+        int(tokens) // int(block_size) * int(units_per_page)
+        for block_size, units_per_page in pages
     )
 
 
@@ -738,7 +738,7 @@ def derive_runtime_kv_capacity(
 ) -> RuntimeKVCapacity:
     """Size one KV unit pool from explicit tokens or a host-owned byte grant.
 
-    ``pages`` holds each cache group's ``(page_tokens, units_per_page)``. The
+    ``pages`` holds each cache group's ``(block_size, units_per_page)``. The
     unit count, which includes the unit-zero sentinel, comes from the first
     source present:
 

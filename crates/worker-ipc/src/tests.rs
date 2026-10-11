@@ -1166,12 +1166,12 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
                     groups: vec![
                         KvGroupTransfer {
                             start: 3,
-                            page_tokens: 4,
+                            block_size: 4,
                             tensors,
                         },
                         KvGroupTransfer {
                             start: 6,
-                            page_tokens: 8,
+                            block_size: 8,
                             tensors: window,
                         },
                     ],
@@ -1193,10 +1193,10 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
                 .unwrap();
         assert_eq!(decoded.output().unwrap(), &report);
 
-        // Zero generations, a zero page size, a group starting before the
+        // Zero generations, a zero block size, a group starting before the
         // base, an unchanged extent with groups, and malformed or unexpected
         // scales are each rejected on encode.
-        for invalid_field in ["source", "base", "page_tokens", "start", "extent", "scales"] {
+        for invalid_field in ["source", "base", "block_size", "start", "extent", "scales"] {
             let mut invalid = report.clone();
             let KvTransfer {
                 source,
@@ -1209,7 +1209,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
             match invalid_field {
                 "source" => source.generation = 0,
                 "base" => base.as_mut().unwrap().generation = 0,
-                "page_tokens" => groups[0].page_tokens = 0,
+                "block_size" => groups[0].block_size = 0,
                 "start" => groups[1].start = 2,
                 "extent" => *base_extent = *published_extent,
                 "scales" if dtype == "float8_e4m3fn" => {
@@ -1733,7 +1733,7 @@ fn worker_info_rejects_duplicate_set_members() {
     assert!(encode_response(&WorkerResponse::info(info)).is_err());
 }
 
-/// A KV pool needs an allocatable unit; every page size must be a power of
+/// A KV pool needs an allocatable unit; every block size must be a power of
 /// two dividing the largest one; a layer belongs to one group; and heads stay
 /// within their logical bounds.
 #[test]
@@ -1742,7 +1742,7 @@ fn worker_info_rejects_inconsistent_kv_groups() {
     assert!(encode_response(&WorkerResponse::info(valid.clone())).is_ok());
     let cases: [fn(&mut KvCacheInfo); 5] = [
         |cache| cache.num_units = 1,
-        |cache| cache.groups[1].page_tokens = 48,
+        |cache| cache.groups[1].block_size = 48,
         |cache| cache.groups[1].layer_ids.push(0),
         |cache| cache.groups[0].layer_ids.clear(),
         |cache| cache.groups[0].kv_head_offset = 1,
@@ -1976,7 +1976,7 @@ fn full_caps() -> WorkerInfo {
                 },
                 KvCacheGroup {
                     kind: KvGroupKind::SlidingWindow { window: 4096 },
-                    page_tokens: 32,
+                    block_size: 32,
                     units_per_page: 2,
                     layer_ids: (14..28).collect(),
                     ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()

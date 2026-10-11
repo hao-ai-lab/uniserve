@@ -171,7 +171,7 @@ def _largest_block_size(
                 dtype=layouts[name].compute_dtype,
                 window=readers[name].window,
                 pages=CachePages(
-                    group.page_tokens, group.dtype, planes.quantized
+                    group.block_size, group.dtype, planes.quantized
                 ),
             )
             for group in planes.groups
@@ -192,17 +192,17 @@ def table_widths(
 
     A full-attention table spans the longest sequence. A sliding-window
     table spans only the pages a reader's window of history and one call's
-    queries intersect, at most ``ceil((window + queries) / page_tokens) +
+    queries intersect, at most ``ceil((window + queries) / block_size) +
     1``. Tables are in table order, one per unit position of every group.
     """
     widths: list[int] = []
     for group in planes.groups:
-        width = ceil_div(max(1, max_sequence_tokens), group.page_tokens)
+        width = ceil_div(max(1, max_sequence_tokens), group.block_size)
         if group.window is not None:
             width = min(
                 width,
                 ceil_div(
-                    group.window + max(1, max_query_tokens), group.page_tokens
+                    group.window + max(1, max_query_tokens), group.block_size
                 )
                 + 1,
             )
@@ -219,7 +219,7 @@ def resident_width(planes: Planes, *, max_sequence_tokens: int) -> int:
     return max(
         1,
         *(
-            ceil_div(max(1, max_sequence_tokens), group.page_tokens)
+            ceil_div(max(1, max_sequence_tokens), group.block_size)
             for group in planes.groups
         ),
     )
@@ -302,7 +302,7 @@ def cache_info(
                 if group.window is None
                 else KvGroupKind.SLIDING_WINDOW,
                 window=0 if group.window is None else group.window,
-                page_tokens=group.page_tokens,
+                block_size=group.block_size,
                 units_per_page=group.units_per_page,
                 layer_ids=tuple(names.index(name) for name in group.layers),
                 num_kv_heads=len(heads),

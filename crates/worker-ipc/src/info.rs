@@ -33,14 +33,14 @@ impl KvCacheInfo {
         self.num_units.saturating_sub(1)
     }
 
-    /// Returns the largest page size of any group, in tokens.
+    /// Returns the largest block size of any group, in tokens.
     ///
-    /// Every page size divides it (`validate`), so a length aligned to it is
+    /// Every block size divides it (`validate`), so a length aligned to it is
     /// a whole number of pages in every group.
-    pub fn max_page_tokens(&self) -> u32 {
+    pub fn max_block_size(&self) -> u32 {
         self.groups
             .iter()
-            .map(|group| group.page_tokens)
+            .map(|group| group.block_size)
             .max()
             .unwrap_or(0)
     }
@@ -89,7 +89,7 @@ impl KvCacheInfo {
     /// Validates the pool size, page shapes and each group's layer and head
     /// placement.
     ///
-    /// Every page size must be a power of two that divides the largest one,
+    /// Every block size must be a power of two that divides the largest one,
     /// so page-aligned prefix lengths agree across groups. A layer belongs to
     /// at most one group.
     pub fn validate(&self) -> ValidationResult<()> {
@@ -98,12 +98,12 @@ impl KvCacheInfo {
             "worker info declare an incomplete KV unit pool"
         );
 
-        let largest = self.max_page_tokens();
+        let largest = self.max_block_size();
         let mut layers = HashSet::new();
         for group in &self.groups {
             ensure_valid!(
-                group.page_tokens.is_power_of_two()
-                    && largest.is_multiple_of(group.page_tokens)
+                group.block_size.is_power_of_two()
+                    && largest.is_multiple_of(group.block_size)
                     && group.units_per_page > 0
                     && group.units_per_page < self.num_units,
                 "worker KV group page shape is invalid"
@@ -682,7 +682,7 @@ impl Default for WorkerInfo {
                 dtype: KvCacheDtype::BFloat16,
                 groups: vec![KvCacheGroup {
                     kind: Default::default(),
-                    page_tokens: 64,
+                    block_size: 64,
                     units_per_page: 1,
                     layer_ids: (0..28).collect(),
                     num_kv_heads: 8,

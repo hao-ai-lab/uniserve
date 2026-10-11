@@ -26,7 +26,7 @@ def test_hybrid_block_size_serves_every_attention_group():
     # would give them 128-token pages, beyond their native reader's limit.
     assert config.block_size == 32
     assert sorted(
-        group.page_tokens for group in plan_cache(model, config).groups
+        group.block_size for group in plan_cache(model, config).groups
     ) == [32, 64]
 
     explicit = replace(config, block_size=64)

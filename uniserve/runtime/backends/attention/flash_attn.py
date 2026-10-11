@@ -28,7 +28,7 @@ def unsupported(
         return "requires a head dimension that is a multiple of 8, at most 256"
     if window is not None:
         return "does not take history windows"
-    if pages is not None and (pages.quantized or pages.page_tokens % 256):
+    if pages is not None and (pages.quantized or pages.block_size % 256):
         return "requires dense 256-token cache blocks"
     return None
 

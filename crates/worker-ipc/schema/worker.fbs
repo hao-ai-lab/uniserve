@@ -126,7 +126,7 @@ table KvGroup {
   kind:KvGroupKind;
   /// Read only when `kind` is `SlidingWindow`.
   window:uint;
-  page_tokens:uint;
+  block_size:uint;
   units_per_page:uint;
   /// Global cache-layer ids of this rank's layers, in column order.
   layer_ids:[uint];
@@ -729,7 +729,7 @@ table DeviceProductTransfer {
 /// keys, values, and, for quantized storage, scales.
 table KvGroupTransfer {
   start:uint;
-  page_tokens:uint;
+  block_size:uint;
   tensors:[TensorTransfer];
 }
 

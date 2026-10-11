@@ -6,7 +6,7 @@ whose logical page spans ``units_per_page`` units owns that many numerical
 block tables (see ``uniserve.runtime.kv_cache``), so one call's attention
 is an ``AttentionBatch`` with one entry per numerical table. Every entry
 shares the call's query and prefix lengths; entries differ in their pages,
-page size, write addresses and, for a history-windowed group, the first page
+block size, write addresses and, for a history-windowed group, the first page
 each row stages.
 
 This module validates one homogeneous group of ``AttentionRow`` values
@@ -116,7 +116,7 @@ def first_page(table: GroupTable, prefix: int) -> int:
     window = table.shape.window
     if window is None:
         return 0
-    return max(0, prefix - window) // table.shape.page_tokens
+    return max(0, prefix - window) // table.shape.block_size
 
 
 def table_pages(
@@ -132,7 +132,7 @@ def table_pages(
     table stages the pages from the first one the row's window reaches
     through the page holding its last query token, or through its last
     installed page when that comes first; at most ``ceil((window + query) /
-    page_tokens) + 1`` pages.
+    block_size) + 1`` pages.
 
     Returns:
         One ``TablePages`` per numerical table in table order: every group's
@@ -154,7 +154,7 @@ def table_pages(
                 if shape.window is not None:
                     end = min(
                         table.end_page,
-                        ceil_div(int(prefix) + int(query), shape.page_tokens),
+                        ceil_div(int(prefix) + int(query), shape.block_size),
                     )
                     first_column = start - table.start_page
                     units = units[
@@ -164,7 +164,7 @@ def table_pages(
                 rows.append(units)
             result.append(
                 TablePages(
-                    shape.page_tokens,
+                    shape.block_size,
                     shape.window is not None,
                     tuple(starts),
                     tuple(rows),

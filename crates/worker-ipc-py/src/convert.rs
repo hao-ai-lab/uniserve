@@ -2068,7 +2068,7 @@ fn kv_group_transfer_to_py<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let value = PyDict::new(py);
     value.set_item(intern!(py, "start"), group.start)?;
-    value.set_item(intern!(py, "page_tokens"), group.page_tokens)?;
+    value.set_item(intern!(py, "block_size"), group.block_size)?;
     // Tensor order is keys, values, then scales for quantized storage (see
     // `KvGroupTransfer::tensors`).
     let tensors = group
@@ -2125,7 +2125,7 @@ fn kv_group_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvGroupTransfer
     }
     Some(KvGroupTransfer {
         start: u32_of(&get(payload, intern!(py, "start"))?)?,
-        page_tokens: u32_of(&get(payload, intern!(py, "page_tokens"))?)?,
+        block_size: u32_of(&get(payload, intern!(py, "block_size"))?)?,
         tensors,
     })
 }
@@ -2165,7 +2165,7 @@ mod tests {
         KvTransfer {
             groups: vec![KvGroupTransfer {
                 start: 0,
-                page_tokens: 4,
+                block_size: 4,
                 tensors,
             }],
             source,

@@ -129,10 +129,10 @@ def select_flow_captures(
 def prefill_units(pages, rows, tokens):
     """Return the fewest pool units a prefill of ``rows`` rows holds.
 
-    ``pages`` holds ``(page_tokens, units_per_page)`` of every cache group.
+    ``pages`` holds ``(block_size, units_per_page)`` of every cache group.
     A prefill row writes its query tokens into pages of its own in every
     group, so a call of ``rows`` rows and ``tokens`` query tokens holds at
-    least ``max(rows, ceil(tokens / page_tokens))`` pages of each group,
+    least ``max(rows, ceil(tokens / block_size))`` pages of each group,
     whatever its row lengths and prefixes. ``capture_lengths`` in
     ``startup`` stages rows that hold exactly this many.
     """

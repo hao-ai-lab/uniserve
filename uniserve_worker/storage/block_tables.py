@@ -38,14 +38,14 @@ class GroupShape:
     """The page shape of one cache group, as block tables index it.
 
     Attributes:
-        page_tokens: Tokens per logical page.
+        block_size: Tokens per logical page.
         units_per_page: Units one logical page occupies; the group owns this
             many consecutive numerical tables.
         window: History tokens any reader of the group needs, or ``None``
             for full attention.
     """
 
-    page_tokens: int
+    block_size: int
     units_per_page: int
     window: int | None = None
 
@@ -85,19 +85,19 @@ class GroupTable:
             WorkerError: ``invalid_descriptor`` when the interval reaches a
                 retired page or lies past the installed pages.
         """
-        page_tokens = self.shape.page_tokens
+        block_size = self.shape.block_size
         per_page = self.shape.units_per_page
         if (
             start < 0
             or length < 0
-            or (length and start < self.start_page * page_tokens)
-            or start + length > self.end_page * page_tokens
+            or (length and start < self.start_page * block_size)
+            or start + length > self.end_page * block_size
         ):
             raise invalid_descriptor("KV token interval exceeds its unit table")
         spans: list[tuple[int, int, int]] = []
         while length:
-            page, offset = divmod(start, page_tokens)
-            count = min(length, page_tokens - offset)
+            page, offset = divmod(start, block_size)
+            count = min(length, block_size - offset)
             first = (page - self.start_page) * per_page
             spans.extend(
                 (unit, offset, count)
@@ -128,7 +128,7 @@ class BlockTables:
     - ``alloced_lens``: int32 ``[rows]``, tokens every installed group of
       the slot covers.
     - ``table_shapes``: int32 ``[tables, 3]``, each numerical table's
-      ``(group, page_tokens, window)``, with window ``-1`` for full
+      ``(group, block_size, window)``, with window ``-1`` for full
       attention; constant after construction.
 
     The device staging tensors are single-buffered and reused by every
@@ -166,7 +166,7 @@ class BlockTables:
             not self.groups
             or min(self.request_pool_size, self.width) < 1
             or any(
-                min(group.page_tokens, group.units_per_page) < 1
+                min(group.block_size, group.units_per_page) < 1
                 for group in self.groups
             )
         ):
@@ -207,7 +207,7 @@ class BlockTables:
                 [
                     (
                         group,
-                        shape.page_tokens,
+                        shape.block_size,
                         -1 if shape.window is None else shape.window,
                     )
                     for group, shape in enumerate(self.groups)
@@ -281,7 +281,7 @@ class BlockTables:
             # [slot]: verified and allocated token lengths per request slot.
             "verified_lengths": BufferConfig((rows,), torch.int32),
             "alloced_lens": BufferConfig((rows,), torch.int32),
-            # [table, 3]: (group, page tokens, window or -1) per table.
+            # [table, 3]: (group, block size, window or -1) per table.
             "table_shapes": BufferConfig((tables, 3), torch.int32),
             # Device staging targets for one full installation. In `install`,
             # row 0 of ``_index_staging`` holds the tables and row 1 the slots
@@ -344,7 +344,7 @@ class BlockTables:
                 or remainder
                 or pages > self.width
                 or not 0 <= table.allocated_tokens
-                or table.allocated_tokens > table.end_page * shape.page_tokens
+                or table.allocated_tokens > table.end_page * shape.block_size
                 or (slot, group) in accepted
             ):
                 raise invalid_descriptor("scheduler block table is invalid")

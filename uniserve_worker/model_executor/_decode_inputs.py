@@ -78,9 +78,9 @@ if triton is not None:
         """
         table = tl.program_id(1)
 
-        # [group, page tokens, window or -1] of this table.
+        # [group, block size, window or -1] of this table.
         group = tl.load(table_shapes + table * 3)
-        page_tokens = tl.load(table_shapes + table * 3 + 1)
+        block_size = tl.load(table_shapes + table * 3 + 1)
         window = tl.load(table_shapes + table * 3 + 2)
         units = request_unit_tables + table * unit_table_stride
 
@@ -103,7 +103,7 @@ if triton is not None:
             # A windowed table stages pages from the first one the decode
             # query's window reaches; a full table from page zero.
             first = tl.where(
-                window >= 0, tl.maximum(cache - window, 0) // page_tokens, 0
+                window >= 0, tl.maximum(cache - window, 0) // block_size, 0
             )
             tl.store(
                 start_pages + table * start_page_stride + offsets,
@@ -113,7 +113,7 @@ if triton is not None:
 
             # Cache length identifies the append page and its token offset.
             # Inactive rows and unavailable pages keep the public -1 sentinel.
-            column = cache // page_tokens - installed
+            column = cache // block_size - installed
             write_units = tl.load(
                 units + slots * unit_row_stride + column,
                 mask=live_rows & (column >= 0) & (column < request_width),
@@ -121,7 +121,7 @@ if triton is not None:
             )
             writes = tl.where(
                 write_units >= 0,
-                write_units.to(tl.int64) * page_tokens + cache % page_tokens,
+                write_units.to(tl.int64) * block_size + cache % block_size,
                 -1,
             )
             tl.store(
@@ -203,7 +203,7 @@ if triton is not None:
             )
             cell_first = tl.where(
                 window >= 0,
-                tl.maximum(cell_cache - window, 0) // page_tokens,
+                tl.maximum(cell_cache - window, 0) // block_size,
                 0,
             )
             source = cell_first - cell_installed + cells
@@ -247,13 +247,13 @@ def gather_request_decode_inputs(
 
     ``request_pool_indices[:rows]`` identifies scheduler-owned request slots.
     The function materializes, for every numerical table ``t`` described by
-    ``table_shapes[t] = (group, page_tokens, window or -1)``, the slots'
+    ``table_shapes[t] = (group, block_size, window or -1)``, the slots'
     units from their first staged page into ``block_tables[t]``, that page
     into ``start_pages[t]`` and the append address into
     ``write_indices[t]``; and, shared by all tables, next-token ids and
     position axes, cache/query lengths and offsets. A row's first staged
     page of a windowed table is the first page its window reaches,
-    ``max(0, cache - window) // page_tokens``; of a full table, page zero.
+    ``max(0, cache - window) // block_size``; of a full table, page zero.
     ``request_unit_tables[t, slot]`` holds the slot's units from its
     installed start page ``request_start_pages[group, slot]`` on. Each table
     stages ``columns`` cells per row. Output rows beyond ``rows`` are

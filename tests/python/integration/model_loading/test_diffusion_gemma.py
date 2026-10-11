@@ -81,15 +81,15 @@ def _layer_units(cache, name):
     return _units(cache, cache.table(name))
 
 
-def _page_tokens(cache, table):
-    return cache.groups[cache.tables[table].group].page_tokens
+def _block_size(cache, table):
+    return cache.groups[cache.tables[table].group].block_size
 
 
 def _batch(cache, build):
     """Build one entry per table; entries share the first one's lengths."""
     entries = {}
     for table in range(len(cache.tables)):
-        entry = build(_units(cache, table), _page_tokens(cache, table))
+        entry = build(_units(cache, table), _block_size(cache, table))
         if entries:
             first = entries[0]
             entry = replace(
@@ -102,11 +102,11 @@ def _batch(cache, build):
 def _paged(cache, *, queries, prefix, causal):
     return _batch(
         cache,
-        lambda units, page_tokens: PagedInput.from_blocks(
+        lambda units, block_size: PagedInput.from_blocks(
             query_lengths=(queries,),
             prefix_lengths=(prefix,),
             blocks=(units,),
-            block_size=page_tokens,
+            block_size=block_size,
             causal=causal,
             device="cpu",
         ),
@@ -116,10 +116,10 @@ def _paged(cache, *, queries, prefix, causal):
 def _segmented(cache, *, count, prefix):
     return _batch(
         cache,
-        lambda units, page_tokens: SegmentedInput(
+        lambda units, block_size: SegmentedInput(
             SequenceLengths.from_lengths((count,), device="cpu"),
             SequenceLengths.from_lengths((prefix,), device="cpu"),
-            BlockTable(torch.tensor([units], dtype=torch.int32), page_tokens),
+            BlockTable(torch.tensor([units], dtype=torch.int32), block_size),
             None,
             torch.full((1, count), count, dtype=torch.int32),
             True,
@@ -656,7 +656,7 @@ def _sequence_batch(cache, rows, *, device, canvas=0):
     entries = {}
     for number, table in enumerate(cache.tables):
         group = cache.groups[table.group]
-        page = group.page_tokens
+        page = group.block_size
         units = tuple(
             range(1 + number * NATIVE_PAGES, 1 + (number + 1) * NATIVE_PAGES)
         )

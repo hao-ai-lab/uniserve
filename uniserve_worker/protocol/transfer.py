@@ -457,7 +457,7 @@ class KvGroupTransfer:
       group's layers, with one dtype shared by both;
     - with ``float8_e4m3fn`` storage only, a third ``float32`` scale tensor
       is ``[pages, 2, layers, head groups]``, where ``pages`` counts the
-      source pages of `page_tokens` tokens the carried tokens touch (the
+      source pages of `block_size` tokens the carried tokens touch (the
       first one holds ``start``), the second axis selects K or V, and the
       kv-head count is a multiple of ``head groups``.
 
@@ -465,7 +465,7 @@ class KvGroupTransfer:
     """
 
     start: int
-    page_tokens: int
+    block_size: int
     tensors: tuple[TensorTransfer, ...]
 
     def validate(self, base_extent: int, published_extent: int) -> None:
@@ -477,7 +477,7 @@ class KvGroupTransfer:
                 with it, or the K/V/scale geometry is invalid.
         """
         if (
-            self.page_tokens < 1
+            self.block_size < 1
             or not base_extent <= self.start <= published_extent
         ):
             raise invalid_descriptor("KV group transfer interval is invalid")
@@ -528,8 +528,8 @@ class KvGroupTransfer:
             # tokens already installed on a partially filled boundary page
             # count toward the page total.
             pages = (
-                self.start % self.page_tokens + carried + self.page_tokens - 1
-            ) // self.page_tokens
+                self.start % self.block_size + carried + self.block_size - 1
+            ) // self.block_size
             if (
                 scales.dtype != "float32"
                 or len(scales.shape) != 4
@@ -558,7 +558,7 @@ class KvGroupTransfer:
         """Encode one group's carried interval and tensors."""
         return {
             "start": self.start,
-            "page_tokens": self.page_tokens,
+            "block_size": self.block_size,
             "tensors": [tensor.to_mapping() for tensor in self.tensors],
         }
 

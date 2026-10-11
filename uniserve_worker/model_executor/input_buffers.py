@@ -458,7 +458,7 @@ class AttentionBuffers(InputBuffers):
                     first = first_page(table, prefix)
                     end = min(
                         table.end_page,
-                        ceil_div(prefix + query, shape.page_tokens),
+                        ceil_div(prefix + query, shape.block_size),
                     )
                 pages.append(max(0, end - first))
                 first_pages.append(first)
@@ -467,7 +467,7 @@ class AttentionBuffers(InputBuffers):
                 start = (ROW_SECTIONS + table_number) * stride
                 host[start : start + count] = pages
                 widths.append(max(1, *pages))
-                block_sizes.append(shape.page_tokens)
+                block_sizes.append(shape.block_size)
                 firsts.append(
                     None if shape.window is None else tuple(first_pages)
                 )

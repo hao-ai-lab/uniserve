@@ -512,7 +512,7 @@ def _token_worker_layout(
             BlockTables.buffers(
                 groups=tuple(
                     GroupShape(
-                        group.page_tokens, group.units_per_page, group.window
+                        group.block_size, group.units_per_page, group.window
                     )
                     for group in planes.groups
                 ),
@@ -536,7 +536,7 @@ def _token_worker_layout(
         )
 
         page_shapes = tuple(
-            (group.page_tokens, group.units_per_page) for group in planes.groups
+            (group.block_size, group.units_per_page) for group in planes.groups
         )
         co_resident_units = _co_resident_units(
             worker_config,

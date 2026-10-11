@@ -79,7 +79,7 @@ def unsupported(
         query_heads=num_heads,
         kv_heads=num_kv_heads,
         head_dim=head_dim,
-        page_tokens=pages.page_tokens,
+        block_size=pages.block_size,
         dtype=dtype,
     )
 
@@ -108,7 +108,7 @@ def _serves_causal(*, num_heads, num_kv_heads, head_dim, dtype, cache, window):
             query_heads=num_heads,
             kv_heads=num_kv_heads,
             head_dim=head_dim,
-            page_tokens=pages.page_tokens,
+            block_size=pages.block_size,
             dtype=dtype,
             causal=True,
             window=window,

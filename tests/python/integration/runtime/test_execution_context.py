@@ -209,11 +209,11 @@ def test_replay_binding_still_rejects_inputs_outside_the_captured_contract():
         assert len(tables) == 2
 
         def batch(counts, scale=1):
-            # Each table pages at its group's page size; ``scale`` breaks
+            # Each table pages at its group's block size; ``scale`` breaks
             # that contract for the second table alone.
             entries = {}
             for number, table in enumerate(tables):
-                pages = cache.groups[cache.tables[table].group].page_tokens
+                pages = cache.groups[cache.tables[table].group].block_size
                 paged = PagedInput.from_blocks(
                     blocks=((1 + 2 * number,), (2 + 2 * number,)),
                     query_lengths=counts,

@@ -52,7 +52,7 @@ def read_candidates(model, prompt, canvas, position, candidates):
     plan = plan_units(config, block_size=block_size)
     blocks, next_unit = {}, 1
     for index, table in enumerate(plan.tables):
-        page = plan.groups[table.group].page_tokens
+        page = plan.groups[table.group].block_size
         pages = math.ceil(length / page)
         blocks[index] = tuple(range(next_unit, next_unit + pages))
         next_unit += pages
@@ -67,7 +67,7 @@ def read_candidates(model, prompt, canvas, position, candidates):
     def attention(build):
         entries = {}
         for index, table in enumerate(cache.tables):
-            page = cache.groups[table.group].page_tokens
+            page = cache.groups[table.group].block_size
             entry = build(blocks[index], page)
             if entries:
                 entry = replace(

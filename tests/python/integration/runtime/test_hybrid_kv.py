@@ -66,7 +66,7 @@ def _history(pool, device):
     written = {}
     for name, table, row in _layers(pool):
         state = pool.cache.state(name)
-        first = table.start_page * table.shape.page_tokens
+        first = table.start_page * table.shape.block_size
         length = 40 - first
         shape = (length, *state.key.shape[2:])
         key = torch.randn(shape, generator=generator).to(device)
@@ -118,9 +118,9 @@ def test_publication_carries_each_group_from_its_first_needed_token(
         # A reader at token 40 needs the windowed group's last eight tokens
         # and the full group's whole history, each over its group's layers.
         windowed, full = publication.groups
-        assert (windowed.start, windowed.page_tokens) == (32, 16)
+        assert (windowed.start, windowed.block_size) == (32, 16)
         assert windowed.tensors[0].shape == (8, 10, 4, 4)
-        assert (full.start, full.page_tokens) == (0, 32)
+        assert (full.start, full.block_size) == (0, 32)
         assert full.tensors[0].shape == (40, 2, 1, 8)
         producer.validate_publications(((source, publication),), ())
         producer.apply_publications(((source, publication),), ())
@@ -145,7 +145,7 @@ def test_publication_carries_each_group_from_its_first_needed_token(
         # Each layer holds exactly the carried tokens at its own units.
         for name, table, row in _layers(consumer):
             first, key, value = written[name]
-            start = table.start_page * table.shape.page_tokens
+            start = table.start_page * table.shape.block_size
             actual = consumer.cache.state(name).read(
                 table.row(row), start=0, length=40 - start
             )

@@ -1433,7 +1433,7 @@ class ModelExecutor:
                         device_causality=self.attention.device_causality,
                         pool=(
                             tuple(
-                                (group.page_tokens, group.units_per_page)
+                                (group.block_size, group.units_per_page)
                                 for group in kv_cache.shapes
                             ),
                             kv_cache.num_units - 1,

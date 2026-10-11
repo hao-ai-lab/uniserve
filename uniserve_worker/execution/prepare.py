@@ -245,7 +245,7 @@ def prepare_batch(
                 for table in _slot_tables(batch, tables, slot):
                     start = max(
                         kv_publication.base_extent,
-                        table.start_page * table.shape.page_tokens,
+                        table.start_page * table.shape.block_size,
                     )
                     if start < end:
                         storage_dependencies.extend(

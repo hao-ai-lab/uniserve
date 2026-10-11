@@ -245,10 +245,10 @@ def _install(manager, count, tokens=SEQUENCE):
     entries, unit = [], 1
     for slot in range(1, count + 1):
         for group, shape in enumerate(manager.shapes):
-            pages = ceil_div(tokens, shape.page_tokens)
+            pages = ceil_div(tokens, shape.block_size)
             units = tuple(range(unit, unit + pages * shape.units_per_page))
             unit += len(units)
-            entries.append((slot, group, 0, units, pages * shape.page_tokens))
+            entries.append((slot, group, 0, units, pages * shape.block_size))
     manager.block_tables.install(tuple(entries))
 
 

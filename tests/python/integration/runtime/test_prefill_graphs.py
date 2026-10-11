@@ -164,7 +164,7 @@ def _install(manager, slots, *, retired):
     entries, unit = [], 1
     for slot in slots:
         for group, shape in enumerate(manager.shapes):
-            pages = ceil_div(SEQUENCE, shape.page_tokens)
+            pages = ceil_div(SEQUENCE, shape.block_size)
             units = tuple(range(unit, unit + pages * shape.units_per_page))
             unit += len(units)
             start = retired if shape.window is not None else 0
@@ -174,7 +174,7 @@ def _install(manager, slots, *, retired):
                     group,
                     start,
                     units[start * shape.units_per_page :],
-                    pages * shape.page_tokens,
+                    pages * shape.block_size,
                 )
             )
     manager.block_tables.install(tuple(entries))
@@ -663,8 +663,7 @@ def test_a_small_pool_replays_every_prefill_bucket(tmp_path, units):
         tmp_path, graphs=True, units=units, slots=12
     ) as (runner, manager, config):
         pages = tuple(
-            (shape.page_tokens, shape.units_per_page)
-            for shape in manager.shapes
+            (shape.block_size, shape.units_per_page) for shape in manager.shapes
         )
         shapes = prefill_captures(
             config,
@@ -695,7 +694,7 @@ def test_a_small_pool_replays_every_prefill_bucket(tmp_path, units):
             entries, unit = [], 1
             for slot, length in enumerate(lengths, start=1):
                 for group, page in enumerate(manager.shapes):
-                    count = ceil_div(length, page.page_tokens)
+                    count = ceil_div(length, page.block_size)
                     held = count * page.units_per_page
                     entries.append(
                         (
@@ -703,7 +702,7 @@ def test_a_small_pool_replays_every_prefill_bucket(tmp_path, units):
                             group,
                             0,
                             tuple(range(unit, unit + held)),
-                            count * page.page_tokens,
+                            count * page.block_size,
                         )
                     )
                     unit += held

@@ -1393,7 +1393,7 @@ fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
     };
     Ok(KvCacheGroup {
         kind,
-        page_tokens: group.page_tokens(),
+        block_size: group.block_size(),
         units_per_page: group.units_per_page(),
         layer_ids: group
             .layer_ids()
@@ -1955,7 +1955,7 @@ fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransf
 fn kv_group_transfer_from_table(group: fbs::KvGroupTransfer<'_>) -> CodecResult<KvGroupTransfer> {
     Ok(KvGroupTransfer {
         start: group.start(),
-        page_tokens: group.page_tokens(),
+        block_size: group.block_size(),
         tensors: group
             .tensors()
             .map(|items| {

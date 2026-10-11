@@ -34,7 +34,7 @@ def unsupported(
     # for causal and dense masks, over 16-, 32- and 64-token pages.
     if window is not None:
         return "has no windowed head dimension 512 kernels"
-    if pages is None or pages.page_tokens not in {16, 32, 64}:
+    if pages is None or pages.block_size not in {16, 32, 64}:
         return "serves head dimension 512 only over 16-, 32- or 64-token pages"
     return None
 

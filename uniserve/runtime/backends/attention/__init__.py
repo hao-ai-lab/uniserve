@@ -25,12 +25,12 @@ from uniserve.tensors import BufferConfig
 class CachePages:
     """How a layer's paged K/V cache stores its pages.
 
-    ``page_tokens`` is the tokens of one page, ``dtype`` the element type
+    ``block_size`` is the tokens of one page, ``dtype`` the element type
     the pages store and ``quantized`` whether they hold per-block FP8
     values with scales.
     """
 
-    page_tokens: int
+    block_size: int
     dtype: torch_lib.dtype
     quantized: bool = False
 

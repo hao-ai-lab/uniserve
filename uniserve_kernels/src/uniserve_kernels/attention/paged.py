@@ -12,7 +12,7 @@ caller is ``uniserve.runtime.backends.attention._paged_inputs``.
 
 A block table whose rows begin at a per-row start page (retired history
 pages) is read from its first column: the key lengths are then counted from
-each row's table origin ``start_page * page_tokens``, so a kernel that aligns
+each row's table origin ``start_page * block_size``, so a kernel that aligns
 queries to the end of their keys sees the same relative causal positions and
 history window as over an unretired table.
 """
@@ -47,7 +47,7 @@ if triton is not None:
         batch_size: tl.int32,
         sequence_block: tl.constexpr,
         num_pages: tl.constexpr,
-        page_size: tl.constexpr,
+        block_size: tl.constexpr,
         row_width: tl.constexpr,
         head_dim: tl.constexpr,
         key_strides: tl.constexpr,
@@ -123,7 +123,7 @@ if triton is not None:
                 key_initialized,
                 value_initialized,
                 num_pages,
-                page_size,
+                block_size,
                 row_width,
                 head_dim,
                 key_strides,
@@ -166,10 +166,10 @@ def prepare(
             contiguous ``[pages, block_size, heads, head_dim]`` caches, one
             slot per ``[heads, head_dim]`` source row (``-1`` skips a row),
             and the per-block initialized flags that written blocks set.
-        start_pages: ``None``, or ``(start_page, page_tokens)``: the int32
+        start_pages: ``None``, or ``(start_page, block_size)``: the int32
             ``[batch_size]`` first logical page of each row's block table
             (any stride) and the tokens per page. Each row's keys are then
-            counted from token ``start_page * page_tokens``.
+            counted from token ``start_page * block_size``.
         semaphore: Optional int32 word that the launch sets to zero, such
             as the ticket counter of the attention launch that follows.
     """

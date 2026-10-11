@@ -733,7 +733,7 @@ fn kv_group_transfer<'a>(
         b,
         &fbs::KvGroupTransferArgs {
             start: v.start,
-            page_tokens: v.page_tokens,
+            block_size: v.block_size,
             tensors,
         },
     )
@@ -1209,7 +1209,7 @@ fn kv_group<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheGroup) -> WIPOffset<fb
         &fbs::KvGroupArgs {
             kind,
             window,
-            page_tokens: v.page_tokens,
+            block_size: v.block_size,
             units_per_page: v.units_per_page,
             layer_ids,
             num_kv_heads: v.num_kv_heads,

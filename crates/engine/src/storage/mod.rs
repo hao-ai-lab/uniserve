@@ -135,7 +135,7 @@ impl LatentPool {
 
     /// Computes the number of physical pages needed for logical latent units.
     ///
-    /// Returns `None` when nonzero units meet a zero page size or the page
+    /// Returns `None` when nonzero units meet a zero block size or the page
     /// count does not fit in `usize`.
     fn pages_needed(&self, units: u64) -> Option<usize> {
         if units == 0 {
