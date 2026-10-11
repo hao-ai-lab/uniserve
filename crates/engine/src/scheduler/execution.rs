@@ -2349,9 +2349,9 @@ impl Scheduler {
     /// Returns whether output capacity can cover every unresolved token-producing call.
     ///
     /// The request's event journal must hold, besides `OUTPUT_TERMINAL_RESERVE`
-    /// events kept for its terminal output, the `call_output_bound` of every
-    /// in-flight call plus the `next_output_bound` of the next one. Returns
-    /// `false` for a request that is not running or whose journal is closed.
+    /// events kept for its terminal output, the `output_bound` of every
+    /// in-flight call plus that of the call it plans next. Returns `false`
+    /// for a request that is not running or whose journal is closed.
     pub(super) fn output_window_ready(&self, id: RequestId) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
@@ -2366,27 +2366,15 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .map(|pending| call_output_bound(pending.call.code, &pending.call.bounds))
+            .map(|pending| output_bound(pending.call.code))
             .sum::<usize>();
+        let next = self
+            .peek_next_call_variant(id)
+            .map_or(DEFAULT_OUTPUT_EVENTS, output_bound);
         available
             .saturating_sub(reserved)
             .saturating_sub(OUTPUT_TERMINAL_RESERVE)
-            >= self.next_output_bound(id)
-    }
-
-    /// Returns the output-size bound, in events, for the next call.
-    ///
-    /// Mirrors the per-kind counts of `call_output_bound`, which charges a
-    /// call once it is in flight, for the kinds `peek_next_call_variant`
-    /// predicts.
-    pub(super) fn next_output_bound(&self, id: RequestId) -> usize {
-        match self.peek_next_call_variant(id) {
-            Some(
-                CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode),
-            ) => 4,
-            Some(CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding)) => 3,
-            Some(_) | None => 2,
-        }
+            >= next
     }
 
     /// Retains a submitted call and its inputs as in flight for its request,

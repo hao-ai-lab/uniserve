@@ -584,21 +584,20 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
     value.div_ceil(divisor)
 }
 
-/// Returns the maximum number of output events one in-flight call can add to
-/// its request's event journal.
+/// Output events a call kind with no entry in `output_bound` can add to its
+/// request's event journal.
+const DEFAULT_OUTPUT_EVENTS: usize = 2;
+
+/// Returns the maximum number of output events one call of kind `code` can
+/// add to its request's event journal.
 ///
-/// `Scheduler::output_window_ready` charges this for every in-flight call; the
-/// per-kind counts must stay in step with `Scheduler::next_output_bound`,
-/// which charges the same events before the call is planned.
-fn call_output_bound(code: CallKind, bounds: &uniserve_worker_ipc::Bounds) -> usize {
+/// `Scheduler::output_window_ready` charges this for every in-flight call and
+/// for the call the request plans next.
+fn output_bound(code: CallKind) -> usize {
     match code {
-        CallKind::Forward(ForwardMode::Verify) => (bounds.max_tokens as usize)
-            .saturating_mul(2)
-            .saturating_add(2),
         CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,
-        CallKind::Media(MediaCall::VideoDecoding) => 2,
         CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding) => 3,
-        _ => 2,
+        _ => DEFAULT_OUTPUT_EVENTS,
     }
 }
 
