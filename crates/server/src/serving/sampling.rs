@@ -55,11 +55,10 @@ pub(super) fn apply_sampling(
         }
     }
     sampling.logit_bias = biases.into_iter().collect();
-    sampling.return_logprobs = stop.logprobs.is_some() || stop.logprob_token_ids.is_some();
+    sampling.return_logprobs = stop.logprobs.is_some();
     sampling.n_logprobs = logprob_count(stop.logprobs);
     sampling.return_prompt_logprobs = stop.prompt_logprobs.is_some();
     sampling.n_prompt_logprobs = logprob_count(stop.prompt_logprobs);
-    sampling.logprob_token_ids = stop.logprob_token_ids.clone().unwrap_or_default();
     sampling.allowed_token_ids = stop.allowed_token_ids.clone();
     sampling.bad_words_ids = tokenize_bad_words(&stop.bad_words, tokenizer)?.unwrap_or_default();
     sampling.validate()?;

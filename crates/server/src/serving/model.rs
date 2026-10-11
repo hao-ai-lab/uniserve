@@ -9,11 +9,10 @@
 //! serving runtime.
 //!
 //! [`InputProcessor`] binds tokenizer assets, generation limits, sampling policy, and
-//! output processing. [`InputProcessor::preprocess_text_request`] produces a [`GenerationRequest`]
-//! and the [`ResponseOptions`] retained by the frontend. The chat and image entry points in the
-//! sibling `preprocessing` module route through the same `InputProcessor::preprocess_generation`,
-//! which delegates SenseNova and Bagel inputs to the sibling `omni` module; `omni` reads the
-//! `pub(super)` fields.
+//! output processing. The chat and image entry points in the sibling `preprocessing` module
+//! route through `InputProcessor::preprocess_generation`, which produces a [`GenerationRequest`]
+//! and the [`ResponseOptions`] retained by the frontend, and delegates SenseNova and Bagel
+//! inputs to the sibling `omni` module; `omni` reads the `pub(super)` fields.
 //! [`InputProcessor::preprocess_video_request`] produces a `DiffusionRequest` for MiniMax H3
 //! through the deployment's `VideoService`.
 
@@ -32,15 +31,14 @@ use uniserve_core::{
 
 use crate::serving::chat::template::renderer::hf::MultimodalRenderInfo;
 use crate::serving::chat::{
-    ChatOutputProcessor, ChatTemplateLoadOptions, HfChatRenderer, Qwen3ChatOutputProcessor,
+    ChatOutputProcessor, ChatRequest, ChatTemplateLoadOptions, HfChatRenderer,
+    Qwen3ChatOutputProcessor,
 };
-use crate::serving::input::{
-    OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions, TextPromptRequest,
-};
+use crate::serving::input::{OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions};
 use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
 use crate::serving::video::plan::VisionConfig;
 use crate::serving::video::{ProcessedVideo, VideoService};
-use crate::serving::{Result, ServeError, cache_isolation_key};
+use crate::serving::{Result, ServeError};
 
 /// Owns the tokenizer and template resources used to produce final engine inputs.
 /// Runtime capabilities are fixed at construction, before this value is shared.
@@ -544,53 +542,10 @@ impl InputProcessor {
             .map_err(|feature| reject(feature.name()))
     }
 
-    /// Preprocesses a programmatic text prompt without a chat-template conversion.
-    pub fn preprocess_text_request(
-        &self,
-        request: TextPromptRequest,
-    ) -> Result<(GenerationRequest, ResponseOptions)> {
-        let TextPromptRequest {
-            request_id,
-            prompt,
-            images,
-            modalities,
-            sampling,
-            stop,
-            negative_text,
-            image_gen,
-            cache_namespace,
-            cache_salt,
-            bypass_cache_read,
-            no_cache_store,
-            priority,
-            output,
-            decode,
-        } = request;
-        let cache = CachePolicy {
-            read: !bypass_cache_read,
-            write: !no_cache_store,
-            isolation_key: cache_isolation_key(cache_namespace.as_deref(), cache_salt.as_deref()),
-        };
-        self.preprocess_generation(
-            request_id,
-            PromptInput::Text(prompt),
-            images,
-            modalities,
-            sampling,
-            stop,
-            negative_text,
-            image_gen,
-            cache,
-            priority,
-            output,
-            decode,
-        )
-    }
-
     /// Tokenizes model input and resolves its final engine and output requirements.
     ///
-    /// `images` are the prompt's input images: the top-level images of a text prompt, or the
-    /// resolved `image_url` parts of a chat prompt in `chat_image_urls` order.
+    /// `images` are the resolved `image_url` parts of a chat prompt, in `chat_image_urls`
+    /// order; a text prompt has none.
     ///
     /// # Errors
     ///
@@ -664,7 +619,7 @@ impl InputProcessor {
         let output_processor = (|| -> std::result::Result<_, crate::serving::TokenizeError> {
             let output_processor = match &self.config.parameters {
                 ModelParameters::Qwen3 => self.preprocess_qwen3_input(
-                    prompt,
+                    chat_only(prompt),
                     &sampling,
                     &stop,
                     &mut generation,
@@ -692,7 +647,7 @@ impl InputProcessor {
                 )?,
                 ModelParameters::DiffusionGemma(profile) => self.preprocess_diffusion_gemma_input(
                     profile,
-                    prompt,
+                    chat_only(prompt),
                     &images,
                     &sampling,
                     &mut generation,
@@ -769,6 +724,19 @@ pub fn video_frame_count(seconds: f64, max_video_seconds: f64) -> std::result::R
     Ok(requested + (22 - requested % 17) % 17)
 }
 
+/// Returns the chat conversation of a prompt for a model that serves chat only.
+///
+/// Only an image-generation request sends a text prompt, and feature validation
+/// refuses it for a model without image output.
+fn chat_only(prompt: PromptInput) -> ChatRequest {
+    match prompt {
+        PromptInput::Chat(chat) => chat,
+        PromptInput::Text(_) => {
+            unreachable!("a text prompt is image generation, refused above for a chat-only model")
+        }
+    }
+}
+
 /// Returns the multimodal resources required by the active profile.
 ///
 /// Used at load time: evaluates `GenerationConstraint::Default` (both understanding and
@@ -823,41 +791,29 @@ fn omni_required_features(
 }
 
 impl InputProcessor {
-    /// Renders a Qwen prompt and fills its token, sampling, and KV requirements.
+    /// Renders a Qwen chat prompt and fills its token, sampling, and KV requirements.
     fn preprocess_qwen3_input(
         &self,
-        prompt: PromptInput,
+        mut chat_request: ChatRequest,
         controls: &crate::serving::SamplingConfig,
         stop: &crate::serving::StopConfig,
         generation: &mut GenerationRequest,
         decode: &mut TextDecodeOptions,
     ) -> std::result::Result<OutputProcessorPolicy, crate::serving::TokenizeError> {
-        let (prompt_token_ids, output_processor, skip_special_tokens) = match prompt {
-            PromptInput::Text(text) => {
-                let ids = self.tokenizer.encode(&text, false)?;
-                (ids, OutputProcessorPolicy::None, decode.skip_special_tokens)
-            }
-            PromptInput::Chat(mut chat_request) => {
-                chat_request.decode_options = decode.clone();
-                chat_request.validate()?;
-                let processor = Qwen3ChatOutputProcessor::new(
-                    &mut chat_request,
-                    std::sync::Arc::clone(&self.tokenizer),
-                    self.parse_reasoning,
-                )?;
-                let rendered_text = self
-                    .chat_renderer()
-                    .ok_or(crate::serving::chat::Error::MissingChatTemplate)?
-                    .render(&chat_request)?;
-                let ids = self.tokenizer.encode(&rendered_text, false)?;
-                let skip = chat_request.decode_options.skip_special_tokens;
-                (
-                    ids,
-                    OutputProcessorPolicy::Chat(ChatOutputProcessor::Qwen3(processor)),
-                    skip,
-                )
-            }
-        };
+        chat_request.decode_options = decode.clone();
+        chat_request.validate()?;
+        let processor = Qwen3ChatOutputProcessor::new(
+            &mut chat_request,
+            std::sync::Arc::clone(&self.tokenizer),
+            self.parse_reasoning,
+        )?;
+        let rendered_text = self
+            .chat_renderer()
+            .ok_or(crate::serving::chat::Error::MissingChatTemplate)?
+            .render(&chat_request)?;
+        let prompt_token_ids = self.tokenizer.encode(&rendered_text, false)?;
+        let skip_special_tokens = chat_request.decode_options.skip_special_tokens;
+        let output_processor = OutputProcessorPolicy::Chat(ChatOutputProcessor::Qwen3(processor));
 
         let prompt_len = prompt_token_ids.len() as u32;
         let (sampling, max_tokens, stop_token_ids) =

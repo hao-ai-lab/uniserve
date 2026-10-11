@@ -10,13 +10,13 @@ use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer};
 use uniserve_engine::{EngineConfig, SimEngine, SimExecutor};
 use uniserve_server::engine_client::EngineClient;
+use uniserve_server::openai::ChatCompletionRequest;
 use uniserve_server::profile::tokenizer::HuggingFaceTokenizer;
 use uniserve_server::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use uniserve_server::serving::media::{ImageFetchPolicy, ImageFetcher};
 use uniserve_server::serving::{
     FinishStatus, InputProcessor, RequestOutput, RequestRenderer, ServingRuntime, StopCause,
-    TextPromptRequest,
 };
 
 /// Builds a serving runtime over a default `SimEngine`.
@@ -90,15 +90,24 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRun
     ServingRuntime::new(processor, client, images, false)
 }
 
-/// Greedy text request that may sample only `a`, so it deterministically
-/// stops on the `aa` stop string after two output tokens.
-fn request(id: &str) -> TextPromptRequest {
-    let mut request = TextPromptRequest::new(id, "prompt");
-    request.sampling.max_tokens = Some(8);
-    request.sampling.temperature = Some(0.0);
-    request.stop.allowed_token_ids = Some(vec![u32::from(b'a')]);
-    request.stop.stop_strings = vec!["aa".to_string()];
-    request
+/// Greedy chat request of at most `max_completion_tokens` tokens that may
+/// sample only `a`, stopping on each of `stop`.
+fn request_with(max_completion_tokens: u32, stop: &[&str]) -> ChatCompletionRequest {
+    serde_json::from_value(serde_json::json!({
+        "model": "sim-model",
+        "messages": [{"role": "user", "content": "prompt"}],
+        "max_completion_tokens": max_completion_tokens,
+        "temperature": 0.0,
+        "allowed_token_ids": [u32::from(b'a')],
+        "stop": stop,
+    }))
+    .unwrap()
+}
+
+/// A request that deterministically stops on the `aa` stop string after two
+/// output tokens.
+fn request() -> ChatCompletionRequest {
+    request_with(8, &["aa"])
 }
 
 /// A request identifier is refused while a request holding it is live and
@@ -108,9 +117,12 @@ fn request(id: &str) -> TextPromptRequest {
 #[tokio::test]
 async fn stop_completion_releases_identity_without_dropping_the_exhausted_stream() {
     let runtime = runtime();
-    let mut first = runtime.generate_text(request("same-id")).await.unwrap();
+    let mut first = runtime
+        .generate_chat("same-id".into(), request())
+        .await
+        .unwrap();
     assert!(matches!(
-        runtime.generate_text(request("same-id")).await,
+        runtime.generate_chat("same-id".into(), request()).await,
         Err(uniserve_server::openai::ApiError::InvalidRequest { .. })
     ));
 
@@ -146,7 +158,10 @@ async fn stop_completion_releases_identity_without_dropping_the_exhausted_stream
     runtime.drain().await;
     assert_eq!(runtime.metrics_snapshot().finished, 1);
 
-    let mut second = runtime.generate_text(request("same-id")).await.unwrap();
+    let mut second = runtime
+        .generate_chat("same-id".into(), request())
+        .await
+        .unwrap();
     // A retained exhausted stream must not cancel a reused external identity.
     drop(first);
     while let Some(event) = second.next().await {
@@ -158,7 +173,7 @@ async fn stop_completion_releases_identity_without_dropping_the_exhausted_stream
     runtime.shutdown().await.unwrap();
 }
 
-/// Cancel, abort, and a dropped `generate_text` future each end a request
+/// Cancel, abort, and a dropped `generate_chat` future each end a request
 /// whose preprocessing has not started. A control yields a single terminal
 /// event, abort takes precedence over an earlier or later cancel, and a
 /// disconnect is recorded as a cancellation.
@@ -186,11 +201,11 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
         for (id, aborted, cancelled) in [("cancel", 0, 1), ("abort", 1, 1), ("disconnect", 1, 2)] {
             // One poll registers the request before it waits for the blocking
             // pool; the registered identifier already refuses a duplicate.
-            let mut pending = Box::pin(runtime.generate_text(request(id)));
+            let mut pending = Box::pin(runtime.generate_chat(id.into(), request()));
             assert!(poll!(pending.as_mut()).is_pending());
             assert_eq!(runtime.metrics_snapshot().active, 1);
             assert!(matches!(
-                runtime.generate_text(request(id)).await,
+                runtime.generate_chat(id.into(), request()).await,
                 Err(uniserve_server::openai::ApiError::InvalidRequest { .. })
             ));
             if id == "disconnect" {
@@ -262,7 +277,7 @@ async fn chat_admission_rejection_remains_a_bad_request() {
     runtime.shutdown().await.unwrap();
 }
 
-/// `compile_us` is measured from the start of `generate_text`, so it includes
+/// `compile_us` is measured from the start of `generate_chat`, so it includes
 /// time spent queued for the blocking pool; the reported total latency must
 /// cover that wait as well.
 #[test]
@@ -284,7 +299,7 @@ fn successful_total_includes_time_waiting_for_preprocessing() {
             release_rx.recv().unwrap();
         });
         ready_rx.await.unwrap();
-        let mut pending = Box::pin(runtime.generate_text(request("timed")));
+        let mut pending = Box::pin(runtime.generate_chat("timed".into(), request()));
         assert!(poll!(pending.as_mut()).is_pending());
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         release_tx.send(()).unwrap();
@@ -311,12 +326,11 @@ fn successful_total_includes_time_waiting_for_preprocessing() {
 async fn completed_request_is_recorded_in_request_metrics() {
     let engine_model = "request-metrics-model";
     let runtime = runtime_for_engine_model(SimEngine::new(), engine_model);
-    let mut request = TextPromptRequest::new("metrics", "prompt");
-    request.sampling.max_tokens = Some(3);
-    request.sampling.temperature = Some(0.0);
-    request.stop.allowed_token_ids = Some(vec![u32::from(b'a')]);
 
-    let mut stream = runtime.generate_text(request).await.unwrap();
+    let mut stream = runtime
+        .generate_chat("metrics".into(), request_with(3, &[]))
+        .await
+        .unwrap();
     let mut usage = None;
     let mut finish = None;
     while let Some(event) = stream.next().await {
@@ -365,12 +379,11 @@ async fn disconnected_request_is_recorded_as_aborted_without_token_usage() {
     let mut worker = SimEngine::new();
     worker.set_text_len(1_000_000);
     let runtime = runtime_for_engine_model(worker, engine_model);
-    let mut request = TextPromptRequest::new("disconnect", "prompt");
-    request.sampling.max_tokens = Some(1_000);
-    request.sampling.temperature = Some(0.0);
-    request.stop.allowed_token_ids = Some(vec![u32::from(b'a')]);
 
-    let mut stream = runtime.generate_text(request).await.unwrap();
+    let mut stream = runtime
+        .generate_chat("disconnect".into(), request_with(1_000, &[]))
+        .await
+        .unwrap();
     loop {
         match stream.next().await.unwrap().unwrap() {
             RequestOutput::TextDelta { text, .. } if !text.is_empty() => break,

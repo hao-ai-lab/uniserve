@@ -23,11 +23,6 @@ use crate::profile::tokenizer::HuggingFaceTokenizer;
 /// System instruction used under `GenerationConstraint::Default` when the
 /// request supplies none.
 const DEFAULT_SYSTEM_PROMPT: &str = "You should first think about the planning process in the mind and then generate the image. \n     The planning process is enclosed within <think> </think> tags, i.e. <think> planning process here </think> image here";
-/// System instruction that establishes Bagel reasoning and answer delimiters.
-///
-/// `serving::omni` places it before the input images of an understanding-only
-/// text prompt, framed by [`BagelProfile::wrap_context_text`].
-pub const CONTEXT_SYSTEM_PROMPT: &str = "\nLet's think step by step to answer the question. For text-based thinking, enclose the process within <think> </think>, e.g. <think> thinking process here </think>. For visual thinking, enclose the content within <image_start> </image_end>, e.g. <image_start> thinking image here </image_end>. Finally conclude with the final answer wrapped in <answer></answer> tags, i.e.<answer> answer here </answer>.\n";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// Loaded Bagel profile and tokenizer assets.
@@ -223,24 +218,21 @@ impl BagelProfile {
     /// - `Default` places the system instruction directly after
     ///   `<|im_start|>`, with no role line, followed by a user turn and an open
     ///   assistant turn.
-    /// - `UndOnly` without images renders a plain user turn and an open
-    ///   assistant turn.
-    /// - `UndOnly` with images encodes the prompt text alone.
+    /// - `UndOnly` renders a plain user turn and an open assistant turn.
     /// - `GenOnly` wraps the prompt with [`Self::wrap_context_text`].
     ///
     /// `system_prompt` applies only under `Default`; `assistant_prefix`
-    /// applies only to the `Default` and image-free `UndOnly` layouts.
+    /// applies only to the `Default` and `UndOnly` layouts.
     pub fn render_prompt_ids(
         &self,
         tokenizer: &HuggingFaceTokenizer,
         constraint: GenerationConstraint,
-        has_images: bool,
         prompt: &str,
         system_prompt: Option<&str>,
         assistant_prefix: Option<&str>,
     ) -> crate::profile::tokenizer::Result<Vec<u32>> {
-        match (constraint, has_images) {
-            (GenerationConstraint::Default, _) => encode(
+        match constraint {
+            GenerationConstraint::Default => encode(
                 tokenizer,
                 &format!(
                     "<|im_start|>{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
@@ -249,7 +241,7 @@ impl BagelProfile {
                     assistant_prefix.unwrap_or("")
                 ),
             ),
-            (GenerationConstraint::UndOnly, false) => encode(
+            GenerationConstraint::UndOnly => encode(
                 tokenizer,
                 &format!(
                     "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
@@ -257,8 +249,7 @@ impl BagelProfile {
                     assistant_prefix.unwrap_or("")
                 ),
             ),
-            (GenerationConstraint::UndOnly, true) => encode(tokenizer, prompt),
-            (GenerationConstraint::GenOnly, _) => self.wrap_context_text(tokenizer, prompt),
+            GenerationConstraint::GenOnly => self.wrap_context_text(tokenizer, prompt),
         }
     }
 

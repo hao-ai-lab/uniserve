@@ -22,11 +22,11 @@ use uniserve_core::{
 };
 
 use crate::profile::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
-use crate::serving::chat::{ChatOutputProcessor, Gemma4ChatOutputProcessor};
+use crate::serving::chat::{ChatOutputProcessor, ChatRequest, Gemma4ChatOutputProcessor};
 use crate::serving::text::TextDecodeOptions;
 use crate::serving::{
-    InputProcessor, OutputProcessorPolicy, PromptInput, SamplingConfig, ServeError, ServeRequestId,
-    StopConfig, TokenizeError, media,
+    InputProcessor, OutputProcessorPolicy, SamplingConfig, ServeError, ServeRequestId, StopConfig,
+    TokenizeError, media,
 };
 
 /// Splits a prompt whose images stand as soft-token runs into the engine's
@@ -171,24 +171,19 @@ impl InputProcessor {
     ///
     /// # Errors
     ///
-    /// Returns `TokenizeError::Invalid` for a text prompt, an image with no
-    /// area, request text that encodes image tokens of its own, or a prompt
-    /// that leaves no room for one canvas; chat validation, rendering,
-    /// tokenizer, and parser construction errors propagate.
+    /// Returns `TokenizeError::Invalid` for an image with no area, request
+    /// text that encodes image tokens of its own, or a prompt that leaves no
+    /// room for one canvas; chat validation, rendering, tokenizer, and parser
+    /// construction errors propagate.
     pub(super) fn preprocess_diffusion_gemma_input(
         &self,
         profile: &DiffusionGemmaProfile,
-        prompt: PromptInput,
+        mut chat: ChatRequest,
         images: &[media::ImageInput],
         sampling: &SamplingConfig,
         generation: &mut GenerationRequest,
         decode: &mut TextDecodeOptions,
     ) -> Result<OutputProcessorPolicy, TokenizeError> {
-        let PromptInput::Chat(mut chat) = prompt else {
-            return Err(TokenizeError::Invalid(
-                "DiffusionGemma generates replies to chat prompts only".to_owned(),
-            ));
-        };
         chat.decode_options = decode.clone();
         chat.validate()?;
         let processor = Gemma4ChatOutputProcessor::new(

@@ -8,23 +8,21 @@
 //! [`prepare_generation_resources`] then resolves sampling, cache policy, and
 //! the KV budget for both profiles.
 //!
-//! Input images arrive already resolved (`serving::media`): chat images in
-//! `chat_image_urls` order, text-prompt images in request order. Chat images,
-//! and images attached to a SenseNova text prompt, are carried through prompt
-//! rendering as request-scoped text placeholders. After the chat template or
-//! prompt layout renders, each placeholder is replaced (SenseNova) or removed
-//! (Bagel), and its byte offset in the cleaned text is converted into a
-//! prompt-token position by tokenizing the text before it. Bagel text prompts
-//! place images at token positions fixed by the prompt layout instead (see
-//! `bagel_prompt`). Either way the position becomes `ImageInput::position`,
-//! the prompt-token boundary at which the image's encoder output enters the
-//! context.
+//! Input images arrive already resolved (`serving::media`), in
+//! `chat_image_urls` order, and are carried through chat rendering as
+//! request-scoped text placeholders. After the chat template renders, each
+//! placeholder is replaced (SenseNova) or removed (Bagel), and its byte
+//! offset in the cleaned text is converted into a prompt-token position by
+//! tokenizing the text before it. The position becomes
+//! `ImageInput::position`, the prompt-token boundary at which the image's
+//! encoder output enters the context. A text prompt, which only the image
+//! generation route sends, carries no input images.
 
 mod output;
 
 use thiserror::Error;
 
-use crate::profile::omni::bagel::{BagelProfile, CONTEXT_SYSTEM_PROMPT};
+use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::omni::resolution::{ResolutionPolicy, resolve_resolution};
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use base64::Engine as _;
@@ -72,30 +70,11 @@ impl From<String> for OmniError {
     }
 }
 
-/// Denoising steps for Bagel context-image mode when the request sets none.
-const DEFAULT_STEPS: u16 = 50;
 // Omni sampler defaults applied by `prepare_generation_resources` before
 // request controls. A zero temperature selects greedy decoding.
 const DEFAULT_TEMPERATURE: f32 = 0.0;
 const DEFAULT_TOP_P: f32 = 1.0;
 const DEFAULT_TOP_K: u32 = 0;
-
-/// Fixed image parameters for Bagel context-image mode.
-///
-/// `bagel_context_image_params` applies these without consulting request
-/// controls.
-mod context_image_defaults {
-    /// Default text classifier-free guidance scale.
-    pub(super) const CFG_TEXT_SCALE: f32 = 4.0;
-    /// Default image classifier-free guidance scale.
-    pub(super) const CFG_IMG_SCALE: f32 = 2.0;
-    /// Default lower bound for guidance renormalization.
-    pub(super) const CFG_RENORM_MIN: f32 = 0.0;
-    /// Default denoising interval for classifier-free guidance.
-    pub(super) const CFG_INTERVAL: (f32, f32) = (0.0, 1.0);
-    /// Default square output dimension in pixels.
-    pub(super) const RESOLUTION: u32 = 512;
-}
 
 /// Input image whose prompt position is resolved but whose encoder inputs are not.
 #[derive(Debug, Clone)]
@@ -191,16 +170,12 @@ pub(super) fn preprocess_sensenova(
     ))
 }
 
-/// Renders Bagel input with the model's context-image conditioning rules.
+/// Fills the Bagel prompt, image inputs, and image-generation parameters.
 ///
-/// A plain-text understanding-only request with input images uses context-image
-/// mode (see `bagel_prompt`): its negative prompt is a copy of the positive
-/// prompt and its image parameters come from `bagel_context_image_params`
-/// instead of `resolve_image_params`. Other requests resolve the negative
-/// prompt and image parameters as [`preprocess_sensenova`] does. On error
-/// `generation` is left unmodified. The returned policy is always
-/// `OutputProcessorPolicy::None`, so Bagel text is emitted without output
-/// filtering.
+/// The negative prompt and image parameters resolve as [`preprocess_sensenova`]
+/// does. On error `generation` is left unmodified. The returned policy is
+/// always `OutputProcessorPolicy::None`, so Bagel text is emitted without
+/// output filtering.
 ///
 /// # Errors
 ///
@@ -216,7 +191,7 @@ pub(super) fn preprocess_bagel(
     image_gen: Option<crate::serving::ImageGenControls>,
     generation: &mut GenerationRequest,
 ) -> OmniResult<OutputProcessorPolicy> {
-    let (prompt_token_ids, images, context_image_mode) = bagel_prompt(
+    let (prompt_token_ids, images) = bagel_prompt(
         profile,
         &processor.tokenizer,
         processor
@@ -229,32 +204,17 @@ pub(super) fn preprocess_bagel(
     )?;
     validate_prompt(&prompt_token_ids)?;
 
-    let negative_prompt_token_ids = if context_image_mode {
-        prompt_token_ids.clone()
-    } else {
-        profile
-            .render_negative_prompt_ids(
-                &processor.tokenizer,
-                negative_text.as_deref().unwrap_or(""),
-            )
-            .map_err(|error| error.to_string())?
-    };
-    let image = if context_image_mode {
-        bagel_context_image_params(
-            profile,
-            image_gen.unwrap_or_default(),
-            generation.sampling.seed,
-        )?
-    } else {
-        resolve_image_params(
-            &profile.image_defaults,
-            &profile.resolution_policy,
-            image_gen.unwrap_or_default(),
-            generation.sampling.seed,
-            negative_text.unwrap_or_default(),
-            generation.constraint,
-        )?
-    };
+    let negative_prompt_token_ids = profile
+        .render_negative_prompt_ids(&processor.tokenizer, negative_text.as_deref().unwrap_or(""))
+        .map_err(|error| error.to_string())?;
+    let image = resolve_image_params(
+        &profile.image_defaults,
+        &profile.resolution_policy,
+        image_gen.unwrap_or_default(),
+        generation.sampling.seed,
+        negative_text.unwrap_or_default(),
+        generation.constraint,
+    )?;
     let multimodal_inputs = prepare_image_inputs(
         prompt_token_ids.len(),
         images,
@@ -279,9 +239,8 @@ pub(super) fn preprocess_bagel(
 
 /// Renders a SenseNova text or chat prompt and resolves positioned input images.
 ///
-/// A text prompt with images gets one placeholder line per image prepended
-/// (see `prompt_with_image_slots`); chat images stay where their content parts
-/// appear.
+/// A text prompt carries no input images; chat images stay where their content
+/// parts appear.
 fn sensenova_prompt(
     profile: &SenseNovaProfile,
     tokenizer: &DynTokenizer,
@@ -293,23 +252,10 @@ fn sensenova_prompt(
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     match prompt {
         PromptInput::Text(prompt) => {
-            if images.is_empty() {
-                let prompt_ids = profile
-                    .render_prompt_ids(tokenizer, constraint, &prompt, None, None)
-                    .map_err(|error| error.to_string())?;
-                Ok((prompt_ids, Vec::new()))
-            } else {
-                let placeholders = image_placeholders(request_id, images.len());
-                let prompt = prompt_with_image_slots(&prompt, &placeholders);
-                let rendered = profile.render_prompt_text(constraint, &prompt, None, None);
-                preprocess_sensenova_with_slots(
-                    tokenizer,
-                    &rendered,
-                    &placeholders,
-                    images,
-                    profile,
-                )
-            }
+            let prompt_ids = profile
+                .render_prompt_ids(tokenizer, constraint, &prompt, None, None)
+                .map_err(|error| error.to_string())?;
+            Ok((prompt_ids, Vec::new()))
         }
         PromptInput::Chat(chat) => render_sensenova_chat(
             profile, tokenizer, renderer, request_id, chat, images, constraint,
@@ -317,14 +263,10 @@ fn sensenova_prompt(
     }
 }
 
-/// Renders a Bagel prompt and selects its context-image conditioning mode.
+/// Renders a Bagel text or chat prompt and resolves positioned input images.
 ///
-/// The returned flag is `true` only for a text prompt under
-/// `GenerationConstraint::UndOnly` with input images. That layout is
-/// `wrap_context_text(CONTEXT_SYSTEM_PROMPT)`, then every image, then
-/// `wrap_context_text(prompt)`. Other text prompts place every image after the
-/// whole rendered prompt; chat prompts place each image where its content
-/// part appears.
+/// A text prompt carries no input images; chat images stay where their content
+/// parts appear.
 fn bagel_prompt(
     profile: &BagelProfile,
     tokenizer: &DynTokenizer,
@@ -333,48 +275,16 @@ fn bagel_prompt(
     prompt: PromptInput,
     images: Vec<crate::serving::ImageInput>,
     constraint: GenerationConstraint,
-) -> OmniResult<(Vec<u32>, Vec<RenderedImage>, bool)> {
+) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     match prompt {
         PromptInput::Chat(chat) => {
-            let (prompt_ids, images) =
-                render_bagel_chat(tokenizer, renderer, request_id, chat, images, constraint)?;
-            Ok((prompt_ids, images, false))
-        }
-        PromptInput::Text(prompt)
-            if constraint == GenerationConstraint::UndOnly && !images.is_empty() =>
-        {
-            let mut prompt_ids = profile
-                .wrap_context_text(tokenizer, CONTEXT_SYSTEM_PROMPT)
-                .map_err(|error| error.to_string())?;
-            let image_position = prompt_ids.len() as u32;
-            prompt_ids.extend(
-                profile
-                    .wrap_context_text(tokenizer, &prompt)
-                    .map_err(|error| error.to_string())?,
-            );
-            let images = images
-                .into_iter()
-                .map(|image| rendered_image(image, image_position))
-                .collect();
-            Ok((prompt_ids, images, true))
+            render_bagel_chat(tokenizer, renderer, request_id, chat, images, constraint)
         }
         PromptInput::Text(prompt) => {
             let prompt_ids = profile
-                .render_prompt_ids(
-                    tokenizer,
-                    constraint,
-                    !images.is_empty(),
-                    &prompt,
-                    None,
-                    None,
-                )
+                .render_prompt_ids(tokenizer, constraint, &prompt, None, None)
                 .map_err(|error| error.to_string())?;
-            let position = prompt_ids.len() as u32;
-            let images = images
-                .into_iter()
-                .map(|image| rendered_image(image, position))
-                .collect();
-            Ok((prompt_ids, images, false))
+            Ok((prompt_ids, Vec::new()))
         }
     }
 }
@@ -628,8 +538,8 @@ pub(super) fn prepare_generation_resources(
 ///
 /// Request fields override profile defaults field by field. The sampling seed
 /// (already resolved from the image and text seeds) overrides the profile
-/// seed. Generated images are retained by default unless the request is
-/// image-only (`GenerationConstraint::GenOnly`).
+/// seed. Generated images are retained unless the request is image-only
+/// (`GenerationConstraint::GenOnly`).
 fn resolve_image_params(
     defaults: &crate::profile::omni::ImageGenerationDefaults,
     resolution_policy: &ResolutionPolicy,
@@ -666,53 +576,8 @@ fn resolve_image_params(
         seed: sampling_seed.or(defaults.seed),
         negative_prompt,
         max_images,
-        image_prompts: image.prompts,
-        retain_images: image
-            .retain_images
-            .unwrap_or(constraint != GenerationConstraint::GenOnly),
-    })
-}
-
-/// Resolves Bagel image parameters for understanding requests with context images.
-///
-/// Guidance, renormalization, and resolution are fixed (see
-/// `context_image_defaults`) and cannot be overridden by the request; of the
-/// image controls only `steps`, `max_images`, `timestep_shift`, `prompts`, and
-/// `retain_images` are honored. The seed is the sampling seed, which already
-/// includes any image seed, or zero when neither is set.
-fn bagel_context_image_params(
-    profile: &BagelProfile,
-    image: crate::serving::ImageGenControls,
-    sampling_seed: Option<u64>,
-) -> OmniResult<ImageParams> {
-    let steps = image.steps.unwrap_or(DEFAULT_STEPS);
-    let max_images = image.max_images.unwrap_or(2);
-    validate_max_images(max_images, profile.image_defaults.max_images_limit)?;
-    // The fixed canvas still passes the profile's per-axis latent bound.
-    let resolution = resolve_resolution(
-        &profile.resolution_policy,
-        None,
-        Some(context_image_defaults::RESOLUTION),
-        Some(context_image_defaults::RESOLUTION),
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(ImageParams {
-        steps,
-        cfg_text_scale: context_image_defaults::CFG_TEXT_SCALE,
-        cfg_img_scale: context_image_defaults::CFG_IMG_SCALE,
-        cfg_renorm_type: uniserve_core::CfgRenorm::TextChannel,
-        cfg_renorm_min: context_image_defaults::CFG_RENORM_MIN,
-        cfg_interval: context_image_defaults::CFG_INTERVAL,
-        timestep_shift: image
-            .timestep_shift
-            .unwrap_or(profile.image_defaults.timestep_shift),
-        height: resolution.height,
-        width: resolution.width,
-        seed: sampling_seed.or(Some(0)),
-        negative_prompt: String::new(),
-        max_images,
-        image_prompts: image.prompts,
-        retain_images: image.retain_images.unwrap_or(true),
+        image_prompts: Vec::new(),
+        retain_images: constraint != GenerationConstraint::GenOnly,
     })
 }
 
@@ -816,13 +681,6 @@ fn image_placeholder(request_id: &str, index: usize) -> String {
     format!("[IMAGE_SLOT_{:016x}_{index}]", fnv1a(request_id.as_bytes()))
 }
 
-/// Builds placeholders for the requested image slots.
-fn image_placeholders(request_id: &str, count: usize) -> Vec<String> {
-    (0..count)
-        .map(|index| image_placeholder(request_id, index))
-        .collect()
-}
-
 /// Replaces each rendered image placeholder exactly once and returns its byte offset.
 ///
 /// Placeholders must appear in `placeholders` order. Each returned offset
@@ -857,24 +715,6 @@ fn replace_rendered_slots(
 /// Pairs a resolved image with its prompt position.
 fn rendered_image(image: crate::serving::ImageInput, position: u32) -> RenderedImage {
     RenderedImage { image, position }
-}
-
-/// Prepends the image slots to a SenseNova text prompt, one per line.
-///
-/// A single slot is bare; multiple slots are labeled `Image-1:`, `Image-2:`,
-/// and so on.
-fn prompt_with_image_slots(prompt: &str, placeholders: &[String]) -> String {
-    let mut output = String::new();
-    if placeholders.len() == 1 {
-        output.push_str(&placeholders[0]);
-        output.push('\n');
-    } else {
-        for (index, placeholder) in placeholders.iter().enumerate() {
-            output.push_str(&format!("Image-{}:{placeholder}\n", index + 1));
-        }
-    }
-    output.push_str(prompt);
-    output
 }
 
 /// Rejects an empty prompt token sequence.

@@ -1,7 +1,7 @@
 //! Model-aware admission, engine submission, and output streaming.
 //!
 //! Requests follow one ownership chain:
-//! `HTTP schema / text prompt -> InputProcessor -> GenerationRequest ->
+//! `HTTP schema -> InputProcessor -> GenerationRequest ->
 //! EngineClient::submit_generation -> RequestOutput stream`.
 //! Video requests follow the same chain with a `DiffusionRequest`,
 //! `EngineClient::submit_media`, and `assembly::assemble_media_event_stream`.
@@ -63,7 +63,7 @@ use uniserve_core::EngineCoreOutput;
 
 pub use input::{
     DecodeControls, ImageGenControls, ModalitySelection, OutputDetail, OutputProcessorPolicy,
-    PromptInput, ResponseOptions, SamplingConfig, StopConfig, TextPromptRequest,
+    PromptInput, ResponseOptions, SamplingConfig, StopConfig,
 };
 pub use media::ImageInput;
 pub use model::{
@@ -302,19 +302,14 @@ fn malformed_output(
     }
 }
 
-/// Folds cache namespace/salt into a stable isolation key.
+/// Folds a request's cache salt into a stable isolation key.
 ///
-/// Returns `None` when both are absent, which leaves the request in the shared cache
-/// partition. Otherwise the key is a 64-bit FNV-1a hash over length-prefixed material, so
-/// `("ab", "c")` and `("a", "bc")` hash different bytes. The hash is deterministic across
-/// processes.
-pub(crate) fn cache_isolation_key(namespace: Option<&str>, salt: Option<&str>) -> Option<u64> {
-    (namespace.is_some() || salt.is_some()).then(|| {
-        let namespace = namespace.unwrap_or_default();
-        let salt = salt.unwrap_or_default();
-        let material = format!("{}:{namespace}{}:{salt}", namespace.len(), salt.len());
-        material
-            .as_bytes()
+/// Returns `None` when the salt is absent, which leaves the request in the shared cache
+/// partition. Otherwise the key is the 64-bit FNV-1a hash of the salt, which is
+/// deterministic across processes.
+pub(crate) fn cache_isolation_key(salt: Option<&str>) -> Option<u64> {
+    salt.map(|salt| {
+        salt.as_bytes()
             .iter()
             .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -469,24 +464,6 @@ impl ServingRuntime {
                 model
                     .preprocess_image_request(input_id, request)
                     .map(Prepared::from)
-            }),
-        )
-        .await
-    }
-
-    /// Runs a programmatic text prompt, including model-specific context images.
-    pub async fn generate_text(
-        &self,
-        request: TextPromptRequest,
-    ) -> crate::openai::Result<RequestOutputStream> {
-        let request_id = request.request_id.clone();
-        self.generate_with(
-            request_id.clone(),
-            blocking(request_id, move |model| {
-                model
-                    .preprocess_text_request(request)
-                    .map(Prepared::from)
-                    .map_err(crate::openai::serve_error_to_api)
             }),
         )
         .await

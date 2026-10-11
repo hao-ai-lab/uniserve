@@ -299,6 +299,24 @@ fn resolve_images(
         .block_on(fetcher.fetch_all(urls))
 }
 
+/// A single-turn text chat request to `processor`'s served model, with the
+/// wire `fields` set on top.
+fn chat_request(
+    processor: &InputProcessor,
+    fields: serde_json::Value,
+) -> uniserve_server::openai::ChatCompletionRequest {
+    let mut request = serde_json::json!({
+        "model": processor.served_model_name(),
+        "messages": [{"role": "user", "content": "hello"}],
+        "modalities": ["text"],
+    });
+    request
+        .as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    serde_json::from_value(request).unwrap()
+}
+
 /// Resolves a chat request's input images under the default image policy
 /// and preprocesses the request with them, as `ServingRuntime::generate_chat`
 /// does.
@@ -827,22 +845,23 @@ fn context_length_limits_preprocessed_requests() {
     )
     .unwrap();
 
-    let request = uniserve_server::serving::TextPromptRequest::new(
-        "context-capacity",
-        "This prompt exceeds eight tokens",
-    );
-    assert!(matches!(
-        processor.preprocess_text_request(request),
-        Err(uniserve_server::serving::ServeError::Tokenize {
-            source: uniserve_server::serving::TokenizeError::Text(
-                uniserve_server::serving::text::Error::PromptTooLong {
-                    max_model_len: 8,
-                    ..
-                }
+    let error = processor
+        .preprocess_chat_request(
+            ServeRequestId::new("context-capacity"),
+            chat_request(
+                &processor,
+                serde_json::json!({"messages": [{
+                    "role": "user",
+                    "content": "This prompt exceeds eight tokens"
+                }]}),
             ),
-            ..
-        })
-    ));
+            Vec::new(),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+    let message = error.to_error_response().error.message;
+    assert!(message.contains("8"), "{message}");
 }
 
 /// Defaults fill only omitted controls: an explicit zero temperature stays
@@ -1006,51 +1025,41 @@ fn bagel_rejects_a_canvas_side_beyond_its_latent_position_table() {
     }
 }
 
-/// Cache namespace and salt select a stable isolation partition, the bypass
-/// flags disable prefix-cache reads and writes without changing the
-/// partition, and prompt logprobs disable reads only, because a prefix-cache
-/// hit would skip the prompt positions whose logprobs are requested.
+/// The cache salt selects a stable isolation partition, and prompt logprobs
+/// disable prefix-cache reads only, because a prefix-cache hit would skip the
+/// prompt positions whose logprobs are requested.
 #[test]
-fn cache_controls_preserve_isolation_and_prompt_logprob_requirements() {
-    use uniserve_server::serving::TextPromptRequest;
-
+fn cache_salt_isolates_and_prompt_logprobs_disable_cache_reads() {
     for (description, model_type) in [
         (ModelDescription::Qwen3, "qwen3"),
         (ModelDescription::SenseNova, "neo_chat"),
         (ModelDescription::Bagel, "bagel"),
     ] {
         let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
-        let mut request = TextPromptRequest::new("cache-controls", "hello");
+        let preprocess = |fields: serde_json::Value| {
+            processor
+                .preprocess_chat_request(
+                    ServeRequestId::new("cache-controls"),
+                    chat_request(&processor, fields),
+                    Vec::new(),
+                )
+                .unwrap()
+        };
 
-        let (shared, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        let (shared, _) = preprocess(serde_json::json!({}));
         assert_eq!(shared.cache.isolation_key, None);
         assert!(shared.cache.read && shared.cache.write);
 
-        // The same namespace and salt always produce the same key.
-        request.cache_namespace = Some("ab".to_string());
-        request.cache_salt = Some("c".to_string());
-        let (isolated, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        // The same salt always produces the same key, and another salt another.
+        let (isolated, _) = preprocess(serde_json::json!({"cache_salt": "ab"}));
         assert!(isolated.cache.isolation_key.is_some());
-        let (repeat, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        assert!(isolated.cache.read && isolated.cache.write);
+        let (repeat, _) = preprocess(serde_json::json!({"cache_salt": "ab"}));
         assert_eq!(repeat.cache.isolation_key, isolated.cache.isolation_key);
-
-        // Namespace and salt are separate coordinates, even when their
-        // concatenated text is identical.
-        request.cache_namespace = Some("a".to_string());
-        request.cache_salt = Some("bc".to_string());
-        let (other, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        let (other, _) = preprocess(serde_json::json!({"cache_salt": "ba"}));
         assert_ne!(other.cache.isolation_key, isolated.cache.isolation_key);
 
-        request.bypass_cache_read = true;
-        request.no_cache_store = true;
-        let (disabled, _) = processor.preprocess_text_request(request.clone()).unwrap();
-        assert!(!disabled.cache.read && !disabled.cache.write);
-        assert_eq!(disabled.cache.isolation_key, other.cache.isolation_key);
-
-        request.bypass_cache_read = false;
-        request.no_cache_store = false;
-        request.stop.prompt_logprobs = Some(0);
-        let (logprobs, response) = processor.preprocess_text_request(request).unwrap();
+        let (logprobs, response) = preprocess(serde_json::json!({"prompt_logprobs": 0}));
         assert!(!logprobs.cache.read && logprobs.cache.write);
         assert!(response.prompt_logprobs_requested);
     }
@@ -1187,10 +1196,16 @@ fn sampling_controls_have_the_same_meaning_across_token_models() {
     ] {
         let (_directory, _, model) = resolved_model(description, model_type);
         for seed in [-1, -2] {
-            let mut input = uniserve_server::serving::TextPromptRequest::new("sampling", "hello");
-            input.sampling.seed = Some(seed);
-            input.stop.logprobs = Some(-1);
-            let (request, _) = model.preprocess_text_request(input).unwrap();
+            let (request, _) = model
+                .preprocess_chat_request(
+                    ServeRequestId::new("sampling"),
+                    chat_request(
+                        &model,
+                        serde_json::json!({"seed": seed, "logprobs": true, "top_logprobs": -1}),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap();
             assert_eq!(request.sampling.seed, Some(seed as u64));
             assert_eq!(request.sampling.n_logprobs, u32::MAX);
         }

@@ -167,15 +167,11 @@ impl crate::serving::InputProcessor {
                 logit_bias: convert_logit_bias(request.logit_bias)?,
                 logprobs: requested_logprobs.then_some(request.top_logprobs.unwrap_or(0)),
                 prompt_logprobs,
-                logprob_token_ids: None,
             },
             None,
             image_gen,
             CachePolicy {
-                isolation_key: crate::serving::cache_isolation_key(
-                    None,
-                    request.cache_salt.as_deref(),
-                ),
+                isolation_key: crate::serving::cache_isolation_key(request.cache_salt.as_deref()),
                 ..CachePolicy::default()
             },
             request.priority.unwrap_or(0),
@@ -208,8 +204,7 @@ fn convert_modalities(modalities: &[ChatModality]) -> ModalitySelection {
 ///
 /// Wire names differ from the serving names: `guidance_scale` and
 /// `image_guidance_scale` are the text and image CFG scales, `cfg_norm` is the
-/// renormalization type, and `num_images` is `max_images`. Per-image prompts
-/// and image retention have no chat wire field and keep their defaults.
+/// renormalization type, and `num_images` is `max_images`.
 fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
     ImageGenControls {
         resolution: config.resolution,
@@ -224,8 +219,6 @@ fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
         timestep_shift: config.timestep_shift,
         seed: config.seed,
         max_images: config.num_images,
-        prompts: Vec::new(),
-        retain_images: None,
     }
 }
 
