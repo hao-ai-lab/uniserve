@@ -1299,7 +1299,6 @@ fn image_from_table(image: fbs::ImageParams<'_>) -> CodecResult<uniserve_core::I
             .image_prompts()
             .map(|items| items.iter().map(str::to_string).collect())
             .unwrap_or_default(),
-        retain_images: true,
     })
 }
 

@@ -662,9 +662,6 @@ pub struct ImageParams {
     /// Optional per-image prompt overrides.
     #[serde(default)]
     pub image_prompts: Vec<String>,
-    /// Whether completed image bytes remain available to the caller.
-    #[serde(default = "default_retain_images")]
-    pub retain_images: bool,
 }
 
 impl ImageParams {
@@ -694,11 +691,6 @@ fn scale_approx(left: f32, right: f32) -> bool {
 /// Returns the neutral diffusion timestep shift.
 fn default_timestep_shift() -> f32 {
     1.0
-}
-
-/// Returns the default policy that retains materialized image bytes.
-fn default_retain_images() -> bool {
-    true
 }
 
 /// Validation failure returned by [`ImageParams::validate`].
@@ -941,7 +933,6 @@ impl Default for ImageParams {
             negative_prompt: String::new(),
             max_images: 1,
             image_prompts: Vec::new(),
-            retain_images: true,
         }
     }
 }

@@ -1744,7 +1744,6 @@ fn full_image() -> ImageParams {
         negative_prompt: "blurry".into(),
         max_images: 1,
         image_prompts: vec!["p0".into(), "p1".into()],
-        retain_images: true,
     }
 }
 
