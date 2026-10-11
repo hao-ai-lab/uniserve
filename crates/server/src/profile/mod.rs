@@ -320,7 +320,9 @@ impl ModelConfig {
         max_model_len: Option<u32>,
     ) -> assets::Result<Self> {
         let (parameters, default_max_model_len) = match description {
-            // MiniMax H3's text encoder serves prompts of up to 16,384 tokens.
+            // The checkpoint's text encoder accepts 262,144 positions. The
+            // default is the prompt length a deployment prepares layouts and
+            // storage for: startup prepares every text capacity up to it.
             ModelDescription::MiniMaxH3 => (ModelParameters::MiniMaxH3, 16_384),
             ModelDescription::Qwen3
             | ModelDescription::SenseNova

@@ -90,7 +90,9 @@ struct Args {
     host_identity: String,
 
     // These options mirror the `uniserve serve` flags of the same names and
-    // feed the engine configuration `build_state` assembles.
+    // feed the engine configuration `build_state` assembles. The default
+    // prompt length is the one `uniserve serve` takes for a MiniMax-H3
+    // pipeline; the text encoder itself accepts more.
     #[arg(long, default_value_t = 16_384, value_parser = clap::value_parser!(u32).range(1..))]
     max_model_len: u32,
 

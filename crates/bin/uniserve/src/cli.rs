@@ -159,8 +159,10 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(value_name = "MODEL")]
     pub model: String,
 
-    /// Override the maximum model context length. When unset, the model's real
-    /// context length (`max_position_embeddings`) is used.
+    /// Override the maximum model context length. When unset, a model with a
+    /// root `config.json` uses its `max_position_embeddings` (8192 when it
+    /// declares none) and a MiniMax-H3 pipeline uses 16384 prompt tokens, the
+    /// longest prompt capacity startup prepares by default.
     #[arg(long = "max-model-len")]
     pub max_model_len: Option<u32>,
     /// Longest video duration, in seconds, a media deployment provisions and
