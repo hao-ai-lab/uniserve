@@ -41,15 +41,15 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString, PyTuple};
 use uniserve_core::{
     AudioClip, Canvas, ConditionMedia, ConditionRole, ImageParams, SamplingParams, TokenLogprob,
-    VideoCondition,
+    VideoCondition, VideoTask,
 };
 use uniserve_worker_ipc::{
     ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallOutput, CallStatus, DType, DecodeRange,
     DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags,
     ForwardStats, GenerationParams, KvGroupTransfer, KvTransfer, LatentParams, Locator,
-    MediaOutput, NewRequest, RequestKey, RequestKind, ShapeBound, TensorPublication, TensorRef,
-    TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
+    MediaOutput, NewRequest, RequestKey, RequestKind, ResponseKind, ShapeBound, TensorPublication,
+    TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
     WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
@@ -211,9 +211,22 @@ impl RequestTypes {
         records.insert("KvGroupTransfer", class(&module, "KvGroupTransfer")?);
         records.insert("KvTransfer", class(&module, "KvTransfer")?);
 
-        // `CallStatus` members travel as their spelling and are never
-        // indexed; a member the schema does not spell is refused here.
+        // These members travel as their spelling and are never indexed; a
+        // member the schema does not spell is refused here.
         enum_members(&call, "CallStatus", CallStatus::ALL.map(CallStatus::as_str))?;
+        let info = py.import("uniserve_worker.protocol.worker_info")?;
+        enum_members(
+            &info,
+            "RequestKind",
+            RequestKind::ALL.map(RequestKind::as_str),
+        )?;
+        enum_members(
+            &info,
+            "ResponseKind",
+            ResponseKind::ALL.map(ResponseKind::as_str),
+        )?;
+        let video = py.import("uniserve_worker.protocol.video")?;
+        enum_members(&video, "VideoTask", VideoTask::ALL.map(VideoTask::as_str))?;
         Ok(Self {
             records,
             call: class(&call, "Call")?,

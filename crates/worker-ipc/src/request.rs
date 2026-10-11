@@ -129,6 +129,21 @@ pub enum ResponseKind {
     Error,
 }
 
+impl ResponseKind {
+    /// Every response kind in declaration order.
+    pub const ALL: [Self; 4] = [Self::Info, Self::Result, Self::Ok, Self::Error];
+
+    /// Returns the stable wire name for this response kind.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Result => "result",
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// Request and call identity attached to a worker error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorCallIdentity {
