@@ -3185,7 +3185,6 @@ impl Scheduler {
                     latent.as_ref(),
                     state,
                     &record,
-                    media.as_deref(),
                     self.config.canvas.as_ref(),
                 ) {
                     self.fail_after_inflight(id, rejection_cause(&call, &error));

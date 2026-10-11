@@ -31,7 +31,7 @@
 //! - `allocation` and `placement`: storage ownership and worker placement.
 //! - `control`: cancellation and frontend lifecycle commands.
 //! - `config`, `stats`, and `stats_report`: limits and statistics.
-//! - `image_artifact`: validation of worker-produced PNG artifacts.
+//! - `image_artifact`: metadata of worker-produced PNG artifacts.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -101,7 +101,7 @@ use uniserve_worker_ipc::{
 };
 
 use crate::executor::WorkerFailure;
-use crate::scheduler::image_artifact::validate_png_artifact;
+use crate::scheduler::image_artifact::png_artifact_info;
 use allocation::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
     UnknownMediaWorker,
@@ -135,13 +135,12 @@ const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
 /// (`Scheduler::select_batch_kind`).
 const PREFILL_WINDOW_CREDITS: usize = 2;
 
-/// Builds a validated image-completion event from a base64 PNG payload.
+/// Builds an image-completion event from a base64 PNG payload.
 ///
-/// Fully decodes the PNG through `validate_png_artifact`; returns `None` when
-/// the payload is not valid base64 or not a fully decodable PNG with nonzero
-/// dimensions.
+/// Reads the dimensions and size through `png_artifact_info`; returns `None`
+/// when the payload has no PNG header with nonzero dimensions.
 fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<EngineCoreOutput> {
-    let metadata = validate_png_artifact(&pixels_png_b64, None)?;
+    let metadata = png_artifact_info(&pixels_png_b64)?;
     Some(EngineCoreOutput::ImageDone {
         image_id,
         height: metadata.height,

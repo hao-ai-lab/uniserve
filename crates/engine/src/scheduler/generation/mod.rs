@@ -33,8 +33,6 @@ use uniserve_worker_ipc::{
     RequestKey, RequestOutput, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
 
-use crate::scheduler::image_artifact::png_artifact_dims_b64;
-
 /// Builds an unstamped product reference for a planned call output.
 ///
 /// The owning `request_key` and `producer_call_id` are placeholders until
@@ -81,7 +79,7 @@ fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, Plannin
 /// The raw size counts three bytes per pixel plus one byte per row. The bound
 /// doubles it, adds 1 MiB, and applies base64's expansion of three bytes to
 /// four characters. It reaches the worker as part of `max_completion_bytes`,
-/// and `validate_generation_result` rejects a larger artifact.
+/// and the worker's encoder refuses a larger artifact.
 fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
     let raw = u64::from(height)
         .checked_mul(u64::from(width).saturating_mul(3).saturating_add(1))
@@ -1023,11 +1021,10 @@ pub(super) fn register_call(
 /// Validates a result against submitted inputs and immutable request limits.
 ///
 /// `image_kv` and `latent` are the inputs frozen when the call was submitted
-/// (`InflightInput::Generation`); `media` is the artifact payload delivered
-/// with the result. A predicated result is valid only when the call carried a
-/// predicate and the result reports no tokens and no products. `canvas` is
-/// the deployment's block-diffusion sampling, which bounds a canvas step's
-/// block. Returns the first violation found; the caller finishes the request
+/// (`InflightInput::Generation`). A predicated result is valid only when the
+/// call carried a predicate and the result reports no tokens and no products.
+/// `canvas` is the deployment's block-diffusion sampling, which bounds a
+/// canvas step's block. Returns the first violation found; the caller finishes the request
 /// with an error on any `Err`.
 pub(crate) fn validate_generation_result(
     call: &Call,
@@ -1035,7 +1032,6 @@ pub(crate) fn validate_generation_result(
     latent: Option<&LatentParams>,
     state: &RequestState,
     record: &RequestOutput,
-    media: Option<&uniserve_core::SharedMedia>,
     canvas: Option<&CanvasSampling>,
 ) -> Result<(), GenerationResultError> {
     let request = &state.req;
@@ -1075,28 +1071,6 @@ pub(crate) fn validate_generation_result(
         if !super::Denoising::completes(interval, record.num_completed_steps) {
             return Err(GenerationResultError::Progress {
                 detail: "denoise_step_mismatch",
-            });
-        }
-    }
-
-    // Read the PNG header to check the requested dimensions. The output path
-    // (`image_done_event`) decodes the full image later.
-    let image_png = media.and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
-    if call_variant == CallKind::Media(MediaCall::ImageDecoding) {
-        if media.is_some_and(|value| value.len() as u64 > call.bounds.max_completion_bytes) {
-            return Err(GenerationResultError::Product {
-                detail: "image_capacity_exceeded",
-            });
-        }
-        let actual =
-            image_png
-                .and_then(png_artifact_dims_b64)
-                .ok_or(GenerationResultError::Product {
-                    detail: "missing_image_dimensions",
-                })?;
-        if actual != (request.image.height, request.image.width) {
-            return Err(GenerationResultError::Product {
-                detail: "image_dimensions_mismatch",
             });
         }
     }
@@ -1423,8 +1397,6 @@ pub(crate) enum GenerationResultError {
     Identity { detail: &'static str },
     #[error("worker progress invalid: {detail}")]
     Progress { detail: &'static str },
-    #[error("worker product invalid: {detail}")]
-    Product { detail: &'static str },
     #[error("worker token result invalid: {detail}")]
     Token { detail: &'static str },
     #[error("worker logprob result invalid: {detail}")]

@@ -139,9 +139,9 @@ pub enum EngineCoreOutput {
     },
     /// Publishes a materialized PNG image.
     ///
-    /// The engine reads `height`, `width`, and `bytes` from the validated PNG
-    /// payload; a payload that fails validation finishes the request with
-    /// [`FinishReason::Error`] instead.
+    /// The engine reads `height`, `width`, and `bytes` from the PNG header
+    /// and the payload length; a payload without a PNG header finishes the
+    /// request with [`FinishReason::Error`] instead.
     ImageDone {
         /// Request-local image identity.
         image_id: u32,
