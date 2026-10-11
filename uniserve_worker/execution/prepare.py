@@ -203,9 +203,7 @@ def prepare_batch(
         # already in its sequence, in every group.
         for allocation in batch.new_cache_units:
             storage_dependencies.extend(
-                cache.write_dependencies(
-                    cache.unit_spans(cache.validate_units(allocation.unit_ids))
-                )
+                cache.write_dependencies(cache.unit_spans(allocation.unit_ids))
             )
 
         for row, write_kv in enumerate(batch.write_kv):
@@ -1704,9 +1702,9 @@ def _bind_cache_tables(
         tables.append(
             (
                 int(table.request_pool_idx),
-                cache.validate_group(table.group_id),
+                int(table.group_id),
                 int(table.start_page),
-                cache.validate_units(table.unit_ids),
+                table.unit_ids,
                 int(table.allocated_tokens),
             )
         )
@@ -1716,15 +1714,7 @@ def _bind_cache_tables(
     for allocation in inputs.new_cache_units:
         if allocation.request_pool_idx not in slots:
             continue
-        units = cache.validate_units(allocation.unit_ids)
-        installed = page_tables.table(
-            allocation.request_pool_idx,
-            cache.validate_group(allocation.group_id),
-        )
-        if not set(units).issubset(installed.units):
-            raise invalid_descriptor(
-                "new cache units are outside the installed block table"
-            )
+        units = tuple(allocation.unit_ids)
 
         # A KV import resets the new units it covers before copying into
         # them (`CacheImport.initialized_units`); every other new unit is

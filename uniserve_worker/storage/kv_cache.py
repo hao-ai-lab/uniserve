@@ -191,11 +191,6 @@ class KVCacheManager:
         )
         # The most tokens a unit holds in any group bounds a whole-unit span.
         self._unit_tokens = max(group.page_tokens for group in groups)
-        # Reuse normalized unit tuples after their bounds have been
-        # established by the validation path.
-        self._validated_units: dict[
-            tuple[tuple[int, ...], bool], tuple[int, ...]
-        ] = {}
 
         # Transport locations of committed exports, updated by the batch
         # commit; publication intervals retained under their buffers.
@@ -326,13 +321,12 @@ class KVCacheManager:
         cancellation.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when the table's units are
-                invalid or ``length`` exceeds its pages.
+            WorkerError: ``invalid_descriptor`` when ``length`` exceeds the
+                table's pages.
         """
         start = table.start_page * table.shape.page_tokens
         if length <= start:
             return
-        self.validate_units(table.units)
         ranges = table.spans(start, length - start)
 
         with self._execution_lock:
@@ -652,69 +646,14 @@ class KVCacheManager:
         self._installed_bases.clear()
         self.cache.close()
 
-    def validate_group(self, group: int) -> int:
-        """Return ``group`` as an integer after checking its range.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when ``group`` is outside the
-                advertised groups.
-        """
-        value = int(group)
-        if value < 0 or value >= len(self.shapes):
-            raise invalid_descriptor(
-                f"KV group {value} outside pool group count {len(self.shapes)}"
-            )
-        return value
-
-    def validate_units(
-        self, unit_ids: Iterable[int], *, allow_sentinel: bool = False
-    ) -> tuple[int, ...]:
-        """Validate physical unit ids and return them as a tuple of ints.
-
-        Real (non-zero) units must be unique and in ``[1, num_units)``. The
-        sentinel unit ``0`` is accepted, possibly repeated, only with
-        ``allow_sentinel``. Accepted tuples are memoized; the checks depend
-        only on the pool size fixed at construction.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when any check fails.
-        """
-        # Resident scheduler tables already use immutable integer tuples.
-        # Check their validated identity before normalizing every element.
-        units = tuple(unit_ids)
-        key = (units, bool(allow_sentinel))
-        cached = self._validated_units.get(key)
-        if cached is not None:
-            return cached
-        units = tuple(int(unit) for unit in units)
-        key = (units, bool(allow_sentinel))
-
-        # Unit 0 is the padding sentinel; uniqueness applies only to real
-        # units.
-        real_units = tuple(unit for unit in units if unit != 0)
-        if len(set(real_units)) != len(real_units):
-            raise invalid_descriptor("KV allocation repeats a physical unit")
-        lower = 0 if allow_sentinel else 1
-        if units and (min(units) < lower or max(units) >= self.num_units):
-            raise invalid_descriptor(
-                "KV allocation exceeds the fixed physical pool"
-            )
-
-        # Bound the memo by clearing it wholesale.
-        if len(self._validated_units) >= 16_384:
-            self._validated_units.clear()
-        self._validated_units[key] = units
-        return units
-
     def zero_units(self, unit_ids: Iterable[int]) -> None:
         """Reset every column and field of the selected physical units.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when the units are invalid;
-                a resource error from ``require_reusable`` when any selected
-                unit is still retained.
+            WorkerError: A resource error from ``require_reusable`` when any
+                selected unit is still retained.
         """
-        units = self.validate_units(unit_ids)
+        units = tuple(unit_ids)
         if not units:
             return
         self.require_reusable(self.unit_spans(units))
@@ -727,11 +666,10 @@ class KVCacheManager:
         (`KVCache.recycle_units`); stale values stay unread.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when the units are invalid;
-                a resource error from ``require_reusable`` when any selected
-                unit is still retained.
+            WorkerError: A resource error from ``require_reusable`` when any
+                selected unit is still retained.
         """
-        units = self.validate_units(unit_ids)
+        units = tuple(unit_ids)
         if not units:
             return
         self.require_reusable(self.unit_spans(units))
@@ -1132,10 +1070,7 @@ class KVCacheManager:
             raise invalid_descriptor(
                 "KV import requires a destination table per group"
             )
-        initialized = self.validate_units(initialized_units)
-        held: set[int] = set()
         for table in tables:
-            held.update(self.validate_units(table.units))
             if (
                 table.allocated_tokens < publication.published_extent
                 or table.start_page * table.shape.page_tokens
@@ -1144,10 +1079,6 @@ class KVCacheManager:
                 raise invalid_descriptor(
                     "KV import exceeds its scheduler block table"
                 )
-        if not set(initialized).issubset(held):
-            raise invalid_descriptor(
-                "KV import resets units outside its block tables"
-            )
 
         if publication.base_extent:
             # Units of the pages that hold the installed base must stay
@@ -1175,7 +1106,7 @@ class KVCacheManager:
                         )
                         * per_page
                     ]
-                    if new != old or set(new).intersection(initialized):
+                    if new != old or set(new).intersection(initialized_units):
                         raise invalid_descriptor(
                             "KV import would replace its installed base units"
                         )
@@ -1184,7 +1115,7 @@ class KVCacheManager:
             publication,
             request_pool_idx=request_pool_idx,
             tables=tuple(tables),
-            initialized_units=initialized,
+            initialized_units=initialized_units,
             transports=transports,
         )
 

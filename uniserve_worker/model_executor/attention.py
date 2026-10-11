@@ -75,7 +75,10 @@ def row_tables(
     tables: BlockTables | None,
     cache: KVCacheManager | None,
 ) -> tuple[tuple[GroupTable, ...], ...]:
-    """Validate scheduler cache extents and resolve each row's group tables.
+    """Resolve each row's installed group tables and authorize its writes.
+
+    The scheduler allocates each request's units, retires its window pages
+    and bounds its lengths; rows are taken as stated.
 
     Args:
         tasks: Rows of one attention call.
@@ -87,10 +90,8 @@ def row_tables(
 
     Raises:
         WorkerError: An ``invalid_descriptor`` error when ``tasks`` is empty,
-            storage or tables are absent, a length is out of range, a request
-            slot lacks an installed group table, a row's resulting length
-            exceeds its allocated capacity, or a windowed row would read a
-            retired page. Errors from ``cache.require_writable`` for a
+            storage or tables are absent, or a request slot lacks an installed
+            group table. Errors from ``cache.require_writable`` for a
             writing row propagate: a resource error when the interval
             overlaps a publication or an import destination, or
             ``invalid_descriptor`` for an interval outside its table.
@@ -104,33 +105,17 @@ def row_tables(
 
     result = []
     for task in tasks:
-        query, prefix = int(task.query_tokens), int(task.seq_len)
-        if query < 1 or prefix < 0:
-            raise invalid_descriptor("forward attention lengths are invalid")
-
-        # Only rows that write KV extend the cached sequence; read-only rows
-        # need capacity for their prefix alone.
-        resulting = prefix + (query if task.write_kv else 0)
-        if resulting > tables.allocated_length(task.request_pool_idx):
-            raise invalid_descriptor(
-                "forward row exceeds its scheduler block table"
-            )
-
         groups = tuple(
             tables.table(task.request_pool_idx, group)
             for group in range(len(tables.groups))
         )
-        for table in groups:
-            window = table.shape.window
-            if (
-                window is not None
-                and first_page(table, prefix) < table.start_page
-            ):
-                raise invalid_descriptor(
-                    "attention row reads retired window pages"
+        if task.write_kv:
+            for table in groups:
+                cache.require_writable(
+                    table,
+                    start=int(task.seq_len),
+                    length=int(task.query_tokens),
                 )
-            if task.write_kv:
-                cache.require_writable(table, start=prefix, length=query)
         result.append(groups)
     return tuple(result)
 
