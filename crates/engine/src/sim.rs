@@ -734,14 +734,9 @@ fn select_token(
             .collect();
         // Stable, so tied candidates keep ascending vocabulary order.
         order.sort_by(|&a, &b| logprob_of(b).total_cmp(&logprob_of(a)));
-        let requested = sampling.logprob_token_ids.iter().map(|&id| id as usize);
-        for index in order
-            .into_iter()
-            .take(sampling.n_logprobs as usize)
-            .chain(requested)
-        {
+        for index in order.into_iter().take(sampling.n_logprobs as usize) {
             let token_id = index as u32;
-            if index < vocabulary && !top.iter().any(|&(existing, ..)| existing == token_id) {
+            if !top.iter().any(|&(existing, ..)| existing == token_id) {
                 let value = logprob_of(index);
                 top.push((token_id, value, rank_of(value)));
             }

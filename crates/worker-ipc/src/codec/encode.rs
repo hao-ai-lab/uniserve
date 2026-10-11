@@ -145,7 +145,6 @@ fn sampling<'a>(
         .allowed_token_ids
         .as_deref()
         .map(|ids| b.create_vector(ids));
-    let logprob_token_ids = Some(b.create_vector(&v.logprob_token_ids));
     let forced_token_ids = Some(b.create_vector(&v.forced_token_ids));
     fbs::SamplingParams::create(
         b,
@@ -169,7 +168,6 @@ fn sampling<'a>(
             return_logprobs: v.return_logprobs,
             return_prompt_logprobs: v.return_prompt_logprobs,
             n_prompt_logprobs: v.n_prompt_logprobs,
-            logprob_token_ids,
             typical_p: v.typical_p,
             forced_token_ids,
         },

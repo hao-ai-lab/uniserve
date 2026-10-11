@@ -21,7 +21,6 @@
 use super::{EncoderCachePin, FlowPrefixState, Phase, RequestAllocations, TerminalIntent};
 use crate::kv::{BlockTable, KvAllocation};
 
-use std::collections::HashSet;
 use uniserve_worker_ipc::{
     CallCoordinates, DEFAULT_COMPONENT, ForwardMode, LatentParams, MediaCall, TransferMode,
 };
@@ -102,10 +101,9 @@ const RANKED_LOGPROB_BYTES: u64 = 12;
 ///
 /// Returns `None` when neither generated nor prompt logprobs are requested.
 /// Each reported row costs 4 bytes plus `RANKED_LOGPROB_BYTES` per entry; a
-/// row's entries are its own token, the requested top-k candidates
-/// (`n_logprobs` or `n_prompt_logprobs`), and the distinct ids of
-/// `logprob_token_ids`. A call reports at most one generated row and
-/// `prompt_positions` prompt rows. The worker sizes its pinned completion
+/// row's entries are its own token and the requested top-k candidates
+/// (`n_logprobs` or `n_prompt_logprobs`). A call reports at most one
+/// generated row and `prompt_positions` prompt rows. The worker sizes its pinned completion
 /// storage from the sum of these bounds over a batch.
 fn logprob_result_bytes(
     sampling: &SamplingParams,
@@ -116,22 +114,14 @@ fn logprob_result_bytes(
     if !generated && !prompt {
         return Ok(None);
     }
-    let requested_ids = sampling
-        .logprob_token_ids
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>()
-        .len() as u64;
     let generated_entries = generated.then_some(
         1_u64
             .checked_add(u64::from(sampling.n_logprobs))
-            .and_then(|value| value.checked_add(requested_ids))
             .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?,
     );
     let prompt_entries = prompt.then_some(
         1_u64
             .checked_add(u64::from(sampling.n_prompt_logprobs))
-            .and_then(|value| value.checked_add(requested_ids))
             .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?,
     );
     let generated_bytes = generated_entries

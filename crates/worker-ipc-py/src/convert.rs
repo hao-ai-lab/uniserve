@@ -1046,10 +1046,6 @@ fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<B
         sampling.return_prompt_logprobs,
     )?;
     dict.set_item(intern!(py, "n_prompt_logprobs"), sampling.n_prompt_logprobs)?;
-    dict.set_item(
-        intern!(py, "logprob_token_ids"),
-        u32_tuple(py, &sampling.logprob_token_ids)?,
-    )?;
 
     let bad_words = sampling
         .bad_words_ids

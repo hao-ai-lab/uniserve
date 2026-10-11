@@ -427,9 +427,6 @@ pub struct SamplingParams {
     /// How many highest-probability alternatives to return per scored prompt position.
     #[serde(default)]
     pub n_prompt_logprobs: u32,
-    /// Token IDs whose log probabilities are returned at every scored position.
-    #[serde(default)]
-    pub logprob_token_ids: Vec<u32>,
     /// Bad-word token sequences: generation may not complete any of these.
     /// Enforced host-side by masking the completing token.
     #[serde(default)]
@@ -511,7 +508,7 @@ pub enum SamplingParamsError {
 impl SamplingParams {
     /// Returns whether generated-token logprobs are enabled.
     pub fn generated_logprobs_requested(&self) -> bool {
-        self.return_logprobs || self.n_logprobs > 0 || !self.logprob_token_ids.is_empty()
+        self.return_logprobs || self.n_logprobs > 0
     }
 
     /// Returns whether prompt-token logprobs are enabled.
@@ -613,7 +610,6 @@ impl Default for SamplingParams {
             n_logprobs: 0,
             return_prompt_logprobs: false,
             n_prompt_logprobs: 0,
-            logprob_token_ids: Vec::new(),
             bad_words_ids: Vec::new(),
             allowed_token_ids: None,
             typical_p: 1.0,

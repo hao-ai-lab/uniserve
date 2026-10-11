@@ -14,31 +14,27 @@ import struct
 
 def decode_logprobs(
     values: tuple[int, ...],
-    layout: tuple[
-        tuple[int, ...], tuple[int, ...], tuple[tuple[int, ...], ...], int, int
-    ],
+    layout: tuple[tuple[int, ...], tuple[int, ...], int],
 ) -> dict[int, tuple[float, tuple[tuple[int, float, int], ...]]]:
     """Decode the sampler's packed float bits and row-major rank columns.
 
     Args:
         values: The packed column read back from completion storage.
-        layout: ``(rows, counts, requested_ids, max_count, max_requested)``
-            from the ``LogprobValues`` the sampler produced: the sampler row
-            index of each packed row, its top-logprob count, its
-            de-duplicated in-vocabulary requested token ids, and the padded
-            widths of the top and requested fields.
+        layout: ``(rows, counts, max_count)`` from the ``LogprobValues`` the
+            sampler produced: the sampler row index of each packed row, its
+            top-logprob count, and the padded width of the top fields.
 
     Returns:
         A map from sampler row index to ``(selected_logprob, entries)``.
         Each entry is ``(token_id, logprob, rank)`` with a 1-based
         competition rank; entries list the selected token first, then the
-        top tokens, then the requested tokens, each token at most once.
+        top tokens, each token at most once.
 
     Raises:
         RuntimeError: ``values`` is shorter or longer than ``layout``
             describes.
     """
-    rows, counts, requested_ids, max_count, max_requested = layout
+    rows, counts, max_count = layout
 
     # Score fields carry float32 bit patterns in the low 32 bits of int64
     # words. The sampler widens them from int32, which sign-extends, so the
@@ -64,16 +60,14 @@ def decode_logprobs(
 
     # The packed column is a fixed sequence of row-major fields; each
     # vector(width) call consumes the next one in the order ``logprob_details``
-    # concatenates them. Top and requested fields are padded to the widest
-    # row; ``counts`` and ``requested_ids`` bound the real columns.
+    # concatenates them. Top fields are padded to the widest row;
+    # ``counts`` bounds the real columns.
     selected_tokens = vector(1)
     selected_values = vector(1)
     selected_ranks = vector(1)
     top_indexes = vector(max_count)
     top_values = vector(max_count)
     top_ranks = vector(max_count)
-    candidate_values = vector(max_requested)
-    candidate_ranks = vector(max_requested)
     if cursor != len(values):
         raise RuntimeError("logprob completion metadata has trailing values")
 
@@ -94,17 +88,6 @@ def decode_logprobs(
                         candidate,
                         float_value(top_values[local][index]),
                         top_ranks[local][index],
-                    )
-                )
-                seen.add(candidate)
-
-        for index, candidate in enumerate(requested_ids[local]):
-            if candidate not in seen:
-                entries.append(
-                    (
-                        candidate,
-                        float_value(candidate_values[local][index]),
-                        candidate_ranks[local][index],
                     )
                 )
                 seen.add(candidate)

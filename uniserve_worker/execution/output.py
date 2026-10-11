@@ -102,16 +102,10 @@ def capture_logprobs(
     """
     if details is None:
         return {}
-    packed, rows, counts, requested_ids, max_count, max_requested = details
+    packed, rows, counts, max_count = details
     capture = output.capture(packed)
     key = capture
-    output.logprob_layouts[key] = (
-        rows,
-        counts,
-        requested_ids,
-        max_count,
-        max_requested,
-    )
+    output.logprob_layouts[key] = (rows, counts, max_count)
     return {index: (*key, index) for index in rows}
 
 

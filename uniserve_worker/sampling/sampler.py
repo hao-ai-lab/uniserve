@@ -59,7 +59,6 @@ def device_greedy_parameters(parameters: SamplingParams) -> bool:
         and parameters.typical_p == 1.0
         and not parameters.return_logprobs
         and int(parameters.n_logprobs) == 0
-        and not parameters.logprob_token_ids
         and not parameters.logit_bias
         and parameters.repetition_penalty == 1.0
         and parameters.frequency_penalty == 0.0
@@ -1181,11 +1180,7 @@ def _shape_sampling_logits_batch(
 
 
 def _wants_logprobs(parameters: SamplingParams) -> bool:
-    return (
-        parameters.return_logprobs
-        or parameters.n_logprobs > 0
-        or bool(parameters.logprob_token_ids)
-    )
+    return parameters.return_logprobs or parameters.n_logprobs > 0
 
 
 def logprob_details(
@@ -1194,7 +1189,7 @@ def logprob_details(
     output_tokens: torch.Tensor,
     parameters: Sequence[SamplingParams],
 ) -> LogprobValues | None:
-    """Compute selected-token, top, and requested-token logprobs and ranks.
+    """Compute selected-token and top logprobs and ranks.
 
     Scores are ``log_softmax`` of the shaped logits, only for calls whose
     parameters request logprobs. Ranks are 1-based competition ranks: one
@@ -1209,9 +1204,8 @@ def logprob_details(
     Returns:
         ``LogprobValues`` whose int64 column concatenates these row-major
         fields over the requesting calls: selected token, selected score
-        bits, selected rank, top token ids, top score bits, top ranks,
-        requested score bits, and requested ranks. Top fields are
-        ``max_count`` wide and requested fields ``max_requested`` wide.
+        bits, selected rank, top token ids, top score bits, and top ranks.
+        Top fields are ``max_count`` wide.
         ``decode_logprobs`` in ``uniserve_worker.sampling.output`` reverses
         this layout. None when no call requests logprobs.
     """
@@ -1276,55 +1270,6 @@ def logprob_details(
         )
         top_ranks = torch.empty_like(top_indexes)
 
-    requested_ids = tuple(
-        tuple(
-            dict.fromkeys(
-                int(value)
-                for value in parameters[index].logprob_token_ids
-                if 0 <= int(value) < vocab
-            )
-        )
-        for index in requested_rows
-    )
-    max_requested = max((len(value) for value in requested_ids), default=0)
-    if max_requested:
-        # Rows with fewer requested ids keep zero-padding columns; the
-        # requested_ids tuples record how many leading columns are real.
-        candidate_indexes = torch.zeros(
-            (len(requested_rows), max_requested),
-            dtype=torch.long,
-            device=work.device,
-        )
-        for row_index, values in enumerate(requested_ids):
-            if values:
-                candidate_indexes[row_index, : len(values)] = torch.tensor(
-                    values,
-                    dtype=torch.long,
-                    device=work.device,
-                )
-        candidate_values = scores.gather(1, candidate_indexes)
-        candidate_ranks = torch.stack(
-            tuple(
-                (scores > candidate_values[:, index].unsqueeze(1)).sum(
-                    dim=-1, dtype=torch.long
-                )
-                + 1
-                for index in range(max_requested)
-            ),
-            dim=1,
-        )
-    else:
-        candidate_values = torch.empty(
-            (len(requested_rows), 0),
-            dtype=scores.dtype,
-            device=work.device,
-        )
-        candidate_ranks = torch.empty(
-            (len(requested_rows), 0),
-            dtype=torch.long,
-            device=work.device,
-        )
-
     def float_bits(values: torch.Tensor) -> torch.Tensor:
         """Reinterpret float32 values as int32 bit patterns widened to int64.
 
@@ -1345,18 +1290,9 @@ def logprob_details(
             top_indexes.reshape(-1).to(torch.long),
             float_bits(top_values.reshape(-1)),
             top_ranks.reshape(-1).to(torch.long),
-            float_bits(candidate_values.reshape(-1)),
-            candidate_ranks.reshape(-1).to(torch.long),
         )
     )
-    return (
-        encoded,
-        requested_rows,
-        counts,
-        requested_ids,
-        max_count,
-        max_requested,
-    )
+    return encoded, requested_rows, counts, max_count
 
 
 def broadcast_selection(

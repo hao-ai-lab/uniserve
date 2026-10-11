@@ -156,13 +156,7 @@ class OutputBuffer:
         self._token_cache: dict[tuple[int, int], tuple[int, ...]] = {}
         self.logprob_layouts: dict[
             tuple[int, int],
-            tuple[
-                tuple[int, ...],
-                tuple[int, ...],
-                tuple[tuple[int, ...], ...],
-                int,
-                int,
-            ],
+            tuple[tuple[int, ...], tuple[int, ...], int],
         ] = {}
         self._logprob_cache: dict[
             tuple[int, int],

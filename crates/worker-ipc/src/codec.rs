@@ -1265,10 +1265,6 @@ fn sampling_from_table(sampling: fbs::SamplingParams<'_>) -> CodecResult<Samplin
         return_logprobs: sampling.return_logprobs(),
         return_prompt_logprobs: sampling.return_prompt_logprobs(),
         n_prompt_logprobs: sampling.n_prompt_logprobs(),
-        logprob_token_ids: sampling
-            .logprob_token_ids()
-            .map(|items| items.iter().collect())
-            .unwrap_or_default(),
         typical_p: sampling.typical_p(),
         forced_token_ids: sampling
             .forced_token_ids()

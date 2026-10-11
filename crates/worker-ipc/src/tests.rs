@@ -1765,7 +1765,6 @@ fn full_sampling() -> SamplingParams {
         return_logprobs: true,
         return_prompt_logprobs: true,
         n_prompt_logprobs: 2,
-        logprob_token_ids: vec![7, 8, 9],
         bad_words_ids: vec![vec![1, 2, 3], vec![42]],
         allowed_token_ids: Some(vec![10, 11, 12]),
         typical_p: 0.8,
