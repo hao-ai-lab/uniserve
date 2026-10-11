@@ -561,16 +561,15 @@ def test_a_deployment_without_condition_capacity_serves_the_largest_set():
 
 def test_a_media_worker_keeps_a_request_slot_for_every_three_queue_positions():
     from tests.python.fixtures.h3 import base_config
+    from tests.python.fixtures.worker_config import cpu_worker_config
     from uniserve_models.minimax_h3 import Model
     from uniserve_worker.bootstrap.model_loader import loaded_worker_config
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.errors import WorkerError
 
     with torch.device("meta"):
         model = Model(base_config())
-    config = WorkerConfig(
-        device="cpu",
-        max_sequence_tokens=4096,
+    config = cpu_worker_config(
+        max_model_len=4096,
         max_video_seconds=5.0,
         max_batch_calls=8,
         max_request_pool_size=8,
