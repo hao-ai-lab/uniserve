@@ -305,14 +305,14 @@ class Communicator:
             output.reshape(-1).copy_(input.reshape(-1))
             return
 
-        name = self._require().group_name
+        group = self._require()
         if tuple(sorted(self.ranks)) == self.ranks:
-            communication.all_gather_into_tensor(output, input, name)
+            communication.all_gather(output, input, group)
         else:
             # The backend delivers chunks in ascending-rank order; copy each
             # into its logical member slot when the orders disagree.
             scratch = torch.empty_like(output)
-            communication.all_gather_into_tensor(scratch, input, name)
+            communication.all_gather(scratch, input, group)
             sources = scratch.reshape(self.size, *input.shape)
             targets = output.reshape(self.size, *input.shape)
             for backend_rank, logical_rank in enumerate(self.backend_order):
@@ -337,11 +337,11 @@ class Communicator:
             output.copy_(input)
             return
 
-        name = self._require().group_name
+        group = self._require()
         order = self.backend_order
         if tuple(sorted(self.ranks)) == self.ranks:
-            communication.all_to_all_single_into(
-                output, input, list(output_splits), list(input_splits), name
+            communication.all_to_all(
+                output, input, list(output_splits), list(input_splits), group
             )
             return
 
@@ -351,12 +351,12 @@ class Communicator:
         packed = torch.cat([send[index] for index in order], dim=0)
         received = torch.empty_like(output)
         backend_output_splits = [output_splits[index] for index in order]
-        communication.all_to_all_single_into(
+        communication.all_to_all(
             received,
             packed,
             backend_output_splits,
             [input_splits[index] for index in order],
-            name,
+            group,
         )
         targets = output.split(tuple(output_splits), dim=0)
         for index, chunk in zip(
@@ -500,7 +500,7 @@ class Communicator:
             output,
             global_dst,
             global_src,
-            self._require().group_name,
+            self._require(),
         )
         return output
 
