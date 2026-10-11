@@ -93,7 +93,7 @@ pub struct EngineSettings {
     /// Static Worker configurations with ordered ranks and named computation components.
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
-    /// `encoder->prefill=shm,prefill->decode=cuda_vmm`.
+    /// `encoder->prefill=posix_shm,prefill->decode=cuda_vmm`.
     pub transfer: TransferConfig,
     /// Number of independent replicas `workers` forms, as equal consecutive
     /// blocks of groups. Each replica runs its own scheduler and KV pool, and

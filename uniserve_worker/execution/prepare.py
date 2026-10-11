@@ -353,7 +353,7 @@ def prepare_inputs(
         if call.kind in BORROWED_INPUT_CALLS
         for product in call.inputs
     }
-    shm = transports.get("shm")
+    shm = transports.get("posix_shm")
     borrowed = {
         entry.product.buffer_id
         for entry in entries
@@ -539,7 +539,7 @@ def prepare_inputs(
                         for location in value.tensor.locations
                         if location.backend in transports
                         and (
-                            location.backend != "shm"
+                            location.backend != "posix_shm"
                             or location.source.node
                             == transports[location.backend].source.node
                         )

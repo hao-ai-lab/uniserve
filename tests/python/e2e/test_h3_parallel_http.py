@@ -391,9 +391,9 @@ def test_component_bindings_release_cancelled_requests(
             # only.
             f"{source}->{destination}="
             + (
-                "shm"
+                "posix_shm"
                 if "host" in (source, destination) or not device_products
-                else "cuda_vmm+shm"
+                else "cuda_vmm+posix_shm"
             )
             for source, destination in sorted(edges)
         ),

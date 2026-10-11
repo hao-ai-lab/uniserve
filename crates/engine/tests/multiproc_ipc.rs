@@ -495,7 +495,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
     // rank 0 (the patch encoder), and once with only the edges
     // `TransferConfig::with_worker_defaults` derives for this worker.
     for transfer in [
-        uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?,
+        uniserve_engine::TransferConfig::parse("worker:1->worker:0=posix_shm")?,
         uniserve_engine::TransferConfig::default(),
     ] {
         let mut args = rank_group_args(1 << 20, 8 << 20);
@@ -834,7 +834,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
     use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
     use uniserve_worker_ipc::{BufferAllocation, DiffusionSamplingParams};
 
-    let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?;
+    let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=posix_shm")?;
     let mut args = rank_group_args(1 << 20, 8 << 20);
     args.queue_depth = 3;
     args.transfer = transfer.clone();
@@ -1102,7 +1102,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
     // Two one-rank instances whose products cross only over shared storage.
     // A product whose one location is in its producer's own address space
     // therefore has no way to the other instance.
-    let edges = "producer->consumer=shm,consumer->producer=shm";
+    let edges = "producer->consumer=posix_shm,consumer->producer=posix_shm";
     let spawn = |worker_id: &str| -> anyhow::Result<WorkerGroup> {
         let mut args = rank_group_args(1 << 20, 8 << 20);
         let binding = WorkerConfig::placed(
@@ -2194,7 +2194,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         attention_backend: "torch".into(),
         // `publisher` is the worker id `SlowShmPublication` names as the
         // source of its segment.
-        transfer: uniserve_engine::TransferConfig::parse("publisher->worker=shm")?,
+        transfer: uniserve_engine::TransferConfig::parse("publisher->worker=posix_shm")?,
         ..config
     })?;
 
@@ -2400,7 +2400,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             args.python = wrapper.clone();
         }
         args.transfer = uniserve_engine::TransferConfig::parse(
-            "encoder-0->encoder-1=shm,encoder-1->encoder-0=shm",
+            "encoder-0->encoder-1=posix_shm,encoder-1->encoder-0=posix_shm",
         )?;
         WorkerGroup::spawn(args)
     };
@@ -2410,7 +2410,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             (WorkerId("encoder-1".into()), spawn("encoder-1", 2)?),
         ],
         uniserve_engine::TransferConfig::parse(
-            "encoder-0->encoder-1=shm,encoder-1->encoder-0=shm",
+            "encoder-0->encoder-1=posix_shm,encoder-1->encoder-0=posix_shm",
         )?,
     )?;
     let pid = std::fs::read_to_string(&pid_file)?.parse::<i32>()?;

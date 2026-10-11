@@ -54,7 +54,7 @@ def publication_key(locator: Locator) -> tuple[str, str]:
     if isinstance(handle, CudaVmmTransfer):
         return "cuda_vmm", handle.publication_id
     if isinstance(handle, PosixShmTransfer):
-        return "shm", handle.name
+        return "posix_shm", handle.name
     raise invalid_descriptor("process publication requires a shared transport")
 
 

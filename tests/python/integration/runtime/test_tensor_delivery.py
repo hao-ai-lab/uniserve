@@ -46,9 +46,9 @@ def _consume(tickets) -> None:
     "backend,device",
     (
         ("local", "cpu"),
-        ("shm", "cpu"),
+        ("posix_shm", "cpu"),
         ("local", "cuda:0"),
-        ("shm", "cuda:0"),
+        ("posix_shm", "cuda:0"),
         ("cuda_vmm", "cuda:0"),
     ),
 )
@@ -230,14 +230,14 @@ def test_explicit_replica_binding_can_use_an_independent_live_publication() -> (
 ):
     events = EventPool()
     first = make_transport(
-        "shm",
+        "posix_shm",
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
         source=WorkerEndpoint.local("encoder", rank=0),
     )
     second = make_transport(
-        "shm",
+        "posix_shm",
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
@@ -269,7 +269,7 @@ def test_explicit_replica_binding_can_use_an_independent_live_publication() -> (
 def test_shm_cuda_region_fits_its_reserved_device_allocation() -> None:
     events = EventPool()
     transport = make_transport(
-        "shm", byte_capacity=16384, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=16384, ticket_capacity=2, event_pool=events
     )
     source = torch.arange(24, dtype=torch.float32).reshape(4, 6)
     location = transport.publish(source)
@@ -484,7 +484,7 @@ def test_cuda_vmm_stages_between_devices_without_peer_access() -> None:
 
 
 @pytest.mark.parametrize("fragmented", (False, True))
-@pytest.mark.parametrize("backends", (("cuda_vmm",), ("shm", "cuda_vmm")))
+@pytest.mark.parametrize("backends", (("cuda_vmm",), ("posix_shm", "cuda_vmm")))
 def test_tensor_delivery_gathers_shards_across_processes(
     fragmented: bool, backends: tuple[str, ...]
 ) -> None:
@@ -626,22 +626,25 @@ def test_backends_share_the_rank_byte_budget_until_publications_retire() -> (
 ):
     events = EventPool()
     transports = make_transports(
-        ("local", "shm"), byte_capacity=64, ticket_capacity=2, event_pool=events
+        ("local", "posix_shm"),
+        byte_capacity=64,
+        ticket_capacity=2,
+        event_pool=events,
     )
     source = torch.arange(8, dtype=torch.float32)
     local = transports["local"].publish(source)
-    shared = transports["shm"].publish(source)
+    shared = transports["posix_shm"].publish(source)
     try:
         with pytest.raises(WorkerError, match="byte capacity is exhausted"):
             transports["local"].publish(source)
-        retired = transports["shm"].release(shared)
+        retired = transports["posix_shm"].release(shared)
         assert retired is not None
         retired.result(timeout=10)
         replacement = transports["local"].publish(source)
         transports["local"].release(replacement)
     finally:
         transports["local"].release(local)
-        transports["shm"].release(shared)
+        transports["posix_shm"].release(shared)
         for transport in transports.values():
             transport.close()
         events.close()
@@ -650,26 +653,26 @@ def test_backends_share_the_rank_byte_budget_until_publications_retire() -> (
 def test_read_ticket_capacity_is_shared_across_backends() -> None:
     events = EventPool()
     transports = make_transports(
-        ("local", "shm"),
+        ("local", "posix_shm"),
         byte_capacity=1024,
         ticket_capacity=1,
         event_pool=events,
     )
     source = torch.arange(8, dtype=torch.float32)
     local = transports["local"].publish(source)
-    shared = transports["shm"].publish(source)
+    shared = transports["posix_shm"].publish(source)
     borrowed = transports["local"].fetch(local, device=torch.device("cpu"))
     destination = torch.full_like(source, -1)
     try:
         with pytest.raises(WorkerError, match="ticket capacity is exhausted"):
-            transports["shm"].fetch(
+            transports["posix_shm"].fetch(
                 shared, device=destination.device, destination=destination
             )
         assert bool(torch.all(destination == -1))
         borrowed.close()
         _consume(
             (
-                transports["shm"].fetch(
+                transports["posix_shm"].fetch(
                     shared, device=destination.device, destination=destination
                 ),
             )
@@ -688,9 +691,9 @@ def test_read_ticket_capacity_is_shared_across_backends() -> None:
     "backend,device",
     (
         ("local", "cpu"),
-        ("shm", "cpu"),
+        ("posix_shm", "cpu"),
         ("local", "cuda:0"),
-        ("shm", "cuda:0"),
+        ("posix_shm", "cuda:0"),
         ("cuda_vmm", "cuda:0"),
     ),
 )
@@ -746,7 +749,8 @@ def test_fragmented_layer_pages_use_one_read_into_reserved_pages(
 
 
 @pytest.mark.parametrize(
-    "backend,device", (("local", "cpu"), ("shm", "cpu"), ("cuda_vmm", "cuda:0"))
+    "backend,device",
+    (("local", "cpu"), ("posix_shm", "cpu"), ("cuda_vmm", "cuda:0")),
 )
 @pytest.mark.parametrize("shard_axis", (0, 1))
 @torch.inference_mode()
@@ -905,10 +909,10 @@ def test_shm_allocation_failure_preserves_publication_capacity(
 ) -> None:
     events = EventPool()
     transport = make_transport(
-        "shm", byte_capacity=16, ticket_capacity=1, event_pool=events
+        "posix_shm", byte_capacity=16, ticket_capacity=1, event_pool=events
     )
     consumer = make_transport(
-        "shm", byte_capacity=16, ticket_capacity=1, event_pool=events
+        "posix_shm", byte_capacity=16, ticket_capacity=1, event_pool=events
     )
     source = torch.arange(4, dtype=torch.float32)
     locator = None
@@ -937,7 +941,7 @@ def test_shm_allocation_failure_preserves_publication_capacity(
         events.close()
 
 
-@pytest.mark.parametrize("backend", ("shm", "cuda_vmm"))
+@pytest.mark.parametrize("backend", ("posix_shm", "cuda_vmm"))
 def test_transfer_orders_destination_writes_before_its_copy(
     backend: str,
 ) -> None:
@@ -946,7 +950,9 @@ def test_transfer_orders_destination_writes_before_its_copy(
         backend, byte_capacity=4096, ticket_capacity=1, event_pool=events
     )
     source = torch.arange(
-        12, dtype=torch.float32, device="cpu" if backend == "shm" else "cuda:0"
+        12,
+        dtype=torch.float32,
+        device="cpu" if backend == "posix_shm" else "cuda:0",
     )
     locator = transport.publish(source)
     destination = torch.empty(12, device="cuda:0")

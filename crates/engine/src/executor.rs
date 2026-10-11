@@ -671,7 +671,7 @@ pub enum TransferBackend {
     #[default]
     Local,
     /// Publishes products through POSIX shared storage.
-    Shm,
+    PosixShm,
     /// Publishes device products through CUDA VMM handles.
     CudaVmm,
     /// Carries a host product's bytes on the rank channel's data path.
@@ -687,7 +687,7 @@ impl TransferBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
-            Self::Shm => "shm",
+            Self::PosixShm => "posix_shm",
             Self::CudaVmm => "cuda_vmm",
             Self::Channel => "channel",
         }
@@ -708,7 +708,7 @@ impl FromStr for TransferBackend {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "local" => Ok(Self::Local),
-            "shm" => Ok(Self::Shm),
+            "posix_shm" => Ok(Self::PosixShm),
             "cuda_vmm" => Ok(Self::CudaVmm),
             "channel" => Ok(Self::Channel),
             _ => Err(TransferConfigError::message(format!(
@@ -838,7 +838,7 @@ impl TransferConfig {
                                 // namespace, so a host product that leaves its host
                                 // travels on the rank channel's data path.
                                 let host = if source.node == destination.node {
-                                    TransferBackend::Shm
+                                    TransferBackend::PosixShm
                                 } else {
                                     TransferBackend::Channel
                                 };
@@ -1107,7 +1107,7 @@ impl TransferConfig {
         tensor.locations.retain(|location| {
             let published = match &location.transport {
                 TransferTransport::Local { .. } => TransferBackend::Local,
-                TransferTransport::PosixShm { .. } => TransferBackend::Shm,
+                TransferTransport::PosixShm { .. } => TransferBackend::PosixShm,
                 TransferTransport::CudaVmm { .. } => TransferBackend::CudaVmm,
                 TransferTransport::Channel { .. } => TransferBackend::Channel,
             };
@@ -1135,7 +1135,7 @@ impl TransferConfig {
     ///
     /// `mechanisms` names the edge's device mechanism, its host mechanism, or
     /// both joined by `+` with the device mechanism first, as in
-    /// `cuda_vmm+shm`. `local` serves both locations. Entries are separated by
+    /// `cuda_vmm+posix_shm`. `local` serves both locations. Entries are separated by
     /// commas, and an omitted rank covers every rank of that worker.
     ///
     /// The result holds no placement: `with_worker_defaults` fills
@@ -1235,7 +1235,7 @@ impl TransferConfig {
         for backend in backends {
             let slot = match backend {
                 TransferBackend::CudaVmm => &mut device,
-                TransferBackend::Shm | TransferBackend::Channel => &mut host,
+                TransferBackend::PosixShm | TransferBackend::Channel => &mut host,
                 TransferBackend::Local => unreachable!("local mechanisms return above"),
             };
             if slot.replace(backend).is_some() {
@@ -1677,7 +1677,7 @@ mod tests {
                     destination_worker: WorkerId("decode".to_owned()),
                     destination_rank: None,
                     device: Some(TransferBackend::CudaVmm),
-                    host: Some(TransferBackend::Shm),
+                    host: Some(TransferBackend::PosixShm),
                 },
                 TransferEdge {
                     source_worker: WorkerId("encoder".to_owned()),
@@ -1722,18 +1722,18 @@ mod tests {
     fn an_edge_names_a_device_mechanism_and_a_host_mechanism() {
         // A product's location decides which mechanism carries it, so one
         // edge binds both, and each location has at most one.
-        let both = TransferConfig::parse("decoder->muxer=cuda_vmm+shm").unwrap();
+        let both = TransferConfig::parse("decoder->muxer=cuda_vmm+posix_shm").unwrap();
         assert_eq!(both.edges[0].device, Some(TransferBackend::CudaVmm));
-        assert_eq!(both.edges[0].host, Some(TransferBackend::Shm));
-        assert!(both.edges[0].carries(TransferBackend::Shm));
+        assert_eq!(both.edges[0].host, Some(TransferBackend::PosixShm));
+        assert!(both.edges[0].carries(TransferBackend::PosixShm));
         assert!(!both.edges[0].carries(TransferBackend::Channel));
 
         let local = TransferConfig::parse("decoder->decoder=local").unwrap();
         assert_eq!(local.edges[0].device, Some(TransferBackend::Local));
         assert_eq!(local.edges[0].host, Some(TransferBackend::Local));
 
-        assert!(TransferConfig::parse("a->b=shm+channel").is_err());
-        assert!(TransferConfig::parse("a->b=local+shm").is_err());
+        assert!(TransferConfig::parse("a->b=posix_shm+channel").is_err());
+        assert!(TransferConfig::parse("a->b=local+posix_shm").is_err());
         assert!(TransferConfig::parse("a->b=cuda_vmm+cuda_vmm").is_err());
     }
 
@@ -1806,7 +1806,8 @@ mod tests {
 
     #[test]
     fn transport_map_parses_edges() {
-        let t = TransferConfig::parse("encoder->prefill=cuda_vmm,prefill->decode=shm").unwrap();
+        let t =
+            TransferConfig::parse("encoder->prefill=cuda_vmm,prefill->decode=posix_shm").unwrap();
         assert_eq!(
             t.edges[0],
             TransferEdge {
@@ -1818,18 +1819,21 @@ mod tests {
                 host: None,
             }
         );
-        assert_eq!(t.edges[1].host, Some(TransferBackend::Shm));
+        assert_eq!(t.edges[1].host, Some(TransferBackend::PosixShm));
         assert!(TransferConfig::parse("bad-entry").is_err());
         assert!(TransferConfig::parse("prefill->decode=tcp").is_err());
-        assert!(TransferConfig::parse("prefill->decode=shm,prefill->decode=cuda_vmm").is_err());
+        assert!(
+            TransferConfig::parse("prefill->decode=posix_shm,prefill->decode=cuda_vmm").is_err()
+        );
         let split =
-            TransferConfig::parse("encoder:0->denoiser:0=shm,encoder:0->denoiser:1=cuda_vmm")
+            TransferConfig::parse("encoder:0->denoiser:0=posix_shm,encoder:0->denoiser:1=cuda_vmm")
                 .unwrap();
         assert_eq!(split.edges[1].source_rank, Some(0));
         assert_eq!(split.edges[1].destination_rank, Some(1));
-        assert!(TransferConfig::parse("encoder:x->denoiser=shm").is_err());
+        assert!(TransferConfig::parse("encoder:x->denoiser=posix_shm").is_err());
         assert!(
-            TransferConfig::parse("encoder->denoiser=shm,encoder:0->denoiser:1=cuda_vmm").is_err()
+            TransferConfig::parse("encoder->denoiser=posix_shm,encoder:0->denoiser:1=cuda_vmm")
+                .is_err()
         );
     }
 

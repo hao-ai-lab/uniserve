@@ -1380,8 +1380,8 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
 
 def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thread_wait(  # noqa: E501
 ) -> None:
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
     admission = ar_params(73, block_ids=(0,), input_images=1)
     image = io.BytesIO()
     Image.new("RGB", (16, 16), (64, 96, 128)).save(image, format="PNG")
@@ -1445,7 +1445,7 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
 def test_free_preserves_another_requests_feature_with_the_same_generation() -> (
     None
 ):
-    worker = execution_worker(transfer_backends=("shm",))
+    worker = execution_worker(transfer_backends=("posix_shm",))
     admissions = (
         ar_params(93, block_ids=(0,), input_images=1),
         ar_params(94, block_ids=(1,), input_images=1),
@@ -1508,8 +1508,8 @@ def test_free_preserves_another_requests_feature_with_the_same_generation() -> (
 def test_cross_stage_device_product_transfer_preserves_generation_and_value() -> (  # noqa: E501
     None
 ):
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
     admission = ar_params(77, block_ids=(0,))
     extend = token_call(
         admission.request_key,
@@ -1689,7 +1689,7 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         worker.close()
 
 
-@pytest.mark.parametrize("backend", ("local", "shm"))
+@pytest.mark.parametrize("backend", ("local", "posix_shm"))
 @pytest.mark.parametrize(
     "dtype", (DType.BF16, DType.F32, DType.I32, DType.I64, DType.I16)
 )
@@ -1803,8 +1803,8 @@ def test_tensor_entry_input_preserves_values_through_output_release(
 def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
     None
 ):
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
     generation = umm_params(
         79, ImageParams(steps=1, height=16, width=16, seed=31)
     )
@@ -1893,8 +1893,8 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
 def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
     height: int, publication: str
 ) -> None:
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
     admission = umm_params(
         75, ImageParams(steps=1, height=height, width=height, seed=29)
     )
@@ -1994,8 +1994,8 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             first.shape[axis] if index == axis else 0 for index in range(2)
         )
         locations = (
-            producer.transports["shm"].publish(first),
-            producer.transports["shm"].publish(second, offset=offset),
+            producer.transports["posix_shm"].publish(first),
+            producer.transports["posix_shm"].publish(second, offset=offset),
         )
         transferred = (
             replace(
@@ -2111,7 +2111,7 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
     encoding_fails: bool,
     monkeypatch,
 ) -> None:
-    worker = execution_worker(transfer_backends=("shm",))
+    worker = execution_worker(transfer_backends=("posix_shm",))
     admission = umm_params(
         76,
         ImageParams(steps=1, height=16, width=16, seed=31),
@@ -2460,7 +2460,7 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         else (),
     )
     worker = execution_worker(
-        transfer_backends=("shm",),
+        transfer_backends=("posix_shm",),
         device=device,
         execution=policy,
         queue_depth=2,
@@ -2597,7 +2597,9 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
 
     from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 
-    with execution_worker(transfer_backends=("shm",), queue_depth=2) as worker:
+    with execution_worker(
+        transfer_backends=("posix_shm",), queue_depth=2
+    ) as worker:
         worker.warmup()
         admission = umm_params(
             76, ImageParams(steps=3, height=16, width=16, seed=29)

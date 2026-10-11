@@ -119,10 +119,14 @@ def test_independent_product_work_preserves_request_progress(
     "backends,device",
     (
         (("local",), "cpu"),
-        (("shm",), "cpu"),
-        (("shm", "local"), "cpu"),
-        pytest.param(("shm", "cuda_vmm"), "cuda:0", marks=pytest.mark.gpu),
-        pytest.param(("cuda_vmm", "shm"), "cuda:0", marks=pytest.mark.gpu),
+        (("posix_shm",), "cpu"),
+        (("posix_shm", "local"), "cpu"),
+        pytest.param(
+            ("posix_shm", "cuda_vmm"), "cuda:0", marks=pytest.mark.gpu
+        ),
+        pytest.param(
+            ("cuda_vmm", "posix_shm"), "cuda:0", marks=pytest.mark.gpu
+        ),
     ),
 )
 def test_retained_encoder_product_outlives_its_producer_request(

@@ -449,7 +449,7 @@ def test_a_retired_segment_no_consumer_began_reading_returns_at_once() -> None:
     """
     events = EventPool()
     transport = make_transport(
-        "shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
     )
     try:
         value = torch.arange(8, dtype=torch.float32)
@@ -988,7 +988,7 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
 
     events = EventPool()
     transport = make_transport(
-        "shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
     )
     pool = LatentPool(
         request_pool_size=2,
@@ -1221,7 +1221,7 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
     events = EventPool()
     # Slots 0 and 1 share this host; slot 2 is on another host.
     transports = make_transports(
-        ("local", "shm", "channel"),
+        ("local", "posix_shm", "channel"),
         byte_capacity=1 << 20,
         ticket_capacity=8,
         event_pool=events,
@@ -1231,10 +1231,10 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
     value = torch.arange(16, dtype=torch.int16).reshape(8, 2)
     try:
         cases = {
-            (1,): {"local", "shm"},
+            (1,): {"local", "posix_shm"},
             (2,): {"local", "channel"},
-            (1, 2): {"local", "shm", "channel"},
-            (): {"local", "shm", "channel"},
+            (1, 2): {"local", "posix_shm", "channel"},
+            (): {"local", "posix_shm", "channel"},
         }
         for consumers, expected in cases.items():
             locations = publish_tensor(
@@ -1253,7 +1253,7 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
                 # their words; the channel and local copies retire with the
                 # release alone.
                 for location in locations:
-                    if location.backend == "shm":
+                    if location.backend == "posix_shm":
                         mapping = open_shared_storage(
                             location.transport.name,
                             segment.HEADER_BYTES + location.nbytes,
@@ -1264,7 +1264,7 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
                         finally:
                             mapping.close()
                     transports[location.backend].release(location)
-                transports["shm"].reap()
+                transports["posix_shm"].reap()
     finally:
         for transport in transports.values():
             transport.close()

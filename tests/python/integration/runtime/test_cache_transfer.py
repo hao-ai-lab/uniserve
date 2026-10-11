@@ -48,7 +48,7 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
     publications = pool
     events = EventPool()
     consumer = make_transport(
-        "shm", byte_capacity=8192, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=8192, ticket_capacity=2, event_pool=events
     )
     write = None
     process.start()
@@ -225,8 +225,8 @@ def test_kv_publications_isolate_request_epochs() -> None:
     "backend,device",
     (
         ("local", "cpu"),
-        ("shm", "cpu"),
-        pytest.param("shm", "cuda:0", marks=pytest.mark.gpu),
+        ("posix_shm", "cpu"),
+        pytest.param("posix_shm", "cuda:0", marks=pytest.mark.gpu),
         pytest.param("cuda_vmm", "cuda:0", marks=pytest.mark.gpu),
     ),
 )
@@ -501,7 +501,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
         table.install(((1, 0, 0, pages, 2 * pool.shapes[0].page_tokens),))
     owners = [pool for pool, table in zip(pools, tables, strict=True)]
     events = [EventPool() for _ in pools]
-    backend = "cuda_vmm" if device.startswith("cuda") else "shm"
+    backend = "cuda_vmm" if device.startswith("cuda") else "posix_shm"
     transports = [
         make_transport(
             backend, byte_capacity=32768, ticket_capacity=32, event_pool=event
@@ -625,7 +625,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
 @pytest.mark.parametrize(
     "mechanisms,device",
     (
-        (("local", "shm"), "cpu"),
+        (("local", "posix_shm"), "cpu"),
         pytest.param(("local", "cuda_vmm"), "cuda:0", marks=pytest.mark.gpu),
     ),
 )

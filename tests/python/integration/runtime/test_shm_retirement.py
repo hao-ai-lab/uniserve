@@ -19,19 +19,19 @@ pytestmark = pytest.mark.integration
 def test_failed_reader_returns_publication_capacity(ending):
     events = EventPool()
     producer = make_transports(
-        ("shm",),
+        ("posix_shm",),
         byte_capacity=4,
         ticket_capacity=1,
         event_pool=events,
         host_slots=(0,),
-    )["shm"]
+    )["posix_shm"]
     consumer = make_transports(
-        ("shm",),
+        ("posix_shm",),
         byte_capacity=4,
         ticket_capacity=1,
         event_pool=events,
         acknowledgment_slot=0,
-    )["shm"]
+    )["posix_shm"]
     locator = producer.publish(torch.tensor([1.0]), consumers=(0,))
     header = shared_memory.SharedMemory(name=locator.transport.name)
     try:

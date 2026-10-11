@@ -183,7 +183,7 @@ class ShmTransport(Transport):
     acknowledged, so a read needs no connection to the producing rank.
     """
 
-    name = "shm"
+    name = "posix_shm"
 
     def __init__(
         self,

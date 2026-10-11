@@ -460,7 +460,7 @@ impl WorkerExecutor {
                                 }
                             }
                             // Shared storage names a segment in one host's namespace.
-                            crate::executor::TransferBackend::Shm => anyhow::ensure!(
+                            crate::executor::TransferBackend::PosixShm => anyhow::ensure!(
                                 !crosses_hosts,
                                 "transfer edge from worker {} on host {source_host} to worker {} \
                              on host {destination_host} crosses hosts over shared storage, \

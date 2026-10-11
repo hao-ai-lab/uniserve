@@ -100,10 +100,10 @@ def _input_publication(
 
 
 def _shm(transports: Mapping[str, Transport]) -> ShmTransport:
-    """Return the rank's shared-storage transport, bound under ``"shm"``."""
+    """Return the rank's shared-storage transport, bound as ``"posix_shm"``."""
     from uniserve_worker.transport.shm import ShmTransport
 
-    transport = transports.get("shm")
+    transport = transports.get("posix_shm")
     if not isinstance(transport, ShmTransport):
         raise unsupported_setup(
             "host media inputs are borrowed over shared storage, which this "
@@ -183,7 +183,7 @@ def read_encoded_units(
     if len(tensor.shape) != 2 or tensor.dtype != "uint8":
         raise invalid_descriptor("encoded units require byte rows")
     units: dict[int, bytes] = {}
-    shm = transports.get("shm")
+    shm = transports.get("posix_shm")
     for location in tensor.locations:
         handle = location.transport
         if isinstance(handle, PosixShmTransfer):

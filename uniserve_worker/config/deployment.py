@@ -762,9 +762,12 @@ def _parse_transfer_backends(value: object) -> tuple[str, ...]:
     if not backends or len(set(backends)) != len(backends):
         raise ValueError("transfer backends must be nonempty and unique")
     if any(
-        name not in {"local", "shm", "cuda_vmm", "channel"} for name in backends
+        name not in {"local", "posix_shm", "cuda_vmm", "channel"}
+        for name in backends
     ):
-        raise ValueError("transfer backends must name local, shm, or cuda_vmm")
+        raise ValueError(
+            "transfer backends must name local, posix_shm, cuda_vmm, or channel"
+        )
     return backends
 
 

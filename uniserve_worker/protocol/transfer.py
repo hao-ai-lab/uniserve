@@ -261,13 +261,12 @@ class Locator:
         """Return the name of the transport that owns this publication.
 
         The names are the `WorkerInfo.transfer_backends` vocabulary and key a
-        rank's transport table. A `PosixShmTransfer` is ``"shm"`` here but
-        ``"posix_shm"`` in the wire mapping.
+        rank's transport table; they are the names the wire mapping carries.
         """
         if isinstance(self.transport, LocalTransfer):
             return "local"
         if isinstance(self.transport, PosixShmTransfer):
-            return "shm"
+            return "posix_shm"
         if isinstance(self.transport, ChannelTransfer):
             return "channel"
         if isinstance(self.transport, CudaVmmTransfer):
