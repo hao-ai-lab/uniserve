@@ -216,6 +216,11 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             let latent_encoding_lane = engine
                 .media_lane_units(uniserve_engine::MediaCall::LatentEncoding)
                 .unwrap_or(1);
+            // The video processor's options are its reference sizing.
+            let references = crate::serving::video::plan::ReferenceConfig::from_kwargs(
+                &config.mm_processor_kwargs,
+            )
+            .map_err(|message| anyhow::anyhow!("invalid --mm-processor-kwargs: {message}"))?;
             Some(
                 crate::serving::video::VideoService::new(
                     denoiser,
@@ -223,12 +228,21 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                     *max_video_seconds,
                     latent_encoding_lane,
                     &config.video_media,
+                    references,
                     Arc::clone(&tokenizer),
                 )
                 .context("failed to bind the video denoiser")?,
             )
         }
-        _ => None,
+        _ => {
+            // No other served model's processor takes options.
+            anyhow::ensure!(
+                config.mm_processor_kwargs.is_empty(),
+                "invalid --mm-processor-kwargs: the processor of `{}` takes no options",
+                config.model
+            );
+            None
+        }
     };
 
     // A DiffusionGemma checkpoint serves the System One readout, whose

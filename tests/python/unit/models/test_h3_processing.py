@@ -4,7 +4,8 @@ The vectors in ``minimax_h3_plan.json``, generated from the diffusers
 MiniMax-H3 pipeline and the checkpoint's Qwen3-VL processor, tokenizer and
 audio VAE, are shared with the Rust planner's tests
 (``crates/server/src/serving/video``), so both implementations are checked
-against the same reference values.
+against the same reference values. That pipeline enlarges small references,
+so the vectors are planned with ``ReferenceConfig(enlarge=True)``.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from uniserve_models.minimax_h3.processing import (
     ImageVision,
     KeyframeFit,
     PlanError,
+    ReferenceConfig,
     RequestPlan,
     Role,
     Target,
@@ -49,6 +51,8 @@ _FIXTURE = json.loads(
     ).read_text()
 )
 _VISION = VisionConfig(**_FIXTURE["vision"])
+# The reference pipeline's sizing, which the vectors follow.
+_RELEASED = ReferenceConfig(enlarge=True)
 _ACCEPTED = [case for case in _FIXTURE["requests"] if "expected" in case]
 _REJECTED = [case for case in _FIXTURE["requests"] if "error" in case]
 
@@ -89,9 +93,9 @@ def test_duration(case):
 def test_reference_image(case):
     if case.get("error"):
         with pytest.raises(ValueError):
-            processing.reference_image_size(*case["size"])
+            processing.reference_image_size(*case["size"], _RELEASED)
         return
-    size = processing.reference_image_size(*case["size"])
+    size = processing.reference_image_size(*case["size"], _RELEASED)
     assert size == _size(case["resize"])
     grid = _VISION.image_grid(size.height, size.width)
     assert list(grid) == case["vision_grid"]
@@ -112,13 +116,22 @@ def test_keyframe_cover_crop(case):
 
 @pytest.mark.parametrize("case", _FIXTURE["video_reference_cases"])
 def test_video_reference(case):
+    # The fixture states a video's displayed size as its aspect.
     media = VideoFacts(
         display_width=case["display"][0],
         display_height=case["display"][1],
+        width=case["display"][0],
+        height=case["display"][1],
         frame_rate=Fraction(*case["frame_rate"]),
         frames=case["frames"],
     )
-    arguments = (media, case["start_seconds"], case["num_frames"], _VISION)
+    arguments = (
+        media,
+        case["start_seconds"],
+        case["num_frames"],
+        _VISION,
+        _RELEASED,
+    )
     if case.get("error"):
         with pytest.raises(ValueError):
             processing.video_reference(*arguments)
@@ -161,6 +174,8 @@ def _media(entry: dict[str, Any]) -> ImageFacts | VideoFacts | AudioFacts:
         return VideoFacts(
             display_width=media["display"][0],
             display_height=media["display"][1],
+            width=media["display"][0],
+            height=media["display"][1],
             frame_rate=Fraction(*media["frame_rate"]),
             frames=media["frames"],
             soundtrack=None if track is None else _audio_facts(track),
@@ -189,6 +204,7 @@ def _plan(case: dict[str, Any]) -> RequestPlan:
         ),
         conditions,
         _VISION,
+        references=_RELEASED,
     )
 
 
@@ -416,3 +432,50 @@ def test_max_seconds_bounds_the_duration():
             max_seconds=8.0,
         )
     assert error.value.field == "target.duration_seconds"
+
+
+def test_references_are_enlarged_only_on_request():
+    """A reference is only ever reduced unless the deployment enlarges.
+
+    An image above the short edge and a video above the canvas of its aspect
+    scale down as the released pipeline scales them; smaller ones keep their
+    own size on the 32-pixel grid.
+    """
+    size = processing.reference_image_size
+    # 1080 rounds to 34 patches; 768 is already on the grid.
+    assert size(1920, 1080) == image.Config(height=1088, width=1920)
+    assert size(768, 768) == image.Config(height=768, width=768)
+    assert size(768, 768, _RELEASED) == image.Config(height=2048, width=2048)
+    # A 2304-pixel short edge exceeds 2048 and is reduced either way.
+    for config in (ReferenceConfig(), _RELEASED):
+        assert size(4096, 2304, config) == image.Config(height=2048, width=3648)
+    # A smaller short edge reduces further and still never enlarges.
+    half = ReferenceConfig(image_short_edge=1024)
+    assert size(2560, 1440, half) == image.Config(height=1024, width=1824)
+    assert size(768, 768, half) == image.Config(height=768, width=768)
+    with pytest.raises(ValueError):
+        size(4100, 1000)
+
+    def canvas(width: int, height: int, config: ReferenceConfig):
+        media = VideoFacts(
+            display_width=width,
+            display_height=height,
+            width=width,
+            height=height,
+            frame_rate=Fraction(24),
+            frames=48,
+        )
+        clip, _ = processing.video_reference(media, 0.0, 124, _VISION, config)
+        return clip.canvas
+
+    # 720p holds fewer pixels than the 16:9 canvas: 720 is 22.5 patches and
+    # rounds half to even. 1080p is reduced to the canvas.
+    assert canvas(1280, 720, ReferenceConfig()) == image.Config(704, 1280)
+    assert canvas(1920, 1080, ReferenceConfig()) == image.Config(768, 1344)
+    assert canvas(1280, 720, _RELEASED) == image.Config(768, 1344)
+
+
+@pytest.mark.parametrize("edge", (0, 1000, 4096, 1024.0))
+def test_a_reference_config_bounds_its_short_edge(edge):
+    with pytest.raises(ValueError, match="short edge"):
+        ReferenceConfig(image_short_edge=edge)

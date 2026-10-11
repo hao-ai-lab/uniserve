@@ -176,13 +176,19 @@ def test_conditions_read_as_the_reference_conditioning(case, root, ffmpeg):
         "square_robot_arm_red_cube_1s.png",
     ],
 )
-def test_image_references_resize_as_pillow(name, root):
+@pytest.mark.parametrize("enlarge", (False, True))
+def test_image_references_resize_as_pillow(name, enlarge, root):
     from PIL import Image, ImageOps
 
     data = (root / "inputs/media" / name).read_bytes()
     decoded = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
     decoded = decoded.convert("RGB")
-    raster = processing.reference_image_size(*decoded.size)
+    # Every image here is smaller than its 2048 short edge: it keeps its
+    # own size on the 32-pixel grid, or is enlarged as the reference
+    # pipeline enlarges it.
+    raster = processing.reference_image_size(
+        *decoded.size, processing.ReferenceConfig(enlarge=enlarge)
+    )
     fit = ImageFit(resized=raster, left=0, top=0, size=raster)
 
     expected = decoded.resize(

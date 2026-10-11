@@ -203,6 +203,11 @@ pub struct Config {
     pub readout: ReadoutOptions,
     /// Block-diffusion sampler overrides applied to every generated reply.
     pub diffusion_generation: DenoisingOverrides,
+    /// Options of the served model's multimodal processor
+    /// (`--mm-processor-kwargs`), by name. The model's processor reads the
+    /// ones it takes and refuses any other at startup; MiniMax H3's reads
+    /// its reference sizing (`serving::video::plan::ReferenceConfig`).
+    pub mm_processor_kwargs: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Sources and limits of the condition media of video requests.
@@ -279,6 +284,7 @@ impl Default for Config {
             image_fetch: ImageFetchPolicy::default(),
             readout: ReadoutOptions::default(),
             diffusion_generation: DenoisingOverrides::default(),
+            mm_processor_kwargs: serde_json::Map::new(),
         }
     }
 }

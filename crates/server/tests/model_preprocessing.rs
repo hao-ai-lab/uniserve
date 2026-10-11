@@ -85,6 +85,7 @@ fn video_service(
         max_video_seconds,
         1,
         &VideoMediaSettings::default(),
+        Default::default(),
         Arc::clone(tokenizer),
     )
     .unwrap()
