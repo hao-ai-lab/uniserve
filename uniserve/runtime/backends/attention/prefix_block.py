@@ -23,7 +23,7 @@ sequence's paged prefix and their current block, with the visibility
 ``P`` is the row's absolute prefix length. Current K/V come from the packed
 projections at the query rows and the prefix from the cache through each
 row's block table, whose first column is its start page when the table
-carries one. A paged input's write addresses are committed before the read,
+carries one. A paged input's slot mapping is committed before the read,
 so later calls find the block in the cache. Device causal flags allow all
 rows to share one launch after the complete cache write. A paged batch
 with only host causal flags uses contiguous runs of equal causality.
@@ -175,9 +175,9 @@ class _PrefixBlock(_Operator):
 
         # A later run may read rows an earlier run of the same sequence
         # writes, so the batch's complete write commits before any run; the
-        # runs carry no write addresses.
-        if batch.write_indices is not None:
-            self.update_cache(k, v, indices=batch.write_indices)
+        # runs carry no slot mapping.
+        if batch.slot_mapping is not None:
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
         for rows, _, run in causal_runs(batch):
             if rows.start == rows.stop:
                 continue
@@ -199,8 +199,8 @@ class _PrefixBlock(_Operator):
             # One launch commits the rows' write, fused where the storage
             # allows, and zeroes the ticket counter of the causal launch.
             prepare(self.cache, k, v, batch, semaphore=self._schedule[:1])
-        elif batch.write_indices is not None:
-            self.update_cache(k, v, indices=batch.write_indices)
+        elif batch.slot_mapping is not None:
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
         if not q.shape[0] or not batch.queries.batch_size:
             return
 

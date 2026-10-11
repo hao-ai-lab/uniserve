@@ -427,7 +427,7 @@ def test_slot_zero_is_writable_and_minus_one_does_not_initialize(quantized):
             [[10000.0, 10000.0], [10000.0, 10000.0]],
         ]
     )
-    state.update(key, -key, indices=torch.tensor([0, 1, -1]))
+    state.update(key, -key, slot_mapping=torch.tensor([0, 1, -1]))
     expected = key[:2].clone()
     actual = state.read((0,), start=0, length=2)
     torch.testing.assert_close(actual[0], expected, rtol=0, atol=0)
@@ -436,7 +436,7 @@ def test_slot_zero_is_writable_and_minus_one_does_not_initialize(quantized):
     assert state.initialized["value"].tolist() == [True, False, False]
     for index in (-2, 12):
         with pytest.raises(ValueError, match="out of bounds"):
-            state.update(key[:1], key[:1], indices=torch.tensor([index]))
+            state.update(key[:1], key[:1], slot_mapping=torch.tensor([index]))
 
 
 def test_fp8_partial_copy_preserves_uncovered_values_and_transfers_encoding():

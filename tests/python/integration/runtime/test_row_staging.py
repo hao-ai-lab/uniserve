@@ -1,12 +1,12 @@
 """Token rows stage the attention columns their slots' resident tables imply.
 
 ``AttentionBuffers.stage_rows`` gathers every numerical table's units, first
-staged pages and write addresses from the request slots' resident tables.
+staged pages and slot mapping from the request slots' resident tables.
 Over random calls of a model whose windowed and full-attention groups share
 one unit pool (six numerical tables, as DiffusionGemma has), its staging
 equals the layout the tables define: every installed page of a full table
 and, for a windowed table, the pages from the first one the row's first
-query reaches back to through its last query; write addresses at
+query reaches back to through its last query; slot mapping at
 ``unit * block_size + offset``, or -1 for rows that do not write. Padding
 the call to a graph bucket leaves its live rows unchanged. The calls
 cover appending rows, mixed appending and read-only rows, read-only
@@ -116,7 +116,7 @@ def _expected(rows, manager):
 
     Returns the same keys as ``_columns``, computed from the host mirrors of
     the tables alone: per numerical table, the staged units of each row
-    (zero past them, to the widest row), first pages and write addresses.
+    (zero past them, to the widest row), first pages and slot mapping.
     """
     tables = manager.block_tables
     queries = tuple(row.query_tokens for row in rows)
@@ -132,7 +132,7 @@ def _expected(rows, manager):
     for group, shape in enumerate(tables.groups):
         for position in range(shape.units_per_page):
             number = tables.first_table[group] + position
-            staged, firsts, writes = [], [], []
+            staged, firsts, slot_mapping = [], [], []
             for row in rows:
                 table = tables.table(row.request_pool_idx, group)
                 first = (
@@ -155,7 +155,7 @@ def _expected(rows, manager):
                 firsts.append(first)
                 for token in range(row.seq_len, row.seq_len + row.query_tokens):
                     page = token // shape.block_size - table.start_page
-                    writes.append(
+                    slot_mapping.append(
                         table.row(position)[page] * shape.block_size
                         + token % shape.block_size
                         if row.write_kv
@@ -185,8 +185,10 @@ def _expected(rows, manager):
             values[number, "start_host"] = (
                 None if shape.window is None else tuple(firsts)
             )
-            values[number, "writes"] = (
-                torch.tensor(writes, dtype=torch.int32) if appending else None
+            values[number, "slot_mapping"] = (
+                torch.tensor(slot_mapping, dtype=torch.int32)
+                if appending
+                else None
             )
             if appending:
                 values[number, "causal"] = tuple(row.causal for row in rows)
@@ -210,7 +212,7 @@ def _columns(batch):
         values[number, "block_size"] = entry.block_table.block_size
         values[number, "start"] = entry.block_table.start_page
         values[number, "start_host"] = entry.block_table.start_page_host
-        values[number, "writes"] = entry.write_indices
+        values[number, "slot_mapping"] = entry.slot_mapping
         if isinstance(entry, PagedInput):
             values[number, "causal"] = entry.causal
     return {
@@ -290,11 +292,13 @@ def test_rows_stage_the_columns_their_resident_tables_define(
                     padded[number, "table"][: len(rows), : width[number]],
                     live[number, "table"],
                 )
-                if live[number, "writes"] is not None:
-                    live_writes = live[number, "writes"]
+                if live[number, "slot_mapping"] is not None:
+                    live_slot_mapping = live[number, "slot_mapping"]
                     assert torch.equal(
-                        padded[number, "writes"][: live_writes.numel()],
-                        live_writes,
+                        padded[number, "slot_mapping"][
+                            : live_slot_mapping.numel()
+                        ],
+                        live_slot_mapping,
                     )
     finally:
         if device != "cpu":

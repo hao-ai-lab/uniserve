@@ -331,13 +331,13 @@ class _ContextPlan:
 
         if (
             isinstance(batch, (PagedInput, SegmentedInput))
-            and batch.write_indices is not None
+            and batch.slot_mapping is not None
         ):
             if self.cache is None:
                 raise RuntimeError(
                     "context cache writes require bound prefix state"
                 )
-            self.cache.update(k, v, indices=batch.write_indices)
+            self.cache.update(k, v, slot_mapping=batch.slot_mapping)
 
         if isinstance(batch, SegmentedInput):
             if self.cache is None:

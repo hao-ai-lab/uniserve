@@ -72,7 +72,7 @@ def test_token_cycle_projects_selected_rows_and_writes_only_supplied_slots():
                 replace(
                     inputs,
                     attention=AttentionBatch.single(
-                        replace(batch, write_indices=None)
+                        replace(batch, slot_mapping=None)
                     ),
                 )
             )
@@ -102,7 +102,7 @@ def test_zero_velocity_preserves_each_raster_through_solver_and_decoder():
         causal=False,
         device="cpu",
     )
-    batch = AttentionBatch.single(replace(batch, write_indices=None))
+    batch = AttentionBatch.single(replace(batch, slot_mapping=None))
     for index in range(schedule.num_steps):
         inputs = DenoiserInput(
             {

@@ -201,7 +201,7 @@ class Operator:
         k: torch_lib.Tensor,
         v: torch_lib.Tensor,
         *,
-        indices: torch_lib.Tensor,
+        slot_mapping: torch_lib.Tensor,
     ) -> None:
         """Write current K/V rows into the bound K/V cache."""
         if self._closed:
@@ -211,7 +211,7 @@ class Operator:
                 "attention cache update requires bound prefix state"
             )
 
-        self.cache.update(k, v, indices=indices)
+        self.cache.update(k, v, slot_mapping=slot_mapping)
 
     def _validate(self, q, k, v, batch, out):
         # Host-driven provider preparation belongs to bind(), before capture.

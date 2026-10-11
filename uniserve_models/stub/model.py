@@ -131,7 +131,7 @@ class _Layer(nn.Module):
         )
 
     def forward(self, hidden, residual, positions, attention):
-        # The layer's table entry supplies the write addresses; an entry
+        # The layer's table entry supplies the slot mapping; an entry
         # without them publishes nothing.
         values = hidden.new_zeros((hidden.shape[0], 1, 1)) + self.scale
         self.attention.update_cache(values, values, attention)

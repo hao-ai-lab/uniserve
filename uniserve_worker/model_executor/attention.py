@@ -6,7 +6,7 @@ whose logical page spans ``units_per_page`` units owns that many numerical
 block tables (see ``uniserve.runtime.kv_cache``), so one call's attention
 is an ``AttentionBatch`` with one entry per numerical table. Every entry
 shares the call's query and prefix lengths; entries differ in their pages,
-block size, write addresses and, for a history-windowed group, the first page
+block size, slot mapping and, for a history-windowed group, the first page
 each row stages.
 
 This module validates one homogeneous group of ``AttentionRow`` values

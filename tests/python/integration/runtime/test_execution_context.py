@@ -125,7 +125,7 @@ def test_device_lengths_drive_current_attention_values(
                 changed = indices(counts)
                 batch.queries.values.copy_(changed.queries.values)
                 batch.queries.offsets.copy_(changed.queries.offsets)
-                batch.write_indices.copy_(changed.write_indices)
+                batch.slot_mapping.copy_(changed.slot_mapping)
                 value.mul_(0.75)
                 context.bind_attention(AttentionBatch.single(batch))
                 actual = (
@@ -289,7 +289,7 @@ def test_nested_execution_contexts_keep_prefixes_independent():
             torch.testing.assert_close(
                 module(two, AttentionBatch.single(batch)), two
             )
-        readonly = replace(batch, write_indices=None)
+        readonly = replace(batch, slot_mapping=None)
         a.bind_attention(AttentionBatch.single(readonly))
         torch.testing.assert_close(
             module(two, AttentionBatch.single(readonly)), one
@@ -482,7 +482,7 @@ def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
             changed = lengths(counts)
             batch.queries.values.copy_(changed.queries.values)
             batch.queries.offsets.copy_(changed.queries.offsets)
-            batch.write_indices.copy_(changed.write_indices)
+            batch.slot_mapping.copy_(changed.slot_mapping)
             torch.testing.assert_close(
                 layer(q, k, v, AttentionBatch.single(batch)),
                 expected(counts),

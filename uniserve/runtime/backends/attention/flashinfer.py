@@ -687,9 +687,9 @@ class _FlashInfer(_Operator):
 
         if (
             isinstance(batch, (PagedInput, SegmentedInput))
-            and batch.write_indices is not None
+            and batch.slot_mapping is not None
         ):
-            self.update_cache(k, v, indices=batch.write_indices)
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
 
         if not q.numel():
             return out

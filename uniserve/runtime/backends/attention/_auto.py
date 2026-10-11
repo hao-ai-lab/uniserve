@@ -389,9 +389,9 @@ class _Automatic(_Operator):
             )
         # A later run may read rows an earlier run of the same sequence
         # writes, so the batch's complete write commits before any run; the
-        # runs carry no write addresses.
-        if batch.write_indices is not None:
-            self.update_cache(k, v, indices=batch.write_indices)
+        # runs carry no slot mapping.
+        if batch.slot_mapping is not None:
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
         for rows, _, run in causal_runs(batch):
             if rows.start == rows.stop:
                 continue

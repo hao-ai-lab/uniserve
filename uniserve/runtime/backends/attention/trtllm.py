@@ -115,8 +115,8 @@ class _TRTLLM(_Operator):
         self._validate(q, k, v, batch, out)
 
         if q.shape[0] == 0:
-            if batch.write_indices is not None:
-                self.update_cache(k, v, indices=batch.write_indices)
+            if batch.slot_mapping is not None:
+                self.update_cache(k, v, slot_mapping=batch.slot_mapping)
             return out
 
         if q.ndim != 3 or (
@@ -153,10 +153,10 @@ class _TRTLLM(_Operator):
             else torch.empty(out.shape, dtype=out.dtype, device=out.device)
         )
 
-        if len(set(batch.causal)) > 1 and batch.write_indices is not None:
+        if len(set(batch.causal)) > 1 and batch.slot_mapping is not None:
             # Causal runs slice query domains. Commit the complete write once
-            # before those runs, whose inputs then carry no write indices.
-            self.update_cache(k, v, indices=batch.write_indices)
+            # before those runs, whose inputs then carry no slot mapping.
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
 
         for query_slice, _, run in causal_runs(batch):
             query = q[query_slice]

@@ -1,7 +1,7 @@
 """Device staging of attention columns for multi-token request rows.
 
 One Triton launch fills, for every numerical block table, the staged units,
-first staged pages and per-token cache write addresses of a call's rows from
+first staged pages and per-token cache slot mapping of a call's rows from
 the request slots' resident tables (``BlockTables``), together with the
 call's shared query and prefix lengths and offsets. It extends the decode
 gather of ``_decode_inputs`` to rows of any length, prefill chunks, canvas
@@ -49,7 +49,7 @@ if triton is not None:
         query_lengths,
         query_offsets,
         prefix_offsets,
-        write_indices,
+        slot_mapping,
         rows,
         tokens,
         cell_programs,
@@ -63,7 +63,7 @@ if triton is not None:
         block_table_stride: tl.constexpr,
         block_table_row_stride: tl.constexpr,
         start_page_stride: tl.constexpr,
-        write_stride: tl.constexpr,
+        slot_stride: tl.constexpr,
         row_block: tl.constexpr,
         block: tl.constexpr,
     ):
@@ -194,7 +194,7 @@ if triton is not None:
                 -1,
             )
             tl.store(
-                write_indices + table * write_stride + token,
+                slot_mapping + table * slot_stride + token,
                 address,
                 mask=live,
             )
@@ -215,7 +215,7 @@ def gather_request_rows(
     query_lengths: torch.Tensor,
     query_offsets: torch.Tensor,
     prefix_offsets: torch.Tensor,
-    write_indices: torch.Tensor,
+    slot_mapping: torch.Tensor,
 ) -> None:
     """Stage every table's columns of ``rows`` request rows.
 
@@ -230,7 +230,7 @@ def gather_request_rows(
     past a row's staged pages) from the first page each row stages (page
     zero, or for a windowed table ``max(0, prefix - window) //
     block_size``) into ``start_pages[t]``, and each token's append address
-    into ``write_indices[t]`` (-1 for rows that do not write); and, shared by
+    into ``slot_mapping[t]`` (-1 for rows that do not write); and, shared by
     all tables, the lengths and offsets. ``request_unit_tables[t, slot]``
     holds the slot's units from its installed start page
     ``request_start_pages[group, slot]`` on.
@@ -255,7 +255,7 @@ def gather_request_rows(
         query_lengths,
         query_offsets,
         prefix_offsets,
-        write_indices,
+        slot_mapping,
     )
     device = columns.device
     if any(value.device != device for value in tensors):
@@ -270,10 +270,10 @@ def gather_request_rows(
         or token_count < 1
         or int(width) < 1
         or int(width) > int(block_tables.shape[2])
-        or token_count > int(write_indices.shape[1])
+        or token_count > int(slot_mapping.shape[1])
         or int(columns.numel())
         < row_columns_size(
-            int(block_tables.shape[1]), tables, int(write_indices.shape[1])
+            int(block_tables.shape[1]), tables, int(slot_mapping.shape[1])
         )
     ):
         raise ValueError("request row staging exceeds its column capacity")
@@ -290,7 +290,7 @@ def gather_request_rows(
             query_lengths,
             query_offsets,
             prefix_offsets,
-            write_indices,
+            slot_mapping,
             rows=count,
             tokens=token_count,
             width=int(width),
@@ -316,7 +316,7 @@ def gather_request_rows(
         block_table_stride=int(block_tables.stride(0)),
         block_table_row_stride=int(block_tables.stride(1)),
         start_page_stride=int(start_pages.stride(0)),
-        write_stride=int(write_indices.stride(0)),
+        slot_stride=int(slot_mapping.stride(0)),
         row_block=triton.next_power_of_2(stride),
         block=block,
         num_warps=4,
@@ -334,7 +334,7 @@ def _gather_rows(
     query_lengths,
     query_offsets,
     prefix_offsets,
-    write_indices,
+    slot_mapping,
     *,
     rows,
     tokens,
@@ -383,7 +383,7 @@ def _gather_rows(
         unit = request_unit_tables[
             table, slots[owner], column.clamp(0, request_width - 1)
         ].to(torch.int64)
-        write_indices[table, :tokens] = torch.where(
+        slot_mapping[table, :tokens] = torch.where(
             valid & (unit >= 0),
             unit * block_size + position % block_size,
             torch.full_like(unit, -1),

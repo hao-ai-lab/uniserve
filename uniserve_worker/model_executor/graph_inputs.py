@@ -471,7 +471,7 @@ def pad_text(batch, rows, tokens, widths, decode, *, staging):
     """Borrow a fixed bucket and make padding inert, including cache writes.
 
     Physical unit zero is valid storage. Padding queries read disposable
-    values but never write a unit: their write indices are -1, their start
+    values but never write a unit: their slot mapping is -1, their start
     pages zero, and their results are discarded. Prefill padding belongs to
     one additional numerical sequence. ``widths[t]`` is the staged width of
     numerical table ``t``.
@@ -531,7 +531,7 @@ def pad_text(batch, rows, tokens, widths, decode, *, staging):
     )
 
     # Tables staged together share one prefix column, padded once; every
-    # table's page columns and write addresses pad with one launch each.
+    # table's page columns and slot mapping pad with one launch each.
     staging.clear_padding(
         live_rows=live_rows, rows=rows, live_tokens=live_tokens, tokens=tokens
     )
@@ -563,15 +563,15 @@ def pad_text(batch, rows, tokens, widths, decode, *, staging):
             )
             padded_prefixes[id(entry.prefixes.values)] = prefixes
 
-        writes = entry.write_indices
-        if writes is not None:
-            writes = _fixed_view(writes, (tokens,))
+        slot_mapping = entry.slot_mapping
+        if slot_mapping is not None:
+            slot_mapping = _fixed_view(slot_mapping, (tokens,))
 
         entries[number] = PagedInput(
             shared,
             prefixes,
             BlockTable(table, blocks.block_size, start, start_host),
-            writes,
+            slot_mapping,
             entry.causal + (causal,) * extra,
             flags,
         )
@@ -641,10 +641,10 @@ def restore_writes(batch, cache: KVCache | None):
     """Snapshot the cache blocks the batch writes and return its restorer.
 
     Blocks are snapshotted only when ``cache`` is given and the attention
-    input has write indices. Each block is saved whole, quantization buffers
+    input has a slot mapping. Each block is saved whole, quantization buffers
     and initialized flags included, along with ``decode_force_finish`` when
     present, so capturing or warming a call leaves the live prefix
-    unchanged. Reading write addresses to the host happens here, during
+    unchanged. Reading the slot mapping on the host happens here, during
     startup preparation, outside graph capture.
     """
     snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -653,14 +653,14 @@ def restore_writes(batch, cache: KVCache | None):
         for number, entry in attention.entries.items():
             if (
                 not isinstance(entry, (PagedInput, SegmentedInput))
-                or entry.write_indices is None
+                or entry.slot_mapping is None
             ):
                 continue
             blocks = tuple(
                 sorted(
                     {
                         int(value) // entry.block_table.block_size
-                        for value in entry.write_indices.cpu().tolist()
+                        for value in entry.slot_mapping.cpu().tolist()
                         if value >= 0
                     }
                 )

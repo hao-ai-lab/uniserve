@@ -220,7 +220,7 @@ def test_staging_builds_one_entry_per_table_from_each_row_start():
             assert entry.block_table.start_page.tolist() == [2]
             assert entry.block_table.start_page_host == (2,)
             assert entry.block_table.indices.tolist() == [[unit]]
-            assert entry.write_indices.tolist() == [
+            assert entry.slot_mapping.tolist() == [
                 unit * 16 + offset for offset in range(8, 12)
             ]
         # The full table stages every held page from page zero.
@@ -228,7 +228,7 @@ def test_staging_builds_one_entry_per_table_from_each_row_start():
         assert full.block_table.block_size == 32
         assert full.block_table.start_page is None
         assert full.block_table.indices.tolist() == [[1, 2]]
-        assert full.write_indices.tolist() == [
+        assert full.slot_mapping.tolist() == [
             2 * 32 + offset for offset in range(8, 12)
         ]
         assert full.prefixes.values.tolist() == [40]
@@ -316,7 +316,7 @@ def test_indexed_decode_gathers_every_table_in_one_staging():
                 entry.block_table.indices[:, :width].tolist()
                 == other.block_table.indices.tolist()
             )
-            assert entry.write_indices.tolist() == other.write_indices.tolist()
+            assert entry.slot_mapping.tolist() == other.slot_mapping.tolist()
             assert entry.prefixes.values.tolist() == list(lengths[::-1])
             if other.block_table.start_page is None:
                 assert entry.block_table.start_page is None

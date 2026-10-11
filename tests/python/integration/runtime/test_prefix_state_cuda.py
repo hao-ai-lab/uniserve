@@ -25,12 +25,12 @@ def _reject_invalid_index(rank, index):
     )
     state = cache.state("attention")
     key = torch.ones(1, 1, 16, device="cuda")
-    indices = torch.tensor([0], device="cuda")
-    state.update(key, key, indices=indices)
+    slot_mapping = torch.tensor([0], device="cuda")
+    state.update(key, key, slot_mapping=slot_mapping)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        state.update(key, key, indices=indices)
-    indices.fill_(index)
+        state.update(key, key, slot_mapping=slot_mapping)
+    slot_mapping.fill_(index)
     graph.replay()
     with pytest.raises(RuntimeError, match="device-side assert"):
         torch.cuda.synchronize()
@@ -98,15 +98,15 @@ def test_state_updates_replay_addresses_and_first_write_scales(quantized):
         device="cuda",
     )
     value = -key.clone()
-    indices = torch.tensor([0, 1, -1], device="cuda")
-    state.update(key, value, indices=indices)
+    slot_mapping = torch.tensor([0, 1, -1], device="cuda")
+    state.update(key, value, slot_mapping=slot_mapping)
     cache.zero_units((0, 1, 2))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        state.update(key, value, indices=indices)
+        state.update(key, value, slot_mapping=slot_mapping)
     for slots in ((4, 5, -1), (-1, 8, 0)):
         cache.zero_units((0, 1, 2))
-        indices.copy_(torch.tensor(slots, device="cuda"))
+        slot_mapping.copy_(torch.tensor(slots, device="cuda"))
         graph.replay()
         torch.cuda.synchronize()
         expected = torch.zeros(12, 2, 2)
@@ -144,7 +144,7 @@ def test_state_updates_replay_addresses_and_first_write_scales(quantized):
     if quantized:
         # Reuse an initialized block and grow its scale on the captured path.
         original = state.read((0,), start=0, length=1)[0].clone()
-        indices.copy_(torch.tensor([1, -1, -1], device="cuda"))
+        slot_mapping.copy_(torch.tensor([1, -1, -1], device="cuda"))
         key[0].fill_(3584.0)
         value[0].fill_(-3584.0)
         graph.replay()

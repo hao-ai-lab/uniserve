@@ -258,7 +258,7 @@ def test_indexed_decode_stages_live_tokens_cache_addresses_and_finish_controls()
                 lengths[slot - 1] for slot in order
             ]
             assert attention.queries.offsets.cpu().tolist() == [0, 1, 2]
-            assert attention.write_indices.cpu().tolist() == [
+            assert attention.slot_mapping.cpu().tolist() == [
                 (13 if slot == 1 else 10) + iteration for slot in order
             ]
             assert batch.decode_force_finish.cpu().tolist() == [
