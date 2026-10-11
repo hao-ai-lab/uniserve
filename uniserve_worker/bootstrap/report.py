@@ -32,9 +32,7 @@ from uniserve.model import (
     VideoDenoiser,
     VideoPostprocessor,
 )
-from uniserve.nn import Linear
 from uniserve.processing import ImageProcessor
-from uniserve.quantization import QuantizedTensor
 from uniserve.runtime.prefix_cache import Planes
 from uniserve.tensors import BufferConfig
 from uniserve_worker.bootstrap.cache import (
@@ -158,14 +156,12 @@ def build_worker_layout(
     worker_config: WorkerConfig,
     *,
     image_processor: ImageProcessor | None = None,
-    model_name: str | None = None,
     queue_depth: int = 1,
     completion_payload_bytes: int = 1 << 20,
     endpoint: WorkerEndpoint | None = None,
     capacity_group: Communicator | None = None,
     transfer_backends: tuple[str, ...] = ("local",),
     components: tuple[tuple[str, ComponentConfig], ...] = (),
-    attention_backend: str = "",
     bindings: Mapping[str, ComponentBinding] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> WorkerLayout:
@@ -200,11 +196,6 @@ def build_worker_layout(
         else supported_calls(model, (name for name, _ in components))
     )
 
-    model_name = (
-        f"{type(model).__module__}.{type(model).__qualname__}"
-        if model_name is None
-        else model_name
-    )
     endpoint = endpoint or WorkerEndpoint.local(rank=int(worker_config.rank))
 
     if state_buffers is None:
@@ -220,7 +211,6 @@ def build_worker_layout(
             worker_config,
             state_buffers=state_buffers,
             bindings=bindings,
-            model_name=model_name,
             queue_depth=queue_depth,
             completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
@@ -230,7 +220,6 @@ def build_worker_layout(
             model,
             worker_config,
             image_processor=image_processor,
-            model_name=model_name,
             queue_depth=queue_depth,
             completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
@@ -255,33 +244,6 @@ def build_worker_layout(
     held = tuple(name for name, _ in components)
     info = replace(
         layout.info,
-        model_dtype=worker_config.model_dtype,
-        attention_backend=attention_backend
-        or worker_config.attention_backend
-        or "auto",
-        # Loading owns quantization selection. Report actual storage formats,
-        # independently of parameter names and module structure.
-        weight_formats=tuple(
-            sorted(
-                {
-                    value.quantizer.format
-                    if isinstance(value, QuantizedTensor)
-                    else "dense"
-                    for value in model.parameters()
-                }
-            )
-        ),
-        activation_formats=tuple(
-            sorted(
-                {
-                    child.input_quantizer.format
-                    if child.input_quantizer is not None
-                    else "dense"
-                    for child in model.modules()
-                    if isinstance(child, Linear)
-                }
-            )
-        ),
         supported_calls=tuple(code for code in CALL_KINDS if code in supported),
         # Advertised routing and advertised work describe the same placement:
         # a call this worker will not accept is a call it does not route.
@@ -315,7 +277,6 @@ def _token_worker_layout(
     worker_config: WorkerConfig,
     *,
     image_processor: ImageProcessor | None,
-    model_name: str,
     queue_depth: int,
     completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
@@ -702,7 +663,6 @@ def _token_worker_layout(
         )
     )
     info = WorkerInfo(
-        model_name=model_name,
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
@@ -790,7 +750,6 @@ def _request_tensor_worker_layout(
     worker_config: WorkerConfig,
     *,
     state_buffers: Mapping[str, BufferConfig],
-    model_name: str,
     queue_depth: int,
     completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
@@ -813,7 +772,6 @@ def _request_tensor_worker_layout(
     builder = media_builder(model, worker_config)
 
     info = WorkerInfo(
-        model_name=model_name,
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),

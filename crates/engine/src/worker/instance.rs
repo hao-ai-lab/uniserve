@@ -518,7 +518,7 @@ impl WorkerGroup {
     ///
     /// Every rank must report valid info naming its launched rank, the group's
     /// world size and worker identity, and must agree with rank 0 apart from
-    /// rank-specific fields and numerical settings. The muxer must run on
+    /// rank-specific fields. The muxer must run on
     /// the head's host, and the ranks' KV regions must cover every layer's KV
     /// heads without a gap. Once all checks pass, no rank's startup may be
     /// cancelled and every rank this process started must still be running.
@@ -533,14 +533,9 @@ impl WorkerGroup {
             u32::try_from(n).context("process world size exceeds the IPC representation")?;
 
         // `info` starts as rank 0's report and becomes the group's; `canonical`
-        // is the reference every rank is compared with, without the numerical
-        // settings ranks may differ in.
+        // is the reference every rank is compared with.
         let mut info = workers[0].info().clone();
         let mut canonical = info.clone();
-        canonical.model_dtype.clear();
-        canonical.attention_backend.clear();
-        canonical.weight_formats.clear();
-        canonical.activation_formats.clear();
 
         // A rank's product storage follows the components it holds, which an
         // asymmetric placement makes rank-specific: a rank that imports a
@@ -591,13 +586,6 @@ impl WorkerGroup {
                     }
                 }
             }
-            // Placement may give ranks different numerical storage; replacement
-            // validation (`validate_replacement_info`) compares each rank with
-            // its own predecessor instead.
-            normalized.model_dtype.clear();
-            normalized.attention_backend.clear();
-            normalized.weight_formats.clear();
-            normalized.activation_formats.clear();
             anyhow::ensure!(
                 normalized == canonical,
                 "physical rank {rank} worker info disagree with rank 0"

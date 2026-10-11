@@ -323,16 +323,14 @@ impl VideoDenoiserInfo {
     }
 }
 
-/// Post-load worker geometry, limits, supported work, and model identity.
+/// Post-load worker geometry, limits and supported work.
 ///
 /// [`WorkerInfo::validate`] checks only internal consistency. The engine's
 /// `RankProcess::finish_startup` additionally checks the description against
-/// the launch: `queue_depth`, rank and world size, component configuration,
-/// and non-empty resolved numerical settings.
+/// the launch: `queue_depth`, rank and world size, and component
+/// configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerInfo {
-    /// Loaded model identity.
-    pub model_name: String,
     /// Model-declared finite terminal-media computation, when supported.
     #[serde(default)]
     pub media_components: std::collections::BTreeMap<MediaCall, String>,
@@ -356,18 +354,6 @@ pub struct WorkerInfo {
     pub fabric_handles: bool,
     /// Number of physical members in this Worker.
     pub world_size: u32,
-    /// Resolved compute dtype, compared per rank on restart.
-    #[serde(default)]
-    pub model_dtype: String,
-    /// Resolved attention selection, compared per rank on restart.
-    #[serde(default)]
-    pub attention_backend: String,
-    /// Numerical weight storage formats present on this rank.
-    #[serde(default)]
-    pub weight_formats: Vec<String>,
-    /// Resolved activation quantization formats on this physical rank.
-    #[serde(default)]
-    pub activation_formats: Vec<String>,
     /// Finalized component membership and logical degrees.
     #[serde(default)]
     pub components: Vec<ComponentInfo>,
@@ -590,9 +576,6 @@ impl WorkerInfo {
                 "worker info declare incomplete latent pool capacity"
             );
         }
-
-        // Model identity remains mandatory independently of enabled resources.
-        ensure_valid!(!self.model_name.is_empty(), "worker model name is empty");
         Ok(())
     }
 }
@@ -601,7 +584,6 @@ impl Default for WorkerInfo {
     /// Returns a valid single-rank autoregressive worker description.
     fn default() -> Self {
         Self {
-            model_name: "model".to_owned(),
             media_components: Default::default(),
             num_inference_steps: 0,
             video_denoiser: None,
@@ -616,10 +598,6 @@ impl Default for WorkerInfo {
             world_size: 1,
             device: "cpu".into(),
             transfer_backends: vec!["local".into()],
-            model_dtype: String::new(),
-            attention_backend: String::new(),
-            weight_formats: Vec::new(),
-            activation_formats: Vec::new(),
             components: Vec::new(),
             supported_calls: vec![
                 CallKind::Forward(ForwardMode::Prefill),

@@ -224,7 +224,6 @@ table MediaComponent { call:MediaCall; component:string; }
 /// `WorkerInfo::validate` checks internal consistency; the engine checks it
 /// against the launch.
 table WorkerInfo {
-  model_name:string;
   endpoint:WorkerEndpoint;
   device:string;
   transfer_backends:[string];
@@ -233,10 +232,6 @@ table WorkerInfo {
   /// startup rather than failing on its first publication.
   fabric_handles:bool = false;
   world_size:uint = 1;
-  model_dtype:string;
-  attention_backend:string;
-  weight_formats:[string];
-  activation_formats:[string];
   components:[ComponentInfo];
   supported_calls:[CallKind];
   queue_depth:uint;

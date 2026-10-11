@@ -1597,9 +1597,6 @@ fn worker_info_round_trips() {
         let count = config.world_size().unwrap();
         let info = WorkerInfo {
             world_size: count as u32,
-            model_dtype: "bfloat16".into(),
-            attention_backend: "torch".into(),
-            weight_formats: vec!["dense".into()],
             kv_cache: Some(KvCacheInfo {
                 groups: vec![KvCacheGroup {
                     layer_ids: (11..20).collect(),
@@ -1985,7 +1982,6 @@ fn full_caps() -> WorkerInfo {
         max_unresolved_calls: 3,
         latent_page_units: 64,
         latent_pages: 17,
-        model_name: "test-model".into(),
         ..WorkerInfo::default()
     }
 }

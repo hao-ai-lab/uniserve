@@ -23,9 +23,7 @@ def test_expert_participant_advertises_no_request_work() -> None:
     """A collective peer is distinct from a request admission target."""
     model = nn.ModuleList([FusedMoE(4, 256, 128, top_k=2, activation="silu")])
     info = build_worker_layout(
-        model,
-        WorkerConfig(role="experts", graph_policy="off"),
-        model_name="uniserve_models.qwen3.Model",
+        model, WorkerConfig(role="experts", graph_policy="off")
     ).info
     reported = WorkerInfo.from_mapping(info.to_mapping())
     assert reported.supported_calls == ()
@@ -70,7 +68,6 @@ def test_worker_info_reports_schedulable_work_and_bounds(
     assert info["max_batch_calls"] > 0
     assert info["max_unresolved_calls"] > 0
     assert info["request_slots"] > 0
-    assert info["model_name"]
 
 
 def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (

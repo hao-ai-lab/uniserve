@@ -1154,12 +1154,10 @@ fn error_call_from_table(call: fbs::ErrorCallIdentity<'_>) -> CodecResult<ErrorC
 
 /// Decodes worker capabilities and validates them with `WorkerInfo::validate`.
 ///
-/// Absent `model_dtype` and `attention_backend` decode as empty strings, and
-/// absent optional vectors as empty. A media call bound more than once is a
-/// malformed frame.
+/// Absent optional vectors decode as empty. A media call bound more than once
+/// is a malformed frame.
 fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
     let info = WorkerInfo {
-        model_name: required_str(info.model_name(), "info.model_name")?,
         endpoint: endpoint_from_table(info.endpoint().context("info has no endpoint")?)?,
         device: required_str(info.device(), "info.device")?,
         fabric_handles: info.fabric_handles(),
@@ -1170,16 +1168,6 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             .map(str::to_owned)
             .collect(),
         world_size: info.world_size(),
-        model_dtype: info.model_dtype().unwrap_or_default().to_owned(),
-        attention_backend: info.attention_backend().unwrap_or_default().to_owned(),
-        weight_formats: info
-            .weight_formats()
-            .map(|values| values.iter().map(str::to_owned).collect())
-            .unwrap_or_default(),
-        activation_formats: info
-            .activation_formats()
-            .map(|values| values.iter().map(str::to_owned).collect())
-            .unwrap_or_default(),
         components: info
             .components()
             .map(|items| {

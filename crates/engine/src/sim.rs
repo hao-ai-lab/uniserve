@@ -508,7 +508,6 @@ impl SimEngine {
             encoder_entry_bytes: 256 << 20,
             max_batch_calls: 1024,
             max_unresolved_calls: 2,
-            model_name: "sim".to_owned(),
             ..WorkerInfo::default()
         };
         Self {

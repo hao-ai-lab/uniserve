@@ -1436,30 +1436,11 @@ fn component_info<'a>(
 }
 
 fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::WorkerInfo<'a>> {
-    let model_name = Some(b.create_string(&v.model_name));
     let endpoint = Some(endpoint(b, &v.endpoint));
     let device = Some(b.create_string(&v.device));
     let transfer_backends = {
         let items = v
             .transfer_backends
-            .iter()
-            .map(|s| b.create_string(s))
-            .collect::<Vec<_>>();
-        Some(b.create_vector(&items))
-    };
-    let model_dtype = Some(b.create_string(&v.model_dtype));
-    let attention_backend = Some(b.create_string(&v.attention_backend));
-    let weight_formats = {
-        let items = v
-            .weight_formats
-            .iter()
-            .map(|s| b.create_string(s))
-            .collect::<Vec<_>>();
-        Some(b.create_vector(&items))
-    };
-    let activation_formats = {
-        let items = v
-            .activation_formats
             .iter()
             .map(|s| b.create_string(s))
             .collect::<Vec<_>>();
@@ -1529,16 +1510,11 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
     fbs::WorkerInfo::create(
         b,
         &fbs::WorkerInfoArgs {
-            model_name,
             endpoint,
             device,
             transfer_backends,
             fabric_handles: v.fabric_handles,
             world_size: v.world_size,
-            model_dtype,
-            attention_backend,
-            weight_formats,
-            activation_formats,
             components,
             supported_calls,
             queue_depth: v.queue_depth,

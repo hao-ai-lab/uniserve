@@ -64,9 +64,8 @@ impl ExecutorInfo {
     /// Validates and constructs capability information for multiple pools.
     ///
     /// Fails when `pools` is empty, repeats a pool id, contains a record that
-    /// fails `WorkerInfo::validate`, mixes models or checkpoint identities, or
-    /// holds replicas of one component that expose different numerical
-    /// outputs.
+    /// fails `WorkerInfo::validate`, or holds replicas of one component that
+    /// expose different numerical outputs.
     pub fn from_workers(pools: Vec<(WorkerId, WorkerInfo)>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !pools.is_empty(),
@@ -74,14 +73,9 @@ impl ExecutorInfo {
         );
         let mut ids = std::collections::HashSet::new();
         let mut components: BTreeMap<&str, &uniserve_worker_ipc::ComponentInfo> = BTreeMap::new();
-        let model_name = &pools[0].1.model_name;
         for (id, info) in &pools {
             anyhow::ensure!(ids.insert(id), "executor info repeats pool id {id}");
             info.validate()?;
-            anyhow::ensure!(
-                &info.model_name == model_name,
-                "worker {id} loaded a different model"
-            );
             for component in &info.components {
                 if let Some(other) = components.get(component.name.as_str()) {
                     anyhow::ensure!(
@@ -208,7 +202,7 @@ impl ExecutorInfo {
     /// A single pool's record is returned unchanged. With several pools, the
     /// record is cloned from the first pool that serves a KV forward call (or
     /// the first pool when none does), so fields the merge does not set, such
-    /// as the model identity and endpoint, come from that pool. Call support and
+    /// as the endpoint, come from that pool. Call support and
     /// media routing are unions, queue depth is a sum, and most batch, slot,
     /// and storage limits take the smallest nonzero value any pool reports.
     /// The exceptions are the KV cache, whose layout the KV pools must share

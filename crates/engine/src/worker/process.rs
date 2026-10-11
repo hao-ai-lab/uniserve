@@ -930,10 +930,9 @@ impl RankProcess {
     /// The rank answers the info request only once its model is built and
     /// warmed up, so once the request is sent this blocks for the rank's
     /// whole preparation, bounded by the rank's liveness and the startup
-    /// cancellation flag rather than a deadline. The report must be valid,
-    /// match the launched queue depth, rank, world size, and components, and
-    /// state the resolved model dtype and attention backend. On success it
-    /// becomes `info`; on failure `info` is unchanged.
+    /// cancellation flag rather than a deadline. The report must be valid
+    /// and match the launched queue depth, rank, world size, and components.
+    /// On success it becomes `info`; on failure `info` is unchanged.
     pub(crate) fn finish_startup(&mut self) -> anyhow::Result<()> {
         let message_id = self.alloc_call_id();
         let mut request = WorkerRequest::info();
@@ -982,10 +981,6 @@ impl RankProcess {
                 .collect::<std::collections::BTreeMap<_, _>>()
                 == self.expected_components,
             "worker resolved component configuration disagrees with configuration"
-        );
-        anyhow::ensure!(
-            !info.model_dtype.is_empty() && !info.attention_backend.is_empty(),
-            "worker omitted resolved numerical settings"
         );
 
         self.check_worker("Worker startup")?;

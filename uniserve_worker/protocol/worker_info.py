@@ -372,7 +372,6 @@ class WorkerInfo:
         host_lane_capacity: Concurrent host-lane tasks this rank admits.
     """
 
-    model_name: str
     endpoint: WorkerEndpoint
     world_size: int
     supported_calls: tuple[CallKind, ...]
@@ -390,10 +389,6 @@ class WorkerInfo:
     encoder_entry_bytes: int = 0
     max_prefill_calls: int = 0
     max_decode_calls: int = 0
-    model_dtype: str = ""
-    attention_backend: str = ""
-    weight_formats: tuple[str, ...] = ()
-    activation_formats: tuple[str, ...] = ()
     components: tuple[ComponentInfo, ...] = ()
     device: str = "cpu"
     transfer_backends: tuple[str, ...] = ("local",)
@@ -446,11 +441,10 @@ class WorkerInfo:
 
         Covers transfer backends, scheduling bounds, the endpoint rank, the
         KV cache that autoregressive calls require, pool sizes, supported and
-        media calls, latent pool completeness, the model name, and the
-        checkpoint identity format. The KV layout validates itself in
-        `KVCacheInfo`. The worker-ipc crate's `WorkerInfo::validate` checks
-        most of the same relations; it also checks the components (unique
-        names, membership within the world, and parallel degrees) and
+        media calls, and latent pool completeness. The KV layout validates
+        itself in `KVCacheInfo`. The worker-ipc crate's `WorkerInfo::validate`
+        checks most of the same relations; it also checks the components
+        (unique names, membership within the world, and parallel degrees) and
         refuses an empty checkpoint identity from any model but the
         weightless stub.
         """
@@ -541,9 +535,6 @@ class WorkerInfo:
                     "worker info declares incomplete latent pool capacity"
                 )
 
-        if not self.model_name:
-            raise invalid_descriptor("worker model name is empty")
-
     @classmethod
     def from_mapping(cls, value: object, where: str = "info") -> WorkerInfo:
         """Decode a worker capability advertisement from IPC data.
@@ -570,32 +561,12 @@ class WorkerInfo:
             else VideoDenoiserInfo.from_mapping(
                 data["video_denoiser"], f"{where}.video_denoiser"
             ),
-            model_dtype=_str(
-                data.get("model_dtype", ""), f"{where}.model_dtype"
-            ),
-            attention_backend=_str(
-                data.get("attention_backend", ""), f"{where}.attention_backend"
-            ),
-            activation_formats=tuple(
-                _str(value, f"{where}.activation_formats")
-                for value in _seq(
-                    data.get("activation_formats", ()),
-                    f"{where}.activation_formats",
-                )
-            ),
-            weight_formats=tuple(
-                _str(value, f"{where}.weight_formats")
-                for value in _seq(
-                    data.get("weight_formats", ()), f"{where}.weight_formats"
-                )
-            ),
             components=tuple(
                 ComponentInfo.from_mapping(item, f"{where}.components[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("components", ()), f"{where}.components")
                 )
             ),
-            model_name=_str(data.get("model_name", ""), f"{where}.model_name"),
             endpoint=WorkerEndpoint.from_mapping(
                 data.get("endpoint"), f"{where}.endpoint"
             ),
@@ -678,16 +649,11 @@ class WorkerInfo:
             "video_denoiser": None
             if self.video_denoiser is None
             else self.video_denoiser.to_mapping(),
-            "model_name": self.model_name,
             "endpoint": self.endpoint.to_mapping(),
             "device": self.device,
             "transfer_backends": list(self.transfer_backends),
             "fabric_handles": self.fabric_handles,
             "world_size": self.world_size,
-            "model_dtype": self.model_dtype,
-            "attention_backend": self.attention_backend,
-            "weight_formats": list(self.weight_formats),
-            "activation_formats": list(self.activation_formats),
             "components": [
                 component.to_mapping() for component in self.components
             ],
