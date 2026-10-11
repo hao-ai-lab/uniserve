@@ -19,9 +19,10 @@ A readout reading more slots than the largest readout tail graph holds
 replays the tails in chunks and returns the eager pass's log-probabilities.
 A model whose final layer exchanges tokens across an expert group keeps its
 readout tail eager.
-After startup, a call of more canvases than every bucket fails instead of
-running eagerly. A worker whose KV unit pool holds fewer requests than its
-call bound starts, and replays calls of as many canvases as the pool holds.
+A call of more canvases than every bucket runs eagerly and returns the
+values a replayed call of the same canvas returns. A worker whose KV unit
+pool holds fewer requests than its call bound starts, and replays calls of
+as many canvases as the pool holds.
 """
 
 from __future__ import annotations
@@ -57,7 +58,6 @@ from uniserve_worker.bootstrap.capacity import (
     input_buffer_config,
 )
 from uniserve_worker.config.execution import CanvasSampling
-from uniserve_worker.errors import ResourceError
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.input_batch import (
     CanvasRow,
@@ -679,15 +679,35 @@ def test_a_readout_answers_every_slot_of_many_canvases(tmp_path):
 
 @SM100
 @torch.inference_mode()
-def test_a_call_exceeding_the_configured_row_capacity_fails(tmp_path):
-    """Calls beyond the deployment's row capacity are rejected."""
+def test_a_call_exceeding_the_largest_bucket_runs_eagerly(tmp_path):
+    """More canvases than the largest bucket run eagerly, with equal values.
+
+    One canvas replays a graph. The same canvas read by ``SLOTS + 1`` rows,
+    more than the largest bucket holds, runs without a graph, and each of
+    its rows returns the replayed canvas's values.
+    """
     _checkpoint(tmp_path)
     with _worker(tmp_path) as (runner, manager, slots):
         _install(manager, 1)
         _, readout, _ = _scenario(slots)
-        rows = (readout[1],) * (SLOTS + 1)
-        with pytest.raises(ResourceError):
-            _run(runner, manager, rows, ForwardMode.TOKEN_DENOISING)
+        replayed = _run(
+            runner, manager, (readout[1],), ForwardMode.TOKEN_DENOISING
+        )
+        assert replayed.stats.cuda_graph_replays == 1
+
+        wide = _run(
+            runner,
+            manager,
+            (readout[1],) * (SLOTS + 1),
+            ForwardMode.TOKEN_DENOISING,
+        )
+        assert wide.stats.cuda_graph_replays == 0
+        assert wide.stats.cuda_graph_runtime_mode_counts == {"eager": 1}
+        (expected,) = _values(replayed)
+        values = _values(wide)
+        assert len(values) == SLOTS + 1
+        for actual in values:
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @SM100
