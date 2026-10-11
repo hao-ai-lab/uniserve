@@ -36,7 +36,7 @@ from uniserve.distributed.mesh import Communicator
 from uniserve.model import CausalLM, VideoPostprocessor
 from uniserve.nn import Linear
 from uniserve.processing import FlowPrompt, ImageProcessor
-from uniserve.quantization import QuantizedTensor, Quantizer
+from uniserve.quantization import QuantizedTensor
 from uniserve.runtime import EventPool, KVCache
 from uniserve.runtime.device import canonical_device, device_storage_budget
 from uniserve.runtime.process_groups import (
@@ -46,17 +46,13 @@ from uniserve.runtime.process_groups import (
 from uniserve.runtime.resources import close_resources
 from uniserve_worker.bootstrap.cache import (
     group_layers,
-    page_size,
-    plan_cache,
     resident_width,
     resolve_page_size,
-    storage,
 )
 from uniserve_worker.bootstrap.capacity import (
     check_startup_storage,
     device_total_bytes,
     graph_table_widths,
-    latent_pool_plan,
     resolve_request_capacity,
 )
 from uniserve_worker.bootstrap.components import (
@@ -540,24 +536,16 @@ class Worker:
                         "KV model worker has no KV-cache configuration"
                     )
 
-                # The pool's planes follow the same plan that sized the
-                # advertised unit bytes; an FP8 cache passes each layer an
-                # FP8 `Quantizer` in place of a storage dtype.
-                planes = plan_cache(text, worker_config)
-                dtype, fp8 = storage(worker_config)
+                # The pool is allocated from the plan that sized the
+                # advertised units, with the granted unit count.
+                planes = layout.planes
+                assert planes is not None
                 self.kv_cache = KVCacheManager(
                     KVCache(
                         cache,
+                        planes,
                         num_units=kv_cache.num_units,
-                        block_size=page_size(worker_config),
                         device=worker_config.device,
-                        dtype=dtype,
-                        quantization={
-                            name: Quantizer("fp8", axis=0)
-                            for name in cache.layers
-                        }
-                        if fp8
-                        else None,
                     ),
                     info=kv_cache,
                     group_layers=group_layers(text, planes),
@@ -606,16 +594,16 @@ class Worker:
             # Denoised samples have their own page pool, which may live on
             # another device. An image worker always holds it; a standalone
             # denoiser's pool lives on the ranks that advance its samples.
-            plan = latent_pool_plan(model, worker_config)
+            plan = layout.latent_pool
             if plan is None or (
                 image_builder(model) is None and not runner.denoises
             ):
                 self.latent_pool = None
             else:
                 self.latent_pool = LatentPool(
-                    request_pool_size=int(info.request_slots),
-                    num_pages=int(info.latent_pages),
-                    page_units=int(info.latent_page_units),
+                    request_pool_size=plan.request_pool_size,
+                    num_pages=plan.num_pages,
+                    page_units=plan.page_units,
                     latent_width=plan.latent_width,
                     dtype=plan.dtype,
                     device=worker_config.generation_device

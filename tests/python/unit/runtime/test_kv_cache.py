@@ -28,7 +28,12 @@ def _hybrid_config():
 
 def test_homogeneous_pool_keeps_the_per_layer_stack_layout():
     config = Config({f"layers.{index}": _layer(8) for index in range(3)})
-    with KVCache(config, num_units=5, block_size=4, device="cpu") as cache:
+    with KVCache(
+        config,
+        plan_units(config, block_size=4),
+        num_units=5,
+        device="cpu",
+    ) as cache:
         planes = cache.planes
         # One group: one unit per page holding every layer as a column, one
         # table, and pages of exactly ``block_size`` tokens.
@@ -54,7 +59,10 @@ def test_homogeneous_pool_keeps_the_per_layer_stack_layout():
 
 def test_hybrid_groups_read_column_planes_of_one_unit_pool():
     with KVCache(
-        _hybrid_config(), num_units=6, block_size=4, device="cpu"
+        _hybrid_config(),
+        plan_units(_hybrid_config(), block_size=4),
+        num_units=6,
+        device="cpu",
     ) as cache:
         planes = cache.planes
         windowed, full = planes.groups
@@ -159,12 +167,15 @@ def _cache(quantized=False, device="cpu"):
     config = Config({"attention": mha.Config(2, 2, (0, 1), torch.float32)})
     return KVCache(
         config,
+        plan_units(
+            config,
+            block_size=4,
+            quantization={
+                "attention": Quantizer("fp8", axis=0) if quantized else None
+            },
+        ),
         num_units=3,
-        block_size=4,
         device=device,
-        quantization={
-            "attention": Quantizer("fp8", axis=0) if quantized else None
-        },
     )
 
 
@@ -295,13 +306,16 @@ def test_zero_units_preserves_other_units_and_layers(device, quantized):
     config = Config({name: _layer(16) for name in ("attention", "other")})
     with KVCache(
         config,
+        plan_units(
+            config,
+            block_size=4,
+            quantization={
+                name: Quantizer("fp8", axis=0) if quantized else None
+                for name in config.layers
+            },
+        ),
         num_units=5,
-        block_size=4,
         device=device,
-        quantization={
-            name: Quantizer("fp8", axis=0) if quantized else None
-            for name in config.layers
-        },
     ) as cache:
         state, other = cache.state("attention"), cache.state("other")
         key = (
@@ -381,7 +395,12 @@ def test_recycled_units_of_mixed_types_read_finite_in_every_group():
             "narrow": mha.Config(2, 8, (0, 1), torch.bfloat16),
         }
     )
-    with KVCache(config, num_units=3, block_size=4, device="cpu") as cache:
+    with KVCache(
+        config,
+        plan_units(config, block_size=4),
+        num_units=3,
+        device="cpu",
+    ) as cache:
         # A finite FP32 value whose low half is a BF16 NaN: the narrow
         # group's view of the same bytes is not finite.
         bits = torch.full((4, 2, 8), 0x3F807FC0, dtype=torch.int32)

@@ -14,7 +14,6 @@ from uniserve.tensors import BufferConfig
 from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.capacity import (
     latent_trajectory_bytes,
-    model_arena_capacity,
     request_tensor_window,
     tensor_slot_capacity,
 )
@@ -221,27 +220,11 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
     layout = build_worker_layout(
         TEST_MODEL, worker_config, image_processor=image_processor()
     )
-    assert layout.info.encoder_entry_bytes == latent_trajectory_bytes(
-        1024,
-        3 * 16**2,
-        4,
+    trajectory = latent_trajectory_bytes(1024, 3 * 16**2, 4)
+    assert layout.info.encoder_entry_bytes == trajectory
+    assert layout.arena.transfer_bytes >= (
+        trajectory * layout.arena.transfer_tickets
     )
-    arena = model_arena_capacity(
-        TEST_MODEL,
-        worker_config,
-        queue_depth=1,
-        completion_payload_bytes=1024,
-        num_units=2,
-        request_pool_size=4,
-        num_latent_pages=5,
-        latent_page_units=4,
-        latent_width=1024,
-        max_latent_feature_bytes=1,
-        max_vision_feature_bytes=1,
-        unit_bytes=1,
-    )
-    expected = latent_trajectory_bytes(1024, 1024, 4)
-    assert arena.transfer_bytes == expected * arena.transfer_tickets
 
 
 @pytest.mark.parametrize(

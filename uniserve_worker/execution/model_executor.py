@@ -1322,12 +1322,12 @@ class ModelExecutor:
         # plus one image's feature span, and at most the tokens the pool's
         # units cover.
         max_rows = min(max_calls, request_slots)
-        pool_rows = (kv_cache.info.num_units - 1) // kv_cache.row_units
+        pool_rows = (kv_cache.num_units - 1) // kv_cache.row_units
         decode_sizes = decode_captures(
             config,
             max_rows=max_rows,
             row_units=kv_cache.row_units,
-            num_units=kv_cache.info.num_units,
+            num_units=kv_cache.num_units,
         )
         feature_injection = (
             self.processor is not None
@@ -1429,7 +1429,7 @@ class ModelExecutor:
                 ):
                     raise ValueError(
                         f"no configured decode graph size fits {rows} rows "
-                        f"and a KV pool of {kv_cache.info.num_units} units, "
+                        f"and a KV pool of {kv_cache.num_units} units, "
                         f"whose rows hold {kv_cache.row_units} units each"
                     )
                 # Graph pools exist only on CUDA, where every prefill call
@@ -1450,7 +1450,7 @@ class ModelExecutor:
                                 (group.page_tokens, group.units_per_page)
                                 for group in kv_cache.shapes
                             ),
-                            kv_cache.info.num_units - 1,
+                            kv_cache.num_units - 1,
                         ),
                     )
                     if ForwardMode.PREFILL in kinds and target.type == "cuda"

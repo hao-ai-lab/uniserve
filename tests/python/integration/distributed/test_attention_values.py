@@ -23,6 +23,7 @@ from uniserve.runtime import (
     KVCache,
     initialize_process_groups,
 )
+from uniserve.runtime.kv_cache import plan_units
 
 pytestmark = pytest.mark.integration
 
@@ -70,7 +71,10 @@ def _run(rank, rendezvous):
                 }
             )
             with KVCache(
-                config, num_units=1, block_size=16, device="cpu"
+                config,
+                plan_units(config, block_size=16),
+                num_units=1,
+                device="cpu",
             ) as cache:
                 with ExecutionContext(
                     layer, cache=cache, attention="torch"
@@ -188,7 +192,10 @@ def _context(rank, rendezvous, gpu):
             with (
                 stream if stream is not None else nullcontext(),
                 KVCache(
-                    config, num_units=3, block_size=16, device=device
+                    config,
+                    plan_units(config, block_size=16),
+                    num_units=3,
+                    device=device,
                 ) as cache,
             ):
                 with ExecutionContext(

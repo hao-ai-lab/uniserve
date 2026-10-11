@@ -278,9 +278,13 @@ def _reference(root, prompt, segments, canvases, slots, features=None):
     """
     model = load_diffusion_gemma(root)
     config = model.text.cache_config
-    tables = len(plan_units(config, block_size=PAGE).tables)
+    planes = plan_units(config, block_size=PAGE)
+    tables = len(planes.tables)
     cache = KVCache(
-        config, num_units=tables * PAGES, block_size=PAGE, device="cpu"
+        config,
+        planes,
+        num_units=tables * PAGES,
+        device="cpu",
     )
     context = ExecutionContext(model, cache=cache, attention="torch")
     values, prompt_values = [], []

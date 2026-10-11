@@ -40,6 +40,7 @@ from uniserve.nn.attention import (
 from uniserve.runtime import KVCache, TensorBuffers
 from uniserve.runtime.backends.attention import resolve
 from uniserve.runtime.backends.attention.torch import Backend as TorchBackend
+from uniserve.runtime.kv_cache import plan_units
 
 pytestmark = [
     pytest.mark.integration,
@@ -82,7 +83,10 @@ def _pool(block_size, window):
         }
     )
     with KVCache(
-        layers, num_units=_UNITS, block_size=block_size, device="cuda"
+        layers,
+        plan_units(layers, block_size=block_size),
+        num_units=_UNITS,
+        device="cuda",
     ) as cache:
         yield cache
 

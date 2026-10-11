@@ -17,6 +17,7 @@ from uniserve.nn.attention import (
     VarlenInput,
 )
 from uniserve.runtime import ExecutionContext, KVCache
+from uniserve.runtime.kv_cache import plan_units
 from uniserve_models import sensenova_u1 as u1
 
 pytestmark = pytest.mark.integration
@@ -172,7 +173,10 @@ def test_cached_text_matches_axial_attention_equations(tmp_path, dtype):
     tokens = torch.tensor([1, 5, 2, 8])
     expected = _text(tokens, state)
     with KVCache(
-        model.text.cache_config, num_units=1, block_size=4, device="cpu"
+        model.text.cache_config,
+        plan_units(model.text.cache_config, block_size=4),
+        num_units=1,
+        device="cpu",
     ) as cache:
         with ExecutionContext(
             model.text, cache=cache, attention="torch"

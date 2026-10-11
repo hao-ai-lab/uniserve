@@ -39,15 +39,16 @@ from uniserve_worker.bootstrap.cache import (
     cache_info,
     plan_cache,
     resident_width,
-    resize_cache,
 )
 from uniserve_worker.bootstrap.capacity import (
     ArenaCapacity,
+    LatentPoolPlan,
     call_window,
     derive_runtime_kv_capacity,
     device_total_bytes,
     input_buffer_config,
     latent_pool_plan,
+    latent_trajectory_bytes,
     local_product_storage_bytes,
     model_arena_capacity,
     product_storage_bytes,
@@ -88,7 +89,6 @@ from uniserve_worker.protocol.call import CALL_KINDS
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import (
     ComponentInfo,
-    KVCacheInfo,
     VideoDenoiserInfo,
     WorkerInfo,
 )
@@ -125,6 +125,13 @@ class WorkerLayout:
             On a request-tensor rank that backs only some products it is
             smaller than ``info.buffer_pool_bytes``, and the worker builds a
             compact pool.
+        planes: The K/V unit pool plan the worker allocates its pool from
+            with ``info.kv_cache.num_units`` units; ``None`` without a
+            ``CausalLM``.
+        latent_pool: The latent pool plan the worker allocates when it
+            advances samples, which ``info.latent_pages`` and
+            ``info.latent_page_units`` advertise; ``None`` without a
+            denoiser.
     """
 
     info: WorkerInfo
@@ -132,6 +139,8 @@ class WorkerLayout:
     input_config: TokenBufferConfig | None
     fixed_device_bytes: tuple[tuple[str, int], ...]
     physical_buffer_pool_bytes: int
+    planes: Planes | None
+    latent_pool: LatentPoolPlan | None
 
 
 def _exports_fabric_handles(device: object) -> bool:
@@ -298,29 +307,14 @@ def _token_worker_layout(
         else 0
     )
 
-    # The planned pool supplies the unit size and a minimal cache
-    # description the group geometry; ``resize_cache`` attaches the granted
-    # unit count at the end. The minimal pool holds the unit-zero sentinel
-    # and one page of the group whose page spans the most units.
+    # The unit pool is planned once; its unit size sizes the grant below and
+    # the worker allocates the pool from the same plan.
     text = capability(model, CausalLM)
-    owns_kv = text is not None
-    planes: Planes | None = None
-    cache: KVCacheInfo | None = None
-    if text is not None:
-        planes = plan_cache(text, worker_config)
-        cache = cache_info(
-            text,
-            worker_config,
-            num_units=1 + max(group.units_per_page for group in planes.groups),
-        )
+    planes = None if text is None else plan_cache(text, worker_config)
     unit_bytes = 0 if planes is None else planes.unit_bytes
 
     flow = image_builder(model)
     plan = latent_pool_plan(model, worker_config) if flow is not None else None
-    latent_page_units = 0 if plan is None else plan.page_units
-    num_latent_pages = 0 if plan is None else plan.num_pages
-    latent_width = 0 if plan is None else plan.latent_width
-    model_dtype_bytes = _model_dtype_bytes(worker_config.model_dtype)
     latent_pool_bytes = 0 if plan is None else plan.capacity_bytes
 
     max_vit_grid_tokens = vision_tokens(model, image_processor)
@@ -335,13 +329,17 @@ def _token_worker_layout(
         max_vision_feature_bytes = (
             max_vit_grid_tokens * feature.shape[1] * feature.dtype.itemsize
         )
+    # One image's whole latent trajectory in the pool's dtype.
     max_latent_feature_bytes = (
         0
-        if flow is None
-        else flow.max_tokens * latent_width * model_dtype_bytes
+        if flow is None or plan is None
+        else latent_trajectory_bytes(
+            flow.max_tokens, plan.latent_width, plan.dtype.itemsize
+        )
     )
 
     capacity = None
+    kv_cache = None
     # Zero leaves prefill and decode calls bounded by the batch call bound
     # alone, as when they run eagerly; captured graphs lower them below.
     max_prefill_calls = max_decode_calls = 0
@@ -365,10 +363,6 @@ def _token_worker_layout(
     arena_args = {
         "queue_depth": int(queue_depth),
         "completion_payload_bytes": int(completion_payload_bytes),
-        "request_pool_size": int(worker_config.max_request_pool_size),
-        "num_latent_pages": num_latent_pages,
-        "latent_page_units": latent_page_units,
-        "latent_width": latent_width,
         "max_latent_feature_bytes": max_latent_feature_bytes,
         "max_vision_feature_bytes": max_vision_feature_bytes,
         "unit_bytes": unit_bytes,
@@ -386,8 +380,10 @@ def _token_worker_layout(
         **arena_args,
     )
     input_config = (
-        input_buffer_config(model, worker_config, processor=image_processor)
-        if owns_kv
+        input_buffer_config(
+            model, worker_config, planes=planes, processor=image_processor
+        )
+        if planes is not None
         else None
     )
 
@@ -409,11 +405,7 @@ def _token_worker_layout(
     )
 
     if text is not None:
-        assert (
-            cache is not None
-            and planes is not None
-            and input_config is not None
-        )
+        assert planes is not None and input_config is not None
         from uniserve_worker.model_executor.canvas_runner import CanvasRunner
         from uniserve_worker.model_executor.graph_inputs import (
             decode_captures,
@@ -574,18 +566,7 @@ def _token_worker_layout(
         fixed_bytes[worker_config.device] += sum(
             field.nbytes for schema in schemas for field in schema.values()
         ) + cache_transfer_workspace_bytes(
-            page_elements=max(
-                group.page_tokens
-                * len(group.layers)
-                * group.num_kv_heads
-                * group.head_dim
-                for group in planes.groups
-            ),
-            page_scales=max(
-                group.page_tokens * len(group.layers) * group.num_kv_heads
-                for group in planes.groups
-            ),
-            capacity=unresolved_window,
+            planes.groups, capacity=unresolved_window
         )
 
         page_shapes = tuple(
@@ -617,6 +598,7 @@ def _token_worker_layout(
             )
             capacity_group.all_reduce(units, op="min")
             capacity = replace(capacity, num_units=int(units.item()))
+        kv_cache = cache_info(text, planes, num_units=capacity.num_units)
 
         # Prefill and decode calls on a CUDA device replay graphs whose rows'
         # pages fit the granted pool. The rows the widest graphs hold bound
@@ -669,13 +651,9 @@ def _token_worker_layout(
         max_decode_calls=max_decode_calls,
         max_batch_tokens=int(worker_config.max_batch_tokens),
         request_slots=int(worker_config.max_request_pool_size),
-        kv_cache=(
-            resize_cache(cache, capacity.num_units)
-            if capacity is not None and cache is not None
-            else None
-        ),
-        latent_page_units=latent_page_units,
-        latent_pages=num_latent_pages,
+        kv_cache=kv_cache,
+        latent_page_units=0 if plan is None else plan.page_units,
+        latent_pages=0 if plan is None else plan.num_pages,
         buffer_pool_bytes=buffer_pool_bytes,
         max_unresolved_calls=unresolved_window,
         media_components={}
@@ -705,6 +683,8 @@ def _token_worker_layout(
         input_config=input_config,
         fixed_device_bytes=tuple(fixed_bytes.items()),
         physical_buffer_pool_bytes=buffer_pool_bytes,
+        planes=planes,
+        latent_pool=plan,
     )
 
 
@@ -787,10 +767,6 @@ def _request_tensor_worker_layout(
         queue_depth=depth,
         completion_payload_bytes=completion_payload_bytes,
         num_units=0,
-        request_pool_size=slots,
-        num_latent_pages=0,
-        latent_page_units=0,
-        latent_width=0,
         max_latent_feature_bytes=0,
         max_vision_feature_bytes=0,
         unit_bytes=0,
@@ -809,6 +785,8 @@ def _request_tensor_worker_layout(
         arena=arena,
         input_config=None,
         fixed_device_bytes=(),
+        planes=None,
+        latent_pool=plan,
         physical_buffer_pool_bytes=slots
         * local_product_storage_bytes(
             resolve_outputs(model, worker_config),
@@ -818,18 +796,6 @@ def _request_tensor_worker_layout(
             ),
         ),
     )
-
-
-def _model_dtype_bytes(dtype: str) -> int:
-    """Return the byte width of a supported model activation dtype."""
-    width = {
-        "float16": 2,
-        "bfloat16": 2,
-        "float32": 4,
-    }.get(str(dtype).removeprefix("torch.").lower())
-    if width is None:
-        raise ValueError(f"unsupported model dtype {dtype!r}")
-    return width
 
 
 def _kv_residency_shape(

@@ -20,7 +20,7 @@ from uniserve.runtime.process_groups import (
     initialize_process_groups,
 )
 from uniserve_models import loading as models
-from uniserve_worker.bootstrap.cache import cache_info
+from uniserve_worker.bootstrap.cache import cache_info, plan_cache
 from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
@@ -51,20 +51,21 @@ def _worker(model, config, *, group=None, attention_ranks=1):
         if expert:
             runner.configure_experts()
         else:
+            planes = plan_cache(model, config)
             cache = KVCache(
                 model.cache_config,
+                planes,
                 num_units=32,
-                block_size=16,
                 device=config.device,
             )
             manager = KVCacheManager(
                 cache,
-                info=cache_info(model, config, num_units=32),
+                info=cache_info(model, planes, num_units=32),
                 request_pool_size=8,
                 table_width=4,
             )
             runner.configure_inputs(
-                input_config=input_buffer_config(model, config),
+                input_config=input_buffer_config(model, config, planes=planes),
                 kv_cache=manager,
                 latent_pool=None,
                 decode_predicates=torch.ones(

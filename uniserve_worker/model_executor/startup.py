@@ -298,7 +298,7 @@ def prepare_prefill(
     pages = tuple(
         (group.page_tokens, group.units_per_page) for group in cache.shapes
     )
-    units = cache.info.num_units - 1
+    units = cache.num_units - 1
     for shape in sorted(
         shapes,
         key=lambda item: (

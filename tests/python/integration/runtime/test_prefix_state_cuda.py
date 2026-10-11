@@ -7,6 +7,7 @@ import torch.multiprocessing as mp
 from uniserve.cache import Config, mha
 from uniserve.quantization import Quantizer
 from uniserve.runtime import KVCache
+from uniserve.runtime.kv_cache import plan_units
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -15,10 +16,11 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 def _reject_invalid_index(rank, index):
     # Device assertions poison their CUDA context, so each rejection runs in
     # its own process. Replay must validate live addresses, not capture values.
+    cache_config = Config({"attention": mha.Config(1, 16, (0,), torch.float32)})
     cache = KVCache(
-        Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
+        cache_config,
+        plan_units(cache_config, block_size=4),
         num_units=3,
-        block_size=4,
         device="cuda",
     )
     state = cache.state("attention")
@@ -41,10 +43,11 @@ def test_cache_replay_rejects_out_of_range_addresses(index):
 
 @torch.inference_mode()
 def _reject_invalid_copy(rank, targets):
+    cache_config = Config({"attention": mha.Config(1, 16, (0,), torch.float32)})
     cache = KVCache(
-        Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
+        cache_config,
+        plan_units(cache_config, block_size=4),
         num_units=3,
-        block_size=4,
         device="cuda",
     )
     state = cache.state("attention")
@@ -70,14 +73,20 @@ def test_block_copy_replay_rejects_invalid_or_repeated_targets(targets):
 @pytest.mark.parametrize("quantized", (False, True))
 @torch.inference_mode()
 def test_state_updates_replay_addresses_and_first_write_scales(quantized):
+    cache_config = Config(
+        {"attention": mha.Config(2, 2, (0, 1), torch.float32)}
+    )
     cache = KVCache(
-        Config({"attention": mha.Config(2, 2, (0, 1), torch.float32)}),
+        cache_config,
+        plan_units(
+            cache_config,
+            block_size=4,
+            quantization={
+                "attention": Quantizer("fp8", axis=0) if quantized else None
+            },
+        ),
         num_units=3,
-        block_size=4,
         device="cuda",
-        quantization={
-            "attention": Quantizer("fp8", axis=0) if quantized else None
-        },
     )
     state = cache.state("attention")
     key = torch.tensor(

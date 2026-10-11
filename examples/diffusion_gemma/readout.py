@@ -57,9 +57,7 @@ def read_candidates(model, prompt, canvas, position, candidates):
         blocks[index] = tuple(range(next_unit, next_unit + pages))
         next_unit += pages
 
-    cache = KVCache(
-        config, num_units=next_unit, block_size=block_size, device=device
-    )
+    cache = KVCache(config, plan, num_units=next_unit, device=device)
     context = ExecutionContext(
         model,
         cache=cache,

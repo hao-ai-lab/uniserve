@@ -154,9 +154,13 @@ class _Reference:
         self.sampling = sampling
         self.model = load_diffusion_gemma(root)
         config = self.model.text.cache_config
-        tables = len(plan_units(config, block_size=PAGE).tables)
+        planes = plan_units(config, block_size=PAGE)
+        tables = len(planes.tables)
         self.cache = KVCache(
-            config, num_units=tables * PAGES, block_size=PAGE, device="cpu"
+            config,
+            planes,
+            num_units=tables * PAGES,
+            device="cpu",
         )
         self.context = ExecutionContext(
             self.model, cache=self.cache, attention="torch"

@@ -131,11 +131,12 @@ class KVCacheManager:
         table_width: int | None = None,
         staging_depth: int = 1,
     ) -> None:
-        """Validate the unit pool against ``info`` and create its owners.
+        """Create the request, publication and import owners of a unit pool.
 
         Args:
             cache: Numerical K/V unit pool; closed by ``close``.
-            info: Advertised unit count and group page shapes and placement.
+            info: The pool's advertised description, which ``cache`` was
+                allocated from: group order, layer placement and stored dtype.
             group_layers: Global cache-layer ids of every layer of each group
                 across all pipeline stages, in ascending order; defaults to
                 this rank's layers, the complete group without pipelining.
@@ -147,29 +148,13 @@ class KVCacheManager:
             staging_depth: Depth of the block tables' host staging rings.
 
         Raises:
-            ValueError: When the pool does not match ``info``, a group's
-                layers are not one consecutive run of its transfer layers, or
-                ``staging_depth`` is below 1.
+            ValueError: When a group's layers are not one consecutive run of
+                its transfer layers, or ``staging_depth`` is below 1.
             WorkerError: ``invalid_descriptor`` when a block-table dimension
                 is below 1.
         """
         self.cache, self.info = cache, info
         groups = cache.groups
-        if cache.num_units != info.num_units or len(groups) != len(info.groups):
-            raise ValueError(
-                "cache backing must match the advertised unit pool"
-            )
-        for group, advertised in zip(groups, info.groups, strict=True):
-            if (
-                group.page_tokens != advertised.page_tokens
-                or group.units_per_page != advertised.units_per_page
-                or group.num_kv_heads != advertised.num_kv_heads
-                or group.head_dim != advertised.head_dim
-                or len(group.layers) != len(advertised.layer_ids)
-            ):
-                raise ValueError(
-                    "cache backing must match the advertised group shapes"
-                )
 
         # Every group's layers read one transfer layer axis; this rank's run
         # must be consecutive and in order within it.
@@ -228,7 +213,7 @@ class KVCacheManager:
         self.block_tables = BlockTables(
             groups=self.shapes,
             request_pool_size=request_pool_size,
-            width=max(1, self.info.num_units - 1)
+            width=max(1, self.num_units - 1)
             if table_width is None
             else table_width,
             device=cache.device,
@@ -251,6 +236,11 @@ class KVCacheManager:
         self.imports = CacheImports(self, capacity=import_capacity)
 
     @property
+    def num_units(self) -> int:
+        """Return the pool's units, the unit-zero sentinel included."""
+        return self.cache.num_units
+
+    @property
     def row_units(self) -> int:
         """Return the units one page of every cache group occupies."""
         return sum(shape.units_per_page for shape in self.shapes)
@@ -269,7 +259,7 @@ class KVCacheManager:
             largest // shape.page_tokens * shape.units_per_page
             for shape in self.shapes
         )
-        return (self.info.num_units - 1) // span_units * largest
+        return (self.num_units - 1) // span_units * largest
 
     def page_units(self, tokens: int) -> int:
         """Return the units of whole pages covering ``tokens`` in every group.
@@ -298,7 +288,7 @@ class KVCacheManager:
         """
         if self.has_pending_accesses:
             raise RuntimeError("startup scratch requires an idle KV pool")
-        if not 0 <= count < self.info.num_units:
+        if not 0 <= count < self.num_units:
             raise ValueError("startup scratch exceeds KV capacity")
         units = tuple(range(1, count + 1))
         self.zero_units(units)
@@ -705,7 +695,7 @@ class KVCacheManager:
         if len(set(real_units)) != len(real_units):
             raise invalid_descriptor("KV allocation repeats a physical unit")
         lower = 0 if allow_sentinel else 1
-        if units and (min(units) < lower or max(units) >= self.info.num_units):
+        if units and (min(units) < lower or max(units) >= self.num_units):
             raise invalid_descriptor(
                 "KV allocation exceeds the fixed physical pool"
             )

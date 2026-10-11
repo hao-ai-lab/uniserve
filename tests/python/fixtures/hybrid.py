@@ -20,7 +20,6 @@ from uniserve_worker.bootstrap.cache import (
     group_layers,
     plan_cache,
     resident_width,
-    storage,
 )
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -74,19 +73,12 @@ def hybrid_pool(
 ) -> KVCacheManager:
     """Own the model's unit pool as a worker does, sized to ``num_units``."""
     planes = plan_cache(model, config)
-    dtype, fp8 = storage(config)
-    if fp8:
-        raise ValueError("the hybrid fixture stores unquantized K/V")
     cache = KVCache(
-        model.cache_config,
-        num_units=num_units,
-        block_size=config.block_size,
-        device=config.device,
-        dtype=dtype,
+        model.cache_config, planes, num_units=num_units, device=config.device
     )
     return KVCacheManager(
         cache,
-        info=cache_info(model, config, num_units=num_units),
+        info=cache_info(model, planes, num_units=num_units),
         group_layers=group_layers(model, planes),
         import_capacity=import_capacity,
         request_pool_size=request_pool_size,
