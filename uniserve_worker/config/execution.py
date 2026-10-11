@@ -370,7 +370,6 @@ class WorkerConfig:
     max_request_pool_size: int = 128
     encoder_cache_entries: int = 256
     generation_device: str | None = None
-    min_request_pool_size: int = 1
     pool_storage_bytes: int | None = None
     model_dtype: str = "bfloat16"
     kv_cache_dtype: str | None = None
@@ -416,7 +415,7 @@ class WorkerConfig:
             raise invalid_descriptor(
                 "worker configuration process rank is invalid"
             )
-        if not 1 <= self.min_request_pool_size <= self.max_request_pool_size:
+        if self.max_request_pool_size < 1:
             raise invalid_descriptor("worker request slot bounds are invalid")
         if self.pool_storage_bytes is not None and self.pool_storage_bytes < 0:
             raise invalid_descriptor(

@@ -119,8 +119,9 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     );
 
     // Admission limits running requests, not the worker's execution capacity.
-    // Media workers retain two internal state slots even when admission permits
-    // only one request. Keep their configured batch capacity independent.
+    // Media workers keep the resident request slots their queue depth
+    // pipelines even when admission permits fewer requests. Keep their
+    // configured batch capacity independent.
     let max_batch_calls = u32::try_from(config.engine.max_batch.max(1))
         .context("max_batch exceeds the worker field width")?;
     let max_batch_tokens = u32::try_from(config.engine.max_num_batched_tokens)

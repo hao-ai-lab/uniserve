@@ -930,11 +930,11 @@ def resolve_request_capacity(
     On a CUDA device, the grant measured now becomes ``pool_storage_bytes``;
     ``Worker.__init__`` calls this after the runner has bound its persistent
     inputs and workspaces, so they are already excluded. A request-tensor
-    worker also receives the largest slot count, from
-    ``min_request_pool_size`` up to ``max_request_pool_size`` and a third of
-    ``queue_depth``, whose request state, products, relays and latent pool fit
-    on every rank of ``capacity_group``, and its batch bounds are clamped to
-    that count. On any other device the configuration is returned unchanged.
+    worker also receives the largest slot count, from one up to
+    ``max_request_pool_size`` and a third of ``queue_depth``, whose request
+    state, products, relays and latent pool fit on every rank of
+    ``capacity_group``, and its batch bounds are clamped to that count. On
+    any other device the configuration is returned unchanged.
 
     Raises:
         WorkerError: With ``UNSUPPORTED_SETUP`` when a request-tensor worker
@@ -1000,7 +1000,7 @@ def resolve_request_capacity(
                 maximum=min(
                     worker_config.max_request_pool_size, queue_depth // 3
                 ),
-                minimum=worker_config.min_request_pool_size,
+                minimum=1,
                 available_bytes=available,
                 auxiliary_bytes=auxiliary_bytes,
             )
