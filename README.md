@@ -205,7 +205,7 @@ crates/worker-ipc/                       Worker messages, serialization, and ice
 crates/worker-ipc-py/                    Python worker IPC extension
 crates/engine/                           Scheduler, executors, and engine process
 crates/server/                           Model profiles, serving funnel, HTTP API, and engine clients
-crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints
+crates/bin/uniserve/                     `serve` CLI entrypoint
 crates/bin/uniserve-host/                Per-host launcher for multi-host deployments
 crates/bin/dynamo-worker/                NVIDIA Dynamo worker backend
 uniserve/                                 Numerical layers, loading, and resource binding

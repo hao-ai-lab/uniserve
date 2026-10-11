@@ -43,10 +43,9 @@
 #   clips (full).
 # The base checkpoint's schedule is 50 sigma points (49 denoiser
 # evaluations) with video shift 12 and audio shift 3; OmniRef's is 9 points,
-# its 8 fused-block forwards, with the same shifts. Every base and OmniRef
-# point states its schedule: UniServe refuses one other than its
-# checkpoint's, and the baselines run the schedule they are sent. FastH3
-# points state none and run the checkpoint's own.
+# its 8 fused-block forwards, with the same shifts. A UniServe point states
+# no schedule and runs its checkpoint's own; a baseline point states the
+# schedule it measures, which the baseline runs as sent.
 #
 # A point first sends its one warmup row (seed 42), which is not measured,
 # then its measured rows one at a time, each with its own seed from 0: four
@@ -71,8 +70,8 @@ artifact_root = "artifacts/minimax_h3/measurements"
 # and W2; 1935 text rows for W3; up to 6913 for W5), the duration bound the
 # longest target, and the condition capacity the rows the references pack.
 
-# Base FL2VA (the diffusers root's denoiser) for t2va: the full 15-second
-# range and one 1024-token text capacity.
+# Base FL2VA (the diffusers root's transformer component) for t2va: the full
+# 15-second range and one 1024-token text capacity.
 [servers.gb200-4]
 host = "127.0.0.1"
 port = 18083
@@ -167,7 +166,7 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# Base Ref2VA (the diffusers root's reference_denoiser): 5 seconds, an
+# Base Ref2VA (the diffusers root's transformer_ref component): 5 seconds, an
 # 8192-token text capacity and 40,960 condition rows, which hold W5's
 # reference video, its soundtrack and the audio reference (about 38,000
 # rows packed densely).
@@ -231,7 +230,7 @@ videos_per_second = "higher"
 "video_latency_ms.p95" = "lower"
 
 # FastH3 OmniRef on the same deployment file: the export's reference DiT
-# with the other components of its pinned base. Its region-sparse attention
+# with the other components of its pinned base. Its segment-sparse attention
 # packs each condition into whole 128-row tiles, so W5 takes 47,104
 # condition rows there; the capacity is 49,152.
 [servers.gb200-4-omniref]
@@ -1260,10 +1259,9 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# SGLang's Ref2VA partition with the same recipe (--model-variant ref2va).
-# The recipe's platform attention (cuDNN SDPA) measured 65.12 s for W4 and
-# 132.41 s for W5 against 65.49 s and 132.79 s with FlashAttention-4
-# (--attention-backend fa; exploratory, two requests each).
+# SGLang's Ref2VA partition with the same recipe (--model-variant ref2va),
+# including its platform attention (cuDNN SDPA); FlashAttention-4
+# (--attention-backend fa) is no faster on W4 and W5.
 [servers.sglang-gb200-4-reference]
 host = "127.0.0.1"
 port = 18083
@@ -1450,10 +1448,9 @@ videos_per_second = "higher"
 "video_latency_ms.p95" = "lower"
 
 # vLLM-Omni's Ref2VA partition directory; it serves ref2va only. The recipe
-# with the text encoder sharded over the four ranks (--text-encoder-tp-size 4)
-# measured lowest on 4xGB200: 52.48 s for W4 and 138.55 s for W5 against the
-# recipe's 52.65 s and 138.95 s (exploratory, two requests each; the
-# difference is within the run-to-run spread on W5).
+# runs with the text encoder sharded over the four ranks
+# (--text-encoder-tp-size 4), which is at least as fast on W4 and W5 as the
+# recipe's own text encoder placement.
 [servers.vllm-omni-gb200-4-reference]
 host = "127.0.0.1"
 port = 18083
@@ -1640,11 +1637,6 @@ warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
-
-# Base Ref2VA (the diffusers root's reference_denoiser): 5 seconds, an
-# 8192-token text capacity and 40,960 condition rows, which hold W5's
-# reference video, its soundtrack and the audio reference (about 38,000
-# rows packed densely).
 
 # SGLang across rank-0 and rank-1: its cookbook's GB200 2x4 recipe, Ulysses 4
 # within a host and ring attention of degree 2 across the hosts, resident

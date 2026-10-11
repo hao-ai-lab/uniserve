@@ -1,5 +1,5 @@
-# Shortcuts for local checks and tests. Build is `pip install` / `cargo`;
-# serving is `uniserve serve <model> --model-description <description>`.
+# Shortcuts for local checks and tests. The README's `uv sync` builds the
+# environment; serving is `uniserve serve <model> --served-model-name <name>`.
 
 python := env("PYTHON", ".venv/bin/python")
 cargo := env("CARGO", "cargo")

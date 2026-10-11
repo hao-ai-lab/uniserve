@@ -72,7 +72,7 @@ export UNISERVE_MINIMAX_H3_FFMPEG=/workspace/tools/ffmpeg-8.1.2/bin
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-w3
 ```
 
-The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF`, and the Hugging Face cache supplies the base revision it pins; two-host points need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`.
+The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF`, and the Hugging Face cache supplies the base revision it pins. The two-host SGLang suites, `sglang-gb200-8` and `sglang-gb200-8-reference`, need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`, the address of `rank-0`, and the reference suite also `UNISERVE_MINIMAX_H3_SHARED_SCRATCH`, a directory both hosts mount.
 
 ## OmniRef reference compositions
 
@@ -95,7 +95,7 @@ A request's packed sequence is its prompt, which carries every visual reference'
 A point sends one warmup at seed 42 and three measured requests one at a time, seeds 0 to 2. One deployment across two four-GB200 hosts (`ulysses8-reference-two-node.json`) serves every cell: `--max-video-seconds 15 --max-model-len 48128 --video-text-capacities 4096,7168,8192,10240,14336,15360,22528,37888,48128 --max-condition-rows 79104`, a text capacity for each cell's prompt and the condition rows of `full`.
 
 ```bash
-export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastH3-OmniRef-v5-DMPDD8-w03-cfg2-step3500
+export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastVideo-FastH3-Omni-8-Step-V1
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-8-omniref-refs --reuse-deployment
 ```
 

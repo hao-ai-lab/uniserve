@@ -131,10 +131,8 @@ markers = [
 # Enforces the Google Python Style Guide
 # (https://google.github.io/styleguide/pyguide.html) on all project Python
 # modules: 80-column line limit (guide section 3.4), Google docstring
-# convention, and PEP 8 naming. Where the guide and the previous project
-# configuration disagreed, the guide wins; resolutions are recorded in
-# specs/python-style.md. The `refs/` reference checkouts keep their own
-# per-repository style enforcement (see refs/TensorRT-LLM/pyproject.toml).
+# convention, and PEP 8 naming. The `refs/` reference checkouts keep their own
+# style and are excluded.
 line-length = 80
 target-version = "py311"
 extend-exclude = [
@@ -148,8 +146,8 @@ extend-exclude = [
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "D", "N", "C4", "UP"]
 ignore = [
-    # Docstring presence is not retroactively enforced (the same resolution
-    # TensorRT-LLM uses); the format of every existing docstring is checked.
+    # Docstring presence is not enforced; the format of every docstring is
+    # checked.
     "D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107", "D417",
     # Rules incompatible with the Google docstring convention; mirrors the set
     # ruff disables when only `convention = "google"` drives the selection.
