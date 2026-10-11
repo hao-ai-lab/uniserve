@@ -1730,7 +1730,6 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert_eq!(info.endpoint.rank, 0);
     assert_eq!(info.max_batch_calls, 256);
     assert_eq!(info.max_batch_tokens, 256);
-    assert_eq!(info.queue_depth as usize, QUEUE_DEPTH);
 
     let mut admission = text_admission(11, 1, 1)?;
     let sampling = &mut admission.ar.as_mut().unwrap().sampling;

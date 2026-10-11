@@ -113,7 +113,7 @@ class Executor:
 
     def __init__(self, worker: Worker) -> None:
         self.worker = worker
-        self.queue_depth = int(worker.info.queue_depth)
+        self.queue_depth = worker.queue_depth
         self._last_batch_id = -1
         self._last_collective_seq = -1
         # Accepted batches by id. Insertion order is submission order, which
@@ -532,7 +532,6 @@ class Executor:
                 kv_cache=self.worker.kv_cache,
                 host_tasks=self.worker.host_tasks,
                 tensor_store=self.worker.tensor_store,
-                worker_info=self.worker.info,
                 latent_pool=self.worker.latent_pool,
                 media_mux=self.worker.media_mux,
                 output_pool=self.worker.output_pool,
@@ -625,7 +624,6 @@ class Executor:
         state.predecessors = self.worker.requests.predecessors(batch.calls)
         validate_batch(
             batch,
-            worker_info=self.worker.info,
             model_runner=self.worker.runner,
             config=self.worker.worker_config,
             predecessors=state.predecessors,

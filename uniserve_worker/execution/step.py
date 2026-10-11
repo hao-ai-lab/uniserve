@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -87,7 +86,6 @@ def execute_batch(
     kv_cache: KVCacheManager | None,
     host_tasks: HostLane,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     output_pool: OutputPool,
@@ -152,7 +150,6 @@ def execute_batch(
             kv_cache=kv_cache,
             host_tasks=host_tasks,
             tensor_store=tensor_store,
-            worker_info=worker_info,
             latent_pool=latent_pool,
             media_mux=media_mux,
             output_pool=output_pool,
@@ -187,7 +184,6 @@ def execute_batch(
         outcomes = dispatch_batch(
             kv_cache=kv_cache,
             tensor_store=tensor_store,
-            worker_info=worker_info,
             latent_pool=latent_pool,
             media_mux=media_mux,
             publication_transports=publication_transports,
@@ -244,10 +240,10 @@ def execute_batch(
             state=state,
             kv_cache=kv_cache,
             tensor_store=tensor_store,
-            worker_info=worker_info,
             latent_pool=latent_pool,
             request_pool=request_pool,
             decode_state=decode_state,
+            model_runner=model_runner,
             config=config,
         )
     except BaseException as error:

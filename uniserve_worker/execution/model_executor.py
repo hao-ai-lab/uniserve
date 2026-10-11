@@ -96,6 +96,7 @@ from uniserve_worker.errors import (
     WorkerErrorCode,
     classify,
     invalid_descriptor,
+    unsupported_setup,
 )
 from uniserve_worker.execution.conditions import (
     CONDITION_PRODUCTS,
@@ -1840,6 +1841,30 @@ class ModelExecutor:
                     stream.stream
                 )
         return True
+
+    def output_rank(self, component: str) -> int:
+        """Return the rank that publishes a component's host products.
+
+        Host products belong to the component's first member rank, the rank
+        whose reports the engine's `WorkerGroup` joins a call's results on
+        whenever the call runs there. A call whose units are dealt to other
+        ranks publishes no host product, and the engine joins it on the
+        first rank it is dealt to. Cooperative numerical outputs may reside
+        on other ranks. A single-rank worker without the component resolves
+        to rank 0.
+
+        Raises:
+            WorkerError: `unsupported_setup` when the component is not
+                configured and the worker has more than one rank.
+        """
+        binding = self.bindings.get(component)
+        if binding is not None:
+            return binding.config.ranks[0]
+        if self.worker_config.world_size == 1:
+            return 0
+        raise unsupported_setup(
+            f"component {component!r} has no publication owner"
+        )
 
     def call_devices(self, call):
         """Return ``(compute, staged, output)`` devices for one call.

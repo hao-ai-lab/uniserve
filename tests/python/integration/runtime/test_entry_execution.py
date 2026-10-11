@@ -699,7 +699,6 @@ def test_worker_reports_text_bounds_and_executes_dense_attention_without_kv():
         component = next(
             value for value in info.components if value.name == "text_encoder"
         )
-        assert component.config.ranks == (0,)
         assert component.outputs == (
             OutputInfo(
                 "conditioning",

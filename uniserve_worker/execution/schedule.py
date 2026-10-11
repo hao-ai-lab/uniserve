@@ -47,7 +47,6 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -61,7 +60,6 @@ def dispatch_batch(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
@@ -124,7 +122,6 @@ def dispatch_batch(
         tuple(scheduled),
         kv_cache=kv_cache,
         tensor_store=tensor_store,
-        worker_info=worker_info,
         latent_pool=latent_pool,
         media_mux=media_mux,
         publication_transports=publication_transports,
@@ -175,7 +172,6 @@ def _execute_ready_actions(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
@@ -237,7 +233,6 @@ def _execute_ready_actions(
                 result = diffusion.prepare_latent(
                     call,
                     kv_cache=kv_cache,
-                    worker_info=worker_info,
                     latent_pool=latent_pool,
                     publication_transports=publication_transports,
                     request_tables=request_tables,
@@ -313,7 +308,6 @@ def _execute_calls(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
@@ -415,7 +409,6 @@ def _execute_calls(
                 state=state,
                 kv_cache=kv_cache,
                 tensor_store=tensor_store,
-                worker_info=worker_info,
                 latent_pool=latent_pool,
                 media_mux=media_mux,
                 publication_transports=publication_transports,
@@ -507,7 +500,6 @@ def _execute_calls(
                 outcomes,
                 state=state,
                 tensor_store=tensor_store,
-                worker_info=worker_info,
                 publication_transports=publication_transports,
                 model_runner=model_runner,
                 request_tables=request_tables,
@@ -526,7 +518,6 @@ def _execute_calls(
                     scheduled,
                     outcomes,
                     state=state,
-                    worker_info=worker_info,
                     latent_pool=latent_pool,
                     publication_transports=publication_transports,
                     request_tables=request_tables,

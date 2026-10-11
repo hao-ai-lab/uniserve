@@ -23,8 +23,8 @@ use std::time::Duration;
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::executor::{
-    BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, WorkerFailure,
-    WorkerId, logical_result,
+    BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, PoolPlacement,
+    WorkerFailure, WorkerId, logical_result,
 };
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
@@ -98,21 +98,20 @@ pub enum BatchEvent {
 }
 
 impl SimExecutor {
-    /// Starts an asynchronous simulator with its advertised queue depth.
-    pub fn new(engine: SimEngine) -> Self {
-        let depth = (engine.info().queue_depth as usize).max(1);
-        Self::with_depth(engine, depth)
-    }
-
-    /// Starts an asynchronous simulator with an explicit in-flight batch limit.
+    /// Starts an asynchronous simulator that holds at most the engine's queue
+    /// depth of batches in flight.
     ///
     /// # Panics
     ///
     /// Panics if the simulator thread cannot be spawned.
-    pub fn with_depth(mut engine: SimEngine, depth: usize) -> Self {
+    pub fn new(mut engine: SimEngine) -> Self {
         let info = engine.info().clone();
         let results_on_wait = engine.results_on_wait;
-        let depth = depth.max(1);
+        let depth = engine.queue_depth;
+        let placement = PoolPlacement {
+            queue_depth: depth,
+            components: engine.components.clone(),
+        };
         let (to_worker, jobs) = crossbeam_channel::unbounded();
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
         let (progress_tx, progress_rx) = crossbeam_channel::bounded(1);
@@ -147,8 +146,11 @@ impl SimExecutor {
                 }
             })
             .expect("spawn sim executor thread");
+        let id = WorkerId("sim".to_owned());
+        let mut executor_info = ExecutorInfo::single(id.clone(), info);
+        executor_info.placements.insert(id, placement);
         Self {
-            executor_info: ExecutorInfo::single(WorkerId("sim".to_owned()), info.clone()),
+            executor_info,
             depth,
             to_worker,
             from_worker,
@@ -533,6 +535,11 @@ impl SimRequestState {
 /// Deterministic local model engine that implements the worker lifecycle protocol.
 pub struct SimEngine {
     info: WorkerInfo,
+    /// Batches the simulated worker's executor keeps in flight, at least one.
+    queue_depth: usize,
+    /// Placement of the components `info.components` names, as the engine
+    /// launched them.
+    components: BTreeMap<String, uniserve_core::ComponentConfig>,
     /// Synthetic tokens sampled before `fake_eos` dominates.
     text_len: usize,
     fake_eos: u32,
@@ -562,9 +569,9 @@ pub struct SimEngine {
 impl SimEngine {
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
-        // Unset fields, including the KV cache and a queue depth of one, come
-        // from `WorkerInfo::default`. One latent page is the reserved sentinel
-        // page that `latent_capacity_units` excludes.
+        // Unset fields, including the KV cache, come from `WorkerInfo::default`.
+        // One latent page is the reserved sentinel page that
+        // `latent_capacity_units` excludes.
         let info = WorkerInfo {
             supported_calls: CallKind::ALL.to_vec(),
             latent_page_units: 64,
@@ -578,6 +585,8 @@ impl SimEngine {
         };
         Self {
             info,
+            queue_depth: 1,
+            components: BTreeMap::new(),
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
@@ -1065,9 +1074,25 @@ impl SimEngine {
         }
     }
 
-    /// Sets the advertised unresolved-batch capacity, clamped to at least one.
+    /// Sets the unresolved-batch capacity, clamped to at least one.
     pub fn set_queue_depth(&mut self, depth: u32) {
-        self.info.queue_depth = depth.max(1);
+        self.queue_depth = depth.max(1) as usize;
+    }
+
+    /// Declares the loaded components, each with the placement the engine
+    /// launched it with.
+    pub fn place_components(
+        &mut self,
+        components: Vec<(
+            uniserve_worker_ipc::ComponentInfo,
+            uniserve_core::ComponentConfig,
+        )>,
+    ) {
+        self.components = components
+            .iter()
+            .map(|(info, config)| (info.name.clone(), config.clone()))
+            .collect();
+        self.info.components = components.into_iter().map(|(info, _)| info).collect();
     }
 
     /// Sets the number of synthetic tokens emitted before the configured EOS.

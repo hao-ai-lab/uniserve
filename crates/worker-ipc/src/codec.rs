@@ -1142,18 +1142,6 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
                     .map(|item| {
                         Ok(crate::ComponentInfo {
                             name: required_str(item.name(), "component.name")?,
-                            config: uniserve_core::ComponentConfig {
-                                ranks: item
-                                    .ranks()
-                                    .map(|ranks| ranks.iter().map(|rank| rank as usize).collect())
-                                    .unwrap_or_default(),
-                                parallel_config: parallel_from_fb(
-                                    item.parallel_config()
-                                        .context("component requires parallel_config")?,
-                                )?,
-                                distribution: distribution_from_fb(item.distribution())?,
-                                units_per_rank: item.units_per_rank() as usize,
-                            },
                             outputs: item
                                 .outputs()
                                 .context("component requires tensor result declarations")?
@@ -1189,7 +1177,6 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             })
             .transpose()?
             .unwrap_or_default(),
-        queue_depth: info.queue_depth(),
         max_batch_calls: info.max_batch_calls(),
         max_batch_tokens: info.max_batch_tokens(),
         max_prefill_calls: info.max_prefill_calls(),
@@ -1501,65 +1488,6 @@ fn kv_cache_from_table(config: fbs::KVCacheInfo<'_>) -> CodecResult<KvCacheInfo>
             .transpose()?
             .unwrap_or_default(),
         dtype: required_parse(config.dtype(), "info.kv_cache.dtype")?,
-    })
-}
-
-/// Decodes how a component spreads independent units over its ranks; wire
-/// `Local` maps to `None`, which runs the component as one model-parallel
-/// group.
-fn distribution_from_fb(
-    value: fbs::ComponentDistribution,
-) -> CodecResult<Option<uniserve_core::ComponentDistribution>> {
-    match value {
-        fbs::ComponentDistribution::Local => Ok(None),
-        fbs::ComponentDistribution::TemporalUnits => {
-            Ok(Some(uniserve_core::ComponentDistribution::TemporalUnits))
-        }
-        _ => codec_bail!("unknown component distribution"),
-    }
-}
-
-/// Decodes a component's parallel degrees and sequence-parallel strategy.
-///
-/// The strategy is a FlatBuffers union: every variant except
-/// `LocalSequence` requires its payload table. Wire `GatherSequence` maps to
-/// `SequenceParallel::Allgather`. `WorkerInfo::validate` checks the degrees
-/// against component membership.
-fn parallel_from_fb(config: fbs::ParallelConfig<'_>) -> CodecResult<uniserve_core::ParallelConfig> {
-    use uniserve_core::SequenceParallel;
-    let sequence_parallel = match config.sequence_parallel_type() {
-        fbs::SequenceParallel::LocalSequence => SequenceParallel::Local,
-        fbs::SequenceParallel::UlyssesSequence => {
-            let value = config
-                .sequence_parallel_as_ulysses_sequence()
-                .context("missing UlyssesSequence configuration")?;
-            SequenceParallel::Ulysses {
-                ulysses_degree: value.ulysses_degree() as usize,
-            }
-        }
-        fbs::SequenceParallel::GatherSequence => {
-            let value = config
-                .sequence_parallel_as_gather_sequence()
-                .context("missing GatherSequence configuration")?;
-            SequenceParallel::Allgather {
-                allgather_degree: value.allgather_degree() as usize,
-            }
-        }
-        fbs::SequenceParallel::HybridSequence => {
-            let value = config
-                .sequence_parallel_as_hybrid_sequence()
-                .context("missing HybridSequence configuration")?;
-            SequenceParallel::Hybrid {
-                ulysses_degree: value.ulysses_degree() as usize,
-                allgather_degree: value.allgather_degree() as usize,
-            }
-        }
-        _ => codec_bail!("unknown sequence parallel strategy"),
-    };
-    Ok(uniserve_core::ParallelConfig {
-        tensor_parallel_size: config.tensor_parallel_size() as usize,
-        pipeline_parallel_size: config.pipeline_parallel_size() as usize,
-        sequence_parallel,
     })
 }
 

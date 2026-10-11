@@ -1547,81 +1547,61 @@ fn batch_allows_a_duplicate_identical_command() {
 
 #[test]
 fn worker_info_round_trips() {
-    use uniserve_core::{ComponentConfig, ParallelConfig, SequenceParallel};
-    let strategies = [
-        SequenceParallel::Local,
-        SequenceParallel::Ulysses { ulysses_degree: 2 },
-        SequenceParallel::Allgather {
-            allgather_degree: 2,
-        },
-        SequenceParallel::Hybrid {
-            ulysses_degree: 2,
-            allgather_degree: 2,
-        },
-    ];
-    for sequence_parallel in strategies {
-        let config = ParallelConfig {
-            sequence_parallel,
-            ..Default::default()
-        };
-        let count = config.world_size().unwrap();
-        let info = WorkerInfo {
-            kv_cache: Some(KvCacheInfo {
-                groups: vec![KvCacheGroup {
-                    layer_ids: (11..20).collect(),
-                    ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
-                }],
-                ..WorkerInfo::default().kv_cache.unwrap()
-            }),
-            components: vec![ComponentInfo {
-                name: "denoiser".into(),
-                config: ComponentConfig::parallel((0..count).rev().collect(), config),
-                outputs: vec![
-                    OutputInfo {
-                        name: "conditioning".into(),
-                        dtype: DType::BF16,
-                        shape_bound: ShapeBound {
-                            dims: vec![
-                                DimBound::Static(1),
-                                DimBound::Device { max: 16384 },
-                                DimBound::Static(2560),
-                            ],
-                        },
-                        raster_axes: None,
-                    },
-                    // A product laid out at the request's raster names it.
-                    OutputInfo {
-                        name: "video_units".into(),
-                        dtype: DType::U8,
-                        shape_bound: ShapeBound {
-                            dims: vec![
-                                DimBound::Device { max: 8 },
-                                DimBound::Static(22),
-                                DimBound::Static(1344),
-                                DimBound::Static(1536),
-                                DimBound::Static(3),
-                            ],
-                        },
-                        raster_axes: Some(RasterAxes {
-                            height: 2,
-                            width: 3,
-                        }),
-                    },
-                ],
+    let info = WorkerInfo {
+        kv_cache: Some(KvCacheInfo {
+            groups: vec![KvCacheGroup {
+                layer_ids: (11..20).collect(),
+                ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
             }],
-            ..Default::default()
-        };
-        // Python startup metadata crosses the serde mapping boundary before
-        // the binary response is delivered to the native host.
-        let mapped = serde_json::to_value(&info).unwrap();
-        assert_eq!(serde_json::from_value::<WorkerInfo>(mapped).unwrap(), info);
-        let response = WorkerResponse::info(info.clone());
-        let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
-        let WorkerResponse::Info { info: decoded, .. } = decoded else {
-            panic!("decoded response must preserve its info variant");
-        };
-        assert_eq!(decoded, info);
-    }
+            ..WorkerInfo::default().kv_cache.unwrap()
+        }),
+        components: vec![ComponentInfo {
+            name: "denoiser".into(),
+            outputs: vec![
+                OutputInfo {
+                    name: "conditioning".into(),
+                    dtype: DType::BF16,
+                    shape_bound: ShapeBound {
+                        dims: vec![
+                            DimBound::Static(1),
+                            DimBound::Device { max: 16384 },
+                            DimBound::Static(2560),
+                        ],
+                    },
+                    raster_axes: None,
+                },
+                // A product laid out at the request's raster names it.
+                OutputInfo {
+                    name: "video_units".into(),
+                    dtype: DType::U8,
+                    shape_bound: ShapeBound {
+                        dims: vec![
+                            DimBound::Device { max: 8 },
+                            DimBound::Static(22),
+                            DimBound::Static(1344),
+                            DimBound::Static(1536),
+                            DimBound::Static(3),
+                        ],
+                    },
+                    raster_axes: Some(RasterAxes {
+                        height: 2,
+                        width: 3,
+                    }),
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+    // Python startup metadata crosses the serde mapping boundary before
+    // the binary response is delivered to the native host.
+    let mapped = serde_json::to_value(&info).unwrap();
+    assert_eq!(serde_json::from_value::<WorkerInfo>(mapped).unwrap(), info);
+    let response = WorkerResponse::info(info.clone());
+    let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
+    let WorkerResponse::Info { info: decoded, .. } = decoded else {
+        panic!("decoded response must preserve its info variant");
+    };
+    assert_eq!(decoded, info);
 }
 
 #[test]
@@ -1924,7 +1904,6 @@ fn full_caps() -> WorkerInfo {
             rank: 1,
             ..WorkerInfo::default().endpoint
         },
-        queue_depth: 2,
         max_batch_calls: 64,
         max_batch_tokens: 4096,
         max_prefill_calls: 31,

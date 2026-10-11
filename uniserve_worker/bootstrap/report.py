@@ -262,8 +262,8 @@ def build_worker_layout(
         if layout.info.max_decode_calls
         else 0,
         components=tuple(
-            ComponentInfo(name, entry, outputs.get(name, ()))
-            for name, entry in components
+            ComponentInfo(name, outputs.get(name, ()))
+            for name, _ in components
         ),
     )
     return replace(layout, info=info)
@@ -661,9 +661,7 @@ def _token_worker_layout(
     )
     info = WorkerInfo(
         endpoint=endpoint,
-        world_size=int(worker_config.world_size),
         supported_calls=supported,
-        queue_depth=int(queue_depth),
         max_batch_calls=int(worker_config.max_batch_calls),
         max_prefill_calls=max_prefill_calls,
         max_decode_calls=max_decode_calls,
@@ -757,11 +755,9 @@ def _request_tensor_worker_layout(
 
     info = WorkerInfo(
         endpoint=endpoint,
-        world_size=int(worker_config.world_size),
         supported_calls=tuple(
             code for code in CALL_KINDS if code in supported_calls(model)
         ),
-        queue_depth=depth,
         max_batch_calls=max_calls,
         max_batch_tokens=max_calls,
         request_slots=slots,

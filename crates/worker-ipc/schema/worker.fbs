@@ -149,23 +149,6 @@ table WorkerEndpoint {
   incarnation:string;
 }
 
-// Sequence-parallel strategy of a component. The decoder requires the payload
-// table of every variant except LocalSequence, and GatherSequence decodes to
-// `SequenceParallel::Allgather`.
-table LocalSequence {}
-table UlyssesSequence { ulysses_degree:uint = 1; }
-table GatherSequence { allgather_degree:uint = 1; }
-table HybridSequence { ulysses_degree:uint = 1; allgather_degree:uint = 1; }
-union SequenceParallel { LocalSequence, UlyssesSequence, GatherSequence, HybridSequence }
-table ParallelConfig {
-  tensor_parallel_size:uint = 1;
-  pipeline_parallel_size:uint = 1;
-  sequence_parallel:SequenceParallel;
-}
-/// `Local` decodes to no distribution: the component runs as one
-/// model-parallel group.
-enum ComponentDistribution:ubyte { Local, TemporalUnits }
-
 /// One declared tensor result of a component; its position in
 /// `ComponentInfo.outputs` is the product output index.
 table OutputInfo {
@@ -184,12 +167,10 @@ table OutputInfo {
   width_axis:int = -1;
 }
 
+/// A loaded component and its declared results. The engine owns the
+/// component's placement.
 table ComponentInfo {
   name:string;
-  ranks:[ulong];
-  parallel_config:ParallelConfig;
-  distribution:ComponentDistribution;
-  units_per_rank:uint = 1;
   outputs:[OutputInfo];
 }
 
@@ -213,8 +194,8 @@ table VideoDenoiserInfo {
 table MediaComponent { call:MediaCall; component:string; }
 
 /// A loaded rank's identity and capabilities, answered to an Info request.
-/// `WorkerInfo::validate` checks internal consistency; the engine checks it
-/// against the launch.
+/// `WorkerInfo::validate` checks internal consistency; launch values such as
+/// placement and queue depth are the engine's and are not reported.
 table WorkerInfo {
   endpoint:WorkerEndpoint;
   /// Whether this rank's device exports a fabric handle. A descriptor handle
@@ -223,7 +204,6 @@ table WorkerInfo {
   fabric_handles:bool = false;
   components:[ComponentInfo];
   supported_calls:[CallKind];
-  queue_depth:uint;
   max_batch_calls:uint;
   max_batch_tokens:uint;
   request_slots:uint;

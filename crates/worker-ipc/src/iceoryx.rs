@@ -133,7 +133,7 @@ macro_rules! ipc_error {
 /// A wire-protocol change bumps this value. Receivers accept only this exact
 /// version, so the engine and the Python worker extension must be built with
 /// the same value.
-pub const IPC_VERSION: u16 = 82;
+pub const IPC_VERSION: u16 = 83;
 
 /// Returns whether this build can decode a peer-advertised IPC `version`.
 pub fn is_supported_ipc_version(version: u16) -> bool {
@@ -293,9 +293,9 @@ impl ClientEndpoint {
     ///
     /// `max_payload` bounds every payload in bytes. `max_inflight` is the number
     /// of [`Pending`] handles this client may hold at once; the engine passes
-    /// its per-rank queue depth, which `RankProcess::finish_startup` requires
-    /// to equal the worker's advertised `queue_depth`. A send while that many
-    /// handles are alive fails with a transport error.
+    /// the per-rank queue depth it launched the worker with, which the worker
+    /// sizes its end of the channel with. A send while that many handles are
+    /// alive fails with a transport error.
     pub fn connect(service: &str, max_payload: usize, max_inflight: usize) -> IpcResult<Self> {
         // Size the service for one client and one server, `max_inflight`
         // outstanding requests and one response per request, and disable

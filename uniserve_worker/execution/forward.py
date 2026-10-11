@@ -51,7 +51,6 @@ if TYPE_CHECKING:
     from uniserve.distributed.mesh import Communicator
     from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -592,7 +591,6 @@ def publish_forward_values(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
@@ -686,7 +684,7 @@ def publish_forward_values(
                 images[index],
                 value,
                 tensor_store=tensor_store,
-                worker_info=worker_info,
+                model_runner=model_runner,
                 publication_transports=publication_transports,
                 config=config,
                 state=state,
@@ -758,7 +756,6 @@ def integrate_predictions(
     outcomes: dict[int, PendingOutput],
     *,
     state: BatchState,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
@@ -801,8 +798,8 @@ def integrate_predictions(
             outcomes[index] = diffusion.finish(
                 call,
                 trajectories[index],
-                worker_info=worker_info,
                 latent_pool=latent_pool,
+                model_runner=model_runner,
                 publication_transports=publication_transports,
                 request_tables=request_tables,
                 config=config,

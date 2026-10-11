@@ -339,6 +339,21 @@ impl WorkerExecutor {
                 .map(|worker| (worker.0.clone(), worker.1.info().clone()))
                 .collect(),
         )?;
+        // The engine states the placement it launched each group with; the
+        // reports do not carry it.
+        executor_info.placements = workers
+            .iter()
+            .map(|(id, worker)| {
+                let (_, components) = worker.placement();
+                (
+                    id.clone(),
+                    crate::executor::PoolPlacement {
+                        queue_depth: worker.queue_depth(),
+                        components: components.clone(),
+                    },
+                )
+            })
+            .collect();
         // The video graph may span workers, so each group learns the whole
         // deployment's routing to name the ranks that read its products.
         let media_routing = executor_info.media_routing()?;
@@ -465,7 +480,7 @@ impl WorkerExecutor {
         // workers from which it cannot be derived.
         executor_info.runtime_info()?;
 
-        let depth = workers.iter().map(|worker| worker.1.queue_depth()).sum();
+        let depth = executor_info.queue_depth();
         let worker_count = workers.len();
         Ok(Self {
             routing,

@@ -691,13 +691,15 @@ fn an_image_encode_waits_for_a_free_host_lane_task() {
     // every ready encode schedulable at once, leaving the lane to bound them.
     sim.set_queue_depth(16);
     sim.set_results_on_wait(true);
+    sim.place_components(vec![(
+        ComponentInfo {
+            name: "model".to_owned(),
+            outputs: Vec::new(),
+        },
+        ComponentConfig::parallel(vec![0], Default::default()),
+    )]);
     let info = sim.mut_info_for_test();
     info.host_lane_capacity = 1;
-    info.components = vec![ComponentInfo {
-        name: "model".to_owned(),
-        config: ComponentConfig::parallel(vec![0], Default::default()),
-        outputs: Vec::new(),
-    }];
     info.media_components = BTreeMap::from([(MediaCall::VisionEncoding, "model".to_owned())]);
     let running = Running::start(sim, SchedulerConfig::default());
 

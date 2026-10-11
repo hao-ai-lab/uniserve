@@ -40,9 +40,9 @@ from uniserve_worker.transport.exports import validate_exports
 
 if TYPE_CHECKING:
     from uniserve_worker.config.execution.execution import WorkerConfig
+    from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
@@ -61,7 +61,7 @@ def commit_batch(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
+    model_runner: ModelExecutor,
     latent_pool: LatentPool | None,
     request_pool: RequestPool,
     decode_state: DecodeState | None,
@@ -147,7 +147,7 @@ def commit_batch(
                     "logprob result exceeds its registered completion capacity"
                 )
 
-            reports_output = config.rank == worker_info.output_rank(
+            reports_output = config.rank == model_runner.output_rank(
                 call.component
             )
             report_products.extend(outcome.products)

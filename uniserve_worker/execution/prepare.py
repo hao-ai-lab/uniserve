@@ -90,7 +90,6 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
@@ -883,7 +882,6 @@ def reserve_outputs(
     kv_cache: KVCacheManager | None,
     host_tasks: HostLane,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     output_pool: OutputPool,
@@ -998,7 +996,7 @@ def reserve_outputs(
             _reserve_host_tasks(
                 active_calls,
                 host_tasks=host_tasks,
-                worker_info=worker_info,
+                model_runner=model_runner,
                 config=config,
                 state=state,
             )
@@ -1107,7 +1105,7 @@ def _reserve_host_tasks(
     *,
     state: BatchState,
     host_tasks: HostLane,
-    worker_info: WorkerInfo,
+    model_runner: ModelExecutor,
     config: WorkerConfig,
 ) -> None:
     """Reserve bounded host-lane slots for the calls that run host work.
@@ -1115,7 +1113,7 @@ def _reserve_host_tasks(
     A media unit encode reserves one slot per unit this rank takes from the
     round; audio encoding, muxing and image decoding reserve one each. A
     non-distributed component's encode and mux work belongs to its
-    publication owner (`WorkerInfo.output_rank`), so other ranks reserve
+    publication owner (`ModelExecutor.output_rank`), so other ranks reserve
     nothing for it; image decoding reserves on every rank that runs it.
 
     The slots are stored in the call's `PendingOutput.host.tasks`. A failure
@@ -1132,21 +1130,14 @@ def _reserve_host_tasks(
         }:
             continue
 
-        component = next(
-            (
-                binding
-                for binding in worker_info.components
-                if binding.name == call.component
-            ),
-            None,
-        )
+        binding = model_runner.bindings.get(call.component)
         distributed = (
-            component is not None and component.config.distribution is not None
+            binding is not None and binding.config.distribution is not None
         )
         if (
             call.kind is not MediaCall.IMAGE_DECODING
             and not distributed
-            and config.rank != worker_info.output_rank(call.component)
+            and config.rank != model_runner.output_rank(call.component)
         ):
             continue
 
@@ -1157,12 +1148,12 @@ def _reserve_host_tasks(
             )
 
         count = 1
-        if call.kind is MediaCall.VIDEO_ENCODING and component is not None:
+        if call.kind is MediaCall.VIDEO_ENCODING and binding is not None:
             count = len(
                 encoded_unit_positions(
                     call,
                     state=state,
-                    component=component.config,
+                    component=binding.config,
                     rank=config.rank,
                 )
             )
@@ -1180,7 +1171,6 @@ def _reserve_host_tasks(
 def validate_batch(
     batch: Batch,
     *,
-    worker_info: WorkerInfo,
     model_runner: ModelExecutor,
     config: WorkerConfig,
     predecessors: Mapping[CallId, CallId | None],
@@ -1197,17 +1187,10 @@ def validate_batch(
     `BlockTables.install` and `Worker.supports_computation`).
     Violations raise `invalid_descriptor` errors.
     """
-    if worker_info.components:
+    if model_runner.bindings:
         for call in batch.calls:
-            entry = next(
-                (
-                    entry
-                    for entry in worker_info.components
-                    if entry.name == call.component
-                ),
-                None,
-            )
-            if entry is None or config.rank not in entry.config.ranks:
+            binding = model_runner.bindings.get(call.component)
+            if binding is None or config.rank not in binding.config.ranks:
                 raise invalid_descriptor(
                     f"call targets component {call.component!r} outside "
                     "this rank"
