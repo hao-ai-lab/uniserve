@@ -54,8 +54,10 @@ UNIFORM_GRID_POINTS = 50
 
 # The released (adapt_shape_v1) canvas rule: a 768-pixel short edge, an area
 # cap of the 16:9 canvas, sides on the packing's 32-pixel grid, and aspect
-# ratios from 1:4 to 4:1. Request planning and the denoisers' canvases both
-# resolve through ``canvas``.
+# ratios from 1:4 to 4:1. The denoisers' canvases resolve through ``canvas``;
+# the server's planner (``crates/server/src/serving/video/plan.rs``) applies
+# the same rule, and both are tested against the diffusers reference vectors
+# in ``tests/python/fixtures/minimax_h3_plan.json``.
 CANVAS_SHORT_EDGE = 768
 CANVAS_MAX_PIXELS = 768 * 1344
 MIN_ASPECT_RATIO, MAX_ASPECT_RATIO = 1 / 4, 4

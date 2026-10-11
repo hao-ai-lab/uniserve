@@ -52,7 +52,7 @@ from uniserve_worker.execution.conditions import (
 )
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.component_binding import ComponentBinding
-from uniserve_worker.protocol.video import VideoAdmission, VideoTask
+from uniserve_worker.protocol.video import VideoAdmission
 
 pytestmark = [
     pytest.mark.integration,
@@ -143,13 +143,13 @@ def _request(root: Path, case: str, ffmpeg: str, image_bands: int = 1):
     admitted in ``image_bands`` bands.
     """
     with published() as publish:
-        run, plan, _, conditions = recorded_request(
-            root, case, ffmpeg, publish, image_bands
+        run, request, _, conditions = recorded_request(
+            root, case, publish, image_bands
         )
         products = read(conditions, vision_encoder(), ffmpeg)
     presentation = json.loads((run / "presentation.json").read_text())
     video = VideoAdmission(
-        VideoTask(plan.task.value),
+        request.task,
         text_tags=tuple(presentation["tags"]),
         conditions=conditions,
     )

@@ -4,17 +4,17 @@
 //! decoded: the generated canvas and frame counts, how every condition is
 //! prepared (keyframe fit, reference image size, 24 fps reference clip,
 //! 32 kHz soundtrack), what the Qwen3-VL conditioner sees of it (vision
-//! grids, 2 fps samples and block timestamps), and the denoiser condition
-//! rows it adds. [`check_request`] applies the subset of rules that needs no
-//! media, so a malformed request is rejected before its media are fetched.
+//! grids, 2 fps samples and block timestamps), and the units the worker
+//! encodes each condition in. [`check_request`] applies the subset of rules
+//! that needs no media, so a malformed request is rejected before its media
+//! are fetched.
 //!
 //! The arithmetic reproduces the diffusers MiniMax-H3 pipeline and the
 //! checkpoint's Qwen3-VL processor operation for operation, in `f64` where
 //! they compute in Python floats, so that every rounding lands on the same
-//! side. The same rules are implemented for library callers by
-//! `uniserve_models/minimax_h3/processing.py`; both are tested against
-//! `tests/python/fixtures/minimax_h3_plan.json`. Rules the reference leaves
-//! open are fixed identically in both:
+//! side; it is tested against
+//! `tests/python/fixtures/minimax_h3_plan.json`, generated from that
+//! pipeline. Rules the reference leaves open are fixed here:
 //!
 //! - `start_time_seconds` skips the first `floor(s * 24 + 0.5)` frames of a
 //!   reference video's 24 fps timeline and the first `floor(s * rate + 0.5)`

@@ -6,10 +6,11 @@ ratio and duration. A t2va row carries no conditions; an fl2va or ref2va row
 lists its condition media, which the body names by ``file://`` URI under the
 point's ``video.condition_root``. The canvas and frame count a target
 resolves to follow the model package's request rules
-(``uniserve_models.minimax_h3.processing``), which the server's planner
-shares; validation holds every MP4 to its own request's canvas and frames.
-Media files are read when the request is built, before measurement, and
-inspection uses each request's shape and never runs inside a load slot.
+(``uniserve_models.minimax_h3.config.canvas`` and
+``uniserve_models.minimax_h3.processing.frame_count``), which the server's
+planner shares; validation holds every MP4 to its own request's canvas and
+frames. Media files are read when the request is built, before measurement,
+and inspection uses each request's shape and never runs inside a load slot.
 """
 
 from __future__ import annotations
@@ -89,17 +90,17 @@ def target_canvas(
     """
     # The model package loads torch, which only video points need, so the
     # rules are imported on first use.
-    from uniserve_models.minimax_h3 import processing
+    from uniserve_models.minimax_h3 import config, processing
 
     ratio = _named_ratio(task, aspect_ratio)
     if ratio is None:
-        if task != processing.Task.FL2VA:
+        if task != "fl2va":
             ratio = processing.DEFAULT_ASPECT_RATIO
         elif keyframe is None:
             raise ValueError("an fl2va auto target follows its first keyframe")
         else:
             ratio = keyframe
-    size = processing.canvas(*ratio)
+    size = config.canvas(*ratio)
     return size.width, size.height
 
 
@@ -123,7 +124,7 @@ def _named_ratio(task: str, aspect_ratio: str) -> tuple[int, int] | None:
     Raises:
         ValueError: The ratio is neither ``auto`` nor a named ratio.
     """
-    from uniserve_models.minimax_h3 import processing
+    from uniserve_models.minimax_h3 import config
 
     if aspect_ratio == "auto":
         return None
@@ -131,7 +132,7 @@ def _named_ratio(task: str, aspect_ratio: str) -> tuple[int, int] | None:
     # accepted exactly as written here.
     named = {
         f"{width}:{height}": (width, height)
-        for width, height in processing.NAMED_ASPECT_RATIOS
+        for width, height in config.NAMED_ASPECT_RATIOS
     }
     if aspect_ratio not in named:
         raise ValueError(
@@ -191,7 +192,7 @@ class VideoTask(BenchmarkTask):
                 cannot be sent them as the same work.
             OSError: A condition media file cannot be read.
         """
-        from uniserve_models.minimax_h3 import processing
+        from uniserve_models.minimax_h3 import config
 
         video = self.point.video
         seconds = float(
@@ -215,7 +216,7 @@ class VideoTask(BenchmarkTask):
             "conditions": conditions,
             "target": {
                 # The only short edge the canvas rule serves.
-                "short_edge": processing.CANVAS_SHORT_EDGE,
+                "short_edge": config.CANVAS_SHORT_EDGE,
                 "aspect_ratio": video.aspect_ratio,
                 "duration_seconds": seconds,
             },
@@ -331,10 +332,10 @@ class VideoTask(BenchmarkTask):
         resolved to (``RequestRecord.video_shape``); a record without one
         fails every shape check.
         """
-        from uniserve_models.minimax_h3 import processing
+        from uniserve_models.minimax_h3 import packing
 
         # The model generates every output at this frame rate.
-        fps = processing.FPS
+        fps = packing.FPS
         outputs = [record.decoded_video for record in records]
         shapes = [record.video_shape for record in records]
         present = (
