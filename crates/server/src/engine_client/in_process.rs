@@ -431,8 +431,8 @@ mod tests {
     use crate::engine_client::EngineClient;
     use uniserve_core::{
         EngineCoreOutput, FeedbackNextToken, FeedbackSource, GenerationConstraint,
-        GenerationRequest, ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageParams,
-        ImageTrigger, SamplingParams,
+        GenerationRequest, ImageEncoderInput, ImageGenerationConfig, ImageParams, ImageTrigger,
+        MediaCall, SamplingParams,
     };
     use uniserve_engine::{EngineConfig, Executor};
 
@@ -601,7 +601,7 @@ mod tests {
             feedback_next_token: FeedbackNextToken::EndOfImage,
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
-                encoder: ImageIngestStep::VitEncode,
+                encoder: MediaCall::VisionEncoding,
                 num_kv_tokens: None,
                 max_kv_tokens: None,
             }],

@@ -80,66 +80,6 @@ impl ForwardMode {
     }
 }
 
-/// A concrete media-input, encoder, diffusion, decoder, or media-output
-/// computation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum MediaCall {
-    /// Decodes a video request's condition media on a host rank into the
-    /// inputs of the vision and latent encoders.
-    MediaReading,
-    VisionEncoding,
-    LatentEncoding,
-    TextEncoding,
-    LatentPreparation,
-    Denoising,
-    ImageDecoding,
-    VideoDecoding,
-    AudioDecoding,
-    VideoEncoding,
-    AudioEncoding,
-    Muxing,
-}
-
-impl MediaCall {
-    /// Every media call in declaration order.
-    ///
-    /// `worker-ipc-py` indexes a Python enum table built from this array with
-    /// `call as usize`, so the order must match the declaration order.
-    pub const ALL: [Self; 12] = [
-        Self::MediaReading,
-        Self::VisionEncoding,
-        Self::LatentEncoding,
-        Self::TextEncoding,
-        Self::LatentPreparation,
-        Self::Denoising,
-        Self::ImageDecoding,
-        Self::VideoDecoding,
-        Self::AudioDecoding,
-        Self::VideoEncoding,
-        Self::AudioEncoding,
-        Self::Muxing,
-    ];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::MediaReading => "media_reading",
-            Self::VisionEncoding => "vision_encoding",
-            Self::LatentEncoding => "latent_encoding",
-            Self::TextEncoding => "text_encoding",
-            Self::LatentPreparation => "latent_preparation",
-            Self::Denoising => "denoising",
-            Self::ImageDecoding => "image_decoding",
-            Self::VideoDecoding => "video_decoding",
-            Self::AudioDecoding => "audio_decoding",
-            Self::VideoEncoding => "video_encoding",
-            Self::AudioEncoding => "audio_encoding",
-            Self::Muxing => "muxing",
-        }
-    }
-}
-
 /// The storage action performed between concrete producers and consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -27,8 +27,7 @@ use uniserve_worker_ipc::{
 };
 
 use uniserve_core::{
-    CanvasSampling, GenerationRequest, ImageEncoderInput, ImageIngestStep, ImageInput, RequestId,
-    SamplingParams,
+    CanvasSampling, GenerationRequest, ImageEncoderInput, ImageInput, RequestId, SamplingParams,
 };
 use uniserve_worker_ipc::{
     Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, Readout,
@@ -461,12 +460,15 @@ impl RequestState {
 
 /// Builds the immutable auxiliary feature product produced by an encode call.
 fn encoder_output(
-    step: ImageIngestStep,
+    encoder: MediaCall,
     limits: &uniserve_core::GenerationLimits,
 ) -> Result<TensorRef, PlanningError> {
-    let bytes = match step {
-        ImageIngestStep::VaeEncode => limits.max_latent_feature_bytes,
-        ImageIngestStep::VitEncode => limits.max_vision_feature_bytes,
+    // An image encoder is a latent or a vision encoding call
+    // (`GenerationRequest::validate`).
+    let bytes = if encoder == MediaCall::LatentEncoding {
+        limits.max_latent_feature_bytes
+    } else {
+        limits.max_vision_feature_bytes
     };
     Ok(bounded_tensor(
         0,
@@ -737,9 +739,10 @@ pub(super) fn plan_image_extend(
     let capacity = encoder.kv_token_capacity(limits)?;
     let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = capacity;
-    match encoder.encoder {
-        ImageIngestStep::VitEncode => call.vision_inputs = vec![VisionInput { offset: 0, feature }],
-        ImageIngestStep::VaeEncode => call.latent_feature_input = Some(feature),
+    if encoder.encoder == MediaCall::LatentEncoding {
+        call.latent_feature_input = Some(feature);
+    } else {
+        call.vision_inputs = vec![VisionInput { offset: 0, feature }];
     }
     call.completion_output = feedback.then(|| output_tensor(0, DType::U8));
     call.token_output = sample_continuation.then(|| output_tensor(1, DType::I64));
@@ -752,15 +755,6 @@ pub(super) fn plan_image_extend(
     finish_plan(request, call, 0)
 }
 
-/// Returns the call kind that runs one image encoder stage: the latent
-/// encoder of `VaeEncode` and the vision encoder of `VitEncode`.
-pub(crate) const fn encoder_call(step: ImageIngestStep) -> CallKind {
-    match step {
-        ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
-        ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
-    }
-}
-
 /// Encodes host image bytes or an existing device image into a feature tensor.
 ///
 /// A device `source` takes precedence over `image_base64`. Fails with
@@ -770,7 +764,7 @@ pub(crate) const fn encoder_call(step: ImageIngestStep) -> CallKind {
 pub(super) fn plan_encode(
     limits: &uniserve_core::GenerationLimits,
     request: &GenerationRequest,
-    step: ImageIngestStep,
+    step: MediaCall,
     image_base64: String,
     source: Option<TensorRef>,
     feedback: bool,
@@ -782,7 +776,7 @@ pub(super) fn plan_encode(
     } else if source.is_none() && image_base64.is_empty() {
         return Err(PlanningError::MissingImageInput);
     }
-    let mut call = computation(request, encoder_call(step));
+    let mut call = computation(request, CallKind::Media(step));
     if source.is_none() && !image_base64.is_empty() {
         call.input_image = Some(image_base64.into());
     }
@@ -1722,7 +1716,7 @@ impl RequestState {
         };
         for _ in 0..blocks {
             let (image, input) = self.input_block(advance.cursor)?;
-            if input.encoder != ImageIngestStep::VitEncode {
+            if input.encoder != MediaCall::VisionEncoding {
                 return None;
             }
             advance.kv = advance.kv.checked_add(input.num_kv_tokens?)?;

@@ -638,7 +638,7 @@ impl Scheduler {
         if st.phase == Phase::Prefill
             && let Some((_, step)) = self.next_context_encode(id)
         {
-            return Some(generation::encoder_call(step));
+            return Some(CallKind::Media(step));
         }
         Some(match st.phase {
             Phase::IngestState => CallKind::Forward(ForwardMode::Prefill),
@@ -655,7 +655,7 @@ impl Scheduler {
             Phase::FeedbackEncode => {
                 let feedback = &st.req.image_generation;
                 feedback.feedback_source.as_ref()?;
-                generation::encoder_call(
+                CallKind::Media(
                     feedback
                         .feedback_encoders
                         .get(st.feedback_encoder_index)?
@@ -1807,7 +1807,7 @@ impl Scheduler {
                 key: cache_key,
                 product: product.clone(),
             });
-            if step == ImageIngestStep::VaeEncode {
+            if step == MediaCall::LatentEncoding {
                 state.input_image_features = Some(product);
                 state.phase = Phase::IngestState;
                 return self.next_context_computation(id, budget, context_rows);
@@ -1852,7 +1852,7 @@ impl Scheduler {
                     break;
                 };
                 if end < text_stop
-                    || input.encoder != ImageIngestStep::VitEncode
+                    || input.encoder != MediaCall::VisionEncoding
                     || rows >= context_rows
                 {
                     break;
@@ -1922,10 +1922,7 @@ impl Scheduler {
     /// which the chunk before it does not reach. A request plans nothing
     /// while its encode is in flight, so the encode's completion identifies
     /// its block by the same walk.
-    pub(super) fn next_context_encode(
-        &self,
-        id: RequestId,
-    ) -> Option<(BlockCursor, ImageIngestStep)> {
+    pub(super) fn next_context_encode(&self, id: RequestId) -> Option<(BlockCursor, MediaCall)> {
         let state = self.running.get(&id)?;
         if state.phase == Phase::IngestState {
             return None;
@@ -1936,7 +1933,7 @@ impl Scheduler {
         let mut encoded = 0;
         while let Some((image, input)) = state.input_block(block) {
             let position = image.position as usize;
-            if input.encoder == ImageIngestStep::VaeEncode {
+            if input.encoder == MediaCall::LatentEncoding {
                 return (position == cursor).then_some((block, input.encoder));
             }
             if position > cursor && position >= reach {

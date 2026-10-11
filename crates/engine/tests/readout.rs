@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use uniserve_core::{
     CachePolicy, EngineCoreOutput, FinishReason, GenerationConstraint, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageInput, ImageParams,
-    MultimodalInputs, ReadoutRow, ReadoutSlot, RejectionKind, RequestId, SamplingParams,
+    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, MultimodalInputs,
+    ReadoutRow, ReadoutSlot, RejectionKind, RequestId, SamplingParams,
 };
 use uniserve_engine::{
     BatchEvent, ComponentConfig, EngineHandle, EventRx, ExecutionBatch, Scheduler, SchedulerConfig,
@@ -439,7 +439,7 @@ fn an_image_readout_reads_the_encoded_image_with_its_prompt() {
         position: 10,
         num_positions: 9,
         encoders: vec![ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: Some(9),
             max_kv_tokens: None,
         }],
@@ -472,7 +472,7 @@ fn vision_image(hash: u64, position: u32, tokens: u32) -> ImageInput {
         position,
         num_positions: tokens,
         encoders: vec![ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: Some(tokens),
             max_kv_tokens: None,
         }],
@@ -717,7 +717,7 @@ fn an_image_encode_waits_for_a_free_host_lane_task() {
                 position: 0,
                 num_positions: 9,
                 encoders: vec![ImageEncoderInput {
-                    encoder: ImageIngestStep::VitEncode,
+                    encoder: MediaCall::VisionEncoding,
                     num_kv_tokens: Some(9),
                     max_kv_tokens: None,
                 }],

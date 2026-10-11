@@ -37,8 +37,8 @@ use uniserve_worker_ipc::{Call, CallKind, ForwardMode, MediaCall};
 use uniserve_core::{EngineCoreOutput, FinishReason};
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageInput, ImageParams,
-    ImageTrigger, MultimodalInputs, RequestId, SamplingParams,
+    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger,
+    MultimodalInputs, RequestId, SamplingParams,
 };
 use uniserve_engine::{
     BatchEvent, BatchResult, EVENT_BUFFER_CAPACITY, EngineHandle, ExecutionBatch, Executor,
@@ -165,7 +165,7 @@ fn image_input(
                 position,
                 num_positions: logical_positions,
                 encoders: vec![ImageEncoderInput {
-                    encoder: ImageIngestStep::VitEncode,
+                    encoder: MediaCall::VisionEncoding,
                     num_kv_tokens: Some(physical_tokens),
                     max_kv_tokens: None,
                 }],
@@ -202,7 +202,7 @@ fn generation_request(
         feedback_next_token: FeedbackNextToken::EndOfImage,
         num_feedback_positions: 2,
         feedback_encoders: vec![ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: None,
             max_kv_tokens: None,
         }],
@@ -1852,12 +1852,12 @@ fn a_latent_image_block_is_written_by_its_own_call() {
     );
     request.multimodal_inputs.images[0].encoders = vec![
         ImageEncoderInput {
-            encoder: ImageIngestStep::VaeEncode,
+            encoder: MediaCall::LatentEncoding,
             num_kv_tokens: Some(6),
             max_kv_tokens: None,
         },
         ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: Some(5),
             max_kv_tokens: None,
         },
@@ -2168,7 +2168,7 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     request.image_generation.feedback_next_token = FeedbackNextToken::Bos;
     request.image_generation.num_feedback_positions = 1;
     request.image_generation.feedback_encoders = vec![ImageEncoderInput {
-        encoder: ImageIngestStep::VitEncode,
+        encoder: MediaCall::VisionEncoding,
         num_kv_tokens: Some(1),
         max_kv_tokens: None,
     }];

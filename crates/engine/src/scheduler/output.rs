@@ -897,7 +897,7 @@ impl Scheduler {
                         // vision block joins the context prefill that reaches
                         // it. Encodes follow the blocks' context order.
                         if let Some(st) = self.running.get_mut(&id) {
-                            if step == ImageIngestStep::VaeEncode {
+                            if step == MediaCall::LatentEncoding {
                                 st.input_image_features = Some(selected_product);
                                 st.phase = Phase::IngestState;
                             } else {

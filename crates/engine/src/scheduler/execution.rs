@@ -2246,7 +2246,7 @@ impl Scheduler {
             Phase::FeedbackEncode => {
                 let feedback = &state.req.image_generation;
                 feedback.feedback_source.as_ref()?;
-                generation::encoder_call(
+                CallKind::Media(
                     feedback
                         .feedback_encoders
                         .get(self.scheduled_feedback(id)?.0)?
