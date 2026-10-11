@@ -498,7 +498,7 @@ def _execute_warmup(
         parts = []
         for completion in failures:
             code = (
-                completion.error_code.value
+                str(completion.error_code)
                 if completion.error_code is not None
                 else "internal"
             )

@@ -721,6 +721,9 @@ pub enum CallStatus {
 
 /// The failure classes of a worker, carried by a call's completion and by an
 /// error response alike.
+///
+/// The Python extension exposes these members as `ErrorCode`, and the worker
+/// raises and reports its failures with them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -748,20 +751,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// Every code in declaration order.
-    pub const ALL: [Self; 9] = [
-        Self::UnsupportedCall,
-        Self::InvalidDescriptor,
-        Self::UnsupportedSetup,
-        Self::InputError,
-        Self::ComputeError,
-        Self::ResourceError,
-        Self::InvariantViolation,
-        Self::FatalWorkerFailure,
-        Self::InvalidRequest,
-    ];
-
-    /// Returns the snake_case name the Python worker spells the code with.
+    /// Returns the snake_case name that spells the code in logs and messages.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UnsupportedCall => "unsupported_call",

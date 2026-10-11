@@ -11,18 +11,18 @@ other exception onto the taxonomy where failures are caught (in `Service`,
 `uniserve_worker.protocol.messages.error_response` sends to the engine, where
 the PyO3 extension decodes them into ``WorkerResponseError``. Those fields
 are scalars, short strings, and call identities, never tensors. The codes are
-the ones the call completions carry (`ErrorCode`), spelled as the worker-ipc
-schema's ``ErrorCode``. `_POLICY` defines each code's default fatality and
+the ones the call completions carry, the extension's own ``ErrorCode`` (the
+worker-ipc schema's enum). `_POLICY` defines each code's default fatality and
 whether its log record carries a stack trace.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from uniserve.runtime import EventPoolError
+from uniserve_worker._uniserve_ipc import ErrorCode
 
 if TYPE_CHECKING:
     from uniserve_worker.protocol.identity import CallId
@@ -41,30 +41,6 @@ __all__ = [
     "unsupported_call",
     "resource_error",
 ]
-
-
-class ErrorCode(StrEnum):
-    """Failure classes of a worker.
-
-    One vocabulary serves a call's completion (``RequestOutput.error_code``)
-    and the error response, and mirrors the worker-ipc schema's
-    ``ErrorCode``: members are spelled with the snake_case names the Rust
-    enum's ``as_str`` returns, so changing a value is a wire-protocol change.
-    The engine stops serving on ``INVARIANT_VIOLATION``.
-    """
-
-    UNSUPPORTED_CALL = "unsupported_call"
-    INVALID_DESCRIPTOR = "invalid_descriptor"
-    UNSUPPORTED_SETUP = "unsupported_setup"
-    INPUT_ERROR = "input_error"
-    COMPUTE_ERROR = "compute_error"
-    RESOURCE_ERROR = "resource_error"
-    INVARIANT_VIOLATION = "invariant_violation"
-    FATAL_WORKER_FAILURE = "fatal_worker_failure"
-    # The worker refuses the request itself: its admitted size does not fit
-    # what the model serves or the worker provisioned. The completion states
-    # why (``RequestOutput.error_message``).
-    INVALID_REQUEST = "invalid_request"
 
 
 class ErrorPolicy(NamedTuple):
@@ -164,7 +140,7 @@ class WorkerError(Exception):
         # stays in this process.
         return {
             "kind": "error",
-            "code": str(self.code),
+            "code": self.code,
             "message": self.message,
             "fatal": bool(self.fatal),
             "phase": self.phase,

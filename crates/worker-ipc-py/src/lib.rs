@@ -3,9 +3,9 @@
 //! The `_uniserve_ipc` extension module exposes `Server`, which owns the
 //! rank's `RankServer` (iceoryx2 shared storage for a rank on the head's
 //! host, a TCP socket for a rank elsewhere); `StreamSignal`, which turns CUDA
-//! stream completion into a readable eventfd; `service_name`; and the
-//! `atomic_store_u32` / `atomic_load_u32` accessors for shared-storage segment
-//! header words. The hand-written stub `uniserve_worker/_uniserve_ipc.pyi`
+//! stream completion into a readable eventfd; `ErrorCode`, the schema's
+//! failure classes; `service_name`; and the `atomic_store_u32` /
+//! `atomic_load_u32` accessors for shared-storage segment header words. The hand-written stub `uniserve_worker/_uniserve_ipc.pyi`
 //! describes the same Python surface and must stay consistent with it.
 //!
 //! # Boundary conversions
@@ -25,11 +25,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod convert;
+mod error_code;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use error_code::PyErrorCode;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -584,6 +586,7 @@ fn atomic_load_u32(buffer: PyBuffer<u8>, offset: usize) -> PyResult<u32> {
 fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServer>()?;
     m.add_class::<PyStreamSignal>()?;
+    m.add_class::<PyErrorCode>()?;
     m.add_function(wrap_pyfunction!(service_name, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_store_u32, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_load_u32, m)?)?;

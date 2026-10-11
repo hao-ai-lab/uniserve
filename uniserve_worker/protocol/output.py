@@ -251,7 +251,7 @@ class RequestOutput:
             "kv_output": None
             if self.kv_output is None
             else self.kv_output.to_mapping(),
-            "error_code": None if error_code is None else error_code.value,
+            "error_code": error_code,
             "error_message": self.error_message,
             "timing_counters": {
                 "queued_us": timing.queued_us,

@@ -41,7 +41,7 @@ def test_a_refusal_carries_its_reason_across_the_wire():
     refused = _completion(ErrorCode.INVALID_REQUEST, REASON)
     refused.validate()
     mapping = refused.to_mapping()
-    assert mapping["error_code"] == "invalid_request"
+    assert mapping["error_code"] is ErrorCode.INVALID_REQUEST
     assert mapping["error_message"] == REASON
 
 
