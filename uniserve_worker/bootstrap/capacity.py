@@ -653,7 +653,6 @@ def model_arena_capacity(
     worker_config: WorkerConfig,
     *,
     queue_depth: int,
-    completion_payload_bytes: int,
     num_units: int,
     request_pool_size: int,
     num_latent_pages: int,
@@ -680,9 +679,8 @@ def model_arena_capacity(
             an image denoiser's ``model_dtype`` is not FP16, BF16 or FP32.
     """
     depth = int(queue_depth)
-    payload_bytes = int(completion_payload_bytes)
     max_calls = int(worker_config.max_batch_calls)
-    if depth < 1 or payload_bytes < 1 or max_calls < 1:
+    if depth < 1 or max_calls < 1:
         raise ValueError("model arena sizing requires positive runtime bounds")
 
     slots = depth * max_calls
@@ -932,11 +930,11 @@ def resolve_request_capacity(
     On a CUDA device, the grant measured now becomes ``pool_storage_bytes``;
     ``Worker.__init__`` calls this after the runner has bound its persistent
     inputs and workspaces, so they are already excluded. A request-tensor
-    worker also receives the largest slot count, from
-    ``min_request_pool_size`` up to ``max_request_pool_size`` and a third of
-    ``queue_depth``, whose request state, products, relays and latent pool fit
-    on every rank of ``capacity_group``, and its batch bounds are clamped to
-    that count. On any other device the configuration is returned unchanged.
+    worker also receives the largest slot count, from one up to
+    ``max_request_pool_size`` and a third of ``queue_depth``, whose request
+    state, products, relays and latent pool fit on every rank of
+    ``capacity_group``, and its batch bounds are clamped to that count. On
+    any other device the configuration is returned unchanged.
 
     Raises:
         WorkerError: With ``UNSUPPORTED_SETUP`` when a request-tensor worker
@@ -1002,7 +1000,7 @@ def resolve_request_capacity(
                 maximum=min(
                     worker_config.max_request_pool_size, queue_depth // 3
                 ),
-                minimum=worker_config.min_request_pool_size,
+                minimum=1,
                 available_bytes=available,
                 auxiliary_bytes=auxiliary_bytes,
             )

@@ -30,7 +30,7 @@ use uniserve_server::serving::systemone::{
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, ImageFetchPolicy,
-    SchedulingPolicy, VideoMediaSettings,
+    SchedulingPolicy, VideoJobSettings, VideoMediaSettings,
 };
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
@@ -155,8 +155,10 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(value_name = "MODEL")]
     pub model: String,
 
-    /// Override the maximum model context length. When unset, the model's real
-    /// context length (`max_position_embeddings`) is used.
+    /// Override the maximum model context length. When unset, a model with a
+    /// root `config.json` uses its `max_position_embeddings` (8192 when it
+    /// declares none) and a MiniMax-H3 pipeline uses 16384 prompt tokens, the
+    /// longest prompt capacity startup prepares by default.
     #[arg(long = "max-model-len")]
     pub max_model_len: Option<u32>,
     /// Longest video duration, in seconds, a media deployment provisions and
@@ -206,6 +208,15 @@ pub(crate) struct SharedRuntimeArgs {
     /// Bytes of condition media one video request may carry in total.
     #[arg(long = "max-request-bytes", default_value_t = VideoMediaSettings::DEFAULT_MAX_REQUEST_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
     pub max_request_bytes: u64,
+    /// Seconds a completed or failed asynchronous video job stays retrievable
+    /// before the server deletes it.
+    #[arg(long = "video-job-retention", default_value_t = VideoJobSettings::DEFAULT_RETENTION_SECONDS, value_parser = clap::value_parser!(u64).range(1..))]
+    pub video_job_retention: u64,
+    /// Bytes of generated video the asynchronous video jobs keep, retained
+    /// artifacts and unfinished downloads together. Retained artifacts are
+    /// shared-memory mappings, so this is the memory the job store may hold.
+    #[arg(long = "max-video-job-bytes", default_value_t = VideoJobSettings::DEFAULT_MAX_RETAINED_BYTES, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub max_video_job_bytes: usize,
     /// `ffprobe` executable that probes video and audio condition media.
     #[arg(long, default_value = "ffprobe", value_name = "PATH")]
     pub ffprobe: std::path::PathBuf,
@@ -230,9 +241,6 @@ pub(crate) struct SharedRuntimeArgs {
     /// Recompute prompt prefixes instead of reusing or retaining cached KV pages.
     #[arg(long)]
     pub disable_prefix_cache: bool,
-    /// Response-ring slot capacity in bytes for the worker IPC transport.
-    #[arg(long, default_value_t = EngineSettings::DEFAULT_RESP_SLOT_CAP, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
-    pub resp_slot_cap: usize,
     /// Compute device for the forward-only worker.
     #[arg(long, default_value = "cuda")]
     pub device: String,
@@ -304,6 +312,11 @@ pub(crate) struct SharedRuntimeArgs {
     /// Maximum number of concurrently resident requests.
     #[arg(long = "max-running-requests", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_seqs: Option<usize>,
+    /// Maximum number of requests the scheduler holds waiting, or finished
+    /// with undelivered events; a submission beyond it is rejected as
+    /// overloaded. Unbounded when unset.
+    #[arg(long = "max-queued-requests", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub max_num_waiting: Option<usize>,
     /// Maximum number of prompt tokens processed per request in one prefill step.
     #[arg(long = "chunked-prefill-size", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub long_prefill_threshold: Option<usize>,
@@ -314,6 +327,14 @@ pub(crate) struct SharedRuntimeArgs {
     /// `0` disables graceful drain (terminate immediately).
     #[arg(long, default_value_t = 30)]
     pub shutdown_timeout: u64,
+    /// Seconds a submitted batch may run without any rank making progress
+    /// before the worker group is treated as hung and replaced, failing its
+    /// requests. A rank that exits is detected at once; this bounds one that
+    /// is alive but stuck. A batch that legitimately runs longer, such as
+    /// the first evaluation of a layout prepared on arrival, needs a larger
+    /// value.
+    #[arg(long = "watchdog-timeout", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    pub watchdog_timeout: u64,
 
     /// The file path to the chat template, or the template in single-line form
     /// for the specified model.
@@ -354,9 +375,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// SSE streams and video downloads) are not bounded by it.
     #[arg(long = "request-timeout", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub request_timeout: Option<u64>,
-    /// HTTP admission limit for in-flight chat completion and image generation
-    /// requests, which are shed with 503 above it. Video requests are bounded
-    /// by the video job slots instead.
+    /// HTTP admission limit for in-flight chat completion, image generation,
+    /// System One and synchronous video requests, which are shed with 503
+    /// above it.
     #[arg(long = "max-concurrent-requests", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub max_concurrent_requests: Option<u64>,
     /// Enable or disable periodic logging of engine statistics.
@@ -478,7 +499,7 @@ impl SharedRuntimeArgs {
             .queue_depth
             .unwrap_or(WorkerProcessArgs::DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
-        worker_process.resp_slot_cap = self.resp_slot_cap;
+        worker_process.watchdog_timeout = Duration::from_secs(self.watchdog_timeout);
         worker_process.max_total_tokens = self.max_total_tokens;
         worker_process.block_size = self.block_size;
         worker_process.attention_backend = self.attention_backend.clone();
@@ -489,6 +510,7 @@ impl SharedRuntimeArgs {
                 .max_num_batched_tokens
                 .unwrap_or(DEFAULT_MAX_NUM_BATCHED_TOKENS),
             max_num_seqs: self.max_num_seqs.unwrap_or(DEFAULT_MAX_NUM_SEQS),
+            max_num_waiting: self.max_num_waiting,
             long_prefill_threshold: self
                 .long_prefill_threshold
                 .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),
@@ -553,6 +575,10 @@ impl SharedRuntimeArgs {
                 remote_media: self.remote_media,
                 max_request_bytes: self.max_request_bytes,
                 ffprobe: self.ffprobe,
+            },
+            video_jobs: VideoJobSettings {
+                retention: Duration::from_secs(self.video_job_retention),
+                max_retained_bytes: self.max_video_job_bytes,
             },
             image_fetch: ImageFetchPolicy {
                 timeout: Duration::from_secs(self.image_fetch_timeout),
@@ -851,8 +877,6 @@ mod tests {
             "1234",
             "--schedule-policy",
             "priority",
-            "--resp-slot-cap",
-            "1048576",
             "--dtype",
             "float16",
             "--mem-fraction-static",

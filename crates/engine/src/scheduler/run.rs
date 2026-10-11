@@ -11,10 +11,11 @@ use uniserve_worker_ipc::{ForwardMode, MediaCall};
 
 /// Intersects model requirements with capacities actually loaded by the worker.
 ///
-/// A generation feature survives only when every call kind it needs is in the
-/// aggregate `supported_calls`; numeric limits are clamped to the reported
-/// latent, batch-token, encoder-entry, buffer-pool, and encoder-cache
-/// capacities.
+/// The workers state which generation features are served: a feature is
+/// available when every call kind it needs is in the aggregate
+/// `supported_calls`, whatever the model description lists. Numeric limits
+/// are clamped to the reported latent, batch-token, encoder-entry,
+/// buffer-pool, and encoder-cache capacities.
 fn resolve_generation_limits(
     mut limits: uniserve_core::GenerationLimits,
     info: &WorkerInfo,
@@ -44,7 +45,7 @@ fn resolve_generation_limits(
     {
         available.insert(uniserve_core::GenerationFeatures::TOKEN_DENOISING);
     }
-    limits.features &= available;
+    limits.features = available;
 
     limits.max_latent_units = limits.max_latent_units.min(info.latent_capacity_units());
     let latent_bound = limits.max_latent_units.min(u64::from(u32::MAX)) as u32;
@@ -225,7 +226,7 @@ impl Scheduler {
             .saturating_mul(max_batch_calls)
             .clamp(1, MAX_INFLIGHT_TRANSFERS);
 
-        config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
+        config.max_num_waiting = config.max_num_waiting.map(|bound| bound.max(1));
 
         // The request pool also holds the rows the runtime keeps outside
         // `max_num_seqs` (`flow_prefix_rows`). `EngineCore::new` launches
@@ -238,7 +239,7 @@ impl Scheduler {
             .saturating_sub(flow_prefix_rows(&info))
             .max(1);
 
-        let requested_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
+        let requested_seqs = config.max_num_seqs.max(1);
         if requested_seqs > main_request_capacity {
             tracing::warn!(
                 requested = requested_seqs,
@@ -341,7 +342,7 @@ impl Scheduler {
 
     /// Caps waiting and terminal-output-retained request state.
     pub fn set_max_num_waiting(&mut self, n: usize) {
-        self.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
+        self.config.max_num_waiting = Some(n.max(1));
     }
 
     /// Returns the executor's aggregate worker capabilities.

@@ -277,19 +277,14 @@ impl PyStreamSignal {
 #[pymethods]
 impl PyServer {
     #[new]
-    #[pyo3(signature = (service_name, max_payload = 1048576, max_inflight = 1, transport = SHARED_STORAGE_CHANNEL))]
-    /// Binds this rank's channel with bounded payload and inflight capacity.
+    #[pyo3(signature = (service_name, max_inflight = 1, transport = SHARED_STORAGE_CHANNEL))]
+    /// Binds this rank's channel with a bounded number of requests in flight.
     ///
     /// `transport` is the mechanism the placement calls for: a rank on the
     /// head's host serves shared storage, and a rank elsewhere serves a socket,
     /// where `service_name` is the host to bind rather than a service.
-    fn new(
-        service_name: &str,
-        max_payload: usize,
-        max_inflight: usize,
-        transport: &str,
-    ) -> PyResult<Self> {
-        let inner = RankServer::bind(transport, service_name, max_payload, max_inflight)
+    fn new(service_name: &str, max_inflight: usize, transport: &str) -> PyResult<Self> {
+        let inner = RankServer::bind(transport, service_name, max_inflight)
             .map_err(|err| py_runtime(format!("failed to bind IPC service: {err:#}")))?;
         let completion_wake = inner.completion_wake();
         Ok(Self {

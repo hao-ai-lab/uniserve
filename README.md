@@ -115,9 +115,10 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--expert-exchange` | `alltoall` | NVLink token exchange, `deepep` elastic dispatch/combine, `megamoe` fused experts, or `dwdp` asynchronous expert-weight prefetch |
 | `--expert-microbatches` | `1` | Independent microbatches; values above one require dedicated experts |
 | `--max-video-seconds` | `15` | Longest admitted clip, from 4 to 15 seconds |
-| `--max-model-len` | Model configuration | Context-length ceiling |
+| `--max-model-len` | The checkpoint's `max_position_embeddings`; 16384 prompt tokens for a MiniMax-H3 pipeline; 8192 when neither exists | Context-length ceiling |
 | `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities prepared at startup |
 | `--max-running-requests` | `128`, clamped to worker capacity | Scheduler active-request bound |
+| `--max-queued-requests` | Unbounded | Requests the scheduler holds waiting or with undelivered events before it rejects a submission as overloaded |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
 | `--block-size` | Chosen by the worker | Tokens per KV page of the widest cache group, supported by every cache group's attention readers |
 | `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |
@@ -128,8 +129,11 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--attention-backend` | `auto` | Attention provider for every call: `torch`, `flash_attn`, `flash_attn_4`, `flashinfer`, `trtllm`, `sgl_kernel` or `prefix_block`; `auto` selects a native kernel per call |
 | `--api-key` | Unset | Bearer token for public routes |
 | `--request-timeout` | Unset | Seconds until response headers; streamed bodies are not bounded |
-| `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation and System One requests; video requests use video job slots |
+| `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation, System One and synchronous video requests |
+| `--video-job-retention` | `3600` | Seconds a completed or failed asynchronous video job stays retrievable |
+| `--max-video-job-bytes` | `1073741824` | Bytes of generated video the asynchronous jobs keep, retained artifacts and unfinished downloads together |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
+| `--watchdog-timeout` | `300` | Seconds a batch may run without any rank making progress before the worker group is replaced |
 | `--image-fetch-timeout` | `20` | Seconds allowed to fetch one `http(s)` image URL, including redirects and the complete body |
 | `--image-fetch-max-bytes` | `20000000` | Largest accepted input image in bytes, for fetched URLs and `data:` URLs alike |
 | `--allow-private-image-urls` | Off | Allow image URLs that resolve to loopback, private, link-local, unique-local, or cloud metadata addresses |

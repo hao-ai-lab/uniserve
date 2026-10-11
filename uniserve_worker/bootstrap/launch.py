@@ -114,7 +114,6 @@ def run_worker(config: WorkerProcessArgs) -> None:
     endpoint_service = endpoint_name(config)
     with WorkerIpcEndpoint(
         endpoint_service,
-        max_payload=config.ipc.max_payload_bytes,
         max_inflight=config.ipc.queue_depth,
         transport=config.ipc.channel_transport,
     ) as endpoint:
@@ -128,7 +127,6 @@ def run_worker(config: WorkerProcessArgs) -> None:
                 "worker IPC endpoint bound",
                 extra={
                     "service": endpoint_service,
-                    "max_payload_bytes": config.ipc.max_payload_bytes,
                     "max_inflight": config.ipc.queue_depth,
                     "supported_calls": sorted(
                         value.value for value in worker.info.supported_calls

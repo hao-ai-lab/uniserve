@@ -202,9 +202,6 @@ impl VideoService {
                 "http": self.media.remote_media,
                 "file": self.media.media_directory.is_some(),
                 "max_request_bytes": limits.total_bytes,
-                "max_image_bytes": limits.image_bytes,
-                "max_video_bytes": limits.video_bytes,
-                "max_audio_bytes": limits.audio_bytes,
             },
             "request_fields": REQUEST_FIELDS,
         })

@@ -2,8 +2,7 @@
 //!
 //! These are requested limits: `Scheduler::with_model_limits` clamps the token
 //! and sequence limits, and the batch limit when the executor advertises a
-//! nonzero call limit, to the executor's capacity, and the sequence and
-//! waiting limits to the hard bounds below.
+//! nonzero call limit, to the executor's capacity.
 
 /// Default maximum calls selected by one generation scheduling pass.
 pub const DEFAULT_MAX_BATCH: usize = 128;
@@ -13,12 +12,6 @@ pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 pub const DEFAULT_MAX_NUM_SEQS: usize = 128;
 /// Default token threshold above which a prefill is chunked.
 pub const DEFAULT_LONG_PREFILL_THRESHOLD: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
-/// Default upper bound for queued requests.
-pub(crate) const DEFAULT_MAX_NUM_WAITING: usize = 4096;
-/// Hard upper bound for configured waiting requests.
-pub(crate) const MAX_NUM_WAITING: usize = 65_536;
-/// Hard upper bound for configured active sequences.
-pub(crate) const MAX_NUM_SEQS: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,10 +43,10 @@ pub struct SchedulerConfig {
     pub max_num_seqs: usize,
     /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
-    /// Admission limit on waiting requests. Submission counts waiting token
-    /// and media requests together with finished requests whose output
-    /// events are still retained.
-    pub max_num_waiting: usize,
+    /// Admission limit on waiting requests, or `None` to queue without
+    /// bound. Submission counts waiting token and media requests together
+    /// with finished requests whose output events are still retained.
+    pub max_num_waiting: Option<usize>,
     /// Block-diffusion sampling of every canvas the deployment generates, as
     /// the workers are launched with. A block-diffusion runtime has no
     /// autoregressive decode, so each request it does not read out runs
@@ -69,7 +62,7 @@ impl Default for SchedulerConfig {
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
-            max_num_waiting: DEFAULT_MAX_NUM_WAITING,
+            max_num_waiting: None,
             canvas: None,
         }
     }

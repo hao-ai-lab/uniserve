@@ -684,14 +684,9 @@ pub enum ImageParamsError {
         /// Maximum supported scale.
         max: f32,
     },
-    /// Per-request image count lies outside its supported range.
-    #[error("max_images must be in 1..={max}, got {got}")]
-    MaxImages {
-        /// Supplied image count.
-        got: u16,
-        /// Maximum supported image count.
-        max: u16,
-    },
+    /// A request that may generate images allows none.
+    #[error("max_images must be at least 1")]
+    MaxImages,
     /// A floating-point parameter is NaN or infinite.
     #[error("{field} must be finite, got {got}")]
     NonFinite {
@@ -771,8 +766,6 @@ impl ImageParams {
     pub const DIM_MULTIPLE: u32 = 16;
     /// Upper bound on any single CFG scale.
     pub const MAX_CFG_SCALE: f32 = 100.0;
-    /// Upper bound on `max_images` per request.
-    pub const MAX_IMAGES: u16 = 256;
 
     /// Validates diffusion parameters before they reach the worker.
     ///
@@ -849,11 +842,8 @@ impl ImageParams {
             });
         }
 
-        if self.max_images == 0 || self.max_images > Self::MAX_IMAGES {
-            return Err(ImageParamsError::MaxImages {
-                got: self.max_images,
-                max: Self::MAX_IMAGES,
-            });
+        if self.max_images == 0 {
+            return Err(ImageParamsError::MaxImages);
         }
         Ok(())
     }
@@ -1064,7 +1054,7 @@ mod tests {
         };
         assert!(matches!(
             zero_images.validate(),
-            Err(ImageParamsError::MaxImages { .. })
+            Err(ImageParamsError::MaxImages)
         ));
     }
 

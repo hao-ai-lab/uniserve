@@ -42,7 +42,9 @@ impl AppState {
     pub fn new(runtime: ServingRuntime) -> Self {
         Self {
             runtime,
-            videos: Arc::default(),
+            videos: Arc::new(crate::video_jobs::VideoJobs::new(
+                crate::config::VideoJobSettings::default(),
+            )),
             enable_log_requests: false,
             enable_request_id_headers: false,
             api_key: None,
@@ -77,10 +79,16 @@ impl AppState {
         self
     }
 
-    /// Configures the maximum number of concurrent chat completion and image
-    /// generation requests.
+    /// Configures the maximum number of concurrent chat completion, image
+    /// generation, System One and synchronous video requests.
     pub fn with_max_concurrent_requests(mut self, limit: Option<u64>) -> Self {
         self.max_concurrent_requests = limit;
+        self
+    }
+
+    /// Configures the retention and memory budget of asynchronous video jobs.
+    pub fn with_video_jobs(mut self, settings: crate::config::VideoJobSettings) -> Self {
+        self.videos = Arc::new(crate::video_jobs::VideoJobs::new(settings));
         self
     }
 

@@ -47,6 +47,5 @@ pub use plan::{
     StartupError,
 };
 pub use request::{
-    ChoiceOption, Criteria, MAX_CHOICE_OPTIONS, MAX_IMAGES, MAX_SCORE_LEVELS, Question,
-    SystemOneRequest,
+    ChoiceOption, Criteria, MAX_CHOICE_OPTIONS, MAX_SCORE_LEVELS, Question, SystemOneRequest,
 };

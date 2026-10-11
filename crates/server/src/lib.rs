@@ -38,7 +38,7 @@ use crate::serving::systemone::ReadoutEncoder;
 use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime};
 use crate::serving::{LoadedModel, LoadedRenderer};
 use anyhow::{Context as _, Result};
-pub use config::{Config, EngineSettings, HttpListenerMode, VideoMediaSettings};
+pub use config::{Config, EngineSettings, HttpListenerMode, VideoJobSettings, VideoMediaSettings};
 use tracing::info;
 pub use uniserve_engine::SchedulingPolicy;
 use uniserve_engine::{EngineConfig, SpecialTokenIds, WorkerProcessArgs};
@@ -107,7 +107,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             })?;
     }
     let max_model_len = model_config.max_model_len;
-    let channel_payload_capacity = model_config.channel_payload_capacity();
     let control_tokens = special_token_ids(&model_config);
     let generation_limits =
         model_config.generation_limits(config.engine.worker_process.model_dtype);
@@ -120,25 +119,16 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     );
 
     // Admission limits running requests, not the worker's execution capacity.
-    // Media workers retain two internal state slots even when admission permits
-    // only one request. Keep their configured batch capacity independent.
+    // Media workers keep the resident request slots their queue depth
+    // pipelines even when admission permits fewer requests. Keep their
+    // configured batch capacity independent.
     let max_batch_calls = u32::try_from(config.engine.max_batch.max(1))
         .context("max_batch exceeds the worker field width")?;
     let max_batch_tokens = u32::try_from(config.engine.max_num_batched_tokens)
         .context("max_num_batched_tokens exceeds the worker field width")?;
 
-    // The model profile states the IPC payload its products need, and both
-    // directions of the worker channel must carry it: the request slot uses
-    // exactly that capacity, and the response slot uses the configured
-    // `resp_slot_cap` only when it is larger.
     let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
-        req_slot_cap: channel_payload_capacity,
-        resp_slot_cap: config
-            .engine
-            .worker_process
-            .resp_slot_cap
-            .max(channel_payload_capacity),
         max_batch_calls,
         max_batch_tokens,
         max_model_len,
@@ -178,6 +168,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_batch: config.engine.max_batch,
         max_num_batched_tokens: config.engine.max_num_batched_tokens,
         max_num_seqs: config.engine.max_num_seqs,
+        max_num_waiting: config.engine.max_num_waiting,
         long_prefill_threshold: config.engine.long_prefill_threshold,
         prefix_cache: config.engine.prefix_cache,
         scheduler_policy: config.engine.scheduler_policy,
@@ -285,6 +276,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .with_api_key(config.api_key.clone())
             .with_request_timeout(config.request_timeout)
             .with_max_concurrent_requests(config.max_concurrent_requests)
-            .with_video_body_limit(config.video_media.body_limit()),
+            .with_video_body_limit(config.video_media.body_limit())
+            .with_video_jobs(config.video_jobs),
     ))
 }

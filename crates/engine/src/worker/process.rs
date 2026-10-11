@@ -232,6 +232,7 @@ impl Default for WorkerProcessArgs {
             worker_id: "worker".into(),
             python: "python3".into(),
             launcher_timeout: std::time::Duration::from_secs(120),
+            watchdog_timeout: std::time::Duration::from_secs(300),
             model: String::new(),
             ranks: vec![crate::WorkerRank {
                 node: "localhost".into(),
@@ -245,8 +246,6 @@ impl Default for WorkerProcessArgs {
             peers: Default::default(),
             stub: false,
             queue_depth: Self::DEFAULT_QUEUE_DEPTH,
-            req_slot_cap: 1 << 20,
-            resp_slot_cap: 8 << 20,
             max_total_tokens: None,
             block_size: None,
             max_batch_calls: 128,
@@ -355,7 +354,6 @@ impl WorkerProcessArgs {
         expert_listen_fd: Option<std::os::fd::RawFd>,
     ) -> anyhow::Result<serde_json::Value> {
         let depth = self.queue_depth.max(1);
-        let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
         // Resolve mechanism ownership from the physical rank's incident edges.
         let (transfer_backends, publish_backends) =
             self.transfer.rank_backends(&self.worker_id, rank);
@@ -403,7 +401,6 @@ impl WorkerProcessArgs {
             json!(self.transfer.products_cross_hosts(&self.worker_id, rank)),
         );
         fields.insert("queue_depth".into(), json!(depth));
-        fields.insert("ipc_payload_cap".into(), json!(max_payload));
         fields.insert("model".into(), json!(self.model));
         fields.insert("device".into(), json!(self.ranks[rank as usize].device));
         fields.insert("rank".into(), json!(rank));
@@ -629,8 +626,6 @@ pub(super) struct PendingRank {
     transport: &'static str,
     /// Channel sizing `adopt` passes to `RankChannel::connect`.
     depth: usize,
-    /// Largest frame payload in bytes, in either direction.
-    max_payload: usize,
     /// Moves by adoption alongside the process it cancels.
     startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Retains the launch descriptor until the rank has read it; adoption
@@ -756,7 +751,6 @@ impl PendingRank {
         registration: &str,
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
-        let max_payload = args.req_slot_cap.max(args.resp_slot_cap).max(1);
         let world_size = args.world_size();
 
         let descriptor_directory = tempfile::Builder::new()
@@ -834,7 +828,6 @@ impl PendingRank {
                 rank,
                 transport: args.channel_transport(rank),
                 depth,
-                max_payload,
                 startup_abort,
                 launch_descriptor: descriptor_directory,
             });
@@ -846,7 +839,6 @@ impl PendingRank {
             rank,
             transport: args.channel_transport(rank),
             depth,
-            max_payload,
             startup_abort,
             launch_descriptor: descriptor_directory,
         })
@@ -885,14 +877,8 @@ impl PendingRank {
         let transport = self.transport;
         // The process stays owned here until the channel exists, so a failed
         // connection terminates the rank instead of orphaning it.
-        let client = RankChannel::connect(
-            transport,
-            endpoint,
-            self.max_payload,
-            self.depth,
-            CHANNEL_CONNECT_TIMEOUT,
-        )
-        .with_context(|| format!("connecting to the channel rank {rank} reported"))?;
+        let client = RankChannel::connect(transport, endpoint, self.depth, CHANNEL_CONNECT_TIMEOUT)
+            .with_context(|| format!("connecting to the channel rank {rank} reported"))?;
         // The rank names its own endpoint, so the head records what it bound.
         tracing::info!(
             rank,
@@ -906,7 +892,6 @@ impl PendingRank {
             rank,
             transport: _,
             depth,
-            max_payload: _,
             startup_abort,
             launch_descriptor,
         } = self;

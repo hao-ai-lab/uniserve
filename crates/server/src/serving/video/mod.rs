@@ -246,12 +246,12 @@ impl VideoProcessor {
             .collect();
         plan::check_request(request.task, &request.target, &specs, &self.limits)?;
 
-        let sources: Vec<(plan::ConditionType, &str)> = request
+        let uris: Vec<&str> = request
             .conditions
             .iter()
-            .map(|condition| (condition.spec.condition_type, condition.uri))
+            .map(|condition| condition.uri)
             .collect();
-        let media = self.fetcher.fetch_all(&sources).await?;
+        let media = self.fetcher.fetch_all(&uris).await?;
         let probes =
             futures::future::try_join_all(media.iter().enumerate().map(|(index, fetched)| {
                 self.prober

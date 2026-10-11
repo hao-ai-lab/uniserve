@@ -437,7 +437,6 @@ def test_sealed_prefill_rejects_calls_no_captured_graph_holds(tmp_path):
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
         queue_depth=2,
-        completion_payload_bytes=1 << 16,
     ) as worker:
         worker.warmup()
         assert worker.info.max_prefill_calls == 31
@@ -501,7 +500,6 @@ def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
         queue_depth=2,
-        completion_payload_bytes=1 << 16,
     ) as worker:
         worker.warmup()
         # Unit zero is the pool's sentinel; each row holds one unit, and the
@@ -563,7 +561,6 @@ def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
         queue_depth=2,
-        completion_payload_bytes=1 << 16,
     ) as worker:
         worker.warmup()
         # Unit zero is the pool's sentinel; each row stages one unit.

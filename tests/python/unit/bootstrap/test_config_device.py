@@ -58,7 +58,6 @@ def test_a_malformed_device_string_is_a_usage_error(
 def test_quantization_config_defaults_to_model_policy(tmp_path) -> None:
     config = worker_args(
         tmp_path,
-        ipc_payload_cap=65536,
         model="model",
         max_batch_tokens=8192,
     )
@@ -70,7 +69,6 @@ def test_quantization_config_defaults_to_model_policy(tmp_path) -> None:
 def test_engine_capacities_reach_worker_resources(tmp_path) -> None:
     config = worker_args(
         tmp_path,
-        ipc_payload_cap=65536,
         model="model",
         device="cpu",
         max_batch_calls=128,
@@ -86,7 +84,6 @@ def test_engine_capacities_reach_worker_resources(tmp_path) -> None:
 def test_quantization_config_reaches_model_launch_config(tmp_path) -> None:
     config = worker_args(
         tmp_path,
-        ipc_payload_cap=65536,
         model="model",
         max_batch_tokens=8192,
         quantization_config={"mode": "balanced"},
@@ -101,7 +98,6 @@ def test_component_quantization_config_reaches_model_launch_config(
 ) -> None:
     config = worker_args(
         tmp_path,
-        ipc_payload_cap=65536,
         model="model",
         max_batch_tokens=8192,
         quantization_config={

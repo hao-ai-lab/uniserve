@@ -368,7 +368,6 @@ class WorkerIpcConfig:
     # head derives this from the transfer edges and the placement, which only
     # it holds.
     products_cross_hosts: bool
-    max_payload_bytes: int
     queue_depth: int
 
 
@@ -472,7 +471,6 @@ class WorkerProcessArgs:
                 acknowledgment_slot=int(namespace.acknowledgment_slot),
                 host_slots=tuple(int(slot) for slot in namespace.host_slots),
                 products_cross_hosts=bool(namespace.products_cross_hosts),
-                max_payload_bytes=int(namespace.ipc_payload_cap),
                 queue_depth=int(namespace.queue_depth),
             ),
             local_rank=int(namespace.local_rank),

@@ -38,13 +38,11 @@ class Server:
     def __new__(
         cls,
         service_name: str,
-        max_payload: int = 1_048_576,
         max_inflight: int = 1,
         transport: str = ...,
     ) -> Self:
         """Bind this rank's channel.
 
-        The channel bounds payload size in bytes and in-flight capacity:
         ``max_inflight`` counts outstanding requests for shared storage and
         queued response frames for a socket. ``transport`` is ``"iceoryx2"``,
         the default, for a rank on the head's host, which serves shared

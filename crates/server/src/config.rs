@@ -59,6 +59,10 @@ pub struct EngineSettings {
     pub max_num_batched_tokens: usize,
     /// Maximum number of concurrently running requests.
     pub max_num_seqs: usize,
+    /// Most requests the scheduler holds waiting, or finished with
+    /// undelivered events, before it rejects a submission as overloaded;
+    /// `None` queues without bound.
+    pub max_num_waiting: Option<usize>,
     /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
     /// Reuse and retain prompt KV prefixes across requests. Per-request cache
@@ -113,6 +117,7 @@ impl Default for EngineSettings {
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
+            max_num_waiting: None,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
@@ -138,10 +143,7 @@ impl Default for EngineSettings {
             transfer: TransferConfig::default(),
             data_parallel_size: 1,
             expert_parallel: None,
-            worker_process: WorkerProcessArgs {
-                resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
-                ..WorkerProcessArgs::default()
-            },
+            worker_process: WorkerProcessArgs::default(),
         }
     }
 }
@@ -181,9 +183,8 @@ pub struct Config {
     /// Optional timeout until a request's response head is returned; streamed
     /// response bodies (chat SSE and video downloads) are not bounded by it.
     pub request_timeout: Option<Duration>,
-    /// Optional HTTP admission limit for in-flight chat completion and image
-    /// generation requests. Video requests are bounded by the video job slots
-    /// instead.
+    /// Optional HTTP admission limit for in-flight chat completion, image
+    /// generation, System One and synchronous video requests.
     pub max_concurrent_requests: Option<u64>,
     /// Maximum time to wait for active HTTP requests to drain on shutdown.
     /// Zero aborts the server as soon as shutdown begins.
@@ -195,6 +196,8 @@ pub struct Config {
     /// Where video-request condition media may come from, and how large it
     /// may be.
     pub video_media: VideoMediaSettings,
+    /// How long, and how much, the asynchronous video jobs keep.
+    pub video_jobs: VideoJobSettings,
     /// Time, size, and destination limits for request image references.
     pub image_fetch: ImageFetchPolicy,
     /// How System One questions are divided among readout prompts and canvases.
@@ -206,6 +209,32 @@ pub struct Config {
     /// ones it takes and refuses any other at startup; MiniMax H3's reads
     /// its reference sizing (`serving::video::plan::ReferenceConfig`).
     pub mm_processor_kwargs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Retention and memory policy of the video job store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct VideoJobSettings {
+    /// How long a completed or failed job is retained before it is deleted.
+    pub retention: Duration,
+    /// Bytes of generated video the store keeps: retained artifacts and
+    /// artifacts an unfinished download still holds.
+    pub max_retained_bytes: usize,
+}
+
+impl VideoJobSettings {
+    /// The default retention, one hour, in seconds.
+    pub const DEFAULT_RETENTION_SECONDS: u64 = 3600;
+    /// The default retained-video budget, 1 GiB.
+    pub const DEFAULT_MAX_RETAINED_BYTES: usize = 1 << 30;
+}
+
+impl Default for VideoJobSettings {
+    fn default() -> Self {
+        Self {
+            retention: Duration::from_secs(Self::DEFAULT_RETENTION_SECONDS),
+            max_retained_bytes: Self::DEFAULT_MAX_RETAINED_BYTES,
+        }
+    }
 }
 
 /// Sources and limits of the condition media of video requests.
@@ -279,6 +308,7 @@ impl Default for Config {
             shutdown_timeout: Duration::from_secs(0),
             reasoning_parsing: true,
             video_media: VideoMediaSettings::default(),
+            video_jobs: VideoJobSettings::default(),
             image_fetch: ImageFetchPolicy::default(),
             readout: ReadoutOptions::default(),
             diffusion_generation: DenoisingOverrides::default(),
@@ -328,11 +358,6 @@ impl EngineSettings {
     /// model exposes a `max_model_len`.
     pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
 
-    /// Default response-ring slot capacity in bytes for the worker IPC
-    /// transport (64 MiB). `build_state` raises the configured capacity to the
-    /// model's channel payload capacity when that is larger.
-    pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
-
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`
     /// override before it reaches the scheduler or KV sizing math. It also
@@ -356,6 +381,10 @@ impl EngineSettings {
         );
         anyhow::ensure!(self.max_num_seqs > 0, "max_num_seqs must be greater than 0");
         anyhow::ensure!(
+            self.max_num_waiting != Some(0),
+            "max_num_waiting must be greater than 0"
+        );
+        anyhow::ensure!(
             self.max_model_len.map(|len| len > 0).unwrap_or(true),
             "max_model_len must be greater than 0"
         );
@@ -366,10 +395,6 @@ impl EngineSettings {
             video_seconds.start(),
             video_seconds.end(),
             self.max_video_seconds
-        );
-        anyhow::ensure!(
-            self.worker_process.resp_slot_cap > 0,
-            "resp_slot_cap must be greater than 0"
         );
         WorkerConfig::validate_all(&self.workers)?;
         Ok(())
@@ -420,13 +445,6 @@ mod tests {
     fn zero_max_model_len_is_rejected() {
         let mut config = Config::default();
         config.engine.max_model_len = Some(0);
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn zero_resp_slot_cap_is_rejected() {
-        let mut config = Config::default();
-        config.engine.worker_process.resp_slot_cap = 0;
         assert!(config.validate().is_err());
     }
 

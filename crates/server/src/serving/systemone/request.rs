@@ -17,7 +17,7 @@
 //! - a score has 1-10 levels (`too_short`/`too_long`);
 //! - a noul question needs non-null `instructions` or a non-null `true` or
 //!   `false` criterion (a `value_error` on the question);
-//! - `x_images` holds 1-8 strings, each an `http(s)` URL or a
+//! - `x_images` holds at least one string, each an `http(s)` URL or a
 //!   `data:image/...;base64,` URI (a `value_error` per item).
 //!
 //! Errors inside a list stop at its maximum length, as pydantic's list
@@ -33,8 +33,6 @@ use crate::serving::systemone::python::{python_space, python_str};
 pub const MAX_CHOICE_OPTIONS: usize = 255;
 /// Most levels of one score question.
 pub const MAX_SCORE_LEVELS: usize = 10;
-/// Most images of one request (`x_images`).
-pub const MAX_IMAGES: usize = 8;
 
 /// A validated System One request.
 #[derive(Debug, Clone, PartialEq)]
@@ -431,15 +429,19 @@ fn parse_score_criteria(
             return None;
         }
     };
-    let checked = issues.bounded_list(levels, &loc, MAX_SCORE_LEVELS, |issues, index, level| {
-        issues.text(level, &at(&loc, index))
-    });
+    let checked = issues.bounded_list(
+        levels,
+        &loc,
+        Some(MAX_SCORE_LEVELS),
+        |issues, index, level| issues.text(level, &at(&loc, index)),
+    );
     checked.then(|| Criteria::Score(levels.clone()))
 }
 
-/// Validates `x_images`: 1-8 image source strings.
+/// Validates `x_images`: at least one image source string. The request's
+/// context bounds how many images fit.
 fn parse_images(items: &[Value], loc: &[LocItem], issues: &mut Issues) -> Vec<String> {
-    let checked = issues.bounded_list(items, loc, MAX_IMAGES, |issues, index, item| {
+    let checked = issues.bounded_list(items, loc, None, |issues, index, item| {
         let loc = at(loc, index);
         match item {
             Value::String(source) if is_image_source(source) => true,
@@ -592,8 +594,8 @@ impl Issues {
         }
     }
 
-    /// Validates a list of at least one and at most `max` items with
-    /// `check`, returning whether it is valid.
+    /// Validates a list of at least one and, when `max` is set, at most
+    /// `max` items with `check`, returning whether it is valid.
     ///
     /// As in pydantic, once the item count exceeds `max` the list reports
     /// only `too_long` with its full length, discarding its item errors.
@@ -601,14 +603,14 @@ impl Issues {
         &mut self,
         items: &[Value],
         loc: &[LocItem],
-        max: usize,
+        max: Option<usize>,
         mut check: impl FnMut(&mut Self, usize, &Value) -> bool,
     ) -> bool {
         let before = self.len();
         let mut valid = true;
         for (index, item) in items.iter().enumerate() {
             valid &= check(self, index, item);
-            if index + 1 > max {
+            if let Some(max) = max.filter(|max| index + 1 > *max) {
                 self.0.truncate(before);
                 self.too_long(loc.to_vec(), "List", max, items.len(), &Value::from(items));
                 return false;

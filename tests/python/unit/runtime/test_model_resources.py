@@ -233,7 +233,6 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
         TEST_MODEL,
         worker_config,
         queue_depth=1,
-        completion_payload_bytes=1024,
         num_units=2,
         request_pool_size=4,
         num_latent_pages=5,
@@ -310,7 +309,6 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
         model,
         config,
         queue_depth=8,
-        completion_payload_bytes=1024,
         components=(("text_encoder", ComponentConfig((0,))),),
     ).info
     arena = BufferPool(byte_capacity=info.buffer_pool_bytes, devices=("cpu",))

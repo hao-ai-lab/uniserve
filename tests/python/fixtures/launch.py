@@ -24,7 +24,6 @@ DEFAULTS: dict[str, Any] = {
     "products_cross_hosts": False,
     "worker_id": "worker",
     "queue_depth": 2,
-    "ipc_payload_cap": 65536,
     "model": "model",
     "device": "cpu",
     "rank": 0,

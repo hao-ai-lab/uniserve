@@ -120,7 +120,6 @@ def test_h3_worker_advertises_bounded_media_products():
         max_model_len=65,
         max_video_seconds=1.0,
         max_request_pool_size=2,
-        min_request_pool_size=2,
         video_frame_sizes=((768, 1344), (1344, 768)),
     )
     outputs = resolve_outputs(model, config)
@@ -467,7 +466,6 @@ def test_h3_audio_product_holds_the_decoded_track(seconds, frames):
         max_model_len=65,
         max_video_seconds=seconds,
         max_request_pool_size=2,
-        min_request_pool_size=2,
     )
     products = {
         value.name: value
@@ -498,7 +496,6 @@ def test_h3_video_capacity_rounds_half_frames_to_even():
         max_model_len=65,
         max_video_seconds=5.1875,
         max_request_pool_size=2,
-        min_request_pool_size=2,
     )
     products = {
         value.name: value
@@ -534,7 +531,6 @@ def test_a_deployment_without_condition_capacity_serves_the_largest_set():
         max_video_seconds=5.0,
         max_batch_calls=2,
         max_request_pool_size=2,
-        min_request_pool_size=2,
         video_frame_sizes=((768, 1344),),
         deployment_components=("transformer_ref",),
     )
@@ -556,3 +552,31 @@ def test_a_deployment_without_condition_capacity_serves_the_largest_set():
 
     plain = replace(config, deployment_components=("transformer",))
     assert loaded_worker_config(text_only, plain, 6).max_condition_rows == 0
+
+
+def test_a_media_worker_keeps_a_request_slot_for_every_three_queue_positions():
+    from tests.python.fixtures.h3 import base_config
+    from uniserve_models.minimax_h3 import Model
+    from uniserve_worker.bootstrap.model_loader import loaded_worker_config
+    from uniserve_worker.config.execution import WorkerConfig
+    from uniserve_worker.errors import WorkerError
+
+    with torch.device("meta"):
+        model = Model(base_config())
+    config = WorkerConfig(
+        device="cpu",
+        max_sequence_tokens=4096,
+        max_video_seconds=5.0,
+        max_batch_calls=8,
+        max_request_pool_size=8,
+        video_frame_sizes=((768, 1344),),
+        deployment_components=("transformer_ref",),
+    )
+
+    for queue_depth, slots in ((3, 1), (6, 2), (8, 2), (24, 8)):
+        resolved = loaded_worker_config(model, config, queue_depth)
+        assert resolved.max_request_pool_size == slots
+        assert resolved.max_batch_calls == slots
+    # Fewer than three positions cannot pipeline one request.
+    with pytest.raises(WorkerError):
+        loaded_worker_config(model, config, 2)

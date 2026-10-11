@@ -78,7 +78,6 @@ def _worker(root):
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
         queue_depth=3,
-        completion_payload_bytes=1 << 16,
         attention="torch",
         host_slots=(0, 1),
     )
