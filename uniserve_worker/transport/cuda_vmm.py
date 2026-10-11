@@ -220,7 +220,6 @@ class CudaVmmTransport(Transport):
         # was copied into its chunk, and the chunk is what waits for the
         # consumers, swept separately in reap().
         self._publications = Publications[_CudaSource](
-            capacity=256,
             reclaim=self._reclaim,
             drain=self._drain,
             # A device publication's chunk is held by the pool until its

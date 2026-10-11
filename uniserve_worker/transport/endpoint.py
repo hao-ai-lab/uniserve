@@ -84,8 +84,6 @@ class Publications(Generic[Source]):
     a device may still be writing.
 
     Args:
-        capacity: Maximum number of registered publications, retired ones
-            still awaiting hand-back included.
         reclaim: Hands a source back to its owner and completes the given
             retirement future, possibly later. Called under this table's lock.
         drain: Blocks until an in-flight reclamation completes; used by
@@ -98,19 +96,14 @@ class Publications(Generic[Source]):
     def __init__(
         self,
         *,
-        capacity: int,
         reclaim: Callable[[Source, Future[None]], None],
         drain: Callable[[Source], None],
         settled: Callable[[Source], bool],
     ) -> None:
-        if capacity < 1:
-            raise ValueError("publication capacity must be positive")
-
         # A fresh name per table, carried as the endpoint of every locator it
         # publishes, so a locator from another or earlier table is refused
         # rather than resolved against the wrong owner.
         self.name = f"uniserve-publications-{uuid.uuid4().hex}"
-        self._capacity = capacity
         self._reclaim = reclaim
         self._drain = drain
         self._settled = settled
@@ -129,8 +122,8 @@ class Publications(Generic[Source]):
         `complete` must follow before the source can be handed back.
 
         Raises:
-            WorkerError: `resource_error` when the table is closing or full,
-                and `invalid_descriptor` when the locator names no shared
+            WorkerError: `resource_error` when the table is closing, and
+                `invalid_descriptor` when the locator names no shared
                 transport or its identity is already registered.
         """
         key = publication_key(locator)
@@ -138,10 +131,8 @@ class Publications(Generic[Source]):
             self._reap_locked()
             if self._error is not None:
                 raise self._error
-            if self._closing or len(self._publications) >= self._capacity:
-                raise resource_error(
-                    "transport publication capacity is unavailable"
-                )
+            if self._closing:
+                raise resource_error("transport publication table is closing")
             if key in self._publications:
                 raise invalid_descriptor(
                     "publication identity is already registered"

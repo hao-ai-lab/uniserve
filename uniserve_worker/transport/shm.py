@@ -201,7 +201,6 @@ class ShmTransport(Transport):
         # `_reclaim` completes a retirement before returning, so `close` has
         # no in-flight reclamation to drain.
         self._publications = Publications[_ShmSource](
-            capacity=256,
             reclaim=self._reclaim,
             drain=lambda source: None,
             settled=self._settled,
@@ -395,10 +394,10 @@ class ShmTransport(Transport):
         Raises:
             WorkerError: `invalid_descriptor` when `publication_views`
                 refuses the source or the locator's identity is already
-                registered; `resource_error` when transfer bytes or
-                the publication table are exhausted, the table is closing,
-                or the CUDA driver refuses to register the segment.
-                Allocation and copy errors propagate.
+                registered; `resource_error` when transfer bytes are
+                exhausted, the table is closing, or the CUDA driver refuses
+                to register the segment. Allocation and copy errors
+                propagate.
         """
         import torch
 
