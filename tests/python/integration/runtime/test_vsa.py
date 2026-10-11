@@ -111,18 +111,17 @@ VALID = (64, 17, 64, 40, 0, 64, 23)
 PROVIDERS = ["sm100", "flashinfer", "triton"]
 
 
-def _attend(module, projections, valid, device):
-    q, k, v, gate = projections.unbind(2)
-    segments = vsa.Segments(
+def _segments(device, valid=VALID):
+    """The layout's tables, which a captured call reads at fixed addresses."""
+    return vsa.Segments(
         TILE,
-        q.shape[0],
+        len(valid) * TILE,
         *layout_tables(valid, INDICES, KEEP, device),
         dense_prefix_tiles=1,
         # A video query attends at most the dense tile and 2 + 1 kept tiles;
         # backends plan from the bound.
-        key_bounds=(len(VALID),) + (4,) * (len(VALID) - 1),
+        key_bounds=(len(valid),) + (4,) * (len(valid) - 1),
     )
-    return module(q, k, v, gate, segments)
 
 
 @pytest.mark.parametrize("provider", PROVIDERS, indirect=True)
@@ -134,37 +133,40 @@ def test_selection_compression_and_graph_replay(provider, stream):
         len(VALID) * TILE, 7, 4, 128, device=device, dtype=torch.bfloat16
     )
     valid = list(VALID)
+    segments = _segments(device)
     module = vsa.SegmentAttention(vsa.BlockAttention(128**-0.5))
+
+    def attend():
+        return module(*projections.unbind(2), segments)
+
+    def expected():
+        # Attention zeroes padding rows of its inputs in place, so the dense
+        # equations read a copy.
+        return segment_reference(
+            *projections.clone().unbind(2),
+            valid=valid,
+            indices=INDICES,
+            keep=KEEP,
+            tile=TILE,
+        )
+
     stream.wait(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream, vsa=provider) as context:
         context.prepare(None)
-
-        def expected():
-            return segment_reference(
-                *projections.clone().unbind(2),
-                valid=valid,
-                indices=INDICES,
-                keep=KEEP,
-                tile=TILE,
-            )
-
-        # Attention zeroes padding rows of its inputs in place, so the dense
-        # equations read a copy.
         want, attending = expected()
-        actual = _attend(module, projections, valid, device).clone()
+        actual = attend().clone()
         torch.testing.assert_close(
             actual[attending], want[attending], rtol=2e-2, atol=2e-2
         )
 
         replayed = torch.empty_like(actual)
         with CUDAGraph(context=context) as graph:
-            graph.capture(
-                lambda: replayed.copy_(
-                    _attend(module, projections, VALID, device)
-                )
-            )
-            # Numerical inputs change without changing the prepared shape.
+            graph.capture(lambda: replayed.copy_(attend()))
+            # Numerical inputs and the tables change without changing the
+            # prepared shapes.
             projections.mul_(0.5)
+            valid[1] = 9
+            segments.variable_block_sizes[1] = 9
             want, attending = expected()
             graph.replay()
             torch.testing.assert_close(

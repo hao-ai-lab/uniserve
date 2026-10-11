@@ -31,6 +31,7 @@ from dataclasses import replace
 from typing import cast
 
 import torch
+import torch.nn.functional as F
 
 from uniserve.diffusion import (
     BlockGrid,
@@ -87,6 +88,17 @@ from .processing import (
     REFERENCE_IMAGE_SHORT_EDGE,
 )
 from .transformer import Transformer, TransformerLayer
+
+# Request banks stride by a field's capacity, and the attention kernels read
+# the int32 tile tables from 16-byte aligned addresses, so a table holds a
+# whole number of 16-byte groups.
+_TABLE_ALIGNMENT = 4
+
+
+def _table_entries(tiles: int) -> int:
+    """Entries of a per-tile int32 request table that holds ``tiles`` tiles."""
+    return -(-tiles // _TABLE_ALIGNMENT) * _TABLE_ALIGNMENT
+
 
 # A visual condition is held at this clean time for every step whose
 # generated video is noisier, as the released model was trained.
@@ -748,7 +760,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         packing = self._segment_packing(size)
         rows = packing.padded_tokens
         local = rows // self._sequence_group().size
-        tiles = rows // packing.tile
+        entries = _table_entries(rows // packing.tile)
         return {
             **samples,
             "prefix_index": BufferConfig((local,), torch.int64),
@@ -756,7 +768,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             "sin": BufferConfig((rows, width), torch.float32),
             "modulation_indices": BufferConfig((local,), torch.int64),
             **{
-                name: BufferConfig((tiles,), torch.int32)
+                name: BufferConfig((entries,), torch.int32)
                 for name in (
                     "variable_block_sizes",
                     "tile_segments",
@@ -818,16 +830,22 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             sequence_length=packing.padded_tokens,
         )
         groups, tags = tables.groups[interval], tables.token_tags[interval]
+        entries = _table_entries(packing.padded_tokens // packing.tile)
         return {
             "prefix_index": tables.prefix_index[interval],
             "cos": cosine.flatten(1),
             "sin": sine.flatten(1),
             # Row ``3 * group + tag`` of each step's modulation products.
             "modulation_indices": groups * 3 + tags,
-            "variable_block_sizes": tables.variable_block_sizes,
-            "tile_segments": tables.tile_segments,
-            "segment_starts": tables.segment_starts,
-            "segment_keep": tables.segment_keep,
+            **{
+                name: F.pad(table, (0, entries - table.numel()))
+                for name, table in (
+                    ("variable_block_sizes", tables.variable_block_sizes),
+                    ("tile_segments", tables.tile_segments),
+                    ("segment_starts", tables.segment_starts),
+                    ("segment_keep", tables.segment_keep),
+                )
+            },
         }
 
     @torch.inference_mode()
@@ -1076,16 +1094,17 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             packing = self._segment_packing(size)
             sparsity = cast(SparseAttention, self.config.attention).sparsity
             tokens = packing.padded_tokens
+            tiles = tokens // packing.tile
             attention = SegmentInput(
                 self._token_slice(tokens),
                 self._sequence_group(),
                 vsa.Segments(
                     packing.tile,
                     tokens,
-                    state["variable_block_sizes"],
-                    state["tile_segments"],
-                    state["segment_starts"],
-                    state["segment_keep"],
+                    state["variable_block_sizes"][:tiles],
+                    state["tile_segments"][:tiles],
+                    state["segment_starts"][:tiles],
+                    state["segment_keep"][:tiles],
                     dense_prefix_tiles=packing.dense_prefix_tiles,
                     key_bounds=packing.key_bounds(sparsity),
                 ),
