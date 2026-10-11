@@ -36,7 +36,7 @@ enum MediaCall : ubyte { None, MediaReading, VisionEncoding, LatentEncoding, Tex
 enum TransferMode : ubyte { None, Tensor, KvPublish, KvInstall }
 
 /// Inline encoding of the Rust `CallKind` sum: exactly one of the three tags
-/// is not `None`. `computation_from_fb` rejects zero or several set tags.
+/// is not `None`. `call_kind_from_fb` rejects zero or several set tags.
 struct CallKind {
   forward_mode:ForwardMode;
   media:MediaCall;
@@ -49,12 +49,17 @@ enum FeatureKind : ubyte { Vision, Latent }
 /// `Predicated` reports a call skipped because its predicate was false.
 enum CallStatus : ubyte { Ok, Predicated, Error }
 
+/// The failure classes of a worker, carried by a call's completion and by an
+/// error response alike.
 enum ErrorCode : ubyte {
-  InvalidCall,
-  ResourceExhausted,
+  UnsupportedCall,
+  InvalidDescriptor,
+  UnsupportedSetup,
+  InputError,
   ComputeError,
-  Cancelled,
-  Internal,
+  ResourceError,
+  InvariantViolation,
+  FatalWorkerFailure,
   InvalidRequest
 }
 
@@ -149,23 +154,6 @@ table WorkerEndpoint {
   incarnation:string;
 }
 
-// Sequence-parallel strategy of a component. The decoder requires the payload
-// table of every variant except LocalSequence, and GatherSequence decodes to
-// `SequenceParallel::Allgather`.
-table LocalSequence {}
-table UlyssesSequence { ulysses_degree:uint = 1; }
-table GatherSequence { allgather_degree:uint = 1; }
-table HybridSequence { ulysses_degree:uint = 1; allgather_degree:uint = 1; }
-union SequenceParallel { LocalSequence, UlyssesSequence, GatherSequence, HybridSequence }
-table ParallelConfig {
-  tensor_parallel_size:uint = 1;
-  pipeline_parallel_size:uint = 1;
-  sequence_parallel:SequenceParallel;
-}
-/// `Local` decodes to no distribution: the component runs as one
-/// model-parallel group.
-enum ComponentDistribution:ubyte { Local, TemporalUnits }
-
 /// One declared tensor result of a component; its position in
 /// `ComponentInfo.outputs` is the product output index.
 table OutputInfo {
@@ -184,12 +172,10 @@ table OutputInfo {
   width_axis:int = -1;
 }
 
+/// A loaded component and its declared results. The engine owns the
+/// component's placement.
 table ComponentInfo {
   name:string;
-  ranks:[ulong];
-  parallel_config:ParallelConfig;
-  distribution:ComponentDistribution;
-  units_per_rank:uint = 1;
   outputs:[OutputInfo];
 }
 
@@ -212,8 +198,8 @@ table VideoDenoiserInfo {
 table MediaComponent { call:MediaCall; component:string; }
 
 /// A loaded rank's identity and capabilities, answered to an Info request.
-/// `WorkerInfo::validate` checks internal consistency; the engine checks it
-/// against the launch.
+/// `WorkerInfo::validate` checks internal consistency; launch values such as
+/// placement and queue depth are the engine's and are not reported.
 table WorkerInfo {
   endpoint:WorkerEndpoint;
   /// Whether this rank's device exports a fabric handle. A descriptor handle
@@ -222,7 +208,6 @@ table WorkerInfo {
   fabric_handles:bool = false;
   components:[ComponentInfo];
   supported_calls:[CallKind];
-  queue_depth:uint;
   max_batch_calls:uint;
   max_batch_tokens:uint;
   request_slots:uint;
@@ -236,11 +221,11 @@ table WorkerInfo {
   media_components:[MediaComponent];
   host_lane_capacity:uint = 1;
   video_denoiser:VideoDenoiserInfo;
-  /// Maximum calls in one prefill run, the rows the rank's captured prefill
-  /// graphs hold; zero leaves prefill runs bounded by `max_batch_calls`.
+  /// Maximum calls in one prefill batch, the rows the rank's captured prefill
+  /// graphs hold; zero leaves prefill batches bounded by `max_batch_calls`.
   max_prefill_calls:uint;
-  /// Maximum calls in one decode run, the rows the rank's largest captured
-  /// decode graph holds; zero leaves decode runs bounded by
+  /// Maximum calls in one decode batch, the rows the rank's largest captured
+  /// decode graph holds; zero leaves decode batches bounded by
   /// `max_batch_calls`.
   max_decode_calls:uint;
 }
@@ -328,7 +313,7 @@ table VisionInput {
   feature:TensorRef (required);
 }
 
-/// One planned computation, decoded into `Call` and checked by
+/// One planned call, decoded into `Call` and checked by
 /// `Call::validate`; relationships to other calls and to the batch's tables
 /// are checked by `Batch::validate`.
 table Call {
@@ -336,7 +321,7 @@ table Call {
   call_id:CallId;
   coordinates:CallCoordinates;
   component:string (required);
-  code:CallKind (required);
+  kind:CallKind (required);
   // Scheduler-reserved maxima, decoded into `Bounds`. `max_tokens` is
   // checked by `Call::validate` and `max_transfer_bytes` by
   // `Batch::validate`; neither validator checks `max_completion_bytes`.
@@ -505,7 +490,7 @@ union BatchCommand { StartCommand, FinishCommand, FreeCommand }
 /// One entry of `Batch.commands`; the decoder rejects an empty union.
 table BatchCommandEnvelope { command:BatchCommand; }
 
-// Static request admission and physical run binding.
+// Static request admission and physical batch binding.
 
 // A video request's task, presentation tags and conditions, decoded into
 // `VideoAdmission` and its `uniserve_core::VideoCondition` values, which
@@ -555,7 +540,7 @@ table VideoAdmission {
   conditions:[VideoCondition];
 }
 
-table ArRequestParams {
+table GenerationParams {
   sampling:SamplingParams;
   negative_token_ids:[uint];
   finish_token_ids:[uint];
@@ -574,7 +559,7 @@ table DiffusionSamplingParams {
 table NewRequest {
   request_key:RequestKey;
   request_pool_idx:uint;
-  ar:ArRequestParams;
+  generation:GenerationParams;
   image:ImageParams;
   diffusion:DiffusionSamplingParams;
   prompt_token_ids:[uint];
@@ -793,15 +778,14 @@ table ErrorCallIdentity {
 /// Rank-to-engine envelope. `response_from_table` enforces the legal field
 /// set per kind: `Info` carries only `info`, `Result` only `result`, and `Ok`
 /// nothing. `Error` carries no success payload and requires a non-empty
-/// `message` and `fatal`; the remaining error fields are optional, and an
-/// empty `code` reads as absent.
+/// `message`, a `code` and `fatal`; the remaining error fields are optional.
 table WorkerResponse {
   kind:RespKind;
   message_id:ulong = null;
   info:WorkerInfo;
   result:BatchOutput;
   message:string;
-  code:string;
+  code:ErrorCode = null;
   /// Whether the worker is unsafe to serve further requests.
   fatal:bool = null;
   phase:string;

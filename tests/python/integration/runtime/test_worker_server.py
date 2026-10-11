@@ -132,7 +132,7 @@ def test_duplicate_submissions_are_rejected_while_the_original_completes(
     assert responses[1]["kind"] == "result"
     for message_id in (2, 3):
         assert responses[message_id]["kind"] == "error"
-        assert responses[message_id]["code"] == "InvalidDescriptor"
+        assert responses[message_id]["code"] == "invalid_descriptor"
     assert responses[4]["kind"] == "ok"
 
 
@@ -155,7 +155,7 @@ def test_failed_submissions_cannot_be_reused_and_allow_shutdown() -> None:
     for message_id in (1, 2):
         response = responses[message_id]
         assert response["kind"] == "error"
-        assert response["code"] == "InvalidDescriptor"
+        assert response["code"] == "invalid_descriptor"
         assert response["fatal"] is False
     assert [response["message_id"] for response in endpoint.responses] == [
         1,
@@ -192,7 +192,7 @@ def test_execution_failure_is_logged_under_the_submit_request(
 
     responses = _by_call(endpoint)
     assert responses[1]["kind"] == "error"
-    assert responses[1]["code"] == "InvalidDescriptor"
+    assert responses[1]["code"] == "invalid_descriptor"
     failures = [
         record.getMessage()
         for record in caplog.records
@@ -285,7 +285,7 @@ def test_refused_call_batch_reports_its_call_kind_route_over_ipc() -> None:
 
     response = _by_call(endpoint)[1]
     assert response["kind"] == "error"
-    assert response["code"] == "InvalidDescriptor"
+    assert response["code"] == "invalid_descriptor"
     assert response["route"] == "prefill"
 
 
@@ -349,10 +349,10 @@ def test_a_batch_id_that_does_not_advance_is_refused_before_new_admission() -> (
     responses = _by_call(endpoint)
     assert responses[1]["kind"] == "result"
     assert responses[2]["kind"] == "error"
-    assert responses[2]["code"] == "InvalidDescriptor"
+    assert responses[2]["code"] == "invalid_descriptor"
     assert responses[3]["kind"] == "error"
-    assert responses[3]["code"] == "InvalidDescriptor"
-    # Rejected work must not admit its request; the same computation still
+    assert responses[3]["code"] == "invalid_descriptor"
+    # Rejected work must not admit its request; the same call still
     # executes once its batch identity advances.
     result = responses[4]["result"]
     assert result["batch_id"] == 3

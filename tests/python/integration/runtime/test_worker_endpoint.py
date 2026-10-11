@@ -126,7 +126,7 @@ def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
     import torch
     import torch.distributed as dist
 
-    from uniserve_worker.errors import WorkerError, WorkerErrorCode
+    from uniserve_worker.errors import ErrorCode, WorkerError
     from uniserve_worker.worker import Worker
 
     dist.init_process_group(
@@ -143,7 +143,7 @@ def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
                 Worker.from_config(
                     _stub_config(tmp_path / "borrowed-world", world_size=2)
                 )
-            assert raised.value.code is WorkerErrorCode.UNSUPPORTED_SETUP
+            assert raised.value.code is ErrorCode.UNSUPPORTED_SETUP
             assert not raised.value.fatal
         else:
             with Worker.from_config(_stub_config(tmp_path / "borrowed-world")):

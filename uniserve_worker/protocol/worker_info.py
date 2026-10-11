@@ -2,11 +2,13 @@
 
 A rank answers the engine's ``info`` request (`RequestKind.INFO`, served by
 `uniserve_worker.service`) with `WorkerInfo.to_mapping()`: its endpoint,
-supported calls, scheduling bounds, KV and latent pool capacity, and
-components. The worker-ipc crate's `WorkerInfo` is the wire counterpart: the
-PyO3 extension converts the mapping into it, and the crate's codec validates
-the report when it encodes it. The engine derives the capacity the scheduler
-plans against from the reports.
+supported calls, scheduling bounds, KV and latent pool capacity, and the
+tensor results of its components. The worker-ipc crate's `WorkerInfo` is the
+wire counterpart: the PyO3 extension converts the mapping into it, and the
+crate's codec validates the report when it encodes it. The engine derives the
+capacity the scheduler plans against from the reports. Values the engine
+launched the worker with, such as component placement and queue depth, are
+the engine's and are not reported.
 """
 
 from __future__ import annotations
@@ -14,8 +16,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from uniserve_worker.config.deployment import ComponentConfig
-from uniserve_worker.errors import unsupported_setup
 from uniserve_worker.protocol.call import CallKind, MediaCall
 from uniserve_worker.protocol.tensor import OutputInfo
 from uniserve_worker.protocol.transfer import WorkerEndpoint
@@ -124,23 +124,18 @@ class KVCacheInfo:
 
 @dataclass(frozen=True, slots=True)
 class ComponentInfo:
-    """A loaded component's configuration and its publishable tensor results.
+    """A loaded component and its publishable tensor results.
 
-    On the wire the `ComponentConfig` fields sit beside ``name`` and
-    ``outputs`` in one flat mapping, as the worker-ipc crate's
-    `ComponentInfo` flattens them. The order of `outputs` defines product
-    output indices.
+    The order of `outputs` defines product output indices.
     """
 
     name: str
-    config: ComponentConfig
     outputs: tuple[OutputInfo, ...] = ()
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode component membership and results for IPC discovery."""
+        """Encode the component's results for IPC discovery."""
         return {
             "name": self.name,
-            **self.config.to_dict(),
             "outputs": [output.to_mapping() for output in self.outputs],
         }
 
@@ -178,19 +173,17 @@ class WorkerInfo:
     """Describes a worker’s capabilities, topology, and resource bounds.
 
     Attributes:
-        queue_depth: Maximum unresolved physical runs, the depth the rank was
-            launched with.
-        max_batch_calls: Maximum calls in one run.
-        max_batch_tokens: Maximum text tokens represented in one run.
-        max_prefill_calls: Maximum calls in one prefill run, the rows the
-            worker's captured prefill graphs hold; a prefill run no graph
-            holds fails. Zero leaves prefill runs bounded by
+        max_batch_calls: Maximum calls in one batch.
+        max_batch_tokens: Maximum text tokens represented in one batch.
+        max_prefill_calls: Maximum calls in one prefill batch, the rows the
+            worker's captured prefill graphs hold; a prefill batch no graph
+            holds fails. Zero leaves prefill batches bounded by
             ``max_batch_calls`` alone, as when they run eagerly.
-        max_decode_calls: Maximum calls in one decode run, the rows the
+        max_decode_calls: Maximum calls in one decode batch, the rows the
             worker's largest captured decode graph holds, fewer when the KV
             pool cannot hold a page of every cache group for more rows; a
-            decode run no graph holds fails. Zero leaves decode runs bounded
-            by ``max_batch_calls`` alone, as when they run eagerly.
+            decode batch no graph holds fails. Zero leaves decode batches
+            bounded by ``max_batch_calls`` alone, as when they run eagerly.
         request_slots: Number of resident request slots.
         latent_page_units: Model-defined units stored in one latent page.
         latent_pages: Physical latent pages, including the reserved sentinel
@@ -202,7 +195,6 @@ class WorkerInfo:
 
     endpoint: WorkerEndpoint
     supported_calls: tuple[CallKind, ...]
-    queue_depth: int
     max_batch_calls: int
     max_batch_tokens: int
     request_slots: int
@@ -217,10 +209,6 @@ class WorkerInfo:
     max_prefill_calls: int = 0
     max_decode_calls: int = 0
     components: tuple[ComponentInfo, ...] = ()
-    # Physical ranks of this worker, which `output_rank` needs for a worker
-    # without a placed component. The engine knows its own placement, so the
-    # report does not carry it.
-    world_size: int = 1
     # Whether this rank's device exports a handle another host can import.
     # A descriptor handle reaches only this host, so the engine refuses a
     # cross-host CUDA VMM transfer edge unless both ends report fabric
@@ -229,30 +217,6 @@ class WorkerInfo:
     media_components: dict[MediaCall, str] = field(default_factory=dict)
     # What the deployment's video denoiser serves; ``None`` without one.
     video_denoiser: VideoDenoiserInfo | None = None
-
-    def output_rank(self, component: str) -> int:
-        """Return the rank that publishes a component's host products.
-
-        Host products belong to the component's first member rank, the rank
-        whose reports the engine's `WorkerGroup` joins a call's results on
-        whenever the call runs there. A call whose units are dealt to other
-        ranks publishes no host product, and the engine joins it on the
-        first rank it is dealt to. Cooperative numerical outputs may reside
-        on other ranks. A single-rank worker without the component resolves
-        to rank 0.
-
-        Raises:
-            WorkerError: `unsupported_setup` when the component is not
-                configured and the worker has more than one rank.
-        """
-        for candidate in self.components:
-            if candidate.name == component:
-                return candidate.config.ranks[0]
-        if self.world_size == 1:
-            return 0
-        raise unsupported_setup(
-            f"component {component!r} has no publication owner"
-        )
 
     @property
     def latent_capacity_units(self) -> int:
@@ -280,7 +244,6 @@ class WorkerInfo:
                 component.to_mapping() for component in self.components
             ],
             "supported_calls": [value.value for value in self.supported_calls],
-            "queue_depth": self.queue_depth,
             "max_batch_calls": self.max_batch_calls,
             "max_batch_tokens": self.max_batch_tokens,
             "max_prefill_calls": self.max_prefill_calls,

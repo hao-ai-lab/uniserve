@@ -1,6 +1,6 @@
 """Call descriptors the engine submits to a worker rank.
 
-A `Call` is one computation for one request: its identity, the coordinates it
+A `Call` is one call for one request: its identity, the coordinates it
 executes at, its kind (`ForwardMode`, `MediaCall`, or `TransferMode`), the
 resource `Bounds` the scheduler reserved, its tensor dataflow, and its scalar
 side inputs. The wire contract and its validators live in the Rust
@@ -44,7 +44,7 @@ class ForwardMode(StrEnum):
 
 
 class MediaCall(StrEnum):
-    """A concrete media reading, encoder, diffusion, or decoder computation."""
+    """A concrete media reading, encoder, diffusion, or decoder call."""
 
     # Decodes a video request's condition media on a host rank into the
     # inputs of the vision and latent encoders.
@@ -81,7 +81,7 @@ CALL_KINDS: tuple[CallKind, ...] = (
 )
 
 
-def computation(value: object, where: str) -> CallKind:
+def call(value: object, where: str) -> CallKind:
     """Decode a call kind from an enum member or its exact wire string.
 
     Args:
@@ -105,7 +105,7 @@ def computation(value: object, where: str) -> CallKind:
         member = _COMPUTATION_BY_VALUE.get(value)
         if member is not None:
             return member
-    raise invalid_descriptor(f"{where} is not a supported computation")
+    raise invalid_descriptor(f"{where} is not a supported call")
 
 
 class CallStatus(StrEnum):
@@ -118,20 +118,6 @@ class CallStatus(StrEnum):
     OK = "ok"
     PREDICATED = "predicated"
     ERROR = "error"
-
-
-class ErrorCode(StrEnum):
-    """Classifies bounded execution failures returned to the scheduler."""
-
-    INVALID_CALL = "invalid_call"
-    RESOURCE_EXHAUSTED = "resource_exhausted"
-    COMPUTE_ERROR = "compute_error"
-    CANCELLED = "cancelled"
-    INTERNAL = "internal"
-    # The worker refuses the request itself: its admitted size does not fit
-    # what the model serves or the worker provisioned. The completion states
-    # why (``RequestOutput.error_message``).
-    INVALID_REQUEST = "invalid_request"
 
 
 # Computations that advance a request's accepted progress; mirrors the Rust
@@ -309,7 +295,7 @@ class VisionInput:
 
 @dataclass(frozen=True, slots=True)
 class Call:
-    """One immutable computation with its identity, dataflow, and limits."""
+    """One immutable call with its identity, dataflow, and limits."""
 
     request_key: identity.RequestKey
     call_id: identity.CallId
@@ -317,7 +303,7 @@ class Call:
     coordinates: CallCoordinates
     kind: CallKind
     bounds: Bounds
-    # Name of the worker model component that executes this computation.
+    # Name of the worker model component that executes this call.
     component: str = DEFAULT_COMPONENT
 
     # Tensor dataflow: generic inputs/outputs plus role-specific endpoints.
@@ -336,7 +322,7 @@ class Call:
     latent_output: tensor.TensorRef | None = None
     image_input: tensor.TensorRef | None = None
     image_output: tensor.TensorRef | None = None
-    # Boolean device completion consumed by a dependent computation.
+    # Boolean device completion consumed by a dependent call.
     completion_output: tensor.TensorRef | None = None
     # Boolean device decision that selects an image transition.
     transition_output: tensor.TensorRef | None = None
@@ -372,7 +358,7 @@ class Call:
     canvas: CanvasStep | None = None
 
     def tensor_inputs(self) -> tuple[tensor.TensorRef, ...]:
-        """Return the tensor inputs of the computation, excluding its predicate.
+        """Return the tensor inputs of the call, excluding its predicate.
 
         Includes the token and latent inputs, which `buffer_inputs` omits.
         """
@@ -392,7 +378,7 @@ class Call:
         )
 
     def tensor_outputs(self) -> tuple[tensor.TensorRef, ...]:
-        """Return every tensor output this computation produces.
+        """Return every tensor output this call produces.
 
         Includes the device scalar outputs (token, completion, transition)
         and the latent output, which `buffer_outputs` omits.

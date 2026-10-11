@@ -60,7 +60,6 @@ if TYPE_CHECKING:
 
     from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
@@ -131,7 +130,6 @@ def prepare_latent(
     *,
     state: BatchState,
     kv_cache: KVCacheManager | None,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
@@ -253,7 +251,7 @@ def prepare_latent(
         output,
         row,
         step=0,
-        worker_info=worker_info,
+        model_runner=model_runner,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
         config=config,
@@ -521,7 +519,7 @@ def finish(
     trajectory: DiffusionState,
     *,
     state: BatchState,
-    worker_info: WorkerInfo,
+    model_runner: ModelExecutor,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
@@ -577,7 +575,7 @@ def finish(
         latent_output,
         row,
         step=final_step,
-        worker_info=worker_info,
+        model_runner=model_runner,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
         config=config,
@@ -619,7 +617,7 @@ def publish_latent_transfer(
     *,
     state: BatchState,
     step: int,
-    worker_info: WorkerInfo,
+    model_runner: ModelExecutor,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
     config: WorkerConfig,
@@ -637,7 +635,7 @@ def publish_latent_transfer(
 
     transports = publication_transports
     if not any(name != "local" for name in transports) or (
-        config.rank != worker_info.output_rank(call.component)
+        config.rank != model_runner.output_rank(call.component)
     ):
         return ()
 

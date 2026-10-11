@@ -953,8 +953,8 @@ impl WorkerGroup {
     /// failed are resolved, at most one per invocation. When a rank that
     /// succeeded still holds unjoined calls, the ranks disagree: the batch is
     /// retired and a plain error returned. Otherwise every error must be
-    /// identical, or a plain error is returned. A fatal error, a
-    /// `SchedulerBug` or `InvariantViolation` code, or a batch carrying a
+    /// identical, or a plain error is returned. A fatal error, an
+    /// `InvariantViolation`, or a batch carrying a
     /// `Free` command returns the `WorkerExecError` itself; `poll_batch`
     /// answers these and the plain errors with recovery. Any other error
     /// retires the batch and returns a `WorkerFailure` naming its unjoined
@@ -1009,10 +1009,7 @@ impl WorkerGroup {
             }
             let batch = &self.pending_batches[&batch_id].batch;
             if canonical.fatal
-                || matches!(
-                    canonical.code.as_deref(),
-                    Some("SchedulerBug" | "InvariantViolation")
-                )
+                || canonical.code == uniserve_worker_ipc::ErrorCode::InvariantViolation
                 || batch
                     .commands
                     .iter()
@@ -1260,7 +1257,7 @@ impl WorkerGroup {
     ) -> Vec<u32> {
         let transfer = &self.process_args.transfer;
         let worker = &self.process_args.worker_id;
-        let consuming: Vec<uniserve_worker_ipc::MediaCall> = match (routed, call.code) {
+        let consuming: Vec<uniserve_worker_ipc::MediaCall> = match (routed, call.kind) {
             (Some(readers), _) => self
                 .media_routing
                 .iter()
@@ -1308,7 +1305,7 @@ impl WorkerGroup {
 
 /// Restrict a physical invocation to each component's actual members. Request and
 /// storage commands retain group-wide visibility, including on otherwise idle
-/// ranks; they do not create synthetic computation completions.
+/// ranks; they do not create synthetic call completions.
 fn rank_projection(
     batch: &Batch,
     components: &BTreeMap<String, crate::ComponentConfig>,
@@ -1643,7 +1640,7 @@ fn validate_and_order_rank_report(
                 }),
             "predicated call published a tensor"
         );
-        if planned.code
+        if planned.kind
             == uniserve_worker_ipc::CallKind::Transfer(uniserve_worker_ipc::TransferMode::KvPublish)
             && completion.output.status == uniserve_worker_ipc::CallStatus::Ok
         {
@@ -1855,10 +1852,6 @@ impl WorkerGroup {
         if !self.is_ready() || self.pending_batches.len() >= self.depth {
             return Err(BatchSubmitError::WouldBlock(Box::new(batch)));
         }
-        batch
-            .validate()
-            .map_err(anyhow::Error::from)
-            .map_err(BatchSubmitError::Failed)?;
         let rank_batches = rank_projection(
             &batch,
             &self.process_args.components,

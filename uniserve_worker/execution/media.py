@@ -102,7 +102,7 @@ def video_shape(runner: ModelExecutor, admission: NewRequest):
         raise invalid_descriptor(str(error)) from error
 
     if media.video_units != len(windows):
-        raise invalid_descriptor("video request has invalid computation bounds")
+        raise invalid_descriptor("video request has invalid call bounds")
     return size
 
 
@@ -912,7 +912,7 @@ def execute(
                 state.forward_stats.append(result.stats)
                 if len(result.values) != 1:
                     raise invalid_descriptor(
-                        "conditioning computation must return one Tensor"
+                        "conditioning call must return one Tensor"
                     )
                 builder.store_conditioning(
                     numerical_shape, slot, result.values[0]

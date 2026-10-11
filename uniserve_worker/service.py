@@ -67,7 +67,7 @@ class Service:
         self.worker = worker
         self.endpoint = endpoint
         # Accepted requests whose responses are not yet sent. Its length is
-        # bounded by `WorkerInfo.queue_depth`, and every in-flight executor
+        # bounded by `Worker.queue_depth`, and every in-flight executor
         # batch has an entry here, so `Executor.submit` never sees a full
         # admission queue from this loop.
         self._pending: deque[PendingResponse] = deque()
@@ -118,7 +118,7 @@ class Service:
 
                 if (
                     not self._closing
-                    and len(self._pending) < self.worker.info.queue_depth
+                    and len(self._pending) < self.worker.queue_depth
                 ):
                     request = self.endpoint.try_recv()
                     if request is not None:

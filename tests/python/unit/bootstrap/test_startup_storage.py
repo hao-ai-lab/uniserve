@@ -13,7 +13,7 @@ from tests.python.fixtures.device_storage import (
 )
 from tests.python.fixtures.worker_config import stub_worker_config
 from uniserve_worker.bootstrap.capacity import check_startup_storage
-from uniserve_worker.errors import WorkerError, WorkerErrorCode
+from uniserve_worker.errors import ErrorCode, WorkerError
 from uniserve_worker.storage.buffer_pool import BufferPool
 from uniserve_worker.storage.tensor_store import TensorStore
 
@@ -52,7 +52,7 @@ def test_startup_refuses_storage_held_outside_the_caching_allocator(
     with pytest.raises(WorkerError) as refused:
         check_startup_storage(config, 5_000, store)
 
-    assert refused.value.code == WorkerErrorCode.UNSUPPORTED_SETUP
+    assert refused.value.code == ErrorCode.UNSUPPORTED_SETUP
     assert "requires 93000 bytes" in str(refused.value)
     assert "of a 90000-byte grant" in str(refused.value)
 

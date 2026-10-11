@@ -104,8 +104,10 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
     releases the storage, and readiness completes the installation.
     """
     with (
-        execution_worker(transfer_backends=("shm",)) as producer,
-        execution_worker(transfer_backends=("shm",), queue_depth=3) as worker,
+        execution_worker(transfer_backends=("posix_shm",)) as producer,
+        execution_worker(
+            transfer_backends=("posix_shm",), queue_depth=3
+        ) as worker,
     ):
         incoming = ar_params(45, block_ids=(0,))
         admission = ar_params(44, block_ids=(0,))
@@ -463,9 +465,9 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
 
 
 def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
-    released_consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
+    released_consumer = execution_worker(transfer_backends=("posix_shm",))
     admission = ar_params(42, block_ids=(0,))
     extend = token_call(
         admission.request_key,
@@ -587,8 +589,8 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
 def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> (  # noqa: E501
     None
 ):
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
     admission = ar_params(43, block_ids=(0,))
     extend = token_call(
         admission.request_key,

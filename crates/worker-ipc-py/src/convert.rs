@@ -43,12 +43,12 @@ use uniserve_core::{
     VideoCondition,
 };
 use uniserve_worker_ipc::{
-    ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
-    BufferAllocation, BufferId, CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType,
-    DecodeRange, DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode, FeatureKind,
-    FinishFlags, ForwardStats, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaOutput,
-    NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication, TensorRef,
-    TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
+    ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, BufferAllocation, BufferId,
+    CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType, DecodeRange,
+    DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags,
+    ForwardStats, GenerationParams, KvGroupTransfer, KvTransfer, LatentParams, Locator,
+    MediaOutput, NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication,
+    TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
     WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
@@ -87,7 +87,7 @@ pub(crate) fn execute_request_to_py<'py>(
 struct RequestTypes {
     records: HashMap<&'static str, Py<PyAny>>,
     call: Py<PyAny>,
-    computation_id: Py<PyAny>,
+    call_id: Py<PyAny>,
     request_key: Py<PyAny>,
     tensor_ref: Py<PyAny>,
     buffer_id: Py<PyAny>,
@@ -156,7 +156,10 @@ impl RequestTypes {
         records.insert("BufferAllocation", class(&module, "BufferAllocation")?);
         records.insert("NewRequest", class(&module, "NewRequest")?);
         records.insert("GenerationParams", class(&module, "GenerationParams")?);
-        records.insert("DiffusionParams", class(&module, "DiffusionParams")?);
+        records.insert(
+            "DiffusionSamplingParams",
+            class(&module, "DiffusionSamplingParams")?,
+        );
         records.insert("TensorPublication", class(&module, "TensorPublication")?);
         let module = py.import("uniserve_worker.protocol.video")?;
         for name in [
@@ -201,7 +204,7 @@ impl RequestTypes {
         Ok(Self {
             records,
             call: class(&call, "Call")?,
-            computation_id: class(&identity, "CallId")?,
+            call_id: class(&identity, "CallId")?,
             request_key: class(&identity, "RequestKey")?,
             tensor_ref: class(&tensor, "TensorRef")?,
             buffer_id: class(&identity, "BufferId")?,
@@ -313,7 +316,7 @@ struct RequestConversion<'py> {
     py: Python<'py>,
     types: &'static RequestTypes,
     request_keys: HashMap<RequestKey, Py<PyAny>>,
-    computation_ids: HashMap<CallId, Py<PyAny>>,
+    call_ids: HashMap<CallId, Py<PyAny>>,
     shape_bounds: HashMap<ShapeBound, Py<PyAny>>,
 }
 
@@ -324,7 +327,7 @@ impl<'py> RequestConversion<'py> {
             py,
             types: RequestTypes::get(py)?,
             request_keys: HashMap::new(),
-            computation_ids: HashMap::new(),
+            call_ids: HashMap::new(),
             shape_bounds: HashMap::new(),
         })
     }
@@ -334,16 +337,16 @@ impl<'py> RequestConversion<'py> {
     /// Call ids repeat across a batch, for example as call identities, as the
     /// `call_id` of latent and decode params, and as the producers named by
     /// tensor references and buffer ids.
-    fn computation_id(&mut self, id: CallId) -> PyResult<Bound<'py, PyAny>> {
-        if let Some(value) = self.computation_ids.get(&id) {
+    fn call_id(&mut self, id: CallId) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(value) = self.call_ids.get(&id) {
             return Ok(value.bind(self.py).clone());
         }
         let value = self
             .types
-            .computation_id
+            .call_id
             .bind(self.py)
             .call1((id.batch_id, id.request_index))?;
-        self.computation_ids.insert(id, value.clone().unbind());
+        self.call_ids.insert(id, value.clone().unbind());
         Ok(value)
     }
 
@@ -390,7 +393,7 @@ impl<'py> RequestConversion<'py> {
         let shape_bound = self.shape_bound(&product.shape_bound)?;
         self.types.tensor_ref.bind(self.py).call1((
             request_key,
-            self.computation_id(product.producer_call_id)?,
+            self.call_id(product.producer_call_id)?,
             product.output_index,
             product.generation,
             self.types.dtype(self.py, product.dtype),
@@ -403,13 +406,13 @@ impl<'py> RequestConversion<'py> {
         let owner = self.request_key(buffer.owner)?;
         self.types.buffer_id.bind(self.py).call1((
             owner,
-            self.computation_id(buffer.producer_call_id)?,
+            self.call_id(buffer.producer_call_id)?,
             buffer.output_index,
             buffer.generation,
         ))
     }
 
-    /// Constructs a typed Python call from its computation fields.
+    /// Constructs a typed Python call from its call fields.
     ///
     /// `Call` is constructed positionally: the argument tuple below follows
     /// the field order of the `Call` dataclass in
@@ -502,9 +505,9 @@ impl<'py> RequestConversion<'py> {
             py,
             [
                 request_key.into_any(),
-                self.computation_id(call.call_id)?,
+                self.call_id(call.call_id)?,
                 coordinates.into_any(),
-                self.types.kind(py, call.code),
+                self.types.kind(py, call.kind),
                 bounds.into_any(),
                 call.component.clone().into_pyobject(py)?.into_any(),
                 pyo3::types::PyTuple::new(py, inputs)?.into_any(),
@@ -648,31 +651,31 @@ impl<'py> RequestConversion<'py> {
 /// shared between calls, commands, input products, and the per-batch
 /// parameter records. `kv_inputs` are the exception: `kv_transfer_to_py`
 /// builds their buffer ids through `buffer_id_to_py`.
-fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>> {
+fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyAny>> {
     let mut native = RequestConversion::new(py)?;
 
-    let calls = run
+    let calls = batch
         .calls
         .iter()
         .map(|call| native.call(call))
         .collect::<PyResult<Vec<_>>>()?;
-    let block_tables = run
+    let block_tables = batch
         .block_tables
         .iter()
         .map(|table| native.block_table(table))
         .collect::<PyResult<Vec<_>>>()?;
-    let new_cache_units = run
+    let new_cache_units = batch
         .new_cache_units
         .iter()
         .map(|allocation| native.cache_unit_allocation(allocation))
         .collect::<PyResult<Vec<_>>>()?;
-    let commands = run
+    let commands = batch
         .commands
         .iter()
         .map(|command| native.command(command))
         .collect::<PyResult<Vec<_>>>()?;
 
-    let input_products = record_tuple(py, &run.input_products, |payload| {
+    let input_products = record_tuple(py, &batch.input_products, |payload| {
         tensor_publication_to_py(py, payload, &mut native)
     })?;
 
@@ -684,35 +687,35 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
     let arguments = pyo3::types::PyTuple::new(
         py,
         [
-            run.batch_id.into_pyobject(py)?.into_any(),
-            run.collective_seq.into_pyobject(py)?.into_any(),
+            batch.batch_id.into_pyobject(py)?.into_any(),
+            batch.collective_seq.into_pyobject(py)?.into_any(),
             pyo3::types::PyTuple::new(py, calls)?.into_any(),
             pyo3::types::PyTuple::new(py, block_tables)?.into_any(),
             pyo3::types::PyTuple::new(py, new_cache_units)?.into_any(),
             (
-                pyo3::types::PyTuple::new(py, &run.forward.call_indices)?,
-                pyo3::types::PyTuple::new(py, &run.forward.request_pool_indices)?,
-                pyo3::types::PyTuple::new(py, &run.forward.seq_lens)?,
-                pyo3::types::PyTuple::new(py, &run.forward.query_lens)?,
-                pyo3::types::PyTuple::new(py, &run.forward.write_kv)?,
+                pyo3::types::PyTuple::new(py, &batch.forward.call_indices)?,
+                pyo3::types::PyTuple::new(py, &batch.forward.request_pool_indices)?,
+                pyo3::types::PyTuple::new(py, &batch.forward.seq_lens)?,
+                pyo3::types::PyTuple::new(py, &batch.forward.query_lens)?,
+                pyo3::types::PyTuple::new(py, &batch.forward.write_kv)?,
             )
                 .into_pyobject(py)?
                 .into_any(),
-            record_tuple(py, &run.latent_params, |params| {
+            record_tuple(py, &batch.latent_params, |params| {
                 latent_params_to_py(py, params, &mut native)
             })?
             .into_any(),
-            record_tuple(py, &run.decode_ranges, |params| {
+            record_tuple(py, &batch.decode_ranges, |params| {
                 decode_range_to_py(py, params, &mut native)
             })?
             .into_any(),
-            record_tuple(py, &run.buffer_allocations, |params| {
+            record_tuple(py, &batch.buffer_allocations, |params| {
                 buffer_allocation_to_py(py, params, &mut native)
             })?
             .into_any(),
             pyo3::types::PyTuple::new(py, commands)?.into_any(),
             input_products.into_any(),
-            record_tuple(py, &run.kv_inputs, |transfer| {
+            record_tuple(py, &batch.kv_inputs, |transfer| {
                 kv_transfer_to_py(py, transfer)
             })?
             .into_any(),
@@ -733,10 +736,7 @@ fn latent_params_to_py<'py>(
         intern!(py, "request_key"),
         context.request_key(params.request_key)?,
     )?;
-    dict.set_item(
-        intern!(py, "call_id"),
-        context.computation_id(params.call_id)?,
-    )?;
+    dict.set_item(intern!(py, "call_id"), context.call_id(params.call_id)?)?;
     dict.set_item(
         intern!(py, "page_table"),
         u32_tuple(py, &params.page_table)?,
@@ -761,10 +761,7 @@ fn decode_range_to_py<'py>(
         intern!(py, "request_key"),
         context.request_key(params.request_key)?,
     )?;
-    dict.set_item(
-        intern!(py, "call_id"),
-        context.computation_id(params.call_id)?,
-    )?;
+    dict.set_item(intern!(py, "call_id"), context.call_id(params.call_id)?)?;
     dict.set_item(intern!(py, "cursor"), params.cursor)?;
     dict.set_item(intern!(py, "max_units"), params.max_units)?;
     dict.set_item(
@@ -828,9 +825,9 @@ fn admission_to_py<'py>(
     dict.set_item(
         intern!(py, "generation"),
         admission
-            .ar
+            .generation
             .as_ref()
-            .map(|ar| ar_params_to_py(py, ar))
+            .map(|generation| generation_params_to_py(py, generation))
             .transpose()?,
     )?;
     dict.set_item(
@@ -977,18 +974,24 @@ fn video_condition_to_py<'py>(
 }
 
 /// Converts autoregressive admission parameters into a Python record.
-fn ar_params_to_py<'py>(py: Python<'py>, ar: &ArRequestParams) -> PyResult<Bound<'py, PyAny>> {
+fn generation_params_to_py<'py>(
+    py: Python<'py>,
+    generation: &GenerationParams,
+) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "sampling"), sampling_to_py(py, &ar.sampling)?)?;
+    dict.set_item(
+        intern!(py, "sampling"),
+        sampling_to_py(py, &generation.sampling)?,
+    )?;
     dict.set_item(
         intern!(py, "negative_token_ids"),
-        u32_tuple(py, &ar.negative_token_ids)?,
+        u32_tuple(py, &generation.negative_token_ids)?,
     )?;
     dict.set_item(
         intern!(py, "finish_token_ids"),
-        u32_tuple(py, &ar.finish_token_ids)?,
+        u32_tuple(py, &generation.finish_token_ids)?,
     )?;
-    dict.set_item(intern!(py, "initial_position"), ar.initial_position)?;
+    dict.set_item(intern!(py, "initial_position"), generation.initial_position)?;
     construct(py, "GenerationParams", &dict)
 }
 
@@ -1003,7 +1006,7 @@ fn diffusion_params_to_py<'py>(
     dict.set_item(intern!(py, "seed"), diffusion.seed)?;
     dict.set_item(intern!(py, "width"), diffusion.width)?;
     dict.set_item(intern!(py, "height"), diffusion.height)?;
-    construct(py, "DiffusionParams", &dict)
+    construct(py, "DiffusionSamplingParams", &dict)
 }
 
 /// Converts sampling controls into the worker's typed parameters.
@@ -1322,7 +1325,7 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     if !absent_or_none(dict, intern!(py, "info"))? {
         return None;
     }
-    let report = run_result_from_py(&get(dict, intern!(py, "result"))?)?;
+    let report = batch_output_from_py(&get(dict, intern!(py, "result"))?)?;
     let identities = error_calls_from_py(dict)?;
     if !identities.is_empty()
         || opt_string(dict, intern!(py, "message"))?.is_some()
@@ -1356,7 +1359,7 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
         message_id: opt_u64(dict, intern!(py, "message_id"))?,
         error: WorkerResponseError {
             message: string_of(&get(dict, intern!(py, "message"))?)?,
-            code: opt_string(dict, intern!(py, "code"))?,
+            code: error_code_of(&get(dict, intern!(py, "code"))?)?,
             fatal: bool_of(&get(dict, intern!(py, "fatal"))?)?,
             phase: opt_string(dict, intern!(py, "phase"))?,
             route: opt_string(dict, intern!(py, "route"))?,
@@ -1369,7 +1372,7 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
 ///
 /// `completions` and `products` must be lists; `forward_stats` may be absent
 /// or `None`, but when present every counter is required.
-fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
+fn batch_output_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
@@ -1526,15 +1529,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
     };
     let error_code = match get(dict, intern!(py, "error_code"))? {
         value if value.is_none() => None,
-        value => Some(match value.cast::<PyString>().ok()?.to_str().ok()? {
-            "invalid_call" => ErrorCode::InvalidCall,
-            "resource_exhausted" => ErrorCode::ResourceExhausted,
-            "compute_error" => ErrorCode::ComputeError,
-            "cancelled" => ErrorCode::Cancelled,
-            "internal" => ErrorCode::Internal,
-            "invalid_request" => ErrorCode::InvalidRequest,
-            _ => return None,
-        }),
+        value => Some(error_code_of(&value)?),
     };
 
     let flags = get(dict, intern!(py, "finish_flags"))?;
@@ -1596,7 +1591,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
             .map(|value| value.ok()?.extract::<f32>().ok())
             .collect::<Option<Vec<_>>>()?,
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
-        call_id: computation_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
+        call_id: call_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
         status,
         error_code,
         error_message: match get(dict, intern!(py, "error_message")) {
@@ -1724,7 +1719,7 @@ fn buffer_id_mapping_from_py(value: &Bound<'_, PyAny>) -> Option<BufferId> {
     let dict = value.cast::<PyDict>().ok()?;
     Some(BufferId {
         owner: request_key_from_py(&get(dict, intern!(py, "owner"))?)?,
-        producer_call_id: computation_id_from_py(&get(dict, intern!(py, "producer_call_id"))?)?,
+        producer_call_id: call_id_from_py(&get(dict, intern!(py, "producer_call_id"))?)?,
         output_index: u16_of(&get(dict, intern!(py, "output_index"))?)?,
         generation: u32_of(&get(dict, intern!(py, "generation"))?)?,
     })
@@ -1774,7 +1769,7 @@ fn tensor_ref_from_py(value: &Bound<'_, PyAny>) -> Option<TensorRef> {
     }
     Some(TensorRef {
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
-        producer_call_id: computation_id_from_py(&get(dict, intern!(py, "producer_call_id"))?)?,
+        producer_call_id: call_id_from_py(&get(dict, intern!(py, "producer_call_id"))?)?,
         output_index: u16_of(&get(dict, intern!(py, "output_index"))?)?,
         generation: u32_of(&get(dict, intern!(py, "generation"))?)?,
         dtype,
@@ -1792,7 +1787,7 @@ fn feature_kind_from_py(value: &Bound<'_, PyAny>) -> Option<FeatureKind> {
 }
 
 /// Decodes a call id from its `batch_id` and `request_index` fields.
-fn computation_id_from_py(value: &Bound<'_, PyAny>) -> Option<CallId> {
+fn call_id_from_py(value: &Bound<'_, PyAny>) -> Option<CallId> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
     Some(CallId::new(
@@ -1818,7 +1813,7 @@ fn error_call_from_py(value: &Bound<'_, PyAny>) -> Option<ErrorCallIdentity> {
     let dict = value.cast::<PyDict>().ok()?;
     Some(ErrorCallIdentity {
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
-        call_id: computation_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
+        call_id: call_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
     })
 }
 
@@ -1974,6 +1969,15 @@ fn opt_bool(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Optio
         Some(value) if value.is_none() => Some(None),
         Some(value) => Some(Some(bool_of(&value)?)),
     }
+}
+
+/// Reads a failure class by the snake_case name `ErrorCode::as_str` spells;
+/// an unknown name rejects the record.
+fn error_code_of(value: &Bound<'_, PyAny>) -> Option<ErrorCode> {
+    let name = value.cast::<PyString>().ok()?.to_str().ok()?.to_owned();
+    ErrorCode::ALL
+        .into_iter()
+        .find(|code| code.as_str() == name)
 }
 
 /// Decodes an absent, `None`, or strict string mapping field.
@@ -2171,9 +2175,9 @@ mod tests {
         }
     }
 
-    /// One submission per computation.
+    /// One submission per call.
     ///
-    /// A batch carries one computation through one component, so the native
+    /// A batch carries one call through one component, so the native
     /// conversion is exercised with a token call, a media call, a KV
     /// transfer and a token-denoising readout in four batches (batch ids 11
     /// to 14 under message ids 9 to 12) rather than one mixed submission.
@@ -2182,7 +2186,7 @@ mod tests {
         let admission = NewRequest::new(
             request_key,
             1,
-            Some(ArRequestParams {
+            Some(GenerationParams {
                 sampling: SamplingParams {
                     temperature: 0.0,
                     ignore_eos: true,
@@ -2235,7 +2239,7 @@ mod tests {
             request_key,
             call_id: CallId::new(11, 0),
             component: "model".into(),
-            code: CallKind::Forward(ForwardMode::Prefill),
+            kind: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,
                 ..Bounds::default()
@@ -2309,7 +2313,7 @@ mod tests {
             request_key: media_key,
             call_id: CallId::new(12, 0),
             component: "model".into(),
-            code: CallKind::Media(MediaCall::LatentPreparation),
+            kind: CallKind::Media(MediaCall::LatentPreparation),
             bounds: Bounds {
                 ..Bounds::default()
             },
@@ -2353,7 +2357,7 @@ mod tests {
             request_key: kv_key,
             call_id: CallId::new(13, 0),
             component: "decoder".into(),
-            code: CallKind::Transfer(TransferMode::KvInstall),
+            kind: CallKind::Transfer(TransferMode::KvInstall),
             bounds: Bounds {
                 max_transfer_bytes: 32,
                 ..Bounds::default()
@@ -2380,7 +2384,7 @@ mod tests {
         let readout_call = Call {
             request_key: readout_key,
             call_id: CallId::new(14, 0),
-            code: CallKind::Forward(ForwardMode::TokenDenoising),
+            kind: CallKind::Forward(ForwardMode::TokenDenoising),
             input_token_ids: vec![4, 9, 4, 1],
             readout: Some(uniserve_worker_ipc::Readout {
                 slot_tokens: vec![0, 2],
@@ -2426,7 +2430,7 @@ mod tests {
             .enumerate()
             .map(|(index, batch)| {
                 let mut request = WorkerRequest::submit(batch);
-                request.set_call_id(Some(9 + index as u64));
+                request.set_message_id(Some(9 + index as u64));
                 request
             })
             .collect()
@@ -2501,7 +2505,7 @@ mod tests {
         readout.candidate_logprobs = vec![-0.5, -2.25, -9.0];
         result.completions.push(publication);
         result.completions.push(readout);
-        response.set_call_id(Some(11));
+        response.set_message_id(Some(11));
         response
     }
 
@@ -2517,7 +2521,7 @@ mod tests {
             worker_exec_us: None,
             forward_stats: None,
         });
-        response.set_call_id(Some(9 + batch_id - 11));
+        response.set_message_id(Some(9 + batch_id - 11));
         pythonize(py, &response).unwrap()
     }
 
@@ -2638,7 +2642,7 @@ mod tests {
                 );
                 assert_eq!(
                     field(&call, "kind.value").extract::<String>().unwrap(),
-                    submitted.code.as_str()
+                    submitted.kind.as_str()
                 );
                 assert_eq!(
                     field(&call, "component").extract::<String>().unwrap(),

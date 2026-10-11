@@ -33,7 +33,7 @@ pub struct SchedulerConfig {
     /// Waiting-queue ordering policy.
     pub policy: SchedulingPolicy,
     /// Maximum calls selected by one generation scheduling pass, across the
-    /// per-computation batches the pass emits.
+    /// per-call-kind batches the pass emits.
     pub max_batch: usize,
     /// Token budget of one generation scheduling pass. Each selected call is
     /// charged its token work, which for a denoising call covers its latent

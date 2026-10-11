@@ -43,8 +43,7 @@ pub use generation::{
     CachePolicy, CanvasSampling, FeedbackNextToken, FeedbackSource, GenerationConstraint,
     GenerationConstraintParseError, GenerationFeatures, GenerationLimits, GenerationRequest,
     GenerationRequestError, GenerationResourceError, ImageEncoderInput, ImageGenerationConfig,
-    ImageIngestStep, ImageInput, ImageTrigger, MultimodalInputs, ReadoutRow, ReadoutSlot,
-    encoder_cache_key,
+    ImageInput, ImageTrigger, MultimodalInputs, ReadoutRow, ReadoutSlot, encoder_cache_key,
 };
 
 /// Thread-safe notification used to wake an engine after command enqueue.
@@ -166,7 +165,7 @@ pub struct UnitId(pub u32);
 )]
 pub struct RequestId(pub u64);
 
-/// Logical computation identity, preserved when a scheduler batch is split across workers.
+/// Logical call identity, preserved when a scheduler batch is split across workers.
 /// The request index is the ordinal assigned at selection, before physical row packing.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
@@ -183,6 +182,66 @@ impl CallId {
         Self {
             batch_id,
             request_index,
+        }
+    }
+}
+
+/// A concrete media-input, encoder, diffusion, decoder, or media-output
+/// call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum MediaCall {
+    /// Decodes a video request's condition media on a host rank into the
+    /// inputs of the vision and latent encoders.
+    MediaReading,
+    VisionEncoding,
+    LatentEncoding,
+    TextEncoding,
+    LatentPreparation,
+    Denoising,
+    ImageDecoding,
+    VideoDecoding,
+    AudioDecoding,
+    VideoEncoding,
+    AudioEncoding,
+    Muxing,
+}
+
+impl MediaCall {
+    /// Every media call in declaration order.
+    ///
+    /// `worker-ipc-py` indexes a Python enum table built from this array with
+    /// `call as usize`, so the order must match the declaration order.
+    pub const ALL: [Self; 12] = [
+        Self::MediaReading,
+        Self::VisionEncoding,
+        Self::LatentEncoding,
+        Self::TextEncoding,
+        Self::LatentPreparation,
+        Self::Denoising,
+        Self::ImageDecoding,
+        Self::VideoDecoding,
+        Self::AudioDecoding,
+        Self::VideoEncoding,
+        Self::AudioEncoding,
+        Self::Muxing,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MediaReading => "media_reading",
+            Self::VisionEncoding => "vision_encoding",
+            Self::LatentEncoding => "latent_encoding",
+            Self::TextEncoding => "text_encoding",
+            Self::LatentPreparation => "latent_preparation",
+            Self::Denoising => "denoising",
+            Self::ImageDecoding => "image_decoding",
+            Self::VideoDecoding => "video_decoding",
+            Self::AudioDecoding => "audio_decoding",
+            Self::VideoEncoding => "video_encoding",
+            Self::AudioEncoding => "audio_encoding",
+            Self::Muxing => "muxing",
         }
     }
 }
@@ -597,9 +656,6 @@ pub struct ImageParams {
     /// Optional per-image prompt overrides.
     #[serde(default)]
     pub image_prompts: Vec<String>,
-    /// Whether completed image bytes remain available to the caller.
-    #[serde(default = "default_retain_images")]
-    pub retain_images: bool,
 }
 
 impl ImageParams {
@@ -629,11 +685,6 @@ fn scale_approx(left: f32, right: f32) -> bool {
 /// Returns the neutral diffusion timestep shift.
 fn default_timestep_shift() -> f32 {
     1.0
-}
-
-/// Returns the default policy that retains materialized image bytes.
-fn default_retain_images() -> bool {
-    true
 }
 
 /// Validation failure returned by [`ImageParams::validate`].
@@ -866,7 +917,6 @@ impl Default for ImageParams {
             negative_prompt: String::new(),
             max_images: 1,
             image_prompts: Vec::new(),
-            retain_images: true,
         }
     }
 }

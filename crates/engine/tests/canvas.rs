@@ -232,7 +232,7 @@ fn blocks_are_denoised_published_and_committed_until_eos() {
     let calls = calls_of(&batches, 1);
     let prompt: Vec<_> = calls
         .iter()
-        .take_while(|(call, _)| call.code == CallKind::Forward(ForwardMode::Prefill))
+        .take_while(|(call, _)| call.kind == CallKind::Forward(ForwardMode::Prefill))
         .collect();
     assert!(
         prompt.iter().all(|(call, _)| call.token_output.is_none()),
@@ -282,7 +282,7 @@ fn blocks_are_denoised_published_and_committed_until_eos() {
         .iter()
         .map(|(call, forward)| {
             (
-                call.code,
+                call.kind,
                 call.canvas.map(|step| (step.block, step.step)),
                 call.input_token_ids.clone(),
                 call.coordinates.kv_visible_len,
@@ -411,7 +411,7 @@ fn a_blocks_first_step_is_queued_behind_the_prefill_before_it() {
         let (prefill_batch, _) = calls[..position]
             .iter()
             .rev()
-            .find(|(_, earlier)| earlier.code == CallKind::Forward(ForwardMode::Prefill))
+            .find(|(_, earlier)| earlier.kind == CallKind::Forward(ForwardMode::Prefill))
             .unwrap();
         assert!(
             submitted[batch] < resolved[prefill_batch],
@@ -477,7 +477,7 @@ fn a_blocks_commit_is_queued_behind_its_no_op_step() {
     let commits: Vec<_> = calls
         .iter()
         .filter(|(_, call)| {
-            call.code == CallKind::Forward(ForwardMode::Prefill)
+            call.kind == CallKind::Forward(ForwardMode::Prefill)
                 && call.coordinates.kv_visible_len >= 24
         })
         .collect();
@@ -548,7 +548,7 @@ fn the_completion_limit_truncates_inside_a_block() {
     let commits = calls_of(&batches, 2)
         .into_iter()
         .filter(|(call, _)| {
-            call.code == CallKind::Forward(ForwardMode::Prefill)
+            call.kind == CallKind::Forward(ForwardMode::Prefill)
                 && call.coordinates.kv_visible_len > 0
         })
         .count();
@@ -672,7 +672,7 @@ fn a_waiting_prompt_is_prefilled_while_a_block_denoises() {
     };
     let prompt_done = first(&|call: &Call| {
         call.request_key.request_id == RequestId(3)
-            && call.code == CallKind::Forward(ForwardMode::Prefill)
+            && call.kind == CallKind::Forward(ForwardMode::Prefill)
             && call.coordinates.kv_visible_len + call.input_token_ids.len() as u32 == 200
     });
     let block_stopped = first(&|call: &Call| {

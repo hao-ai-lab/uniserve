@@ -749,7 +749,7 @@ def token_call(
     predicate: TensorRef | None = None,
     logprobs: bool = False,
 ) -> Call:
-    """Build a token computation with its actual model input IDs."""
+    """Build a token call with its actual model input IDs."""
     block_table = _BLOCK_TABLES.setdefault(rk, [])
     added = [_kv_page(value) for value in block_table_delta]
     if set(added) & set(block_table):

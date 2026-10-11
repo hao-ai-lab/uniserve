@@ -23,8 +23,8 @@ use std::time::Duration;
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::executor::{
-    BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, WorkerFailure,
-    WorkerId, logical_result,
+    BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, PoolPlacement,
+    WorkerFailure, WorkerId, logical_result,
 };
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
@@ -94,21 +94,20 @@ pub enum BatchEvent {
 }
 
 impl SimExecutor {
-    /// Starts an asynchronous simulator with its advertised queue depth.
-    pub fn new(engine: SimEngine) -> Self {
-        let depth = (engine.info().queue_depth as usize).max(1);
-        Self::with_depth(engine, depth)
-    }
-
-    /// Starts an asynchronous simulator with an explicit in-flight batch limit.
+    /// Starts an asynchronous simulator that holds at most the engine's queue
+    /// depth of batches in flight.
     ///
     /// # Panics
     ///
     /// Panics if the simulator thread cannot be spawned.
-    pub fn with_depth(mut engine: SimEngine, depth: usize) -> Self {
+    pub fn new(mut engine: SimEngine) -> Self {
         let info = engine.info().clone();
         let results_on_wait = engine.results_on_wait;
-        let depth = depth.max(1);
+        let depth = engine.queue_depth;
+        let placement = PoolPlacement {
+            queue_depth: depth,
+            components: engine.components.clone(),
+        };
         let (to_worker, jobs) = crossbeam_channel::unbounded();
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
         let (progress_tx, progress_rx) = crossbeam_channel::bounded(1);
@@ -143,8 +142,11 @@ impl SimExecutor {
                 }
             })
             .expect("spawn sim executor thread");
+        let id = WorkerId("sim".to_owned());
+        let mut executor_info = ExecutorInfo::single(id.clone(), info);
+        executor_info.placements.insert(id, placement);
         Self {
-            executor_info: ExecutorInfo::single(WorkerId("sim".to_owned()), info.clone()),
+            executor_info,
             depth,
             to_worker,
             from_worker,
@@ -482,7 +484,7 @@ impl SimRequestState {
     /// Creates request state from an admitted request.
     fn new(admission: NewRequest) -> Self {
         let prefix_len = admission
-            .ar
+            .generation
             .as_ref()
             .map_or(0, |branch| branch.initial_position);
         Self {
@@ -517,7 +519,7 @@ impl SimRequestState {
 
     /// Returns shared access to the simulated sampling configuration.
     fn sampling(&self) -> Option<&SamplingParams> {
-        self.admission.ar.as_ref().map(|und| &und.sampling)
+        self.admission.generation.as_ref().map(|und| &und.sampling)
     }
 
     /// Returns shared access to the simulated image configuration.
@@ -529,6 +531,11 @@ impl SimRequestState {
 /// Deterministic local model engine that implements the worker lifecycle protocol.
 pub struct SimEngine {
     info: WorkerInfo,
+    /// Batches the simulated worker's executor keeps in flight, at least one.
+    queue_depth: usize,
+    /// Placement of the components `info.components` names, as the engine
+    /// launched them.
+    components: BTreeMap<String, uniserve_core::ComponentConfig>,
     /// Synthetic tokens sampled before `fake_eos` dominates.
     text_len: usize,
     fake_eos: u32,
@@ -751,9 +758,9 @@ fn select_token(
 impl SimEngine {
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
-        // Unset fields, including the KV cache and a queue depth of one, come
-        // from `WorkerInfo::default`. One latent page is the reserved sentinel
-        // page that `latent_capacity_units` excludes.
+        // Unset fields, including the KV cache, come from `WorkerInfo::default`.
+        // One latent page is the reserved sentinel page that
+        // `latent_capacity_units` excludes.
         let info = WorkerInfo {
             supported_calls: CallKind::ALL.to_vec(),
             latent_page_units: 64,
@@ -767,6 +774,8 @@ impl SimEngine {
         };
         Self {
             info,
+            queue_depth: 1,
+            components: BTreeMap::new(),
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
@@ -837,7 +846,7 @@ impl SimEngine {
                     // token's logical position, which a prefill reaches past
                     // its query tokens and a decode or verify one past its
                     // first.
-                    let query_tokens = match call.code {
+                    let query_tokens = match call.kind {
                         CallKind::Forward(ForwardMode::Prefill) => call.bounds.max_tokens,
                         _ => 1,
                     };
@@ -902,7 +911,7 @@ impl SimEngine {
     /// `predicate_values`. Errors when a chained call states coordinates other
     /// than the request's own, when sampling rejects the call's RNG, or when
     /// synthetic media encoding or publication fails. A sampling pipeline with
-    /// no valid distribution yields an `Error` record with `InvalidCall`
+    /// no valid distribution yields an `Error` record with `InvalidDescriptor`
     /// instead.
     fn execute_call(
         vocab: usize,
@@ -955,7 +964,7 @@ impl SimEngine {
         };
         set_kv_lengths(&mut record, request.kv_visible_len);
 
-        match call.code {
+        match call.kind {
             work @ (CallKind::Forward(ForwardMode::Prefill)
             | CallKind::Forward(ForwardMode::Decode)
             | CallKind::Forward(ForwardMode::Verify)) => {
@@ -1002,7 +1011,7 @@ impl SimEngine {
                     )?
                     else {
                         record.status = CallStatus::Error;
-                        record.error_code = Some(ErrorCode::InvalidCall);
+                        record.error_code = Some(ErrorCode::InvalidDescriptor);
                         return Ok(record);
                     };
                     record.finish_flags.eos = output.token == fake_eos;
@@ -1017,7 +1026,7 @@ impl SimEngine {
                     // call forces a finish.
                     let admitted_stops = request
                         .admission
-                        .ar
+                        .generation
                         .as_ref()
                         .map_or(&[][..], |und| und.finish_token_ids.as_slice());
                     let continuation = admitted_stops.binary_search(&output.token).is_err()
@@ -1252,9 +1261,25 @@ impl SimEngine {
         }
     }
 
-    /// Sets the advertised unresolved-batch capacity, clamped to at least one.
+    /// Sets the unresolved-batch capacity, clamped to at least one.
     pub fn set_queue_depth(&mut self, depth: u32) {
-        self.info.queue_depth = depth.max(1);
+        self.queue_depth = depth.max(1) as usize;
+    }
+
+    /// Declares the loaded components, each with the placement the engine
+    /// launched it with.
+    pub fn place_components(
+        &mut self,
+        components: Vec<(
+            uniserve_worker_ipc::ComponentInfo,
+            uniserve_core::ComponentConfig,
+        )>,
+    ) {
+        self.components = components
+            .iter()
+            .map(|(info, config)| (info.name.clone(), config.clone()))
+            .collect();
+        self.info.components = components.into_iter().map(|(info, _)| info).collect();
     }
 
     /// Sets the number of synthetic tokens emitted before the configured EOS.
@@ -1533,7 +1558,7 @@ impl SimEngine {
                         .copied()
                         .ok_or_else(|| {
                             anyhow::anyhow!(
-                                "computation {:?} predicate names an unresolved product",
+                                "call {:?} predicate names an unresolved product",
                                 call.call_id
                             )
                         })
@@ -1574,7 +1599,7 @@ impl SimEngine {
                 request,
             )?;
             if let (CallKind::Media(_), Some(reason)) =
-                (call.code, refused.get(&call.request_key.request_id))
+                (call.kind, refused.get(&call.request_key.request_id))
             {
                 completion.status = CallStatus::Error;
                 completion.media_output = None;
@@ -1629,7 +1654,7 @@ impl SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_ipc::{
-        ArRequestParams, Bounds, CallId, DType, ForwardBatch, RequestKey, ShapeBound, TensorRef,
+        Bounds, CallId, DType, ForwardBatch, GenerationParams, RequestKey, ShapeBound, TensorRef,
     };
 
     fn request_key() -> RequestKey {
@@ -1640,7 +1665,7 @@ mod tests {
         NewRequest::new(
             request_key(),
             1,
-            Some(ArRequestParams {
+            Some(GenerationParams {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
@@ -1694,7 +1719,7 @@ mod tests {
             request_key,
             call_id: CallId::new(batch_id, request_index),
             component: "model".into(),
-            code: CallKind::Forward(ForwardMode::Prefill),
+            kind: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,
                 ..Bounds::default()
@@ -1728,7 +1753,7 @@ mod tests {
     }
 
     #[test]
-    fn same_request_computations_preserve_coordinates_and_sequential_tokens() {
+    fn same_request_calls_preserve_coordinates_and_sequential_tokens() {
         let mut executor = SimExecutor::new(SimEngine::new());
         let mut selected = batch(1, 3);
         let mut successor = batch(1, 4).requests.remove(0);

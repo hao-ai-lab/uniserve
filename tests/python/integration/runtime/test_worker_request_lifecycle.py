@@ -21,12 +21,11 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-from uniserve_worker.errors import WorkerError
+from uniserve_worker.errors import ErrorCode, WorkerError
 from uniserve_worker.protocol.batch import Finish, Free, NewRequest
 from uniserve_worker.protocol.call import (
     CallCoordinates,
     CallStatus,
-    ErrorCode,
     ForwardMode,
     TransferMode,
 )
@@ -120,10 +119,14 @@ def test_independent_product_work_preserves_request_progress(
     "backends,device",
     (
         (("local",), "cpu"),
-        (("shm",), "cpu"),
-        (("shm", "local"), "cpu"),
-        pytest.param(("shm", "cuda_vmm"), "cuda:0", marks=pytest.mark.gpu),
-        pytest.param(("cuda_vmm", "shm"), "cuda:0", marks=pytest.mark.gpu),
+        (("posix_shm",), "cpu"),
+        (("posix_shm", "local"), "cpu"),
+        pytest.param(
+            ("posix_shm", "cuda_vmm"), "cuda:0", marks=pytest.mark.gpu
+        ),
+        pytest.param(
+            ("cuda_vmm", "posix_shm"), "cuda:0", marks=pytest.mark.gpu
+        ),
     ),
 )
 def test_retained_encoder_product_outlives_its_producer_request(
@@ -509,7 +512,9 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
         ),
     )
     assert closed_report.completions[0].status is CallStatus.ERROR
-    assert closed_report.completions[0].error_code is ErrorCode.INVALID_CALL
+    assert (
+        closed_report.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
+    )
 
     active_decode = token_call(
         active_admission.request_key,
@@ -636,7 +641,9 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
         ),
     )
     assert retired_report.completions[0].status is CallStatus.ERROR
-    assert retired_report.completions[0].error_code is ErrorCode.INVALID_CALL
+    assert (
+        retired_report.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
+    )
     worker.close()
 
 
@@ -724,5 +731,5 @@ def test_a_call_whose_coordinates_contradict_the_request_is_refused() -> None:
         refused = finalized_report(worker, worker.submit(contradicted))
 
         assert refused.completions[0].status is CallStatus.ERROR
-        assert refused.completions[0].error_code is ErrorCode.INVALID_CALL
+        assert refused.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
         assert refused.completions[0].committed_tokens == ()

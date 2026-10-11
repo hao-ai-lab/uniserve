@@ -16,8 +16,8 @@ use std::time::Duration;
 use uniserve_core::EngineCoreOutput;
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageParams, ImageTrigger,
-    RequestId, SamplingParams,
+    ImageEncoderInput, ImageGenerationConfig, ImageParams, ImageTrigger, MediaCall, RequestId,
+    SamplingParams,
 };
 use uniserve_engine::{EngineHandle, Scheduler, SimEngine, SimExecutor, SpecialTokenIds};
 
@@ -44,7 +44,7 @@ fn main() {
             feedback_next_token: FeedbackNextToken::EndOfImage,
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
-                encoder: ImageIngestStep::VitEncode,
+                encoder: MediaCall::VisionEncoding,
                 num_kv_tokens: None,
                 max_kv_tokens: None,
             }],

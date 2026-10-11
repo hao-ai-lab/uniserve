@@ -253,7 +253,7 @@ def test_every_replica_answers_a_seeded_request(served):
     serves one. Independent replicas each serve their copy alone with the
     same model, so their replies are identical. Expert-parallel replicas
     take every expert layer in steps together. Their attention and dense
-    computation keeps local shapes, while the shared expert computation
+    call keeps local shapes, while the shared expert call
     receives the group's tokens. Different peer batches can change its
     floating-point rounding. Each replica must still answer with a complete
     reply of its own. DWDP keeps local numerical batches independent.

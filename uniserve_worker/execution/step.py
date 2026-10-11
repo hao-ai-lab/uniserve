@@ -19,8 +19,8 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from uniserve_worker.errors import (
+    ErrorCode,
     WorkerError,
-    WorkerErrorCode,
     classify,
     invalid_descriptor,
     should_capture_trace,
@@ -31,7 +31,7 @@ from uniserve_worker.execution.commit import commit_batch, discard_batch
 from uniserve_worker.execution.prepare import reserve_outputs
 from uniserve_worker.execution.schedule import dispatch_batch
 from uniserve_worker.profiling import _forward_stats
-from uniserve_worker.protocol.call import CallStatus, ErrorCode
+from uniserve_worker.protocol.call import CallStatus
 from uniserve_worker.protocol.output import (
     FinishFlags,
     ForwardStats,
@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -62,24 +61,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _completion_error_code(code: WorkerErrorCode) -> ErrorCode:
-    """Map internal failure classes to their completion-wire error codes.
-
-    Every class without its own case, including descriptor, setup, input and
-    scheduler errors, maps to ``ErrorCode.INVALID_CALL``.
-    """
-    if code == WorkerErrorCode.RESOURCE_ERROR:
-        return ErrorCode.RESOURCE_EXHAUSTED
-    if code == WorkerErrorCode.COMPUTE_ERROR:
-        return ErrorCode.COMPUTE_ERROR
-    if code in {
-        WorkerErrorCode.INVARIANT_VIOLATION,
-        WorkerErrorCode.FATAL_WORKER_FAILURE,
-    }:
-        return ErrorCode.INTERNAL
-    return ErrorCode.INVALID_CALL
-
-
 def execute_batch(
     state: BatchState,
     *,
@@ -87,7 +68,6 @@ def execute_batch(
     kv_cache: KVCacheManager | None,
     host_tasks: HostLane,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     output_pool: OutputPool,
@@ -152,7 +132,6 @@ def execute_batch(
             kv_cache=kv_cache,
             host_tasks=host_tasks,
             tensor_store=tensor_store,
-            worker_info=worker_info,
             latent_pool=latent_pool,
             media_mux=media_mux,
             output_pool=output_pool,
@@ -187,7 +166,6 @@ def execute_batch(
         outcomes = dispatch_batch(
             kv_cache=kv_cache,
             tensor_store=tensor_store,
-            worker_info=worker_info,
             latent_pool=latent_pool,
             media_mux=media_mux,
             publication_transports=publication_transports,
@@ -244,10 +222,10 @@ def execute_batch(
             state=state,
             kv_cache=kv_cache,
             tensor_store=tensor_store,
-            worker_info=worker_info,
             latent_pool=latent_pool,
             request_pool=request_pool,
             decode_state=decode_state,
+            model_runner=model_runner,
             config=config,
         )
     except BaseException as error:
@@ -352,7 +330,7 @@ def _publication_failure(
         for call in state.batch.calls
     )
     classified = WorkerError(
-        code=WorkerErrorCode.INVARIANT_VIOLATION,
+        code=ErrorCode.INVARIANT_VIOLATION,
         message=(f"batch publication failed after visibility began: {error}"),
         fatal=True,
         phase="batch publication",
@@ -409,7 +387,6 @@ def _error_outputs(
     coordinates when the call has no predecessor or the request pool no
     longer holds the call's exact request key.
     """
-    completion_code = _completion_error_code(error.code)
     records: list[RequestOutput] = []
     for call in state.batch.calls:
         # Report accepted coordinates only for the matching admitted epoch;
@@ -428,7 +405,7 @@ def _error_outputs(
             request_key=call.request_key,
             call_id=call.call_id,
             status=CallStatus.ERROR,
-            error_code=completion_code,
+            error_code=error.code,
             timing_counters=TimingCounters(),
             kv_visible_len=(
                 0 if runtime is None else int(runtime.kv_visible_len)

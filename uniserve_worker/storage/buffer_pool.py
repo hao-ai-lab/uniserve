@@ -23,8 +23,8 @@ import torch
 
 from uniserve.runtime.device import canonical_device
 from uniserve_worker.errors import (
+    ErrorCode,
     WorkerError,
-    WorkerErrorCode,
     invalid_descriptor,
 )
 from uniserve_worker.protocol.batch import BufferAllocation
@@ -35,7 +35,7 @@ from uniserve_worker.protocol.tensor import TensorRef
 def _invariant(message: str) -> WorkerError:
     """Construct a classified invariant error for persistent-buffer misuse."""
     return WorkerError(
-        code=WorkerErrorCode.INVARIANT_VIOLATION,
+        code=ErrorCode.INVARIANT_VIOLATION,
         message=message,
         fatal=True,
     )

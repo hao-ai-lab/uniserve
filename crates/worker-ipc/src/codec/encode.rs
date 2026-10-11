@@ -4,7 +4,7 @@
 //! and `response`, called by `encode_request` and `encode_response`, which
 //! first validate submitted batches, worker info, and batch outputs. The
 //! builders perform no checks of their own and cannot fail; they rely on that
-//! validation for narrowing casts such as the parallel degrees in `parallel`.
+//! validation for narrowing casts.
 //!
 //! FlatBuffers builds bottom-up: a table can reference only objects already
 //! written to the builder. Each function first serializes its strings,
@@ -212,16 +212,16 @@ fn image<'a>(
     )
 }
 
-fn ar<'a>(
+fn generation<'a>(
     b: &mut FlatBufferBuilder<'a>,
-    v: &ArRequestParams,
-) -> WIPOffset<fbs::ArRequestParams<'a>> {
+    v: &GenerationParams,
+) -> WIPOffset<fbs::GenerationParams<'a>> {
     let sampling = Some(sampling(b, &v.sampling));
     let negative_token_ids = Some(b.create_vector(&v.negative_token_ids));
     let finish_token_ids = Some(b.create_vector(&v.finish_token_ids));
-    fbs::ArRequestParams::create(
+    fbs::GenerationParams::create(
         b,
-        &fbs::ArRequestParamsArgs {
+        &fbs::GenerationParamsArgs {
             sampling,
             negative_token_ids,
             finish_token_ids,
@@ -352,7 +352,7 @@ fn video_admission<'a>(
 
 fn admission<'a>(b: &mut FlatBufferBuilder<'a>, v: &NewRequest) -> WIPOffset<fbs::NewRequest<'a>> {
     let request_key = Some(request_key(b, &v.request_key));
-    let ar = v.ar.as_ref().map(|value| ar(b, value));
+    let generation = v.generation.as_ref().map(|value| generation(b, value));
     let image = v.image.as_ref().map(|value| image(b, value));
     let diffusion = v.diffusion.as_ref().map(|value| diffusion(b, value));
     let video = v.video.as_ref().map(|value| video_admission(b, value));
@@ -362,7 +362,7 @@ fn admission<'a>(b: &mut FlatBufferBuilder<'a>, v: &NewRequest) -> WIPOffset<fbs
         &fbs::NewRequestArgs {
             request_key,
             request_pool_idx: v.request_pool_idx,
-            ar,
+            generation,
             image,
             diffusion,
             prompt_token_ids,
@@ -471,7 +471,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
     let call_id = fbs::CallId::new(v.call_id.batch_id, v.call_id.request_index);
     let coordinates = Some(coordinates(b, &v.coordinates));
     let component = Some(b.create_string(&v.component));
-    let code = computation_to_fb(v.code);
+    let code = call_kind_to_fb(v.kind);
 
     // The schema has no `Bounds` table: the bounds are scalar fields of the
     // `Call` table, which `call_from_table` reassembles.
@@ -561,7 +561,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             call_id: Some(&call_id),
             coordinates,
             component,
-            code: Some(&code),
+            kind: Some(&code),
             max_tokens,
             max_completion_bytes,
             max_transfer_bytes,
@@ -1260,66 +1260,6 @@ fn kv_cache<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheInfo) -> WIPOffset<fbs
     )
 }
 
-/// Writes a component's parallel degrees.
-///
-/// The `as u32` casts cannot truncate for a validated `WorkerInfo`:
-/// `WorkerInfo::validate` requires positive degrees whose product fits `u32`.
-fn parallel<'a>(
-    b: &mut FlatBufferBuilder<'a>,
-    v: &uniserve_core::ParallelConfig,
-) -> WIPOffset<fbs::ParallelConfig<'a>> {
-    use uniserve_core::SequenceParallel;
-    let (sequence_parallel_type, sequence_parallel) = match v.sequence_parallel {
-        SequenceParallel::Local => (
-            fbs::SequenceParallel::LocalSequence,
-            fbs::LocalSequence::create(b, &fbs::LocalSequenceArgs {}).as_union_value(),
-        ),
-        SequenceParallel::Ulysses { ulysses_degree } => (
-            fbs::SequenceParallel::UlyssesSequence,
-            fbs::UlyssesSequence::create(
-                b,
-                &fbs::UlyssesSequenceArgs {
-                    ulysses_degree: ulysses_degree as u32,
-                },
-            )
-            .as_union_value(),
-        ),
-        SequenceParallel::Allgather { allgather_degree } => (
-            fbs::SequenceParallel::GatherSequence,
-            fbs::GatherSequence::create(
-                b,
-                &fbs::GatherSequenceArgs {
-                    allgather_degree: allgather_degree as u32,
-                },
-            )
-            .as_union_value(),
-        ),
-        SequenceParallel::Hybrid {
-            ulysses_degree,
-            allgather_degree,
-        } => (
-            fbs::SequenceParallel::HybridSequence,
-            fbs::HybridSequence::create(
-                b,
-                &fbs::HybridSequenceArgs {
-                    ulysses_degree: ulysses_degree as u32,
-                    allgather_degree: allgather_degree as u32,
-                },
-            )
-            .as_union_value(),
-        ),
-    };
-    fbs::ParallelConfig::create(
-        b,
-        &fbs::ParallelConfigArgs {
-            tensor_parallel_size: v.tensor_parallel_size as u32,
-            pipeline_parallel_size: v.pipeline_parallel_size as u32,
-            sequence_parallel_type,
-            sequence_parallel: Some(sequence_parallel),
-        },
-    )
-}
-
 fn output_info<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &crate::OutputInfo,
@@ -1349,26 +1289,6 @@ fn component_info<'a>(
     v: &crate::ComponentInfo,
 ) -> WIPOffset<fbs::ComponentInfo<'a>> {
     let name = Some(b.create_string(&v.name));
-    let ranks = {
-        let values = v
-            .config
-            .ranks
-            .iter()
-            .map(|&rank| rank as u64)
-            .collect::<Vec<_>>();
-        Some(b.create_vector(&values))
-    };
-    let parallel_config = Some(parallel(b, &v.config.parallel_config));
-    // Wire `Local` encodes an absent distribution; `distribution_from_fb`
-    // maps it back to `None`.
-    let distribution = match v.config.distribution {
-        None => fbs::ComponentDistribution::Local,
-        Some(uniserve_core::ComponentDistribution::TemporalUnits) => {
-            fbs::ComponentDistribution::TemporalUnits
-        }
-    };
-    // `WorkerInfo::validate` bounds `units_per_rank` to `u32`.
-    let units_per_rank = v.config.units_per_rank as u32;
     let outputs = {
         let items = v
             .outputs
@@ -1377,17 +1297,7 @@ fn component_info<'a>(
             .collect::<Vec<_>>();
         Some(b.create_vector(&items))
     };
-    fbs::ComponentInfo::create(
-        b,
-        &fbs::ComponentInfoArgs {
-            name,
-            ranks,
-            parallel_config,
-            distribution,
-            units_per_rank,
-            outputs,
-        },
-    )
+    fbs::ComponentInfo::create(b, &fbs::ComponentInfoArgs { name, outputs })
 }
 
 fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::WorkerInfo<'a>> {
@@ -1405,7 +1315,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             .supported_calls
             .iter()
             .copied()
-            .map(computation_to_fb)
+            .map(call_kind_to_fb)
             .collect::<Vec<_>>();
         Some(b.create_vector(&items))
     };
@@ -1460,7 +1370,6 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             fabric_handles: v.fabric_handles,
             components,
             supported_calls,
-            queue_depth: v.queue_depth,
             max_batch_calls: v.max_batch_calls,
             max_batch_tokens: v.max_batch_tokens,
             request_slots: v.request_slots,
@@ -1532,7 +1441,7 @@ pub(super) fn response<'a>(
         WorkerResponse::Ok { .. } => {}
         WorkerResponse::Error { error, .. } => {
             args.message = Some(b.create_string(&error.message));
-            args.code = error.code.as_deref().map(|s| b.create_string(s));
+            args.code = Some(error_code_to_fb(error.code));
             // `fatal` is an optional scalar (`bool = null`): `Some` writes it
             // even when false, and `response_from_table` requires it on error
             // responses.

@@ -12,7 +12,7 @@ use base64::Engine as _;
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-use uniserve_core::{GenerationLimits, GenerationRequest, ImageIngestStep};
+use uniserve_core::{GenerationLimits, GenerationRequest, MediaCall};
 use uniserve_engine::VideoDenoiserInfo;
 use uniserve_server::VideoMediaSettings;
 use uniserve_server::openai::VideoGenerationRequest;
@@ -541,7 +541,7 @@ fn sensenova_places_the_input_image_at_its_rendered_slot() {
             .collect::<Vec<_>>(),
     );
     assert_eq!(position, marker_positions[1]);
-    assert_eq!(steps, &[ImageIngestStep::VitEncode]);
+    assert_eq!(steps, &[MediaCall::VisionEncoding]);
 
     // Feedback for the default 16:9 canvas (2048x1152) is a 64x36 ViT grid at
     // 32 pixels per token plus one marker token.
@@ -581,7 +581,7 @@ fn bagel_places_the_input_image_between_surrounding_chat_text() {
     assert!((position as usize) < response.prompt_token_ids.len());
     assert_eq!(
         steps,
-        &[ImageIngestStep::VaeEncode, ImageIngestStep::VitEncode]
+        &[MediaCall::LatentEncoding, MediaCall::VisionEncoding]
     );
 }
 

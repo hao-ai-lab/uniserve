@@ -279,7 +279,7 @@ pub(crate) struct SharedRuntimeArgs {
     pub workers: Option<Box<[WorkerConfig]>>,
     /// Directed product bindings: source[:rank]->destination[:rank]=mechanisms,
     /// where mechanisms names the edge's device mechanism, its host mechanism,
-    /// or both joined by `+` with the device mechanism first (`cuda_vmm+shm`).
+    /// or both joined by `+` with the device mechanism first (`cuda_vmm+posix_shm`).
     #[arg(long)]
     pub transfer: Option<TransferConfig>,
     /// Tokens per KV page of the cache group with the widest token rows, a

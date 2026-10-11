@@ -34,7 +34,8 @@ const STEPS: u32 = 3;
 /// Every request carries the same short prompt.
 const PROMPT: [u32; 3] = [11, 12, 13];
 
-/// Declares one loaded component with the outputs it produces.
+/// Declares one loaded component with the outputs it produces and the
+/// placement the engine launched it with.
 ///
 /// A distributed component reconstructs one media unit per rank per round
 /// (`units_per_rank` of one) and keeps the default parallel config, whose
@@ -44,17 +45,19 @@ fn component(
     ranks: Vec<usize>,
     distributed: bool,
     outputs: Vec<OutputInfo>,
-) -> ComponentInfo {
+) -> (ComponentInfo, ComponentConfig) {
     let mut config = ComponentConfig::parallel(ranks, Default::default());
     if distributed {
         config.distribution = Some(ComponentDistribution::TemporalUnits);
     }
 
-    ComponentInfo {
-        name: name.to_owned(),
+    (
+        ComponentInfo {
+            name: name.to_owned(),
+            outputs,
+        },
         config,
-        outputs,
-    }
+    )
 }
 
 /// A small tensor result, indexed by media unit or row along a device-actual
@@ -134,25 +137,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
     sim.set_queue_depth(64);
     sim.set_results_on_wait(true);
 
-    let info = sim.mut_info_for_test();
-    info.supported_calls = MediaCall::ALL
-        .iter()
-        .filter(|call| **call != MediaCall::ImageDecoding)
-        .map(|call| CallKind::Media(*call))
-        .collect();
-    info.video_denoiser = Some(VideoDenoiserInfo {
-        tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
-        schedule_points: STEPS + 1,
-        video_shift: 12.0,
-        audio_shift: 3.0,
-        canvases: Vec::new(),
-    });
-    // The denoiser's latent pool holds the reserved sentinel page plus two
-    // pages of samples per request slot.
-    info.latent_page_units = 256;
-    info.latent_pages = 2 * info.request_slots + 1;
-    info.host_lane_capacity = host_lane_capacity;
-    info.components = vec![
+    sim.place_components(vec![
         component(
             "media_reader",
             vec![0],
@@ -221,7 +206,26 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
             vec![output("audio_samples", None)],
         ),
         component("muxer", vec![0], false, Vec::new()),
-    ];
+    ]);
+
+    let info = sim.mut_info_for_test();
+    info.supported_calls = MediaCall::ALL
+        .iter()
+        .filter(|call| **call != MediaCall::ImageDecoding)
+        .map(|call| CallKind::Media(*call))
+        .collect();
+    info.video_denoiser = Some(VideoDenoiserInfo {
+        tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
+        schedule_points: STEPS + 1,
+        video_shift: 12.0,
+        audio_shift: 3.0,
+        canvases: Vec::new(),
+    });
+    // The denoiser's latent pool holds the reserved sentinel page plus two
+    // pages of samples per request slot.
+    info.latent_page_units = 256;
+    info.latent_pages = 2 * info.request_slots + 1;
+    info.host_lane_capacity = host_lane_capacity;
     info.media_components = BTreeMap::from([
         (MediaCall::MediaReading, "media_reader".to_owned()),
         (MediaCall::VisionEncoding, "text_encoder".to_owned()),
@@ -452,7 +456,7 @@ fn media_calls(batch: &ExecutionBatch) -> Vec<ObservedCall> {
         .requests
         .iter()
         .filter_map(|(call, placement)| {
-            let CallKind::Media(media_call) = call.code else {
+            let CallKind::Media(media_call) = call.kind else {
                 return None;
             };
             Some(ObservedCall {
@@ -536,7 +540,7 @@ fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option
         match event {
             BatchEvent::Submitted(batch) => {
                 readers.extend(batch.requests.iter().filter_map(|(call, placement)| {
-                    let CallKind::Media(media_call) = call.code else {
+                    let CallKind::Media(media_call) = call.kind else {
                         return None;
                     };
                     Some((
@@ -908,7 +912,7 @@ fn call_indices(served: &Served, request: RequestId, media_call: MediaCall) -> V
         .iter()
         .enumerate()
         .filter(|(_, (call, _))| {
-            call.request_key.request_id == request && call.code == CallKind::Media(media_call)
+            call.request_key.request_id == request && call.kind == CallKind::Media(media_call)
         })
         .map(|(index, _)| index)
         .collect()

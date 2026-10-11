@@ -27,11 +27,6 @@ from typing import TypeAlias
 
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import identity
-from uniserve_worker.protocol.validation import (
-    _map,
-    _str,
-    _uint,
-)
 
 #: Bytes of a POSIX file-descriptor allocation handle. It names an open file of
 #: the exporting process, so a consumer on the same host receives a usable
@@ -85,22 +80,6 @@ class WorkerEndpoint:
             socket.gethostname(),
             _address_space,
             uuid.uuid4().hex,
-        )
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "endpoint"
-    ) -> WorkerEndpoint:
-        """Parse a complete worker endpoint identity from the wire schema."""
-        data = _map(value, where)
-        return cls(
-            worker_id=_str(data.get("worker_id"), f"{where}.worker_id"),
-            rank=_uint(data.get("rank"), f"{where}.rank"),
-            node=_str(data.get("node"), f"{where}.node"),
-            address_space=_str(
-                data.get("address_space"), f"{where}.address_space"
-            ),
-            incarnation=_str(data.get("incarnation"), f"{where}.incarnation"),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -282,13 +261,12 @@ class Locator:
         """Return the name of the transport that owns this publication.
 
         The names are the `WorkerInfo.transfer_backends` vocabulary and key a
-        rank's transport table. A `PosixShmTransfer` is ``"shm"`` here but
-        ``"posix_shm"`` in the wire mapping.
+        rank's transport table; they are the names the wire mapping carries.
         """
         if isinstance(self.transport, LocalTransfer):
             return "local"
         if isinstance(self.transport, PosixShmTransfer):
-            return "shm"
+            return "posix_shm"
         if isinstance(self.transport, ChannelTransfer):
             return "channel"
         if isinstance(self.transport, CudaVmmTransfer):

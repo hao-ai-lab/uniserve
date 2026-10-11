@@ -15,7 +15,7 @@
 use super::*;
 use uniserve_worker_ipc::MediaCall;
 
-/// Algorithm inputs retained until their computation completes.
+/// Algorithm inputs retained until their call completes.
 pub(super) enum InflightInput {
     Generation {
         /// Physical KV start and exact token contribution, when known, from the
@@ -157,7 +157,7 @@ impl Inflight {
                 prefill: batch
                     .requests
                     .iter()
-                    .any(|(call, _)| batch_kind(call.code) == BatchKind::Prefill),
+                    .any(|(call, _)| batch_kind(call.kind) == BatchKind::Prefill),
             },
         );
     }
@@ -194,7 +194,7 @@ impl Inflight {
             .iter()
             .filter(|(holder, _)| **holder != id)
             .flat_map(|(_, calls)| calls)
-            .any(|call| call.call.code == CallKind::Media(MediaCall::Denoising))
+            .any(|call| call.call.kind == CallKind::Media(MediaCall::Denoising))
     }
 
     /// Stateful calls retain request order. Pure media branches complete
@@ -232,7 +232,7 @@ impl Inflight {
                 }
                 if let Some(completion) = pending.get(&call.call_id) {
                     ready.push((
-                        completion_priority(call.code),
+                        completion_priority(call.kind),
                         completion.arrival_seq,
                         *id,
                         call.call_id,

@@ -37,8 +37,8 @@ use uniserve_engine::{
     WorkerProcessArgs,
 };
 use uniserve_worker_ipc::{
-    ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CacheUnitAllocation, Call, CallId,
-    CallKind, CallStatus, DType, DimBound, ErrorCode, ForwardBatch, Locator, NewRequest,
+    Batch, BatchCommand, BlockTable, Bounds, CacheUnitAllocation, Call, CallId, CallKind,
+    CallStatus, DType, DimBound, ErrorCode, ForwardBatch, GenerationParams, Locator, NewRequest,
     RequestKey, ShapeBound, TensorPublication, TensorRef, TransferHandle, TransferTransport,
 };
 
@@ -166,7 +166,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
         request_key: second_key,
         call_id: CallId::new(3, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Media(MediaCall::VisionEncoding),
+        kind: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
             ..Bounds::default()
@@ -283,7 +283,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 0,
             );
             let request = |mut request: WorkerRequest, message_id| {
-                request.set_call_id(Some(message_id));
+                request.set_message_id(Some(message_id));
                 request
             };
             let initial = client.send_request(&request(WorkerRequest::submit(batch.clone()), 1))?;
@@ -364,7 +364,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                     anyhow::bail!("duplicate submission was accepted");
                 };
                 anyhow::ensure!(
-                    error.code.as_deref() == Some("InvalidDescriptor"),
+                    error.code == ErrorCode::InvalidDescriptor,
                     "duplicate must be a protocol error"
                 );
             }
@@ -413,7 +413,7 @@ fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Resu
     let result = (|| -> anyhow::Result<()> {
         let client = ClientEndpoint::connect(&accept_reported_endpoint(&listener)?, 8)?;
         let request = |mut request: WorkerRequest, message_id| {
-            request.set_call_id(Some(message_id));
+            request.set_message_id(Some(message_id));
             request
         };
         let serve = |batch_id: u64, request_id: u64, slot: u32, message_id| -> anyhow::Result<()> {
@@ -494,7 +494,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
     // rank 0 (the patch encoder), and once with only the edges
     // `TransferConfig::with_worker_defaults` derives for this worker.
     for transfer in [
-        uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?,
+        uniserve_engine::TransferConfig::parse("worker:1->worker:0=posix_shm")?,
         uniserve_engine::TransferConfig::default(),
     ] {
         let mut args = rank_group_args();
@@ -597,7 +597,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             request_key: admission.request_key,
             call_id: CallId::new(2, 0),
             component: "model".into(),
-            code: CallKind::Transfer(TransferMode::Tensor),
+            kind: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
                 max_transfer_bytes: value.max_bytes(),
                 ..Bounds::default()
@@ -637,7 +637,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             request_key: admission.request_key,
             call_id: CallId::new(3, 0),
             component: "vision_encoder".into(),
-            code: CallKind::Transfer(TransferMode::Tensor),
+            kind: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
                 max_transfer_bytes: publication.max_bytes(),
                 ..Bounds::default()
@@ -833,7 +833,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
     use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
     use uniserve_worker_ipc::{BufferAllocation, DiffusionSamplingParams};
 
-    let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?;
+    let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=posix_shm")?;
     let mut args = rank_group_args();
     args.queue_depth = 3;
     args.transfer = transfer.clone();
@@ -950,7 +950,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         request_key: key,
         call_id: CallId::new(1, 0),
         component: "model".into(),
-        code: CallKind::Media(MediaCall::VisionEncoding),
+        kind: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds::default(),
         inputs: vec![],
         outputs: vec![value.clone()],
@@ -993,7 +993,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         request_key: key,
         call_id: CallId::new(2, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: value.max_bytes(),
             ..Bounds::default()
@@ -1081,7 +1081,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                             assert!(!independent_returned);
                             independent_returned = true;
                         }
-                        computation => panic!("unexpected completed computation {computation:?}"),
+                        call => panic!("unexpected completed call {call:?}"),
                     }
                 }
             }
@@ -1101,7 +1101,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
     // Two one-rank instances whose products cross only over shared storage.
     // A product whose one location is in its producer's own address space
     // therefore has no way to the other instance.
-    let edges = "producer->consumer=shm,consumer->producer=shm";
+    let edges = "producer->consumer=posix_shm,consumer->producer=posix_shm";
     let spawn = |worker_id: &str| -> anyhow::Result<WorkerGroup> {
         let mut args = rank_group_args();
         let binding = WorkerConfig::placed(
@@ -1219,7 +1219,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
         request_key: key,
         call_id: CallId::new(2, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: value.max_bytes(),
             ..Bounds::default()
@@ -1729,10 +1729,9 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert_eq!(info.endpoint.rank, 0);
     assert_eq!(info.max_batch_calls, 256);
     assert_eq!(info.max_batch_tokens, 256);
-    assert_eq!(info.queue_depth as usize, QUEUE_DEPTH);
 
     let mut admission = text_admission(11, 1, 1)?;
-    let sampling = &mut admission.ar.as_mut().unwrap().sampling;
+    let sampling = &mut admission.generation.as_mut().unwrap().sampling;
     sampling.return_logprobs = true;
     sampling.n_logprobs = 1;
     sampling.return_prompt_logprobs = true;
@@ -1876,7 +1875,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     let closed = execute(&mut executor, descendant)?;
     let closed_record = &closed.results[0].output;
     assert_eq!(closed_record.status, CallStatus::Error);
-    assert_eq!(closed_record.error_code, Some(ErrorCode::InvalidCall));
+    assert_eq!(closed_record.error_code, Some(ErrorCode::InvalidDescriptor));
 
     qualify_kv_rank_locations(&mut executor)?;
 
@@ -1955,7 +1954,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         request_key,
         call_id: CallId::new(10, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::KvPublish),
+        kind: CallKind::Transfer(TransferMode::KvPublish),
         bounds: Bounds {
             max_transfer_bytes: 4096,
             ..Bounds::default()
@@ -2192,7 +2191,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         attention_backend: "torch".into(),
         // `publisher` is the worker id `SlowShmPublication` names as the
         // source of its segment.
-        transfer: uniserve_engine::TransferConfig::parse("publisher->worker=shm")?,
+        transfer: uniserve_engine::TransferConfig::parse("publisher->worker=posix_shm")?,
         ..config
     })?;
 
@@ -2311,7 +2310,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         request_key: admission.request_key,
         call_id: CallId::new(3, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: input.max_bytes(),
             ..Bounds::default()
@@ -2353,7 +2352,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Independent instances accepting the same computation must retain separate capacity.
+/// Independent instances accepting the same call must retain separate capacity.
 #[test]
 fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow::Result<()> {
     use uniserve_engine::{
@@ -2398,7 +2397,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             args.python = wrapper.clone();
         }
         args.transfer = uniserve_engine::TransferConfig::parse(
-            "encoder-0->encoder-1=shm,encoder-1->encoder-0=shm",
+            "encoder-0->encoder-1=posix_shm,encoder-1->encoder-0=posix_shm",
         )?;
         WorkerGroup::spawn(args)
     };
@@ -2408,7 +2407,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             (WorkerId("encoder-1".into()), spawn("encoder-1", 2)?),
         ],
         uniserve_engine::TransferConfig::parse(
-            "encoder-0->encoder-1=shm,encoder-1->encoder-0=shm",
+            "encoder-0->encoder-1=posix_shm,encoder-1->encoder-0=posix_shm",
         )?,
     )?;
     let pid = std::fs::read_to_string(&pid_file)?.parse::<i32>()?;
@@ -2538,7 +2537,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         call_id: CallId::new(6, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: source.max_bytes(),
             ..Bounds::default()
@@ -2583,7 +2582,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         call_id: CallId::new(7, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: publication.max_bytes(),
             ..Bounds::default()
@@ -2636,7 +2635,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         call_id: CallId::new(8, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Media(MediaCall::VisionEncoding),
+        kind: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
             ..Bounds::default()
@@ -2765,7 +2764,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: next.request_key,
         call_id: CallId::new(15, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: feature.max_bytes(),
             ..Bounds::default()
@@ -2880,9 +2879,9 @@ impl Drop for PausedProcess {
 
 /// An external shared-storage publisher the test controls.
 ///
-/// The segment carries what a consumer needs in its header: the digest of the
-/// locator that names it, and a readiness word the test writes after the
-/// payload. Until then a rank that reads it waits on that word.
+/// The segment carries what a consumer needs in its header: a readiness word
+/// the test writes after the payload. Until then a rank that reads it waits
+/// on that word.
 struct SlowShmPublication {
     name: String,
     endpoint: String,
@@ -2917,33 +2916,8 @@ impl SlowShmPublication {
         // which leaves the readiness word pending and every acknowledgment
         // word unclaimed.
         file.set_len(SEGMENT_HEADER_BYTES + 1)?;
-        // The header names the exact locator the rank will be handed, the way
-        // the worker's own publications do, so the rank accepts the segment.
-        file.write_all_at(&publication.digest()?, 0)?;
         file.write_all_at(&[0], SEGMENT_HEADER_BYTES)?;
         Ok(publication)
-    }
-
-    /// The digest the worker computes over a locator: SHA-256 of its
-    /// canonical JSON, keys sorted, no whitespace.
-    fn digest(&self) -> anyhow::Result<[u8; 32]> {
-        use sha2::Digest as _;
-
-        let canonical = format!(
-            concat!(
-                "{{\"device\":\"cpu\",\"dtype\":\"uint8\",\"endpoint\":\"{endpoint}\",",
-                "\"name\":\"{name}\",\"nbytes\":1,\"offset\":[0],\"shape\":[1],",
-                "\"source\":{{\"address_space\":\"{address_space}\",",
-                "\"incarnation\":\"{incarnation}\",\"node\":\"{node}\",\"rank\":0,",
-                "\"worker_id\":\"publisher\"}},\"transport\":\"posix_shm\"}}"
-            ),
-            endpoint = self.endpoint,
-            name = self.name,
-            address_space = self.address_space(),
-            incarnation = self.endpoint,
-            node = self.node()?,
-        );
-        Ok(sha2::Sha256::digest(canonical.as_bytes()).into())
     }
 
     fn address_space(&self) -> String {
@@ -3008,7 +2982,7 @@ fn spawn_rank_group() -> anyhow::Result<WorkerGroup> {
 /// The components the stub model declares, over `rank_count` ranks.
 ///
 /// A placement names what a worker holds, and a worker that serves a model's
-/// whole computation holds every component it declares.
+/// whole call holds every component it declares.
 fn stub_components(
     rank_count: usize,
 ) -> std::collections::BTreeMap<String, uniserve_core::ComponentConfig> {
@@ -3189,7 +3163,7 @@ fn text_admission(
     Ok(NewRequest::new(
         RequestKey::new(1, RequestId(request_id), request_epoch),
         request_pool_idx,
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: SamplingParams {
                 temperature: 0.0,
                 ignore_eos: true,
@@ -3279,7 +3253,7 @@ fn token_batch(
         request_key,
         call_id,
         component: "model".into(),
-        code: mode,
+        kind: mode,
         bounds: Bounds {
             max_tokens: tokens.len().max(1) as u32,
             max_kv_units: u32::from(prefix_length == 0),

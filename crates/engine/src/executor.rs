@@ -7,8 +7,9 @@
 //! drives worker processes, and `SimExecutor` (`crate::sim`).
 //!
 //! Besides the trait, this module owns the values that cross that boundary:
-//! [`ExecutorInfo`], which merges the pools' reported capabilities into the
-//! single capacity view the scheduler plans against; the result types a poll
+//! [`ExecutorInfo`], which merges the pools' reported capabilities, beside
+//! the placement the engine launched them with, into the single capacity view
+//! the scheduler plans against; the result types a poll
 //! returns; and [`TransferConfig`], the directed transfer edges between worker
 //! ranks and the placement they resolve against, from which the head derives
 //! each rank's launch descriptor fields (transfer mechanisms, acknowledgment
@@ -37,11 +38,31 @@ mod batch;
 
 pub use batch::{ExecutionBatch, RequestPlacement};
 
+/// What the engine launched one pool with.
+///
+/// The engine decides these values and hands them to the worker at launch, so
+/// the worker's report does not carry them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoolPlacement {
+    /// Unresolved physical batches the pool admits at once, counted as at
+    /// least one.
+    pub queue_depth: usize,
+    /// The pool's components by name, each with its member ranks, parallel
+    /// degrees and distribution.
+    pub components: BTreeMap<String, ComponentConfig>,
+}
+
 /// Concrete pool information reported through the execution boundary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecutorInfo {
     /// Physical pool identities and their reported capabilities.
     pub workers: Vec<(WorkerId, WorkerInfo)>,
+    /// For each pool, what the engine launched it with. A pool absent from
+    /// the map is placed with no components and a queue depth of one.
+    ///
+    /// `WorkerExecutor::try_new` and `SimExecutor` fill this from their
+    /// launch; `single` and `from_workers` leave it empty.
+    pub placements: BTreeMap<WorkerId, PoolPlacement>,
     /// For each worker that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
@@ -57,7 +78,7 @@ impl ExecutorInfo {
     pub fn single(id: WorkerId, info: WorkerInfo) -> Self {
         Self {
             workers: vec![(id, info)],
-            video_codecs: BTreeMap::new(),
+            ..Self::default()
         }
     }
 
@@ -88,8 +109,27 @@ impl ExecutorInfo {
         }
         Ok(Self {
             workers: pools,
-            video_codecs: BTreeMap::new(),
+            ..Self::default()
         })
+    }
+
+    /// Returns the configuration the engine placed component `name` with on
+    /// `worker`, or `None` when the pool launched no such component.
+    pub fn component_config(&self, worker: &WorkerId, name: &str) -> Option<&ComponentConfig> {
+        self.placements.get(worker)?.components.get(name)
+    }
+
+    /// Returns the batches the pools admit in flight together: the sum of
+    /// their launched queue depths, each counted as at least one.
+    pub fn queue_depth(&self) -> usize {
+        self.workers
+            .iter()
+            .map(|(id, _)| {
+                self.placements
+                    .get(id)
+                    .map_or(1, |placement| placement.queue_depth.max(1))
+            })
+            .fold(0usize, usize::saturating_add)
     }
 
     /// Resolves which component serves each media call across every worker.
@@ -149,12 +189,11 @@ impl ExecutorInfo {
     pub fn media_lane_units(&self, call: MediaCall) -> Option<u32> {
         self.workers
             .iter()
-            .filter_map(|(_, info)| {
+            .filter_map(|(id, info)| {
                 let component = info.media_components.get(&call)?;
-                let find =
-                    |name: &String| info.components.iter().find(|binding| &binding.name == name);
-                let binding = find(component)?;
-                if binding.config.distribution.is_none() {
+                let find = |name: &String| self.component_config(id, name);
+                let config = find(component)?;
+                if config.distribution.is_none() {
                     return Some(1);
                 }
 
@@ -163,18 +202,17 @@ impl ExecutorInfo {
                     .get(&MediaCall::TextEncoding)
                     .filter(|_| call == MediaCall::LatentEncoding)
                     .and_then(find);
-                let unshared = binding
-                    .config
+                let unshared = config
                     .ranks
                     .iter()
-                    .filter(|rank| prompt.is_none_or(|prompt| !prompt.config.ranks.contains(rank)))
+                    .filter(|rank| prompt.is_none_or(|prompt| !prompt.ranks.contains(rank)))
                     .count();
                 let ranks = if unshared == 0 {
-                    binding.config.ranks.len()
+                    config.ranks.len()
                 } else {
                     unshared
                 };
-                u32::try_from(ranks * binding.config.units_per_rank.max(1)).ok()
+                u32::try_from(ranks * config.units_per_rank.max(1)).ok()
             })
             .min()
     }
@@ -187,8 +225,8 @@ impl ExecutorInfo {
     /// record is cloned from the first pool that serves a KV forward call (or
     /// the first pool when none does), so fields the merge does not set, such
     /// as the endpoint, come from that pool. Call support and
-    /// media routing are unions, queue depth is a sum, and most batch, slot,
-    /// and storage limits take the smallest nonzero value any pool reports.
+    /// media routing are unions, and most batch, slot, and storage limits
+    /// take the smallest nonzero value any pool reports.
     /// The exceptions are the KV cache, whose layout the KV pools must share
     /// and whose unit count is their smallest; request slots of a deployment
     /// that muxes video,
@@ -288,20 +326,13 @@ impl ExecutorInfo {
             merged.kv_cache = None;
         }
 
-        // A call is supported when any pool serves it. Each pool contributes
-        // its own queue depth, counted as at least one. Unless noted at the
-        // field, the remaining limits take the smallest nonzero value, and are
-        // zero only when every pool reports zero.
+        // A call is supported when any pool serves it. Unless noted at the
+        // field, the limits take the smallest nonzero value, and are zero
+        // only when every pool reports zero.
         merged.supported_calls = CallKind::ALL
             .into_iter()
             .filter(|variant| routed(*variant).is_some())
             .collect();
-        merged.queue_depth = self
-            .workers
-            .iter()
-            .map(|(_, info)| info.queue_depth.max(1))
-            .try_fold(0u32, |total, depth| total.checked_add(depth))
-            .context("worker capacity exceeds the engine window")?;
         merged.max_batch_calls = self
             .workers
             .iter()
@@ -640,7 +671,7 @@ pub enum TransferBackend {
     #[default]
     Local,
     /// Publishes products through POSIX shared storage.
-    Shm,
+    PosixShm,
     /// Publishes device products through CUDA VMM handles.
     CudaVmm,
     /// Carries a host product's bytes on the rank channel's data path.
@@ -656,7 +687,7 @@ impl TransferBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
-            Self::Shm => "shm",
+            Self::PosixShm => "posix_shm",
             Self::CudaVmm => "cuda_vmm",
             Self::Channel => "channel",
         }
@@ -677,7 +708,7 @@ impl FromStr for TransferBackend {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "local" => Ok(Self::Local),
-            "shm" => Ok(Self::Shm),
+            "posix_shm" => Ok(Self::PosixShm),
             "cuda_vmm" => Ok(Self::CudaVmm),
             "channel" => Ok(Self::Channel),
             _ => Err(TransferConfigError::message(format!(
@@ -807,7 +838,7 @@ impl TransferConfig {
                                 // namespace, so a host product that leaves its host
                                 // travels on the rank channel's data path.
                                 let host = if source.node == destination.node {
-                                    TransferBackend::Shm
+                                    TransferBackend::PosixShm
                                 } else {
                                     TransferBackend::Channel
                                 };
@@ -1076,7 +1107,7 @@ impl TransferConfig {
         tensor.locations.retain(|location| {
             let published = match &location.transport {
                 TransferTransport::Local { .. } => TransferBackend::Local,
-                TransferTransport::PosixShm { .. } => TransferBackend::Shm,
+                TransferTransport::PosixShm { .. } => TransferBackend::PosixShm,
                 TransferTransport::CudaVmm { .. } => TransferBackend::CudaVmm,
                 TransferTransport::Channel { .. } => TransferBackend::Channel,
             };
@@ -1104,7 +1135,7 @@ impl TransferConfig {
     ///
     /// `mechanisms` names the edge's device mechanism, its host mechanism, or
     /// both joined by `+` with the device mechanism first, as in
-    /// `cuda_vmm+shm`. `local` serves both locations. Entries are separated by
+    /// `cuda_vmm+posix_shm`. `local` serves both locations. Entries are separated by
     /// commas, and an omitted rank covers every rank of that worker.
     ///
     /// The result holds no placement: `with_worker_defaults` fills
@@ -1204,7 +1235,7 @@ impl TransferConfig {
         for backend in backends {
             let slot = match backend {
                 TransferBackend::CudaVmm => &mut device,
-                TransferBackend::Shm | TransferBackend::Channel => &mut host,
+                TransferBackend::PosixShm | TransferBackend::Channel => &mut host,
                 TransferBackend::Local => unreachable!("local mechanisms return above"),
             };
             if slot.replace(backend).is_some() {
@@ -1266,8 +1297,8 @@ pub struct WorkerExecError {
     pub batch_id: Option<u64>,
     /// Whether the error invalidates the worker process or executor.
     pub fatal: bool,
-    /// Stable worker-defined error code, when classified.
-    pub code: Option<String>,
+    /// Failure class the worker assigned.
+    pub code: uniserve_worker_ipc::ErrorCode,
     /// Human-readable failure description.
     pub message: String,
     /// Execution phase in which the failure occurred, when known.
@@ -1370,7 +1401,6 @@ mod tests {
             .into_iter()
             .map(|name| uniserve_worker_ipc::ComponentInfo {
                 name: name.to_owned(),
-                config: ComponentConfig::parallel(vec![0], ParallelConfig::default()),
                 outputs: Vec::new(),
             })
             .collect();
@@ -1457,7 +1487,7 @@ mod tests {
                 (WorkerId("model".to_owned()), model),
                 (WorkerId("host".to_owned()), host),
             ],
-            video_codecs: BTreeMap::new(),
+            ..ExecutorInfo::default()
         };
         let routing = info.media_routing().expect("the union is complete");
         assert_eq!(routing.len(), 8);
@@ -1471,62 +1501,84 @@ mod tests {
     /// out the ranks its worker's text encoder takes.
     #[test]
     fn media_lanes_count_the_units_one_call_covers() {
-        let encoder = |id: &str, ranks: usize, units_per_rank: usize| {
-            let (id, mut info) =
-                media_pool(id, &[(MediaCall::LatentEncoding, "latent_encoder")], 1);
-            let config = &mut info.components[0].config;
-            config.ranks = (0..ranks).collect();
-            config.distribution = Some(uniserve_core::ComponentDistribution::TemporalUnits);
-            config.units_per_rank = units_per_rank;
-            (id, info)
+        let placed = |id: &str, components: &[(&str, Vec<usize>, bool, usize)]| {
+            let routes = [
+                (MediaCall::LatentEncoding, "latent_encoder"),
+                (MediaCall::TextEncoding, "text_encoder"),
+            ];
+            let (id, info) = media_pool(id, &routes, 1);
+            let placement = PoolPlacement {
+                queue_depth: 1,
+                components: components
+                    .iter()
+                    .map(|(name, ranks, distributed, units_per_rank)| {
+                        let mut config =
+                            ComponentConfig::parallel(ranks.clone(), ParallelConfig::default());
+                        if *distributed {
+                            config.distribution =
+                                Some(uniserve_core::ComponentDistribution::TemporalUnits);
+                        }
+                        config.units_per_rank = *units_per_rank;
+                        ((*name).to_owned(), config)
+                    })
+                    .collect(),
+            };
+            (id, info, placement)
         };
-        let lanes = |workers| {
-            ExecutorInfo {
-                workers,
-                video_codecs: BTreeMap::new(),
+        let lanes = |pools: Vec<(WorkerId, WorkerInfo, PoolPlacement)>| {
+            let mut info = ExecutorInfo::default();
+            for (id, worker, placement) in pools {
+                info.placements.insert(id.clone(), placement);
+                info.workers.push((id, worker));
             }
-            .media_lane_units(MediaCall::LatentEncoding)
+            info.media_lane_units(MediaCall::LatentEncoding)
+        };
+        // The text encoder shares no rank with the latent encoder unless a
+        // test says so.
+        let encoder = |id: &str, ranks: usize, units_per_rank: usize| {
+            placed(
+                id,
+                &[
+                    ("latent_encoder", (0..ranks).collect(), true, units_per_rank),
+                    ("text_encoder", Vec::new(), false, 1),
+                ],
+            )
         };
 
         assert_eq!(lanes(vec![encoder("a", 4, 1)]), Some(4));
         assert_eq!(lanes(vec![encoder("a", 4, 2)]), Some(8));
         assert_eq!(lanes(vec![encoder("a", 4, 1), encoder("b", 2, 1)]), Some(2));
-        let (id, mut single) = encoder("a", 4, 1);
-        single.components[0].config.distribution = None;
-        assert_eq!(lanes(vec![(id, single)]), Some(1));
+        assert_eq!(
+            lanes(vec![placed(
+                "a",
+                &[
+                    ("latent_encoder", vec![0, 1, 2, 3], false, 1),
+                    ("text_encoder", Vec::new(), false, 1),
+                ],
+            )]),
+            Some(1)
+        );
 
         // A latent encoding round covers the ranks the prompt's encoding
         // leaves free: those the latent encoder does not share with its
         // worker's text encoder, or all of them when it shares every one.
         let beside = |text: Vec<usize>| {
-            let (id, mut info) = media_pool(
+            lanes(vec![placed(
                 "a",
                 &[
-                    (MediaCall::LatentEncoding, "latent_encoder"),
-                    (MediaCall::TextEncoding, "text_encoder"),
+                    ("latent_encoder", vec![4, 5, 6, 7, 0, 1, 2, 3], true, 1),
+                    ("text_encoder", text, false, 1),
                 ],
-                1,
-            );
-            for binding in &mut info.components {
-                if binding.name == "text_encoder" {
-                    binding.config.ranks = text.clone();
-                } else {
-                    binding.config.ranks = vec![4, 5, 6, 7, 0, 1, 2, 3];
-                    binding.config.distribution =
-                        Some(uniserve_core::ComponentDistribution::TemporalUnits);
-                }
-            }
-            lanes(vec![(id, info)])
+            )])
         };
         assert_eq!(beside(vec![0, 1, 2, 3]), Some(4));
         assert_eq!(beside(vec![0]), Some(7));
         assert_eq!(beside((0..8).collect()), Some(8));
         assert_eq!(
-            lanes(vec![media_pool(
-                "a",
-                &[(MediaCall::Denoising, "denoiser")],
-                1
-            )]),
+            lanes(vec![{
+                let (id, info) = media_pool("a", &[(MediaCall::Denoising, "denoiser")], 1);
+                (id, info, PoolPlacement::default())
+            }]),
             None
         );
     }
@@ -1557,7 +1609,7 @@ mod tests {
             });
             ExecutorInfo {
                 workers: vec![(WorkerId("model".to_owned()), info)],
-                video_codecs: BTreeMap::new(),
+                ..ExecutorInfo::default()
             }
         };
 
@@ -1589,7 +1641,7 @@ mod tests {
                 (WorkerId("model".to_owned()), model.clone()),
                 (WorkerId("host".to_owned()), host),
             ],
-            video_codecs: BTreeMap::new(),
+            ..ExecutorInfo::default()
         };
         let message = info
             .media_routing()
@@ -1603,7 +1655,7 @@ mod tests {
                 (WorkerId("model".to_owned()), model),
                 (WorkerId("other".to_owned()), other),
             ],
-            video_codecs: BTreeMap::new(),
+            ..ExecutorInfo::default()
         };
         let message = info
             .media_routing()
@@ -1625,7 +1677,7 @@ mod tests {
                     destination_worker: WorkerId("decode".to_owned()),
                     destination_rank: None,
                     device: Some(TransferBackend::CudaVmm),
-                    host: Some(TransferBackend::Shm),
+                    host: Some(TransferBackend::PosixShm),
                 },
                 TransferEdge {
                     source_worker: WorkerId("encoder".to_owned()),
@@ -1670,18 +1722,18 @@ mod tests {
     fn an_edge_names_a_device_mechanism_and_a_host_mechanism() {
         // A product's location decides which mechanism carries it, so one
         // edge binds both, and each location has at most one.
-        let both = TransferConfig::parse("decoder->muxer=cuda_vmm+shm").unwrap();
+        let both = TransferConfig::parse("decoder->muxer=cuda_vmm+posix_shm").unwrap();
         assert_eq!(both.edges[0].device, Some(TransferBackend::CudaVmm));
-        assert_eq!(both.edges[0].host, Some(TransferBackend::Shm));
-        assert!(both.edges[0].carries(TransferBackend::Shm));
+        assert_eq!(both.edges[0].host, Some(TransferBackend::PosixShm));
+        assert!(both.edges[0].carries(TransferBackend::PosixShm));
         assert!(!both.edges[0].carries(TransferBackend::Channel));
 
         let local = TransferConfig::parse("decoder->decoder=local").unwrap();
         assert_eq!(local.edges[0].device, Some(TransferBackend::Local));
         assert_eq!(local.edges[0].host, Some(TransferBackend::Local));
 
-        assert!(TransferConfig::parse("a->b=shm+channel").is_err());
-        assert!(TransferConfig::parse("a->b=local+shm").is_err());
+        assert!(TransferConfig::parse("a->b=posix_shm+channel").is_err());
+        assert!(TransferConfig::parse("a->b=local+posix_shm").is_err());
         assert!(TransferConfig::parse("a->b=cuda_vmm+cuda_vmm").is_err());
     }
 
@@ -1754,7 +1806,8 @@ mod tests {
 
     #[test]
     fn transport_map_parses_edges() {
-        let t = TransferConfig::parse("encoder->prefill=cuda_vmm,prefill->decode=shm").unwrap();
+        let t =
+            TransferConfig::parse("encoder->prefill=cuda_vmm,prefill->decode=posix_shm").unwrap();
         assert_eq!(
             t.edges[0],
             TransferEdge {
@@ -1766,18 +1819,21 @@ mod tests {
                 host: None,
             }
         );
-        assert_eq!(t.edges[1].host, Some(TransferBackend::Shm));
+        assert_eq!(t.edges[1].host, Some(TransferBackend::PosixShm));
         assert!(TransferConfig::parse("bad-entry").is_err());
         assert!(TransferConfig::parse("prefill->decode=tcp").is_err());
-        assert!(TransferConfig::parse("prefill->decode=shm,prefill->decode=cuda_vmm").is_err());
+        assert!(
+            TransferConfig::parse("prefill->decode=posix_shm,prefill->decode=cuda_vmm").is_err()
+        );
         let split =
-            TransferConfig::parse("encoder:0->denoiser:0=shm,encoder:0->denoiser:1=cuda_vmm")
+            TransferConfig::parse("encoder:0->denoiser:0=posix_shm,encoder:0->denoiser:1=cuda_vmm")
                 .unwrap();
         assert_eq!(split.edges[1].source_rank, Some(0));
         assert_eq!(split.edges[1].destination_rank, Some(1));
-        assert!(TransferConfig::parse("encoder:x->denoiser=shm").is_err());
+        assert!(TransferConfig::parse("encoder:x->denoiser=posix_shm").is_err());
         assert!(
-            TransferConfig::parse("encoder->denoiser=shm,encoder:0->denoiser:1=cuda_vmm").is_err()
+            TransferConfig::parse("encoder->denoiser=posix_shm,encoder:0->denoiser:1=cuda_vmm")
+                .is_err()
         );
     }
 

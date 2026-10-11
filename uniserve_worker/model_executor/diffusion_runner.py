@@ -121,7 +121,7 @@ class LadderBucket(GraphBucket):
 
 
 class DiffusionRunner(ModelRunner):
-    """Run one denoiser binding's diffusion computation.
+    """Run one denoiser binding's diffusion call.
 
     The denoiser's conditioning decides the form, and execution dispatches by
     that capability rather than by model:
@@ -143,7 +143,7 @@ class DiffusionRunner(ModelRunner):
       them, and scatters the successor to the pages' other bank. ``bind``
       states a request's ladder over its slot of the request bank and its
       pages once; ``step`` advances it, replaying the layout's graph when
-      ``capture`` made it resident and evaluating the same computation
+      ``capture`` made it resident and evaluating the same call
       eagerly when the runner does not capture. A captured graph addresses
       the step through a device index and the pages and the slot through
       device indices, so one graph serves every step, slot and request of
@@ -698,7 +698,7 @@ class DiffusionRunner(ModelRunner):
         Gathers the committed samples, and with ``gathers`` the slot's banked
         state the device ``slot_index`` names, evaluates ``call`` and
         scatters the successor samples. Eager steps and captured graphs run
-        this same computation.
+        this same call.
         """
         pool = cast("LatentPool", self.pool)
         rows, indices = pool.page_rows, entry.rows
@@ -806,7 +806,7 @@ class DiffusionRunner(ModelRunner):
             def compute(_):
                 return self._advance(entry, call, bucket.gathers, slot_index)
 
-            # ``warmup`` ran this layout's computation at the same shapes,
+            # ``warmup`` ran this layout's call at the same shapes,
             # so capture needs no eager pass of its own.
             bucket.graphs[None] = CUDAGraphRunner.capture(
                 context,

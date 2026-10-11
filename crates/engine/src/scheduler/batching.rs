@@ -11,7 +11,7 @@
 //! `num_scheduled_denoise_steps`), so a successor can be planned before its
 //! predecessor resolves. Each planned call then reserves its storage, is
 //! registered as in flight, and joins the pass's batch for its `CallKind`:
-//! one batch per computation, each a single numerical call on one component.
+//! one batch per call kind, each a single numerical call on one component.
 //!
 //! The lane (`BatchKind`) only separates prefill from decode. `BatchKind::Media`
 //! calls are eligible in every pass, and a pass with no lane applies no filter.
@@ -67,8 +67,8 @@ impl Scheduler {
     /// it costs nothing once its request has left `running`. A verify call
     /// costs its input tokens plus one, and every other call its `max_tokens`
     /// bound.
-    fn computation_token_cost(&self, call: &Call) -> usize {
-        match call.code {
+    fn call_token_cost(&self, call: &Call) -> usize {
+        match call.kind {
             CallKind::Media(MediaCall::Denoising) => {
                 let Some(state) = self.running.get(&call.request_key.request_id) else {
                     return 0;
@@ -82,7 +82,7 @@ impl Scheduler {
         }
     }
 
-    /// Reserves persistent buffers, latent pages, and transfer capacity for one computation.
+    /// Reserves persistent buffers, latent pages, and transfer capacity for one call.
     ///
     /// Returns the call's output buffer spans, in `Call::buffer_outputs`
     /// order, or `None` when the call cannot run now: the flow prefix of a
@@ -99,7 +99,7 @@ impl Scheduler {
     /// capacity.
     fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<BufferSpan>> {
         let id = call.request_key.request_id;
-        if call.code == CallKind::Media(MediaCall::Denoising) && !self.ensure_flow_prefix(id) {
+        if call.kind == CallKind::Media(MediaCall::Denoising) && !self.ensure_flow_prefix(id) {
             return None;
         }
         let uses_transfer = call.bounds.max_transfer_bytes > 0;
@@ -111,7 +111,7 @@ impl Scheduler {
             .get(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
         self.placement
-            .worker_target(self.executor.as_ref(), &self.info, request_key, call.code)?;
+            .worker_target(self.executor.as_ref(), &self.info, request_key, call.kind)?;
 
         let mut buffer_allocations = Vec::new();
         for bytes in call.buffer_outputs().map(TensorRef::max_bytes) {
@@ -137,7 +137,7 @@ impl Scheduler {
         // across the trajectory's calls; a failed grow leaves the existing
         // pages allocated.
         if matches!(
-            call.code,
+            call.kind,
             CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
         ) && self.worker_tracks_image_latent()
         {
@@ -182,7 +182,7 @@ impl Scheduler {
     /// Workers report the rows their captured prefill and decode graphs hold
     /// (`WorkerInfo::max_prefill_calls`, `WorkerInfo::max_decode_calls`); zero
     /// means those calls run eagerly and only the pass's call bound applies,
-    /// as it does to every other computation.
+    /// as it does to every other call.
     pub(super) fn call_limit(&self, code: CallKind) -> usize {
         let reported = match code {
             CallKind::Forward(ForwardMode::Prefill) => self.info.max_prefill_calls,
@@ -199,7 +199,7 @@ impl Scheduler {
     ///
     /// Walks `ids` in assembly order until `max_batch` calls are selected or
     /// the token budget is spent. A prefill or decode batch stops growing
-    /// at its `call_limit`; requests whose next call is of that computation
+    /// at its `call_limit`; requests whose next call is of that kind
     /// then wait for a later pass. Every selected call is registered in flight
     /// before this returns. A failed call preparation returns no batches; most
     /// such failures latch engine-fatal first.
@@ -208,9 +208,9 @@ impl Scheduler {
         ids: &[RequestId],
         lane: Option<BatchKind>,
     ) -> Vec<ExecutionBatch> {
-        // One batch per computation: a batch is one numerical call on one
+        // One batch per call kind: a batch is one numerical call on one
         // component, so a rank receives it as a single homogeneous group. The
-        // component a call binds to follows from its computation, so the two
+        // component a call binds to follows from its kind, so the two
         // together name one group. Computations keep the order in which their
         // first call was selected.
         let mut code_order: Vec<CallKind> = Vec::new();
@@ -289,13 +289,13 @@ impl Scheduler {
                 continue;
             }
             // Build one call when its exact resident resources fit.
-            if let Some(mut call) = self.next_generation_computation(id, budget, rows_left) {
-                // A planned call joins its computation's batch only while it
+            if let Some(mut call) = self.next_generation_call(id, budget, rows_left) {
+                // A planned call joins its kind's batch only while it
                 // has room; otherwise it waits for a later pass, as a call
                 // without resources does below. A context prefill plans
                 // within the pass's context rows.
-                let prefill = call.code == CallKind::Forward(ForwardMode::Prefill);
-                if full(&code_batches, call.code)
+                let prefill = call.kind == CallKind::Forward(ForwardMode::Prefill);
+                if full(&code_batches, call.kind)
                     || (prefill && generation::prefill_rows(&call) > rows_left.context)
                 {
                     if let Some(state) = self.running.get_mut(&id) {
@@ -310,7 +310,7 @@ impl Scheduler {
                 // prepares the image, so it waits here, as a media call
                 // does, until those host lanes have room.
                 let image_lane =
-                    match call.code {
+                    match call.kind {
                         CallKind::Media(media_call) if call.input_image.is_some() => {
                             let Some(request_key) = self.running.get(&id).map(|state| {
                                 RequestKey::new(self.engine_id, id, state.request_epoch)
@@ -320,7 +320,7 @@ impl Scheduler {
                             let demand = self.image_lane_demand(request_key, media_call);
                             let ledger = image_lanes.get_or_insert_with(|| self.lane_occupancy());
                             if !ledger.admits(&demand, id, self) {
-                                self.record_domain_backpressure(call.code);
+                                self.record_domain_backpressure(call.kind);
                                 if let Some(state) = self.running.get_mut(&id) {
                                     state.num_kv_units_sent = state
                                         .num_kv_units_sent
@@ -340,7 +340,7 @@ impl Scheduler {
                 // row must not spend the pass before the request that holds
                 // the row, which is the one whose steps release it.
                 let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
-                    self.record_domain_backpressure(call.code);
+                    self.record_domain_backpressure(call.kind);
                     // Planning a forward advanced `num_kv_units_sent` past its
                     // fresh units; roll it back so the next plan declares them.
                     if let Some(state) = self.running.get_mut(&id) {
@@ -354,7 +354,7 @@ impl Scheduler {
                     );
                     continue;
                 };
-                let cost = self.computation_token_cost(&call);
+                let cost = self.call_token_cost(&call);
                 budget = budget.saturating_sub(cost);
                 if call.readout.is_some() {
                     let rows = self.running.get(&id).and_then(|state| {
@@ -372,7 +372,7 @@ impl Scheduler {
 
                 // Identify the call by its batch and row, and stamp the
                 // coordinates projected through the request's in-flight calls.
-                let code = call.code;
+                let code = call.kind;
                 let batch = code_batches.entry(code).or_insert_with(|| {
                     code_order.push(code);
                     ExecutionBatch::new(
@@ -415,7 +415,7 @@ impl Scheduler {
                             NewRequest::new(
                                 request_key,
                                 request_pool_idx,
-                                Some(ArRequestParams {
+                                Some(GenerationParams {
                                     sampling: st.req.sampling.clone(),
                                     negative_token_ids: st.req.negative_prompt_token_ids.clone(),
                                     finish_token_ids,
@@ -638,7 +638,7 @@ impl Scheduler {
         if st.phase == Phase::Prefill
             && let Some((_, step)) = self.next_context_encode(id)
         {
-            return Some(generation::encoder_call(step));
+            return Some(CallKind::Media(step));
         }
         Some(match st.phase {
             Phase::IngestState => CallKind::Forward(ForwardMode::Prefill),
@@ -655,7 +655,7 @@ impl Scheduler {
             Phase::FeedbackEncode => {
                 let feedback = &st.req.image_generation;
                 feedback.feedback_source.as_ref()?;
-                generation::encoder_call(
+                CallKind::Media(
                     feedback
                         .feedback_encoders
                         .get(st.feedback_encoder_index)?
@@ -668,7 +668,7 @@ impl Scheduler {
         })
     }
 
-    /// Registers one selected computation with its allocated physical inputs and outputs.
+    /// Registers one selected call with its allocated physical inputs and outputs.
     ///
     /// Sets the call's device predicate, derives its KV, forward-row, and
     /// latent inputs from the lengths its in-flight predecessors project,
@@ -702,7 +702,7 @@ impl Scheduler {
             return None;
         };
         if self.inflight.has_pending_calls(request_id)
-            && !self.can_queue_successor(request_id, call.code)
+            && !self.can_queue_successor(request_id, call.kind)
         {
             tracing::error!(
                 request_id = request_id.0,
@@ -750,9 +750,9 @@ impl Scheduler {
                 self.fatal = true;
                 return None;
             };
-            if call.code == CallKind::Forward(ForwardMode::Decode) {
+            if call.kind == CallKind::Forward(ForwardMode::Decode) {
                 predecessor.token_output.clone()
-            } else if self.follows_unconditionally(request_id, call.code) {
+            } else if self.follows_unconditionally(request_id, call.kind) {
                 None
             } else {
                 predecessor.completion_output.clone()
@@ -769,13 +769,13 @@ impl Scheduler {
 
         call.predicate = predicate;
 
-        // Freeze physical inputs before registering this computation as pending.
+        // Freeze physical inputs before registering this call as pending.
         // Accepted progress may stop on cancellation while these inputs still drain.
         // `visible` is the KV length after the in-flight predecessors; `input`
         // counts the tokens this call appends. Publication, latent preparation,
         // and denoising only read the request's KV.
         let (_, visible) = self.scheduled_token_lengths(request_id)?;
-        let kv_lengths = match call.code {
+        let kv_lengths = match call.kind {
             // A context prefill's bound counts its prompt tokens and its
             // vision blocks' exact KV lengths.
             CallKind::Forward(ForwardMode::Prefill) => Some(KvLengths {
@@ -798,7 +798,7 @@ impl Scheduler {
         // Latent preparation opens the trajectory at step zero, a denoising
         // call starts after the steps already scheduled, and image decoding
         // sits at the end of the schedule.
-        let start_step = match call.code {
+        let start_step = match call.kind {
             CallKind::Media(MediaCall::LatentPreparation) => Some(0),
             CallKind::Media(MediaCall::Denoising) => self.num_scheduled_denoise_steps(request_id),
             CallKind::Media(MediaCall::ImageDecoding) => self
@@ -812,7 +812,7 @@ impl Scheduler {
         // current input image's encoder.
         let num_image_kv_tokens = if consumes_image_features(&call) {
             let state = self.running.get(&request_id)?;
-            let encoder = if is_feedback_computation(&call) {
+            let encoder = if is_feedback_call(&call) {
                 state
                     .req
                     .image_generation
@@ -897,7 +897,7 @@ impl Scheduler {
             // its last declaration (growth, or window retirement in a
             // sliding-window group) or it holds fresh units, which the worker
             // must reset before use. A forward's fresh units are those
-            // allocated since the declared watermark (`plan_computation`).
+            // allocated since the declared watermark (`plan_call`).
             // Admission (or re-admission) declares every table again, with
             // every allocated page fresh; pages acquired from the prefix
             // cache already hold computed KV and are never fresh.
@@ -1034,7 +1034,7 @@ impl Scheduler {
         // finalizes the prefix, the call also prefills a non-empty negative
         // prompt into it; the prefix's tables are resent until then and
         // whenever the prefix has gained pages.
-        if call.code == CallKind::Media(MediaCall::Denoising) {
+        if call.kind == CallKind::Media(MediaCall::Denoising) {
             let Some(KvLengths {
                 visible: conditioning_tokens,
                 ..
@@ -1103,7 +1103,7 @@ impl Scheduler {
         // Latent allocations describe the request-owned page table and the
         // exact denoising interval executed by this call.
         if matches!(
-            call.code,
+            call.kind,
             CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
         ) || call.latent_input.is_some()
         {
@@ -1131,7 +1131,7 @@ impl Scheduler {
             let Some(start_step) = start_step else {
                 tracing::error!(
                     request_id = request_id.0,
-                    call = call.code.as_str(),
+                    call = call.kind.as_str(),
                     "latent call has no submitted step"
                 );
                 self.fatal = true;
@@ -1139,7 +1139,7 @@ impl Scheduler {
             };
             // A denoising call covers one step; latent preparation and
             // image decoding cover none.
-            let step_count = u32::from(call.code == CallKind::Media(MediaCall::Denoising));
+            let step_count = u32::from(call.kind == CallKind::Media(MediaCall::Denoising));
             latent = Some(Denoising::params(
                 call.request_key,
                 call.call_id,
@@ -1331,7 +1331,7 @@ impl Scheduler {
         }
     }
 
-    /// Builds a computation and records the KV units owned by its next dispatch.
+    /// Builds a call and records the KV units owned by its next dispatch.
     ///
     /// For a forward call, sets `bounds.max_kv_units` to the units every
     /// group's table gained since the last dispatch and advances
@@ -1340,7 +1340,7 @@ impl Scheduler {
     /// Returns `None` when the request is not running, when planning fails
     /// (the request is then finished with `Error`), or, after latching
     /// engine-fatal, when a forward's request holds no KV tables.
-    pub(super) fn plan_computation(
+    pub(super) fn plan_call(
         &mut self,
         id: RequestId,
         build: impl FnOnce(&Self, &GenerationRequest) -> Result<Call, generation::PlanningError>,
@@ -1349,7 +1349,7 @@ impl Scheduler {
         match planned {
             Ok(mut call) => {
                 if matches!(
-                    call.code,
+                    call.kind,
                     CallKind::Forward(ForwardMode::Prefill)
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)
@@ -1380,17 +1380,17 @@ impl Scheduler {
         }
     }
 
-    /// Selects the next computation using accepted state and pending input ranges.
+    /// Selects the next call using accepted state and pending input ranges.
     ///
     /// Prompt text and input images still to ingest go through
-    /// `next_context_computation`; otherwise the request's next phase decides.
+    /// `next_context_call`; otherwise the request's next phase decides.
     /// A canvas pass takes the next readout rows that fit both `budget`
     /// tokens and the pass's canvas `rows`, and a context prefill the
     /// segments that fit its context rows. Returns `None` when nothing can be
     /// planned now, including when the KV capacity a call needs, the
     /// image-branch reservation, or room for one whole canvas row is
     /// unavailable.
-    pub(super) fn next_generation_computation(
+    pub(super) fn next_generation_call(
         &mut self,
         id: RequestId,
         budget: usize,
@@ -1406,7 +1406,7 @@ impl Scheduler {
                     .is_some_and(|count| count < st.req.multimodal_inputs.images.len())
         });
         if context_pending {
-            return self.next_context_computation(id, budget, rows.context);
+            return self.next_context_call(id, budget, rows.context);
         }
         if self.running.get(&id)?.image_reservation_pending
             && !self.promote_gen_branch_reservation(id)
@@ -1432,7 +1432,7 @@ impl Scheduler {
                 let sampling_state = self.build_token_masks(id, 0, 0);
 
                 let generates_canvases = self.config.canvas.is_some();
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_prompt(
                         request,
                         cursor as u32,
@@ -1467,7 +1467,7 @@ impl Scheduler {
                     return None;
                 }
 
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_decode(request, None, input_token, relay_input, sampling_state)
                 })
             }
@@ -1478,11 +1478,11 @@ impl Scheduler {
                     return None;
                 }
 
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_close_kv(request, token, false)
                 })
             }
-            Phase::PublishKv => self.plan_computation(id, |scheduler, request| {
+            Phase::PublishKv => self.plan_call(id, |scheduler, request| {
                 generation::plan_kv_publish(
                     scheduler
                         .info
@@ -1494,7 +1494,7 @@ impl Scheduler {
             }),
             Phase::PrepareGen => {
                 let conditioning = self.kv_conditioning(id)?;
-                self.plan_computation(id, |scheduler, request| {
+                self.plan_call(id, |scheduler, request| {
                     generation::plan_diffusion_prepare(
                         &scheduler.generation_limits,
                         scheduler.latent_dtype,
@@ -1517,7 +1517,7 @@ impl Scheduler {
                     .pending_output(id, |call| call.latent_output.as_ref())
                     .or(self.running.get(&id)?.denoising.latent())
                     .cloned()?;
-                self.plan_computation(id, |scheduler, request| {
+                self.plan_call(id, |scheduler, request| {
                     generation::plan_diffusion_step(
                         &scheduler.generation_limits,
                         scheduler.latent_dtype,
@@ -1532,7 +1532,7 @@ impl Scheduler {
                     .pending_output(id, |call| call.latent_output.as_ref())
                     .or(self.running.get(&id)?.denoising.latent())
                     .cloned()?;
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_diffusion_finalize(request, latent)
                 })
             }
@@ -1555,7 +1555,7 @@ impl Scheduler {
                 } else {
                     String::new()
                 };
-                self.plan_computation(id, |scheduler, request| {
+                self.plan_call(id, |scheduler, request| {
                     generation::plan_encode(
                         &scheduler.generation_limits,
                         request,
@@ -1584,7 +1584,7 @@ impl Scheduler {
                 };
 
                 let sampling_state = self.build_token_masks(id, 0, usize::from(is_final_step));
-                self.plan_computation(id, |scheduler, request| {
+                self.plan_call(id, |scheduler, request| {
                     generation::plan_image_extend(
                         &scheduler.generation_limits,
                         request,
@@ -1600,7 +1600,7 @@ impl Scheduler {
                     )
                 })
             }
-            Phase::IngestState => self.next_context_computation(id, budget, rows.context),
+            Phase::IngestState => self.next_context_call(id, budget, rows.context),
             Phase::Readout => {
                 // Whole rows join the pass in report order while they fit its
                 // remaining tokens and canvas rows.
@@ -1618,7 +1618,7 @@ impl Scheduler {
                 if end == start {
                     return None;
                 }
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_readout(request, start..end)
                 })
             }
@@ -1675,7 +1675,7 @@ impl Scheduler {
                 if step >= canvas.max_steps {
                     return None;
                 }
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_canvas_step(request, &canvas, block, step)
                 })
             }
@@ -1698,7 +1698,7 @@ impl Scheduler {
                 if !self.ensure_request_capacity(id, kv_visible_len as usize, end) {
                     return None;
                 }
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_canvas_commit(request, &tokens)
                 })
             }
@@ -1725,7 +1725,7 @@ impl Scheduler {
     /// Returns `None` when nothing can be planned now, including when the
     /// next block does not fit this pass or the request's KV capacity is
     /// unavailable.
-    pub(super) fn next_context_computation(
+    pub(super) fn next_context_call(
         &mut self,
         id: RequestId,
         budget: usize,
@@ -1753,7 +1753,7 @@ impl Scheduler {
             ) {
                 return None;
             }
-            return self.plan_computation(id, |scheduler, request| {
+            return self.plan_call(id, |scheduler, request| {
                 generation::plan_image_extend(
                     &scheduler.generation_limits,
                     request,
@@ -1782,7 +1782,7 @@ impl Scheduler {
                 // A cache miss schedules the encoder. Nothing else of the
                 // request is planned while it is in flight, so its completion
                 // finds the same block here.
-                return self.plan_computation(id, |scheduler, request| {
+                return self.plan_call(id, |scheduler, request| {
                     generation::plan_encode(
                         &scheduler.generation_limits,
                         request,
@@ -1807,10 +1807,10 @@ impl Scheduler {
                 key: cache_key,
                 product: product.clone(),
             });
-            if step == ImageIngestStep::VaeEncode {
+            if step == MediaCall::LatentEncoding {
                 state.input_image_features = Some(product);
                 state.phase = Phase::IngestState;
-                return self.next_context_computation(id, budget, context_rows);
+                return self.next_context_call(id, budget, context_rows);
             }
             state.context_features.push(product);
         }
@@ -1852,7 +1852,7 @@ impl Scheduler {
                     break;
                 };
                 if end < text_stop
-                    || input.encoder != ImageIngestStep::VitEncode
+                    || input.encoder != MediaCall::VisionEncoding
                     || rows >= context_rows
                 {
                     break;
@@ -1896,7 +1896,7 @@ impl Scheduler {
 
         let sampling_state = self.build_token_masks(id, 0, 0);
         let generates_canvases = self.config.canvas.is_some();
-        self.plan_computation(id, |_scheduler, request| {
+        self.plan_call(id, |_scheduler, request| {
             generation::plan_prompt(
                 request,
                 cursor as u32,
@@ -1922,10 +1922,7 @@ impl Scheduler {
     /// which the chunk before it does not reach. A request plans nothing
     /// while its encode is in flight, so the encode's completion identifies
     /// its block by the same walk.
-    pub(super) fn next_context_encode(
-        &self,
-        id: RequestId,
-    ) -> Option<(BlockCursor, ImageIngestStep)> {
+    pub(super) fn next_context_encode(&self, id: RequestId) -> Option<(BlockCursor, MediaCall)> {
         let state = self.running.get(&id)?;
         if state.phase == Phase::IngestState {
             return None;
@@ -1936,7 +1933,7 @@ impl Scheduler {
         let mut encoded = 0;
         while let Some((image, input)) = state.input_block(block) {
             let position = image.position as usize;
-            if input.encoder == ImageIngestStep::VaeEncode {
+            if input.encoder == MediaCall::LatentEncoding {
                 return (position == cursor).then_some((block, input.encoder));
             }
             if position > cursor && position >= reach {

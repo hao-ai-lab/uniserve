@@ -38,8 +38,8 @@ from uniserve.model import CanvasTokens, TokenDenoiser, VocabShard
 from uniserve.nn import VocabParallelEmbedding
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig
+from uniserve_worker.config.execution import CanvasSampling
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.protocol.batch import CanvasSampling
 
 # Sampler state fields kept per slot, each a bank with one row per slot.
 FIELDS = ("canvas", "history", "self_conditioning")

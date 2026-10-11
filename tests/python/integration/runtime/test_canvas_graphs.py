@@ -56,6 +56,7 @@ from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
 )
+from uniserve_worker.config.execution import CanvasSampling
 from uniserve_worker.errors import ResourceError
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.input_batch import (
@@ -63,7 +64,6 @@ from uniserve_worker.model_executor.input_batch import (
     CanvasStepRow,
     TokenRow,
 )
-from uniserve_worker.protocol.batch import CanvasSampling
 from uniserve_worker.protocol.call import (
     Bounds,
     Call,

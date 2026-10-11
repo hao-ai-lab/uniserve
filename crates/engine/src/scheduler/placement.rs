@@ -177,9 +177,9 @@ impl Placement {
         call: &Call,
     ) -> Option<(crate::WorkerId, String)> {
         let (id, bound_component) = if call.component == DEFAULT_COMPONENT {
-            self.worker_target(executor, info, call.request_key, call.code)
+            self.worker_target(executor, info, call.request_key, call.kind)
         } else {
-            self.component_target(executor, call.request_key, call.code, &call.component)
+            self.component_target(executor, call.request_key, call.kind, &call.component)
         }?;
         let target = (id.clone(), bound_component.to_owned());
         self.affinity

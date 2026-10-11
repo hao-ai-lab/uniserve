@@ -14,13 +14,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.errors import ErrorCode, invalid_descriptor
 from uniserve_worker.protocol import identity, transfer
 from uniserve_worker.protocol.batch import TensorPublication
-from uniserve_worker.protocol.call import (
-    CallStatus,
-    ErrorCode,
-)
+from uniserve_worker.protocol.call import CallStatus
 
 
 @dataclass(frozen=True, slots=True)

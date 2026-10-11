@@ -4,7 +4,9 @@
 //! codec validates, and the engine requires a replacement rank to report an
 //! identical description apart from its endpoint. The executor then derives
 //! the capacity view the scheduler plans against from the descriptions of all
-//! workers (`ExecutorInfo::runtime_info`).
+//! workers (`ExecutorInfo::runtime_info`). A report states what loading the
+//! model decided; the values the engine launched the rank with (placement,
+//! queue depth) are not echoed back.
 
 use super::*;
 
@@ -170,20 +172,21 @@ impl KvCacheInfo {
     }
 }
 
-/// One component's finalized configuration shared by all worker descriptions.
+/// One loaded component and the tensor results its computation declares.
+///
+/// The engine owns the component's placement (member ranks, parallel degrees,
+/// distribution); the report names only what loading the model decided.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentInfo {
     /// Component name; `WorkerInfo::validate` requires it to be non-empty and
     /// unique within one worker.
     pub name: String,
-    #[serde(flatten)]
-    pub config: uniserve_core::ComponentConfig,
     /// Named tensor results declared by the loaded computation. Their order
     /// defines product output indices independently of Worker grouping.
     pub outputs: Vec<OutputInfo>,
 }
 
-/// A computation's bounded tensor result, before request and storage binding.
+/// A call's bounded tensor result, before request and storage binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputInfo {
     /// Result name; `OutputInfo::validate` requires it to be non-empty and
@@ -322,8 +325,8 @@ impl VideoDenoiserInfo {
 ///
 /// [`WorkerInfo::validate`] checks internal consistency, and the codec runs it
 /// when it encodes or decodes the report. The engine owns the launch values
-/// (placement, queue depth, transfer mechanisms) and does not check the report
-/// against them.
+/// (placement, queue depth, transfer mechanisms) and the report does not
+/// carry them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerInfo {
     /// Model-declared finite terminal-media computation, when supported.
@@ -346,24 +349,21 @@ pub struct WorkerInfo {
     pub components: Vec<ComponentInfo>,
     /// Call families accepted by the worker.
     pub supported_calls: Vec<CallKind>,
-    /// Maximum unresolved physical runs. It must equal the depth the engine
-    /// launched the rank with and connects its channel with.
-    pub queue_depth: u32,
-    /// Maximum calls in one run.
+    /// Maximum calls in one batch.
     pub max_batch_calls: u32,
-    /// Maximum text tokens represented in one run.
+    /// Maximum text tokens represented in one batch.
     pub max_batch_tokens: u32,
-    /// Maximum calls in one prefill run: the rows the rank's captured
-    /// prefill graphs hold. A prefill run no captured graph holds fails, so
-    /// the scheduler never forms one. Zero leaves prefill runs bounded by
+    /// Maximum calls in one prefill batch: the rows the rank's captured
+    /// prefill graphs hold. A prefill batch no captured graph holds fails, so
+    /// the scheduler never forms one. Zero leaves prefill batches bounded by
     /// `max_batch_calls` alone, as when they run eagerly.
     #[serde(default)]
     pub max_prefill_calls: u32,
-    /// Maximum calls in one decode run: the rows the rank's largest captured
+    /// Maximum calls in one decode batch: the rows the rank's largest captured
     /// decode graph holds, fewer when its KV pool cannot hold a page of
-    /// every cache group for more rows. A decode run no captured graph
+    /// every cache group for more rows. A decode batch no captured graph
     /// holds fails, so the scheduler never forms one. Zero leaves decode
-    /// runs bounded by `max_batch_calls` alone, as when they run eagerly.
+    /// batches bounded by `max_batch_calls` alone, as when they run eagerly.
     #[serde(default)]
     pub max_decode_calls: u32,
     /// Number of resident request slots.
@@ -411,8 +411,7 @@ impl WorkerInfo {
     pub fn validate(&self) -> ValidationResult<()> {
         self.endpoint.validate()?;
 
-        // Components: unique names and outputs, and parallel degrees
-        // consistent with membership.
+        // Components: unique names and outputs.
         let mut names = HashSet::new();
         for component in &self.components {
             ensure_valid!(
@@ -427,35 +426,6 @@ impl WorkerInfo {
                     "component repeats a tensor result name"
                 );
             }
-            let params = &component.config;
-            ensure_valid!(!params.ranks.is_empty(), "component names no member rank");
-            ensure_valid!(
-                params.ranks.iter().collect::<HashSet<_>>().len() == params.ranks.len(),
-                "component repeats process ranks"
-            );
-            let degree = params
-                .parallel_config
-                .world_size()
-                .map_err(|error| invalid_message!("{error}"))?;
-            ensure_valid!(
-                degree <= u32::MAX as usize,
-                "parallel degrees exceed protocol range"
-            );
-            ensure_valid!(
-                params.units_per_rank > 0 && params.units_per_rank <= u32::MAX as usize,
-                "component unit capacity is outside protocol range"
-            );
-            // A distributed component spreads independent units over its member
-            // ranks without model parallelism, so its degree is one; otherwise
-            // every member rank is one position in the parallel degrees.
-            ensure_valid!(
-                if params.distribution.is_some() {
-                    degree == 1
-                } else {
-                    degree == params.ranks.len()
-                },
-                "component membership disagrees with parallel degrees"
-            );
         }
 
         // A collective-only participant owns no request components or KV.
@@ -466,7 +436,7 @@ impl WorkerInfo {
                     && self.kv_cache.is_none()
                     && self.latent_pages == 0
                     && self.media_components.is_empty()),
-            "a worker without call kinds must own no request computation"
+            "a worker without call kinds must own no request call"
         );
         ensure_valid!(
             self.supported_calls
@@ -498,7 +468,6 @@ impl WorkerInfo {
                 && self.max_unresolved_calls > 0,
             "worker info declare a zero scheduling bound"
         );
-        ensure_valid!(self.queue_depth > 0, "worker queue depth must be positive");
         ensure_valid!(
             self.max_prefill_calls <= self.max_batch_calls,
             "worker prefill call bound exceeds its batch call bound"
@@ -553,7 +522,6 @@ impl Default for WorkerInfo {
                 CallKind::Forward(ForwardMode::Prefill),
                 CallKind::Forward(ForwardMode::Decode),
             ],
-            queue_depth: 1,
             max_batch_calls: 1,
             max_batch_tokens: 8192,
             max_prefill_calls: 0,

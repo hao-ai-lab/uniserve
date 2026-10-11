@@ -28,7 +28,6 @@ libc.workspace = true
 testing = []
 
 [dev-dependencies]
-sha2.workspace = true
 tracing-subscriber.workspace = true
 uniserve-engine = { path = ".", features = ["testing"] }
 

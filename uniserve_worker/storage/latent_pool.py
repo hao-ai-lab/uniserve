@@ -976,7 +976,7 @@ class LatentPool:
 
         The slot must be empty and the pages free; the slot owns them from
         this call. The returned first-axis spans exclude page padding. They
-        address bank zero directly and remain invisible to computation until
+        address bank zero directly and remain invisible to call until
         adoption, which makes bank zero the slot's active bank.
         """
         self._reap_imports()

@@ -53,10 +53,10 @@ from uniserve.nn.attention import (
 from uniserve.runtime import ExecutionContext, KVCache
 from uniserve.runtime.kv_cache import plan_units
 from uniserve.sampling import SamplingParams
+from uniserve_worker.config.execution import CanvasSampling
 from uniserve_worker.protocol.batch import (
     Batch,
     CacheUnitAllocation,
-    CanvasSampling,
     Finish,
     GenerationParams,
     NewRequest,

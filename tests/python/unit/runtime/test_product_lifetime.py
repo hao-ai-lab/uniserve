@@ -135,7 +135,7 @@ def _table(pool, units):
     "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
 )
 @pytest.mark.parametrize("abandoned", (False, True))
-def test_kv_computation_retains_pages_through_output_completion_and_reuse(
+def test_kv_call_retains_pages_through_output_completion_and_reuse(
     device: str, abandoned: bool
 ) -> None:
     cache = mha_pool(
@@ -180,7 +180,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
             torch.testing.assert_close(actual, independent, rtol=0, atol=0)
         assert not cache.retirement_ready(requests=(request,))
         # Releasing another product of this request does not retire its KV
-        # computation. The execution fence still protects page reuse above.
+        # call. The execution fence still protects page reuse above.
         assert cache.retirement_ready(
             buffers=(BufferId(request, CallId(2, 0), 0, 2),)
         )
@@ -229,7 +229,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
             assert torch.count_nonzero(actual).item() == 0
 
         # A subsequent lease over the same bounded output storage must retain
-        # its own computation even though the preceding future is complete.
+        # its own call even though the preceding future is complete.
         next_output = outputs.acquire(1, token_capacity=8, devices=(device,))
         next_completion = next_output.completion_future()
         cache.retain_execution(
@@ -449,7 +449,7 @@ def test_a_retired_segment_no_consumer_began_reading_returns_at_once() -> None:
     """
     events = EventPool()
     transport = make_transport(
-        "shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
     )
     try:
         value = torch.arange(8, dtype=torch.float32)
@@ -985,7 +985,7 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
 
     events = EventPool()
     transport = make_transport(
-        "shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
     )
     pool = LatentPool(
         request_pool_size=2,
@@ -1218,7 +1218,7 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
     events = EventPool()
     # Slots 0 and 1 share this host; slot 2 is on another host.
     transports = make_transports(
-        ("local", "shm", "channel"),
+        ("local", "posix_shm", "channel"),
         byte_capacity=1 << 20,
         ticket_capacity=8,
         event_pool=events,
@@ -1228,10 +1228,10 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
     value = torch.arange(16, dtype=torch.int16).reshape(8, 2)
     try:
         cases = {
-            (1,): {"local", "shm"},
+            (1,): {"local", "posix_shm"},
             (2,): {"local", "channel"},
-            (1, 2): {"local", "shm", "channel"},
-            (): {"local", "shm", "channel"},
+            (1, 2): {"local", "posix_shm", "channel"},
+            (): {"local", "posix_shm", "channel"},
         }
         for consumers, expected in cases.items():
             locations = publish_tensor(
@@ -1250,7 +1250,7 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
                 # their words; the channel and local copies retire with the
                 # release alone.
                 for location in locations:
-                    if location.backend == "shm":
+                    if location.backend == "posix_shm":
                         mapping = open_shared_storage(
                             location.transport.name,
                             segment.HEADER_BYTES + location.nbytes,
@@ -1261,7 +1261,7 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
                         finally:
                             mapping.close()
                     transports[location.backend].release(location)
-                transports["shm"].reap()
+                transports["posix_shm"].reap()
     finally:
         for transport in transports.values():
             transport.close()

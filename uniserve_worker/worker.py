@@ -401,6 +401,9 @@ class Worker:
                 )
 
             self.model = model
+            # Unresolved batches this rank holds; the engine connects the
+            # rank's channel with the same depth.
+            self.queue_depth = int(queue_depth)
             self.process_groups = process_groups
             self.sampling_group = sampling_group
             self.tokenizer = tokenizer
@@ -756,14 +759,14 @@ class Worker:
                 runner.bind_canvas_slots(self.canvas_slots)
 
             # Only the muxer member that publishes the component's host
-            # products (`WorkerInfo.output_rank`) holds a `MediaMux`; it
+            # products (`ModelExecutor.output_rank`) holds a `MediaMux`; it
             # assembles each request's container on its host lane.
             muxer = self.runner.bindings.get(MUXER_COMPONENT)
             self.media_mux = (
                 MediaMux(rank=worker_config.rank)
                 if muxer is not None
                 and muxer.owns
-                and worker_config.rank == info.output_rank(MUXER_COMPONENT)
+                and worker_config.rank == runner.output_rank(MUXER_COMPONENT)
                 else None
             )
             if self.media_mux is not None:
@@ -811,8 +814,8 @@ class Worker:
         if self._closed:
             raise RuntimeError("worker is closed and cannot be reused")
 
-    def supports_computation(self, kind: CallKind) -> bool:
-        """Return whether this worker can execute this computation."""
+    def supports_call(self, kind: CallKind) -> bool:
+        """Return whether this worker can execute this call."""
         return kind in self.info.supported_calls
 
     def warmup(self) -> None:

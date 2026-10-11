@@ -1,7 +1,7 @@
 """Typed worker error taxonomy.
 
 Every worker failure is represented as a `WorkerError` carrying a stable
-``code`` (`WorkerErrorCode`), a ``message``, and ``fatal`` (whether the
+``code`` (`ErrorCode`), a ``message``, and ``fatal`` (whether the
 worker process is unsafe for further work and must be torn down). Worker code
 raises one directly through the constructors here, and `classify` maps any
 other exception onto the taxonomy where failures are caught (in `Service`,
@@ -10,9 +10,10 @@ other exception onto the taxonomy where failures are caught (in `Service`,
 ``WorkerError.to_mapping`` produces the IPC error response fields that
 `uniserve_worker.protocol.messages.error_response` sends to the engine, where
 the PyO3 extension decodes them into ``WorkerResponseError``. Those fields
-are scalars, short strings, and call identities, never tensors. `_POLICY`
-defines each code's default fatality and whether its log record carries a
-stack trace.
+are scalars, short strings, and call identities, never tensors. The codes are
+the ones the call completions carry (`ErrorCode`), spelled as the worker-ipc
+schema's ``ErrorCode``. `_POLICY` defines each code's default fatality and
+whether its log record carries a stack trace.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
     from uniserve_worker.protocol.identity import CallId
 
 __all__ = [
-    "WorkerErrorCode",
+    "ErrorCode",
     "ErrorPolicy",
     "WorkerError",
     "InputError",
@@ -42,24 +43,28 @@ __all__ = [
 ]
 
 
-class WorkerErrorCode(StrEnum):
-    """Stable worker error identifiers.
+class ErrorCode(StrEnum):
+    """Failure classes of a worker.
 
-    Members are strings because the IPC error response carries the value
-    (for example ``"InvariantViolation"``) as its ``code`` field. The engine
-    matches on these values (``WorkerGroup::join_rank_errors``, for example,
-    escalates ``InvariantViolation`` as it does fatal errors), so changing a
-    value is a wire-protocol change.
+    One vocabulary serves a call's completion (``RequestOutput.error_code``)
+    and the error response, and mirrors the worker-ipc schema's
+    ``ErrorCode``: members are spelled with the snake_case names the Rust
+    enum's ``as_str`` returns, so changing a value is a wire-protocol change.
+    The engine stops serving on ``INVARIANT_VIOLATION``.
     """
 
-    UNSUPPORTED_CALL = "UnsupportedCall"
-    INVALID_DESCRIPTOR = "InvalidDescriptor"
-    UNSUPPORTED_SETUP = "UnsupportedSetup"
-    INPUT_ERROR = "InputError"
-    COMPUTE_ERROR = "ComputeError"
-    RESOURCE_ERROR = "ResourceError"
-    INVARIANT_VIOLATION = "InvariantViolation"
-    FATAL_WORKER_FAILURE = "FatalWorkerFailure"
+    UNSUPPORTED_CALL = "unsupported_call"
+    INVALID_DESCRIPTOR = "invalid_descriptor"
+    UNSUPPORTED_SETUP = "unsupported_setup"
+    INPUT_ERROR = "input_error"
+    COMPUTE_ERROR = "compute_error"
+    RESOURCE_ERROR = "resource_error"
+    INVARIANT_VIOLATION = "invariant_violation"
+    FATAL_WORKER_FAILURE = "fatal_worker_failure"
+    # The worker refuses the request itself: its admitted size does not fit
+    # what the model serves or the worker provisioned. The completion states
+    # why (``RequestOutput.error_message``).
+    INVALID_REQUEST = "invalid_request"
 
 
 class ErrorPolicy(NamedTuple):
@@ -84,19 +89,19 @@ class ErrorPolicy(NamedTuple):
 # `_DEFAULT_POLICY` applies to a code missing from `_POLICY`.
 _DEFAULT_POLICY = ErrorPolicy(fatal=False, capture_trace=False)
 
-_POLICY: dict[WorkerErrorCode, ErrorPolicy] = {
-    WorkerErrorCode.UNSUPPORTED_CALL: ErrorPolicy(False, False),
-    WorkerErrorCode.INVALID_DESCRIPTOR: ErrorPolicy(False, False),
-    WorkerErrorCode.UNSUPPORTED_SETUP: ErrorPolicy(False, False),
-    WorkerErrorCode.INPUT_ERROR: ErrorPolicy(False, False),
-    WorkerErrorCode.COMPUTE_ERROR: ErrorPolicy(False, True),
-    WorkerErrorCode.RESOURCE_ERROR: ErrorPolicy(False, True),
-    WorkerErrorCode.INVARIANT_VIOLATION: ErrorPolicy(True, True),
-    WorkerErrorCode.FATAL_WORKER_FAILURE: ErrorPolicy(True, True),
+_POLICY: dict[ErrorCode, ErrorPolicy] = {
+    ErrorCode.UNSUPPORTED_CALL: ErrorPolicy(False, False),
+    ErrorCode.INVALID_DESCRIPTOR: ErrorPolicy(False, False),
+    ErrorCode.UNSUPPORTED_SETUP: ErrorPolicy(False, False),
+    ErrorCode.INPUT_ERROR: ErrorPolicy(False, False),
+    ErrorCode.COMPUTE_ERROR: ErrorPolicy(False, True),
+    ErrorCode.RESOURCE_ERROR: ErrorPolicy(False, True),
+    ErrorCode.INVARIANT_VIOLATION: ErrorPolicy(True, True),
+    ErrorCode.FATAL_WORKER_FAILURE: ErrorPolicy(True, True),
 }
 
 
-def should_capture_trace(code: WorkerErrorCode) -> bool:
+def should_capture_trace(code: ErrorCode) -> bool:
     """Return whether an error of this class warrants a stack trace.
 
     `uniserve_worker.profiling.record_failure` and the batch failure log in
@@ -126,7 +131,7 @@ class WorkerError(Exception):
             call_id)`` tuples.
     """
 
-    code: WorkerErrorCode
+    code: ErrorCode
     message: str
     fatal: bool = False
     req_id: int | None = None
@@ -193,11 +198,9 @@ class InputError(WorkerError):
         the caller passes it; other keyword arguments set `WorkerError`
         fields.
         """
-        policy = _POLICY[WorkerErrorCode.INPUT_ERROR]
+        policy = _POLICY[ErrorCode.INPUT_ERROR]
         kw.setdefault("fatal", policy.fatal)
-        super().__init__(
-            code=WorkerErrorCode.INPUT_ERROR, message=message, **kw
-        )
+        super().__init__(code=ErrorCode.INPUT_ERROR, message=message, **kw)
 
 
 class ComputeError(WorkerError):
@@ -210,11 +213,9 @@ class ComputeError(WorkerError):
         the caller passes it; other keyword arguments set `WorkerError`
         fields.
         """
-        policy = _POLICY[WorkerErrorCode.COMPUTE_ERROR]
+        policy = _POLICY[ErrorCode.COMPUTE_ERROR]
         kw.setdefault("fatal", policy.fatal)
-        super().__init__(
-            code=WorkerErrorCode.COMPUTE_ERROR, message=message, **kw
-        )
+        super().__init__(code=ErrorCode.COMPUTE_ERROR, message=message, **kw)
 
 
 class ResourceError(WorkerError):
@@ -227,14 +228,12 @@ class ResourceError(WorkerError):
         the caller passes it; other keyword arguments set `WorkerError`
         fields.
         """
-        policy = _POLICY[WorkerErrorCode.RESOURCE_ERROR]
+        policy = _POLICY[ErrorCode.RESOURCE_ERROR]
         kw.setdefault("fatal", policy.fatal)
-        super().__init__(
-            code=WorkerErrorCode.RESOURCE_ERROR, message=message, **kw
-        )
+        super().__init__(code=ErrorCode.RESOURCE_ERROR, message=message, **kw)
 
 
-def _make(code: WorkerErrorCode, message: str, **kw: Any) -> WorkerError:
+def _make(code: ErrorCode, message: str, **kw: Any) -> WorkerError:
     """Construct a `WorkerError` whose ``fatal`` defaults to its policy.
 
     Keyword arguments set the other `WorkerError` fields, and an explicit
@@ -296,7 +295,7 @@ def _looks_like_fatal_cuda(lowered_msg: str) -> bool:
 def unsupported_call(kind: str, req_id: int | None = None) -> WorkerError:
     """Create a classified error for a call kind this worker cannot run."""
     return _make(
-        WorkerErrorCode.UNSUPPORTED_CALL,
+        ErrorCode.UNSUPPORTED_CALL,
         f"call kind {kind!r} is not supported by this worker",
         req_id=req_id,
         call_kind=kind,
@@ -305,7 +304,7 @@ def unsupported_call(kind: str, req_id: int | None = None) -> WorkerError:
 
 def invalid_descriptor(message: str, **kw: Any) -> WorkerError:
     """Create a classified error for malformed scheduler or transport input."""
-    return _make(WorkerErrorCode.INVALID_DESCRIPTOR, message, **kw)
+    return _make(ErrorCode.INVALID_DESCRIPTOR, message, **kw)
 
 
 def unsupported_setup(message: str, **kw: Any) -> WorkerError:
@@ -314,7 +313,7 @@ def unsupported_setup(message: str, **kw: Any) -> WorkerError:
     Used for launch configuration and for missing worker resources that a
     call requires, such as request block tables.
     """
-    return _make(WorkerErrorCode.UNSUPPORTED_SETUP, message, **kw)
+    return _make(ErrorCode.UNSUPPORTED_SETUP, message, **kw)
 
 
 def resource_error(message: str, **kw: Any) -> ResourceError:
@@ -332,22 +331,22 @@ def resource_error(message: str, **kw: Any) -> ResourceError:
 #     text/hierarchy heuristics, so for example a ValueError whose message
 #     mentions "out of memory" classifies as RESOURCE_ERROR.
 # An exception matching no rule falls through to ComputeError in `classify`.
-_CLASSIFY_RULES: list[tuple[Any, WorkerErrorCode]] = [
+_CLASSIFY_RULES: list[tuple[Any, ErrorCode]] = [
     (
         lambda exc, lowered: _looks_like_fatal_cuda(lowered),
-        WorkerErrorCode.FATAL_WORKER_FAILURE,
+        ErrorCode.FATAL_WORKER_FAILURE,
     ),
     (
         lambda exc, lowered: _looks_like_oom(exc, lowered),
-        WorkerErrorCode.RESOURCE_ERROR,
+        ErrorCode.RESOURCE_ERROR,
     ),
     (
         lambda exc, lowered: isinstance(exc, EventPoolError),
-        WorkerErrorCode.INVARIANT_VIOLATION,
+        ErrorCode.INVARIANT_VIOLATION,
     ),
     (
         lambda exc, lowered: isinstance(exc, NotImplementedError),
-        WorkerErrorCode.UNSUPPORTED_CALL,
+        ErrorCode.UNSUPPORTED_CALL,
     ),
     # Treated as a malformed call or descriptor decoded from IPC. The rule
     # applies wherever the exception was raised, including during execution.
@@ -355,11 +354,11 @@ _CLASSIFY_RULES: list[tuple[Any, WorkerErrorCode]] = [
         lambda exc, lowered: isinstance(
             exc, (KeyError, IndexError, TypeError, ValueError)
         ),
-        WorkerErrorCode.INPUT_ERROR,
+        ErrorCode.INPUT_ERROR,
     ),
     (
         lambda exc, lowered: isinstance(exc, AssertionError),
-        WorkerErrorCode.INVARIANT_VIOLATION,
+        ErrorCode.INVARIANT_VIOLATION,
     ),
 ]
 
@@ -392,15 +391,15 @@ def classify(
 
     # Rules match the context-prefixed message, not the bare exception text.
     lowered = msg.lower()
-    code = WorkerErrorCode.COMPUTE_ERROR
+    code = ErrorCode.COMPUTE_ERROR
     for predicate, rule_code in _CLASSIFY_RULES:
         if predicate(exc, lowered):
             code = rule_code
             break
-    if code is WorkerErrorCode.INPUT_ERROR:
+    if code is ErrorCode.INPUT_ERROR:
         return InputError(msg, **kw)
-    if code is WorkerErrorCode.COMPUTE_ERROR:
+    if code is ErrorCode.COMPUTE_ERROR:
         return ComputeError(msg, **kw)
-    if code is WorkerErrorCode.RESOURCE_ERROR:
+    if code is ErrorCode.RESOURCE_ERROR:
         return ResourceError(msg, **kw)
     return _make(code, msg, **kw)

@@ -60,7 +60,7 @@ fn ar_decode_call() -> Call {
         request_key: request_key(),
         call_id: CallId::new(11, 0),
         component: "model".into(),
-        code: kind,
+        kind,
         bounds: Bounds {
             max_tokens: 1,
             ..Bounds::default()
@@ -129,7 +129,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         request_key: request_key(),
         call_id,
         component: "model".into(),
-        code: kind,
+        kind,
         bounds: Bounds {
             max_tokens: if denoises { 4 } else { 0 },
             ..Bounds::default()
@@ -185,7 +185,7 @@ fn admission() -> NewRequest {
     NewRequest::new(
         request_key(),
         u32::try_from(request_key().request_id.0).unwrap(),
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: SamplingParams::default(),
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![2, 7],
@@ -358,7 +358,7 @@ fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
 }
 
 #[test]
-fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
+fn call_coordinates_survive_physical_dispatch_and_reject_collisions() {
     let batch_id = u64::MAX - 7;
     let first = call_for(
         CallKind::Media(MediaCall::TextEncoding),
@@ -409,7 +409,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
             next_buffer_offset += bytes;
         }
         // Each forward call holds one fresh KV unit.
-        let capacity_units = u32::from(matches!(call.code, CallKind::Forward(_)));
+        let capacity_units = u32::from(matches!(call.kind, CallKind::Forward(_)));
         if capacity_units > 0 {
             // The request id doubles as the request pool slot, which forward
             // rows, block tables, and unit allocations require to be positive.
@@ -436,7 +436,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
             );
         }
         if matches!(
-            call.code,
+            call.kind,
             CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
         ) || call.latent_input.is_some()
         {
@@ -448,11 +448,11 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 height: 1,
                 width: 1,
                 start_step: 0,
-                step_count: u32::from(call.code == CallKind::Media(MediaCall::Denoising)),
+                step_count: u32::from(call.kind == CallKind::Media(MediaCall::Denoising)),
             });
         }
         if matches!(
-            call.code,
+            call.kind,
             CallKind::Media(
                 MediaCall::VideoDecoding
                     | MediaCall::VideoEncoding
@@ -524,7 +524,7 @@ fn a_readout_and_its_candidate_logprobs_round_trip() {
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
             .unwrap();
-    assert_eq!(decoded.report().unwrap(), &report);
+    assert_eq!(decoded.output().unwrap(), &report);
 }
 
 /// A readout belongs to a token-denoising call and must address the canvas
@@ -575,7 +575,7 @@ fn canvas_step_batch() -> Batch {
     let admission = NewRequest::new(
         request_key(),
         u32::try_from(request_key().request_id.0).unwrap(),
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: SamplingParams {
                 seed: Some(11),
                 ..SamplingParams::default()
@@ -608,7 +608,7 @@ fn a_canvas_step_and_its_block_round_trip() {
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
             .unwrap();
-    assert_eq!(decoded.report().unwrap(), &report);
+    assert_eq!(decoded.output().unwrap(), &report);
 }
 
 /// A canvas step belongs to a token-denoising call, which carries either a
@@ -682,7 +682,7 @@ fn malformed_call(
             request_key: Some(key),
             call_id: Some(&fbs::CallId::new(1, 0)),
             component: Some(component),
-            code: Some(&code),
+            kind: Some(&code),
             coordinates,
             ..Default::default()
         },
@@ -692,6 +692,7 @@ fn malformed_call(
         &mut builder,
         &fbs::BatchArgs {
             batch_id: 1,
+            collective_seq: 1,
             calls: Some(calls),
             ..Default::default()
         },
@@ -709,7 +710,7 @@ fn malformed_call(
 }
 
 #[test]
-fn decoder_requires_one_concrete_computation() {
+fn decoder_requires_one_concrete_call() {
     use crate::schema::uniserve::ipc as fbs;
     for (forward, media) in [
         (fbs::ForwardMode::None, fbs::MediaCall::None),
@@ -722,7 +723,7 @@ fn decoder_requires_one_concrete_computation() {
 }
 
 #[test]
-fn every_computation_variant_round_trips_in_its_own_batch() {
+fn every_call_kind_round_trips_in_its_own_batch() {
     let batches = comprehensive_batches();
     assert_eq!(batches.len(), CallKind::ALL.len());
     for batch in batches {
@@ -731,7 +732,7 @@ fn every_computation_variant_round_trips_in_its_own_batch() {
 }
 
 #[test]
-fn a_batch_carries_one_computation_through_one_entry() {
+fn a_batch_carries_one_call_through_one_entry() {
     let decode = call_for(CallKind::Forward(ForwardMode::Decode), CallId::new(1, 0));
     let prefill = call_for(CallKind::Forward(ForwardMode::Prefill), CallId::new(1, 1));
     let mixed = batch_with_calls(1, Vec::new(), vec![decode.clone(), prefill]);
@@ -816,7 +817,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             request_key: request_key(),
             call_id: CallId::new(56 + index as u64, 0),
             component: (*entry).into(),
-            code: CallKind::Media(*stage),
+            kind: CallKind::Media(*stage),
             bounds: Bounds::default(),
             inputs: vec![latent.clone()],
             outputs: Vec::new(),
@@ -946,7 +947,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
         let decoded =
             decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
                 .unwrap();
-        assert_eq!(decoded.report().unwrap(), &report);
+        assert_eq!(decoded.output().unwrap(), &report);
 
         // Other product dtypes round-trip with locator byte sizes that follow
         // their element widths.
@@ -966,7 +967,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
                 &encode_response(&WorkerResponse::result(typed_report.clone())).unwrap(),
             )
             .unwrap();
-            assert_eq!(decoded.report().unwrap(), &typed_report);
+            assert_eq!(decoded.output().unwrap(), &typed_report);
         }
     }
 }
@@ -1048,7 +1049,7 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
             .unwrap();
-    assert_eq!(decoded.report().unwrap(), &report);
+    assert_eq!(decoded.output().unwrap(), &report);
 
     // A grown extent must carry the tensors of its suffix.
     let KvTransfer {
@@ -1171,7 +1172,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
         let decoded =
             decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
                 .unwrap();
-        assert_eq!(decoded.report().unwrap(), &report);
+        assert_eq!(decoded.output().unwrap(), &report);
 
         // Zero generations, a zero page size, a group starting before the
         // base, an unchanged extent with groups, and malformed or unexpected
@@ -1214,7 +1215,7 @@ fn error_completion_round_trips_with_its_error_code() {
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report)).unwrap()).unwrap();
     assert_eq!(
-        decoded.report().unwrap().completions().next().unwrap(),
+        decoded.output().unwrap().completions().next().unwrap(),
         &record
     );
 }
@@ -1483,9 +1484,9 @@ fn call_sampling_state_preserves_whitelist_presence() {
 }
 
 #[test]
-fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
+fn image_encoder_input_round_trips_and_rejects_an_incompatible_call() {
     let mut call = ar_decode_call();
-    call.code = CallKind::Media(MediaCall::VisionEncoding);
+    call.kind = CallKind::Media(MediaCall::VisionEncoding);
     call.input_image = Some("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGN0SGhgIAUwkaR6VMOohiGlAQCjvQFA6eri4wAAAABJRU5ErkJggg==".into());
     call.token_output = None;
     let batch = batch_with_calls(1, vec![admission()], vec![call.clone()]);
@@ -1506,7 +1507,7 @@ fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
         ),
     ] {
         let mut invalid = call.clone();
-        invalid.code = code;
+        invalid.kind = code;
         invalid.input_image = image;
         let request = WorkerRequest::submit(batch_with_calls(1, vec![admission()], vec![invalid]));
         assert!(encode_request(&request).is_err());
@@ -1547,81 +1548,61 @@ fn batch_allows_a_duplicate_identical_command() {
 
 #[test]
 fn worker_info_round_trips() {
-    use uniserve_core::{ComponentConfig, ParallelConfig, SequenceParallel};
-    let strategies = [
-        SequenceParallel::Local,
-        SequenceParallel::Ulysses { ulysses_degree: 2 },
-        SequenceParallel::Allgather {
-            allgather_degree: 2,
-        },
-        SequenceParallel::Hybrid {
-            ulysses_degree: 2,
-            allgather_degree: 2,
-        },
-    ];
-    for sequence_parallel in strategies {
-        let config = ParallelConfig {
-            sequence_parallel,
-            ..Default::default()
-        };
-        let count = config.world_size().unwrap();
-        let info = WorkerInfo {
-            kv_cache: Some(KvCacheInfo {
-                groups: vec![KvCacheGroup {
-                    layer_ids: (11..20).collect(),
-                    ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
-                }],
-                ..WorkerInfo::default().kv_cache.unwrap()
-            }),
-            components: vec![ComponentInfo {
-                name: "denoiser".into(),
-                config: ComponentConfig::parallel((0..count).rev().collect(), config),
-                outputs: vec![
-                    OutputInfo {
-                        name: "conditioning".into(),
-                        dtype: DType::BF16,
-                        shape_bound: ShapeBound {
-                            dims: vec![
-                                DimBound::Static(1),
-                                DimBound::Device { max: 16384 },
-                                DimBound::Static(2560),
-                            ],
-                        },
-                        raster_axes: None,
-                    },
-                    // A product laid out at the request's raster names it.
-                    OutputInfo {
-                        name: "video_units".into(),
-                        dtype: DType::U8,
-                        shape_bound: ShapeBound {
-                            dims: vec![
-                                DimBound::Device { max: 8 },
-                                DimBound::Static(22),
-                                DimBound::Static(1344),
-                                DimBound::Static(1536),
-                                DimBound::Static(3),
-                            ],
-                        },
-                        raster_axes: Some(RasterAxes {
-                            height: 2,
-                            width: 3,
-                        }),
-                    },
-                ],
+    let info = WorkerInfo {
+        kv_cache: Some(KvCacheInfo {
+            groups: vec![KvCacheGroup {
+                layer_ids: (11..20).collect(),
+                ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
             }],
-            ..Default::default()
-        };
-        // Python startup metadata crosses the serde mapping boundary before
-        // the binary response is delivered to the native host.
-        let mapped = serde_json::to_value(&info).unwrap();
-        assert_eq!(serde_json::from_value::<WorkerInfo>(mapped).unwrap(), info);
-        let response = WorkerResponse::info(info.clone());
-        let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
-        let WorkerResponse::Info { info: decoded, .. } = decoded else {
-            panic!("decoded response must preserve its info variant");
-        };
-        assert_eq!(decoded, info);
-    }
+            ..WorkerInfo::default().kv_cache.unwrap()
+        }),
+        components: vec![ComponentInfo {
+            name: "denoiser".into(),
+            outputs: vec![
+                OutputInfo {
+                    name: "conditioning".into(),
+                    dtype: DType::BF16,
+                    shape_bound: ShapeBound {
+                        dims: vec![
+                            DimBound::Static(1),
+                            DimBound::Device { max: 16384 },
+                            DimBound::Static(2560),
+                        ],
+                    },
+                    raster_axes: None,
+                },
+                // A product laid out at the request's raster names it.
+                OutputInfo {
+                    name: "video_units".into(),
+                    dtype: DType::U8,
+                    shape_bound: ShapeBound {
+                        dims: vec![
+                            DimBound::Device { max: 8 },
+                            DimBound::Static(22),
+                            DimBound::Static(1344),
+                            DimBound::Static(1536),
+                            DimBound::Static(3),
+                        ],
+                    },
+                    raster_axes: Some(RasterAxes {
+                        height: 2,
+                        width: 3,
+                    }),
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+    // Python startup metadata crosses the serde mapping boundary before
+    // the binary response is delivered to the native host.
+    let mapped = serde_json::to_value(&info).unwrap();
+    assert_eq!(serde_json::from_value::<WorkerInfo>(mapped).unwrap(), info);
+    let response = WorkerResponse::info(info.clone());
+    let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
+    let WorkerResponse::Info { info: decoded, .. } = decoded else {
+        panic!("decoded response must preserve its info variant");
+    };
+    assert_eq!(decoded, info);
 }
 
 #[test]
@@ -1764,7 +1745,6 @@ fn full_image() -> ImageParams {
         negative_prompt: "blurry".into(),
         max_images: 1,
         image_prompts: vec!["p0".into(), "p1".into()],
-        retain_images: true,
     }
 }
 
@@ -1776,7 +1756,7 @@ fn comprehensive_batches() -> Vec<Batch> {
     let ar_params = NewRequest::new(
         key_for_request(100),
         100,
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: full_sampling(),
             negative_token_ids: vec![100, 101],
             finish_token_ids: vec![2, 7],
@@ -1838,7 +1818,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             request_key: key,
             call_id,
             component: "model".into(),
-            code: kind,
+            kind,
             bounds: Bounds {
                 max_tokens: 7 + index as u32,
                 max_completion_bytes: 4096,
@@ -1875,7 +1855,7 @@ fn comprehensive_batches() -> Vec<Batch> {
         batches.push(batch_with_calls(42 + index as u64, admissions, calls));
     }
     // The pass's retirement rides on its last batch.
-    let last = batches.pop().expect("one batch per computation variant");
+    let last = batches.pop().expect("one batch per call variant");
     batches.push(last.with_commands(vec![BatchCommand::Finish {
         request_key: key_for_request(201),
         retained_buffers: Vec::new(),
@@ -1889,9 +1869,9 @@ fn request_fixtures() -> Vec<WorkerRequest> {
         comprehensive_batches()
             .into_iter()
             .next()
-            .expect("one batch per computation variant"),
+            .expect("one batch per call variant"),
     );
-    submit.set_call_id(Some(91));
+    submit.set_message_id(Some(91));
     vec![WorkerRequest::info(), submit, WorkerRequest::close()]
 }
 
@@ -1924,7 +1904,6 @@ fn full_caps() -> WorkerInfo {
             rank: 1,
             ..WorkerInfo::default().endpoint
         },
-        queue_depth: 2,
         max_batch_calls: 64,
         max_batch_tokens: 4096,
         max_prefill_calls: 31,
@@ -2035,7 +2014,7 @@ fn full_run_result() -> BatchOutput {
     error_record.request_key = key_for_request(102);
     error_record.call_id = CallId::new(11, 2);
     error_record.status = CallStatus::Error;
-    error_record.error_code = Some(ErrorCode::ResourceExhausted);
+    error_record.error_code = Some(ErrorCode::ResourceError);
     error_record.finish_flags = FinishFlags {
         eos: false,
         length: false,
@@ -2080,7 +2059,7 @@ fn response_fixtures() -> Vec<WorkerResponse> {
             message_id: Some(17),
             error: WorkerResponseError {
                 message: "device fault on decode".into(),
-                code: Some("compute_error".into()),
+                code: ErrorCode::ComputeError,
                 fatal: false,
                 phase: Some("execute".into()),
                 route: Some("und.decode".into()),

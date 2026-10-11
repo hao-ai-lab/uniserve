@@ -37,8 +37,8 @@ use uniserve_worker_ipc::{Call, CallKind, ForwardMode, MediaCall};
 use uniserve_core::{EngineCoreOutput, FinishReason};
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageInput, ImageParams,
-    ImageTrigger, MultimodalInputs, RequestId, SamplingParams,
+    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger,
+    MultimodalInputs, RequestId, SamplingParams,
 };
 use uniserve_engine::{
     BatchEvent, BatchResult, EVENT_BUFFER_CAPACITY, EngineHandle, ExecutionBatch, Executor,
@@ -165,7 +165,7 @@ fn image_input(
                 position,
                 num_positions: logical_positions,
                 encoders: vec![ImageEncoderInput {
-                    encoder: ImageIngestStep::VitEncode,
+                    encoder: MediaCall::VisionEncoding,
                     num_kv_tokens: Some(physical_tokens),
                     max_kv_tokens: None,
                 }],
@@ -177,7 +177,7 @@ fn image_input(
 /// Builds a unified generation request with a fixed image-generation policy.
 ///
 /// The policy triggers on token 1000, lets image-only requests start image
-/// computation without first generating internal text, and, for
+/// call without first generating internal text, and, for
 /// Default-constraint requests, feeds each generated image back through one
 /// ViT encode. Tests that need a different trigger use `with_trigger` or edit
 /// `image_generation` afterwards.
@@ -202,7 +202,7 @@ fn generation_request(
         feedback_next_token: FeedbackNextToken::EndOfImage,
         num_feedback_positions: 2,
         feedback_encoders: vec![ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: None,
             max_kv_tokens: None,
         }],
@@ -647,7 +647,7 @@ fn forward_batch_calls(prefill: u32, decode: u32) -> (Vec<usize>, Vec<usize>) {
         let BatchEvent::Submitted(batch) = event else {
             continue;
         };
-        match batch.requests.first().map(|(call, _)| call.code) {
+        match batch.requests.first().map(|(call, _)| call.kind) {
             Some(CallKind::Forward(ForwardMode::Prefill)) => {
                 prefill_calls.push(batch.requests.len())
             }
@@ -1852,12 +1852,12 @@ fn a_latent_image_block_is_written_by_its_own_call() {
     );
     request.multimodal_inputs.images[0].encoders = vec![
         ImageEncoderInput {
-            encoder: ImageIngestStep::VaeEncode,
+            encoder: MediaCall::LatentEncoding,
             num_kv_tokens: Some(6),
             max_kv_tokens: None,
         },
         ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: Some(5),
             max_kv_tokens: None,
         },
@@ -1890,10 +1890,10 @@ fn a_latent_image_block_is_written_by_its_own_call() {
         .collect();
     let context: Vec<_> = calls
         .iter()
-        .take_while(|call| call.code != CallKind::Forward(ForwardMode::Decode))
+        .take_while(|call| call.kind != CallKind::Forward(ForwardMode::Decode))
         .collect();
     assert_eq!(
-        context.iter().map(|call| call.code).collect::<Vec<_>>(),
+        context.iter().map(|call| call.kind).collect::<Vec<_>>(),
         vec![
             CallKind::Forward(ForwardMode::Prefill),
             CallKind::Media(MediaCall::LatentEncoding),
@@ -2156,7 +2156,6 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
             ImageParams {
                 steps: 2,
                 max_images: 1,
-                retain_images: false,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2168,7 +2167,7 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     request.image_generation.feedback_next_token = FeedbackNextToken::Bos;
     request.image_generation.num_feedback_positions = 1;
     request.image_generation.feedback_encoders = vec![ImageEncoderInput {
-        encoder: ImageIngestStep::VitEncode,
+        encoder: MediaCall::VisionEncoding,
         num_kv_tokens: Some(1),
         max_kv_tokens: None,
     }];
@@ -2456,7 +2455,6 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
         ImageParams {
             steps: 3,
             max_images: 1,
-            retain_images: true,
             ..Default::default()
         },
         GenerationConstraint::Default,

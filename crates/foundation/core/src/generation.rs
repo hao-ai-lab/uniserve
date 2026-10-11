@@ -18,7 +18,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ImageParams, ImageParamsError, RequestId, SamplingParams, SamplingParamsError};
+use crate::{
+    ImageParams, ImageParamsError, MediaCall, RequestId, SamplingParams, SamplingParamsError,
+};
 
 /// Output constraint applied to the default generation paradigm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -82,7 +84,7 @@ pub struct MultimodalInputs {
 /// Canvas token `j` sits at the model position that follows the prompt's
 /// logical positions by `j`. Every canvas token attends to the whole prompt
 /// and to every token of its own row, and the pass writes no KV. The rows of
-/// one request are independent computations over the same prompt.
+/// one request are independent calls over the same prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadoutRow {
     /// Canvas token ids.
@@ -192,7 +194,7 @@ impl ImageInput {
             && self
                 .encoders
                 .iter()
-                .all(|input| input.encoder == ImageIngestStep::VitEncode)
+                .all(|input| input.encoder == MediaCall::VisionEncoding)
     }
 }
 
@@ -203,8 +205,9 @@ impl ImageInput {
 /// (see [`ImageEncoderInput::kv_token_capacity`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageEncoderInput {
-    /// Model encoder consuming this image. List order determines context write order.
-    pub encoder: ImageIngestStep,
+    /// Encoding call consuming this image: [`MediaCall::VisionEncoding`] or
+    /// [`MediaCall::LatentEncoding`]. List order determines context write order.
+    pub encoder: MediaCall,
     /// Exact KV tokens this encoder writes, when known before execution.
     pub num_kv_tokens: Option<u32>,
     /// Upper bound on a worker-selected KV length. When both it and
@@ -213,23 +216,13 @@ pub struct ImageEncoderInput {
     pub max_kv_tokens: Option<u32>,
 }
 
-/// One image ingest worker step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImageIngestStep {
-    /// Encodes image pixels into a latent representation.
-    VaeEncode,
-    /// Encodes image content into vision features.
-    VitEncode,
-}
-
 /// Derives the cache identity of one ordered image encoder.
 ///
 /// `step_index` is the encoder's index in `ImageInput::encoders`. The engine
 /// derives the key when it looks up a cached product before encoding and
 /// again when it stores the encoder's product, so both must use the same
 /// index for a stored product to be found.
-pub fn encoder_cache_key(image_hash: u64, step_index: usize, step: ImageIngestStep) -> u64 {
+pub fn encoder_cache_key(image_hash: u64, step_index: usize, encoder: MediaCall) -> u64 {
     // Apply FNV-1a to the complete domain tuple in a fixed byte order. Including
     // the stage index distinguishes repeated encoder kinds within one image input.
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -237,10 +230,7 @@ pub fn encoder_cache_key(image_hash: u64, step_index: usize, step: ImageIngestSt
         .to_le_bytes()
         .into_iter()
         .chain((step_index as u64).to_le_bytes())
-        .chain([match step {
-            ImageIngestStep::VaeEncode => 1,
-            ImageIngestStep::VitEncode => 2,
-        }])
+        .chain([encoder as u8])
     {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -402,14 +392,14 @@ impl ImageGenerationConfig {
     pub fn required_features(
         &self,
         constraint: GenerationConstraint,
-        context_image_steps: impl IntoIterator<Item = ImageIngestStep>,
+        context_image_steps: impl IntoIterator<Item = MediaCall>,
     ) -> GenerationFeatures {
         // Understanding execution is the common control path for every request.
         let mut needs = GenerationFeatures::UNDERSTANDING;
 
         // Context images require the encoder stages declared by their inputs.
         for step in context_image_steps {
-            needs.insert(step.required_feature());
+            needs.insert(encoder_feature(step));
         }
 
         if self.generates_images(constraint) {
@@ -420,20 +410,20 @@ impl ImageGenerationConfig {
         // materialization.
         if self.feeds_back_images(constraint) {
             for step in self.feedback_encoders.iter().map(|input| input.encoder) {
-                needs.insert(step.required_feature());
+                needs.insert(encoder_feature(step));
             }
         }
         needs
     }
 }
 
-impl ImageIngestStep {
-    /// Returns the runtime feature that executes this encoder stage.
-    const fn required_feature(self) -> GenerationFeatures {
-        match self {
-            Self::VaeEncode => GenerationFeatures::LATENT_ENCODE,
-            Self::VitEncode => GenerationFeatures::VISION_ENCODE,
-        }
+/// Returns the runtime feature that executes one image encoding call; a call
+/// that encodes no image requires none.
+const fn encoder_feature(encoder: MediaCall) -> GenerationFeatures {
+    match encoder {
+        MediaCall::LatentEncoding => GenerationFeatures::LATENT_ENCODE,
+        MediaCall::VisionEncoding => GenerationFeatures::VISION_ENCODE,
+        _ => GenerationFeatures::empty(),
     }
 }
 
@@ -730,12 +720,12 @@ impl GenerationRequest {
         .then_some(self.image_generation.feedback_encoders.as_slice());
         for (step, bytes, resource) in [
             (
-                ImageIngestStep::VaeEncode,
+                MediaCall::LatentEncoding,
                 limits.max_latent_feature_bytes,
                 "max_latent_feature_bytes",
             ),
             (
-                ImageIngestStep::VitEncode,
+                MediaCall::VisionEncoding,
                 limits.max_vision_feature_bytes,
                 "max_vision_feature_bytes",
             ),
@@ -809,8 +799,9 @@ impl ImageEncoderInput {
         limits: &GenerationLimits,
     ) -> Result<u32, GenerationResourceError> {
         let capacity = match self.encoder {
-            ImageIngestStep::VaeEncode => limits.max_vae_grid_tokens,
-            ImageIngestStep::VitEncode => limits.max_vit_grid_tokens,
+            MediaCall::LatentEncoding => limits.max_vae_grid_tokens,
+            MediaCall::VisionEncoding => limits.max_vit_grid_tokens,
+            _ => 0,
         };
         let tokens = self
             .num_kv_tokens
@@ -822,16 +813,6 @@ impl ImageEncoderInput {
             });
         }
         Ok(tokens)
-    }
-}
-
-impl ImageIngestStep {
-    /// Returns the stable call name used by resource diagnostics.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::VaeEncode => "vae_encode",
-            Self::VitEncode => "vit_encode",
-        }
     }
 }
 
@@ -968,7 +949,7 @@ impl GenerationRequest {
             .sum()
     }
 
-    /// Returns the runtime features the request's computation reaches.
+    /// Returns the runtime features the request's call reaches.
     ///
     /// A readout needs token denoising and the encoders of its context
     /// images; any other request needs what its generation graph reaches
@@ -988,12 +969,12 @@ impl GenerationRequest {
     pub fn canvas_features(&self) -> GenerationFeatures {
         self.context_encoders()
             .fold(GenerationFeatures::TOKEN_DENOISING, |needs, step| {
-                needs | step.required_feature()
+                needs | encoder_feature(step)
             })
     }
 
     /// Returns the encoder steps of the request's context images.
-    fn context_encoders(&self) -> impl Iterator<Item = ImageIngestStep> + '_ {
+    fn context_encoders(&self) -> impl Iterator<Item = MediaCall> + '_ {
         self.multimodal_inputs
             .images
             .iter()
@@ -1150,6 +1131,14 @@ fn validate_image_encoders(
         return Err(GenerationRequestError::ZeroImageLogicalPositions);
     }
     for input in inputs {
+        if !matches!(
+            input.encoder,
+            MediaCall::VisionEncoding | MediaCall::LatentEncoding
+        ) {
+            return Err(GenerationRequestError::NotAnImageEncoder {
+                call: input.encoder,
+            });
+        }
         if input.num_kv_tokens == Some(0) || input.max_kv_tokens == Some(0) {
             return Err(GenerationRequestError::ZeroImageKvBound);
         }
@@ -1174,6 +1163,12 @@ pub enum GenerationRequestError {
     /// An image input, or configured image feedback, declares no encoder stages.
     #[error("image input has no encoders")]
     MissingImageEncoders,
+    /// An image encoder is neither a vision nor a latent encoding call.
+    #[error("{} is not an image encoder", call.as_str())]
+    NotAnImageEncoder {
+        /// The call the input names.
+        call: MediaCall,
+    },
     /// An input image carries no encoded payload.
     #[error("image payload must not be empty")]
     EmptyImagePayload,
@@ -1313,12 +1308,12 @@ mod tests {
             num_feedback_positions: 1,
             feedback_encoders: vec![
                 ImageEncoderInput {
-                    encoder: ImageIngestStep::VaeEncode,
+                    encoder: MediaCall::LatentEncoding,
                     num_kv_tokens: None,
                     max_kv_tokens: Some(64),
                 },
                 ImageEncoderInput {
-                    encoder: ImageIngestStep::VitEncode,
+                    encoder: MediaCall::VisionEncoding,
                     num_kv_tokens: None,
                     max_kv_tokens: Some(64),
                 },
@@ -1339,12 +1334,12 @@ mod tests {
                     num_positions: 1,
                     encoders: vec![
                         ImageEncoderInput {
-                            encoder: ImageIngestStep::VaeEncode,
+                            encoder: MediaCall::LatentEncoding,
                             num_kv_tokens: None,
                             max_kv_tokens: Some(64),
                         },
                         ImageEncoderInput {
-                            encoder: ImageIngestStep::VitEncode,
+                            encoder: MediaCall::VisionEncoding,
                             num_kv_tokens: Some(32),
                             max_kv_tokens: None,
                         },
@@ -1384,11 +1379,11 @@ mod tests {
 
     #[test]
     fn encoder_cache_keys_are_stable_and_step_scoped() {
-        let first = encoder_cache_key(17, 0, ImageIngestStep::VaeEncode);
-        assert_eq!(first, encoder_cache_key(17, 0, ImageIngestStep::VaeEncode));
-        assert_ne!(first, encoder_cache_key(18, 0, ImageIngestStep::VaeEncode));
-        assert_ne!(first, encoder_cache_key(17, 1, ImageIngestStep::VaeEncode));
-        assert_ne!(first, encoder_cache_key(17, 0, ImageIngestStep::VitEncode));
+        let first = encoder_cache_key(17, 0, MediaCall::LatentEncoding);
+        assert_eq!(first, encoder_cache_key(17, 0, MediaCall::LatentEncoding));
+        assert_ne!(first, encoder_cache_key(18, 0, MediaCall::LatentEncoding));
+        assert_ne!(first, encoder_cache_key(17, 1, MediaCall::LatentEncoding));
+        assert_ne!(first, encoder_cache_key(17, 0, MediaCall::VisionEncoding));
     }
 
     #[test]
@@ -1462,12 +1457,12 @@ mod tests {
             num_positions: 1,
             encoders: vec![
                 ImageEncoderInput {
-                    encoder: ImageIngestStep::VaeEncode,
+                    encoder: MediaCall::LatentEncoding,
                     num_kv_tokens: Some(1_026),
                     max_kv_tokens: None,
                 },
                 ImageEncoderInput {
-                    encoder: ImageIngestStep::VitEncode,
+                    encoder: MediaCall::VisionEncoding,
                     num_kv_tokens: Some(1_371),
                     max_kv_tokens: None,
                 },
@@ -1494,7 +1489,9 @@ mod tests {
         limits.max_vit_grid_tokens = 0;
         assert_eq!(
             request.validate_resources(&limits),
-            Err(GenerationResourceError::UnboundedImageKv { call: "vit_encode" })
+            Err(GenerationResourceError::UnboundedImageKv {
+                call: "vision_encoding"
+            })
         );
 
         // The remaining cases keep the unbounded ViT input, which resolves to
@@ -1574,6 +1571,17 @@ mod tests {
             Err(GenerationRequestError::MissingImageEncoders)
         );
 
+        // An image is encoded by a vision or a latent encoding call, nothing
+        // else.
+        let mut not_an_encoder = complete_request();
+        not_an_encoder.multimodal_inputs.images[0].encoders[0].encoder = MediaCall::Denoising;
+        assert_eq!(
+            not_an_encoder.validate(),
+            Err(GenerationRequestError::NotAnImageEncoder {
+                call: MediaCall::Denoising
+            })
+        );
+
         // Exact contributions and capacities are validated before admission.
         for (tokens, capacity, error) in [
             (Some(0), None, GenerationRequestError::ZeroImageKvBound),
@@ -1604,7 +1612,7 @@ mod tests {
         let mut injected = complete_request();
         injected.multimodal_inputs.images[0].encoders.truncate(1);
         injected.multimodal_inputs.images[0].encoders[0] = ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: None,
             max_kv_tokens: Some(64),
         };
@@ -1674,7 +1682,7 @@ mod tests {
         request.max_und_tokens = 0;
         request.image_generation = ImageGenerationConfig::default();
         request.multimodal_inputs.images[0].encoders.truncate(1);
-        request.multimodal_inputs.images[0].encoders[0].encoder = ImageIngestStep::VitEncode;
+        request.multimodal_inputs.images[0].encoders[0].encoder = MediaCall::VisionEncoding;
         request.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
         request.readout = vec![
             ReadoutRow {

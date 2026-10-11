@@ -46,11 +46,9 @@ class CallId:
         request index zero.
         """
         if not 0 <= self.batch_id <= 0xFFFFFFFFFFFFFFFF:
-            raise invalid_descriptor("computation batch id is outside uint64")
+            raise invalid_descriptor("call batch id is outside uint64")
         if not 0 <= self.request_index <= 0xFFFFFFFF:
-            raise invalid_descriptor(
-                "computation request index is outside uint32"
-            )
+            raise invalid_descriptor("call request index is outside uint32")
         if self.batch_id == 0 and self.request_index != 0:
             raise invalid_descriptor(
                 "admission identity requires request index zero"
@@ -65,7 +63,7 @@ class CallId:
         return value
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize the computation identity for IPC."""
+        """Serialize the call identity for IPC."""
         return {"batch_id": self.batch_id, "request_index": self.request_index}
 
 

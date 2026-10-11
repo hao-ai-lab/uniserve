@@ -76,7 +76,6 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.host import HostLane
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.latent_pool import LatentPool
     from uniserve_worker.storage.tensor_store import TensorStore
@@ -287,7 +286,7 @@ def publish_features(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
+    model_runner: ModelExecutor,
     publication_transports: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> PendingOutput:
@@ -312,7 +311,7 @@ def publish_features(
     products: tuple[TensorPublication, ...] = ()
     if any(
         name != "local" for name in publication_transports
-    ) and config.rank == worker_info.output_rank(call.component):
+    ) and config.rank == model_runner.output_rank(call.component):
         locations = publish_tensor(
             publication_transports,
             resident,

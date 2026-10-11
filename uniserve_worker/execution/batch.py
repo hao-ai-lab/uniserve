@@ -55,7 +55,7 @@ from uniserve_worker.transport.ticket import TransferTicket
 class BatchState:
     """Retain inputs, physical dependencies, outputs and delivery position.
 
-    The `Executor` submits inputs, launches computation, and materializes
+    The `Executor` submits inputs, launches call, and materializes
     results. This object has no callback that can execute its batch or
     advance the worker.
 

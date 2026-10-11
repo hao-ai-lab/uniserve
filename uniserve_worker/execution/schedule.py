@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
 from uniserve.runtime.resources import close_resources
-from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.errors import ErrorCode, invalid_descriptor
 from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.calls import _predicated_outcome
@@ -33,7 +33,6 @@ from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
-    ErrorCode,
     ForwardMode,
     MediaCall,
     TransferMode,
@@ -47,7 +46,6 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -61,7 +59,6 @@ def dispatch_batch(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
@@ -124,7 +121,6 @@ def dispatch_batch(
         tuple(scheduled),
         kv_cache=kv_cache,
         tensor_store=tensor_store,
-        worker_info=worker_info,
         latent_pool=latent_pool,
         media_mux=media_mux,
         publication_transports=publication_transports,
@@ -175,7 +171,6 @@ def _execute_ready_actions(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
@@ -190,7 +185,7 @@ def _execute_ready_actions(
     Each call dispatches by kind to its owning module and runs inside
     ``state.scope()``, which makes the batch stream current when the batch
     has one. On a video worker (``video_postprocessor`` set), device
-    computation also lands here: a request's vision and condition latent
+    call also lands here: a request's vision and condition latent
     encodings through ``conditions``, and denoising and decode rounds
     through ``media.execute``. Calls that already have an outcome are
     skipped.
@@ -237,7 +232,6 @@ def _execute_ready_actions(
                 result = diffusion.prepare_latent(
                     call,
                     kv_cache=kv_cache,
-                    worker_info=worker_info,
                     latent_pool=latent_pool,
                     publication_transports=publication_transports,
                     request_tables=request_tables,
@@ -313,7 +307,6 @@ def _execute_calls(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
@@ -415,7 +408,6 @@ def _execute_calls(
                 state=state,
                 kv_cache=kv_cache,
                 tensor_store=tensor_store,
-                worker_info=worker_info,
                 latent_pool=latent_pool,
                 media_mux=media_mux,
                 publication_transports=publication_transports,
@@ -507,7 +499,6 @@ def _execute_calls(
                 outcomes,
                 state=state,
                 tensor_store=tensor_store,
-                worker_info=worker_info,
                 publication_transports=publication_transports,
                 model_runner=model_runner,
                 request_tables=request_tables,
@@ -526,7 +517,6 @@ def _execute_calls(
                     scheduled,
                     outcomes,
                     state=state,
-                    worker_info=worker_info,
                     latent_pool=latent_pool,
                     publication_transports=publication_transports,
                     request_tables=request_tables,

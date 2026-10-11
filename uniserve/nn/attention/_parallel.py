@@ -13,6 +13,7 @@ import torch
 from uniserve.distributed.chunks import (
     ChunkProducer,
     _produce_chunks,
+    payload_rows,
 )
 from uniserve.distributed.mesh import DeviceMesh
 
@@ -70,8 +71,7 @@ class AttentionRowExchange:
         """Bound each peer payload while preserving tile-aligned row
         intervals.
         """  # noqa: D205
-        payload = prod(tensor.shape[1:]) * tensor.element_size()
-        return max(128, (32 * 1024 * 1024 // payload // 128) * 128)
+        return payload_rows(prod(tensor.shape[1:]), tensor.element_size())
 
     @staticmethod
     def partition_workspace(

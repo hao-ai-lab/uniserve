@@ -19,7 +19,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-pub use uniserve_core::{CallId, ForwardStats};
+pub use uniserve_core::{CallId, ForwardStats, MediaCall};
 use uniserve_core::{
     ImageParams, KvCacheDtype, KvCacheGroup, RequestId, SamplingParams, TokenLogprob, UnitId,
 };

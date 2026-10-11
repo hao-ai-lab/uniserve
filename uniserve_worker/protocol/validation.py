@@ -1,23 +1,20 @@
-"""Primitive validation for decoded worker wire values.
+"""Primitive validation for decoded worker values.
 
-The ``from_mapping`` parsers of the `uniserve_worker.protocol` records that
-are read from a mapping (the launch descriptor's `CanvasSampling` and the
-records nested in `WorkerInfo`) use these helpers to type-check each field,
-and record constructors use `_nonnegative`; `worker_info` keeps local
-variants instead. Every helper takes the decoded value and `where`, the path
-of the field; the checks a helper performs raise `invalid_descriptor` with
-that path in the message. Integer and number helpers reject `bool`, although
-it subclasses `int`.
+The launch descriptor's `CanvasSampling.from_mapping` uses these helpers to
+type-check each field, and record constructors use `_nonnegative`. Every
+helper takes the decoded value and `where`, the path of the field; the checks
+a helper performs raise `invalid_descriptor` with that path in the message.
+Integer and number helpers reject `bool`, although it subclasses `int`.
 
 Most helpers test for the exact built-in type first and then fall back to
-`isinstance`, so subclasses and other `Mapping` or `Sequence` implementations
-are accepted as well.
+`isinstance`, so subclasses and other `Mapping` implementations are accepted
+as well.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any, cast
 
 from uniserve_worker.errors import invalid_descriptor
@@ -30,35 +27,6 @@ def _map(value: object, where: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise invalid_descriptor(f"{where} must be a map")
     return cast(Mapping[str, Any], value)
-
-
-def _seq(value: object, where: str) -> Sequence[Any]:
-    """Require a decoded wire field to be a non-string sequence."""
-    kind = type(value)
-    if kind is list or kind is tuple:
-        return cast(Sequence[Any], value)
-    if not isinstance(value, Sequence) or isinstance(
-        value, (str, bytes, bytearray)
-    ):
-        raise invalid_descriptor(f"{where} must be a list")
-    return value
-
-
-def _tagged(value: object, where: str) -> tuple[str, object]:
-    """Split an adjacently tagged ``{"kind": ..., "value": ...}`` mapping.
-
-    Returns the tag, which must be a string, and the payload unvalidated;
-    the caller validates the payload according to the tag.
-    """
-    data = _map(value, where)
-    return _str(data.get("kind"), f"{where}.kind"), data.get("value")
-
-
-def _str(value: object, where: str) -> str:
-    """Require a decoded wire field to contain text."""
-    if not isinstance(value, str):
-        raise invalid_descriptor(f"{where} must be a string")
-    return value
 
 
 def _uint(value: object, where: str) -> int:

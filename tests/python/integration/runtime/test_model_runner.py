@@ -35,7 +35,7 @@ from uniserve.model import Logits
 from uniserve_models.stub import Model
 from uniserve_models.stub import entry_points as entry_points
 from uniserve_worker.config.execution import LaneConfig
-from uniserve_worker.errors import WorkerError
+from uniserve_worker.errors import ErrorCode, WorkerError
 from uniserve_worker.protocol.batch import (
     BlockTable,
     Free,
@@ -49,7 +49,6 @@ from uniserve_worker.protocol.call import (
     Call,
     CallCoordinates,
     CallStatus,
-    ErrorCode,
     ForwardMode,
     ImageParams,
     MediaCall,
@@ -314,7 +313,7 @@ def test_text_extension_rejects_missing_input_tokens() -> None:
         ),
     )
     assert report.completions[0].status is CallStatus.ERROR
-    assert report.completions[0].error_code is ErrorCode.INVALID_CALL
+    assert report.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
 
 
 def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent() -> (  # noqa: E501
@@ -366,7 +365,7 @@ def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent()
     )
 
     assert report.completions[0].status is CallStatus.ERROR
-    assert report.completions[0].error_code is ErrorCode.INVALID_CALL
+    assert report.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
 
 
 def test_decode_reuses_the_published_request_page_table() -> None:
@@ -628,7 +627,7 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
         worker.close()
 
 
-def test_computation_identity_preserves_homogeneous_decode():
+def test_call_identity_preserves_homogeneous_decode():
     worker = execution_worker()
     admissions = (ar_params(41, block_ids=(0,)), ar_params(42, block_ids=(1,)))
     prefill_ops = []
@@ -914,7 +913,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
     failed = finalized_report(worker, worker.submit(batch))
 
     assert failed.completions[0].status is CallStatus.ERROR
-    assert failed.completions[0].error_code is ErrorCode.INVALID_CALL
+    assert failed.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
     assert failed.completions[0].num_completed_steps == 0
 
     replacement, _replacement_latent = diffusion_step_call(
@@ -1382,8 +1381,8 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
 
 def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thread_wait(  # noqa: E501
 ) -> None:
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
     admission = ar_params(73, block_ids=(0,), input_images=1)
     image = io.BytesIO()
     Image.new("RGB", (16, 16), (64, 96, 128)).save(image, format="PNG")
@@ -1447,7 +1446,7 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
 def test_free_preserves_another_requests_feature_with_the_same_generation() -> (
     None
 ):
-    worker = execution_worker(transfer_backends=("shm",))
+    worker = execution_worker(transfer_backends=("posix_shm",))
     admissions = (
         ar_params(93, block_ids=(0,), input_images=1),
         ar_params(94, block_ids=(1,), input_images=1),
@@ -1510,8 +1509,8 @@ def test_free_preserves_another_requests_feature_with_the_same_generation() -> (
 def test_cross_stage_device_product_transfer_preserves_generation_and_value() -> (  # noqa: E501
     None
 ):
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
     admission = ar_params(77, block_ids=(0,))
     extend = token_call(
         admission.request_key,
@@ -1691,7 +1690,7 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         worker.close()
 
 
-@pytest.mark.parametrize("backend", ("local", "shm"))
+@pytest.mark.parametrize("backend", ("local", "posix_shm"))
 @pytest.mark.parametrize(
     "dtype", (DType.BF16, DType.F32, DType.I32, DType.I64, DType.I16)
 )
@@ -1805,8 +1804,8 @@ def test_tensor_entry_input_preserves_values_through_output_release(
 def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
     None
 ):
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
     generation = umm_params(
         79, ImageParams(steps=1, height=16, width=16, seed=31)
     )
@@ -1895,8 +1894,8 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
 def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
     height: int, publication: str
 ) -> None:
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
     admission = umm_params(
         75, ImageParams(steps=1, height=height, width=height, seed=29)
     )
@@ -1996,8 +1995,8 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             first.shape[axis] if index == axis else 0 for index in range(2)
         )
         locations = (
-            producer.transports["shm"].publish(first),
-            producer.transports["shm"].publish(second, offset=offset),
+            producer.transports["posix_shm"].publish(first),
+            producer.transports["posix_shm"].publish(second, offset=offset),
         )
         transferred = (
             replace(
@@ -2113,7 +2112,7 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
     encoding_fails: bool,
     monkeypatch,
 ) -> None:
-    worker = execution_worker(transfer_backends=("shm",))
+    worker = execution_worker(transfer_backends=("posix_shm",))
     admission = umm_params(
         76,
         ImageParams(steps=1, height=16, width=16, seed=31),
@@ -2462,7 +2461,7 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         else (),
     )
     worker = execution_worker(
-        transfer_backends=("shm",),
+        transfer_backends=("posix_shm",),
         device=device,
         execution=policy,
         queue_depth=2,
@@ -2594,12 +2593,14 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
 
 
 def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
-    """A received Free must progress while computation waits for its storage."""
+    """A received Free must progress while call waits for its storage."""
     from concurrent.futures import ThreadPoolExecutor
 
     from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 
-    with execution_worker(transfer_backends=("shm",), queue_depth=2) as worker:
+    with execution_worker(
+        transfer_backends=("posix_shm",), queue_depth=2
+    ) as worker:
         worker.warmup()
         admission = umm_params(
             76, ImageParams(steps=3, height=16, width=16, seed=29)

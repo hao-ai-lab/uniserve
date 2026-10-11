@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use uniserve_core::{
     CachePolicy, EngineCoreOutput, FinishReason, GenerationConstraint, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageInput, ImageParams,
-    MultimodalInputs, ReadoutRow, ReadoutSlot, RejectionKind, RequestId, SamplingParams,
+    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, MultimodalInputs,
+    ReadoutRow, ReadoutSlot, RejectionKind, RequestId, SamplingParams,
 };
 use uniserve_engine::{
     BatchEvent, ComponentConfig, EngineHandle, EventRx, ExecutionBatch, Scheduler, SchedulerConfig,
@@ -240,7 +240,7 @@ fn a_readout_prefills_without_sampling_and_answers_every_candidate_once() {
     let calls = calls_of(&batches, 1);
     let (prefills, canvases): (Vec<_>, Vec<_>) = calls
         .iter()
-        .partition(|(call, _)| call.code == CallKind::Forward(ForwardMode::Prefill));
+        .partition(|(call, _)| call.kind == CallKind::Forward(ForwardMode::Prefill));
     assert!(
         prefills.iter().all(|(call, _)| call.token_output.is_none()),
         "a readout prompt samples no token"
@@ -257,7 +257,7 @@ fn a_readout_prefills_without_sampling_and_answers_every_candidate_once() {
     // nothing, and the slots index the masked tokens of the concatenation.
     assert_eq!(canvases.len(), 1);
     let (canvas, forward) = &canvases[0];
-    assert_eq!(canvas.code, CallKind::Forward(ForwardMode::TokenDenoising));
+    assert_eq!(canvas.kind, CallKind::Forward(ForwardMode::TokenDenoising));
     assert_eq!(canvas.coordinates.kv_visible_len, 40);
     assert_eq!(canvas.coordinates.logical_position, 40);
     assert_eq!(
@@ -417,7 +417,7 @@ fn readouts_of_one_state_reuse_the_shared_prompt_pages() {
     assert_eq!(hits, 48);
     let prefills: Vec<_> = calls_of(&batches, 5)
         .into_iter()
-        .filter(|(call, _)| call.code == CallKind::Forward(ForwardMode::Prefill))
+        .filter(|(call, _)| call.kind == CallKind::Forward(ForwardMode::Prefill))
         .collect();
     assert_eq!(prefills.len(), 1);
     assert_eq!(prefills[0].0.coordinates.kv_visible_len, 48);
@@ -439,7 +439,7 @@ fn an_image_readout_reads_the_encoded_image_with_its_prompt() {
         position: 10,
         num_positions: 9,
         encoders: vec![ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: Some(9),
             max_kv_tokens: None,
         }],
@@ -452,7 +452,7 @@ fn an_image_readout_reads_the_encoded_image_with_its_prompt() {
     assert!(
         calls
             .iter()
-            .any(|(call, _)| call.code == CallKind::Media(MediaCall::VisionEncoding))
+            .any(|(call, _)| call.kind == CallKind::Media(MediaCall::VisionEncoding))
     );
     let (canvas, forward) = calls
         .iter()
@@ -472,7 +472,7 @@ fn vision_image(hash: u64, position: u32, tokens: u32) -> ImageInput {
         position,
         num_positions: tokens,
         encoders: vec![ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: Some(tokens),
             max_kv_tokens: None,
         }],
@@ -487,7 +487,7 @@ fn context_prefills(
 ) -> Vec<(Call, uniserve_worker_ipc::ForwardBatch)> {
     calls_of(batches, request)
         .into_iter()
-        .filter(|(call, _)| call.code == CallKind::Forward(ForwardMode::Prefill))
+        .filter(|(call, _)| call.kind == CallKind::Forward(ForwardMode::Prefill))
         .collect()
 }
 
@@ -508,7 +508,7 @@ fn an_image_prompt_is_written_by_one_context_prefill() {
     assert_answered(&answer, &request);
 
     let calls = calls_of(&batches, 9);
-    let kinds: Vec<_> = calls.iter().map(|(call, _)| call.code).collect();
+    let kinds: Vec<_> = calls.iter().map(|(call, _)| call.kind).collect();
     assert_eq!(
         kinds,
         vec![
@@ -555,7 +555,7 @@ fn a_context_prefill_writes_every_image_it_reaches() {
     let calls = calls_of(&batches, 10);
     let encodes: Vec<_> = calls
         .iter()
-        .filter(|(call, _)| call.code == CallKind::Media(MediaCall::VisionEncoding))
+        .filter(|(call, _)| call.kind == CallKind::Media(MediaCall::VisionEncoding))
         .map(|(call, _)| call.encoder_output.clone().unwrap().buffer_id())
         .collect();
     assert_eq!(encodes.len(), 2);
@@ -607,7 +607,7 @@ fn image_contexts_respect_the_workers_prefill_row_capacity() {
         let rows: usize = batch
             .requests
             .iter()
-            .filter(|(call, _)| call.code == CallKind::Forward(ForwardMode::Prefill))
+            .filter(|(call, _)| call.kind == CallKind::Forward(ForwardMode::Prefill))
             .map(|(_, placement)| placement.forward.query_lens.len())
             .sum();
         assert!(rows <= 3, "prefill batch has {rows} numerical rows");
@@ -691,13 +691,15 @@ fn an_image_encode_waits_for_a_free_host_lane_task() {
     // every ready encode schedulable at once, leaving the lane to bound them.
     sim.set_queue_depth(16);
     sim.set_results_on_wait(true);
+    sim.place_components(vec![(
+        ComponentInfo {
+            name: "model".to_owned(),
+            outputs: Vec::new(),
+        },
+        ComponentConfig::parallel(vec![0], Default::default()),
+    )]);
     let info = sim.mut_info_for_test();
     info.host_lane_capacity = 1;
-    info.components = vec![ComponentInfo {
-        name: "model".to_owned(),
-        config: ComponentConfig::parallel(vec![0], Default::default()),
-        outputs: Vec::new(),
-    }];
     info.media_components = BTreeMap::from([(MediaCall::VisionEncoding, "model".to_owned())]);
     let running = Running::start(sim, SchedulerConfig::default());
 
@@ -715,7 +717,7 @@ fn an_image_encode_waits_for_a_free_host_lane_task() {
                 position: 0,
                 num_positions: 9,
                 encoders: vec![ImageEncoderInput {
-                    encoder: ImageIngestStep::VitEncode,
+                    encoder: MediaCall::VisionEncoding,
                     num_kv_tokens: Some(9),
                     max_kv_tokens: None,
                 }],
@@ -742,7 +744,7 @@ fn an_image_encode_waits_for_a_free_host_lane_task() {
                 let count = batch
                     .requests
                     .iter()
-                    .filter(|(call, _)| call.code == CallKind::Media(MediaCall::VisionEncoding))
+                    .filter(|(call, _)| call.kind == CallKind::Media(MediaCall::VisionEncoding))
                     .count();
                 encodes += count;
                 in_flight.insert(batch.id, count);
@@ -796,7 +798,7 @@ fn a_ready_canvas_pass_runs_before_waiting_prefill() {
                 batch
                     .requests
                     .iter()
-                    .map(|(call, _)| (call.request_key.request_id.0, call.code))
+                    .map(|(call, _)| (call.request_key.request_id.0, call.kind))
                     .collect(),
             ),
             BatchEvent::Resolved { .. } => None,
@@ -853,7 +855,7 @@ fn a_readout_pass_is_queued_behind_its_prompt_prefill() {
             .iter()
             .position(|event| match event {
                 BatchEvent::Submitted(batch) => {
-                    batch.requests.iter().any(|(call, _)| call.code == code)
+                    batch.requests.iter().any(|(call, _)| call.kind == code)
                 }
                 BatchEvent::Resolved { .. } => false,
             })
@@ -901,7 +903,7 @@ fn a_readout_pass_is_queued_behind_its_image_context_prefill() {
             .iter()
             .position(|event| match event {
                 BatchEvent::Submitted(batch) => {
-                    batch.requests.iter().any(|(call, _)| call.code == code)
+                    batch.requests.iter().any(|(call, _)| call.kind == code)
                 }
                 BatchEvent::Resolved { .. } => false,
             })
@@ -943,14 +945,14 @@ fn a_cached_image_joins_its_context_prefill_without_an_encode() {
 
     let encoded = calls_of(&batches, 13)
         .into_iter()
-        .find(|(call, _)| call.code == CallKind::Media(MediaCall::VisionEncoding))
+        .find(|(call, _)| call.kind == CallKind::Media(MediaCall::VisionEncoding))
         .and_then(|(call, _)| call.encoder_output)
         .unwrap();
     let calls = calls_of(&batches, 14);
     assert!(
         calls
             .iter()
-            .all(|(call, _)| call.code != CallKind::Media(MediaCall::VisionEncoding))
+            .all(|(call, _)| call.kind != CallKind::Media(MediaCall::VisionEncoding))
     );
     let prefills = context_prefills(&batches, 14);
     assert_eq!(prefills.len(), 1);

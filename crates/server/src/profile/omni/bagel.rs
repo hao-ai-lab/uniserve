@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, ImageEncoderInput,
-    ImageGenerationConfig, ImageIngestStep, ImageTrigger, ModelDtype,
+    ImageGenerationConfig, ImageTrigger, MediaCall, ModelDtype,
 };
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
@@ -138,12 +138,12 @@ impl BagelProfile {
         };
         let image_encoders = vec![
             ImageEncoderInput {
-                encoder: ImageIngestStep::VaeEncode,
+                encoder: MediaCall::LatentEncoding,
                 num_kv_tokens: None,
                 max_kv_tokens: None,
             },
             ImageEncoderInput {
-                encoder: ImageIngestStep::VitEncode,
+                encoder: MediaCall::VisionEncoding,
                 num_kv_tokens: None,
                 max_kv_tokens: None,
             },
@@ -160,7 +160,7 @@ impl BagelProfile {
             },
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
-                encoder: ImageIngestStep::VaeEncode,
+                encoder: MediaCall::LatentEncoding,
                 num_kv_tokens: None,
                 max_kv_tokens: None,
             }],
@@ -300,12 +300,12 @@ impl BagelProfile {
         )?;
         Ok(vec![
             ImageEncoderInput {
-                encoder: ImageIngestStep::VaeEncode,
+                encoder: MediaCall::LatentEncoding,
                 num_kv_tokens: Some(vae_tokens),
                 max_kv_tokens: None,
             },
             ImageEncoderInput {
-                encoder: ImageIngestStep::VitEncode,
+                encoder: MediaCall::VisionEncoding,
                 num_kv_tokens: Some(vit_tokens),
                 max_kv_tokens: None,
             },
@@ -326,7 +326,7 @@ impl BagelProfile {
         let mut policy = self.image_generation.clone();
         if policy.feedback_source.is_none()
             || policy.feedback_encoders.len() != 1
-            || policy.feedback_encoders[0].encoder != ImageIngestStep::VaeEncode
+            || policy.feedback_encoders[0].encoder != MediaCall::LatentEncoding
         {
             return Err(assets::Error::invalid(
                 "image feedback encoders do not match the model processor",

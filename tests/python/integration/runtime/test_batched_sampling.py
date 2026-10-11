@@ -29,11 +29,11 @@ from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
 from uniserve.sampling import SamplingParams
 from uniserve_models.stub import STUB_IMG_START_TOKEN_ID
+from uniserve_worker.errors import ErrorCode
 from uniserve_worker.protocol.batch import GenerationParams, NewRequest
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
-    ErrorCode,
     ForwardMode,
     SamplingState,
 )
@@ -525,7 +525,7 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         ),
     )
     assert failed.completions[0].status is CallStatus.ERROR
-    assert failed.completions[0].error_code is ErrorCode.INVALID_CALL
+    assert failed.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
 
     continued = token_call(
         admission.request_key,
@@ -681,5 +681,5 @@ def test_all_masked_branch_state_produces_an_error_completion() -> None:
 
     completion = result.completions[0]
     assert completion.status is CallStatus.ERROR
-    assert completion.error_code is ErrorCode.INVALID_CALL
+    assert completion.error_code is ErrorCode.INVALID_DESCRIPTOR
     assert completion.committed_tokens == ()

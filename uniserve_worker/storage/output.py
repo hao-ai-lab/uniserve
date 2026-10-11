@@ -25,7 +25,7 @@ import torch
 
 from uniserve.runtime import EventPool
 from uniserve.runtime.device import canonical_device
-from uniserve_worker.errors import WorkerError, WorkerErrorCode, resource_error
+from uniserve_worker.errors import ErrorCode, WorkerError, resource_error
 from uniserve_worker.profiling import timing_events_enabled
 from uniserve_worker.sampling.output import decode_logprobs
 
@@ -37,7 +37,7 @@ _next_buffer_generation = 1
 def _invariant(message: str) -> WorkerError:
     """Construct a classified invariant error for output-buffer misuse."""
     return WorkerError(
-        code=WorkerErrorCode.INVARIANT_VIOLATION,
+        code=ErrorCode.INVARIANT_VIOLATION,
         message=message,
         fatal=True,
     )

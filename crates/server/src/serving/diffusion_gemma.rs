@@ -18,8 +18,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use uniserve_core::{
-    CanvasSampling, GenerationRequest, ImageEncoderInput, ImageIngestStep, ImageInput,
-    MultimodalInputs,
+    CanvasSampling, GenerationRequest, ImageEncoderInput, ImageInput, MediaCall, MultimodalInputs,
 };
 
 use crate::profile::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
@@ -57,7 +56,7 @@ pub(crate) fn engine_images(
             position: u32::try_from(prompt.len()).unwrap_or(u32::MAX),
             num_positions: placement.soft_tokens,
             encoders: vec![ImageEncoderInput {
-                encoder: ImageIngestStep::VitEncode,
+                encoder: MediaCall::VisionEncoding,
                 num_kv_tokens: Some(placement.soft_tokens),
                 max_kv_tokens: None,
             }],

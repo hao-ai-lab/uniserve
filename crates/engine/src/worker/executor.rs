@@ -43,7 +43,7 @@ struct PendingWorker {
     /// reconciliation when the group will send no report.
     submitted: bool,
     /// Calls whose completion this worker has not yet returned, with the
-    /// computation code the completion must carry.
+    /// call code the completion must carry.
     calls: HashMap<(RequestKey, uniserve_worker_ipc::CallId), uniserve_worker_ipc::CallKind>,
 }
 
@@ -93,7 +93,7 @@ struct WorkerSubmission {
 impl WorkerSubmission {
     /// Builds the one submission a worker receives for this batch.
     ///
-    /// A batch carries one computation to one component, so a worker receives
+    /// A batch carries one call to one component, so a worker receives
     /// it once, under one identity, and answers it once. Product inputs the
     /// worker does not yet hold travel as dependencies and hold the submission
     /// in its queue until they resolve. Inputs, KV inputs, and dependencies
@@ -339,6 +339,21 @@ impl WorkerExecutor {
                 .map(|worker| (worker.0.clone(), worker.1.info().clone()))
                 .collect(),
         )?;
+        // The engine states the placement it launched each group with; the
+        // reports do not carry it.
+        executor_info.placements = workers
+            .iter()
+            .map(|(id, worker)| {
+                let (_, components) = worker.placement();
+                (
+                    id.clone(),
+                    crate::executor::PoolPlacement {
+                        queue_depth: worker.queue_depth(),
+                        components: components.clone(),
+                    },
+                )
+            })
+            .collect();
         // The video graph may span workers, so each group learns the whole
         // deployment's routing to name the ranks that read its products.
         let media_routing = executor_info.media_routing()?;
@@ -445,7 +460,7 @@ impl WorkerExecutor {
                                 }
                             }
                             // Shared storage names a segment in one host's namespace.
-                            crate::executor::TransferBackend::Shm => anyhow::ensure!(
+                            crate::executor::TransferBackend::PosixShm => anyhow::ensure!(
                                 !crosses_hosts,
                                 "transfer edge from worker {} on host {source_host} to worker {} \
                              on host {destination_host} crosses hosts over shared storage, \
@@ -465,7 +480,7 @@ impl WorkerExecutor {
         // workers from which it cannot be derived.
         executor_info.runtime_info()?;
 
-        let depth = workers.iter().map(|worker| worker.1.queue_depth()).sum();
+        let depth = executor_info.queue_depth();
         let worker_count = workers.len();
         Ok(Self {
             routing,
@@ -822,7 +837,7 @@ impl WorkerExecutor {
         Ok(admissions)
     }
 
-    /// Includes every admitted or queued owner of this request's computation and products.
+    /// Includes every admitted or queued owner of this request's call and products.
     fn request_workers(&self, request: RequestKey) -> Vec<usize> {
         let mut owners = self
             .admitted_workers
@@ -1585,7 +1600,7 @@ impl Executor for WorkerExecutor {
             // register the producer and holders of its outputs and the
             // worker-local buffer allocations its placement names.
             for (call, placement) in &batch.requests {
-                let variant = call.code;
+                let variant = call.kind;
                 let call_worker =
                     self.routing
                         .get(&placement.worker)
@@ -1791,7 +1806,7 @@ impl Executor for WorkerExecutor {
                         submitted: false,
                         calls: calls
                             .iter()
-                            .map(|(call, _)| ((call.request_key, call.call_id), call.code))
+                            .map(|(call, _)| ((call.request_key, call.call_id), call.kind))
                             .collect(),
                     },
                 );

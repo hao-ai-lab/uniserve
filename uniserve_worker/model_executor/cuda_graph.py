@@ -293,7 +293,7 @@ class CUDAGraphRunner:
 
         With ``warm``, an eager call first warms the kernel specializations
         and prepared resources that ``CUDAGraph.capture`` requires; a caller
-        that has already run the same computation at the same shapes passes
+        that has already run the same call at the same shapes passes
         ``warm=False``. ``warmup`` may complete numerical work outside a
         partial graph, such as its remaining expert exchanges; by default
         it runs ``call``. ``restore``, when given, returns mutated state to its

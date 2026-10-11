@@ -754,7 +754,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                 torch.testing.assert_close(
                     actual[slot][name], expected[slot][name], rtol=0, atol=0
                 )
-        # The two prompt lengths are distinct computations.
+        # The two prompt lengths are distinct calls.
         assert not torch.equal(expected[1]["video"], expected[2]["video"])
 
 

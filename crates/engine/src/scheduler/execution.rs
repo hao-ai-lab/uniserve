@@ -62,7 +62,7 @@ impl Scheduler {
                 }
                 Err(ExecutorSubmitError::Failed(error)) => {
                     // Failure reconciliation owns the pending identities until
-                    // every affected computation has been retired.
+                    // every affected call has been retired.
                     self.on_executor_error(error);
                     return true;
                 }
@@ -74,7 +74,7 @@ impl Scheduler {
     /// Returns whether any rank queue can still accept a batch.
     ///
     /// `queue_depth` bounds the batches in flight on one rank, not across the
-    /// instance: a batch carries one computation to one component, so a media
+    /// instance: a batch carries one call to one component, so a media
     /// pass occupies a slot on each component it touches rather than a single
     /// shared slot. Assembling stops once every rank queue is full.
     fn a_rank_queue_admits(&self) -> bool {
@@ -295,7 +295,7 @@ impl Scheduler {
 fn rejection_cause(call: &Call, error: &generation::GenerationResultError) -> String {
     format!(
         "{error} (call {}.{}, {:?})",
-        call.call_id.batch_id, call.call_id.request_index, call.code
+        call.call_id.batch_id, call.call_id.request_index, call.kind
     )
 }
 
@@ -556,7 +556,7 @@ impl Scheduler {
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .filter_map(|pending| match pending.call.code {
+                .filter_map(|pending| match pending.call.kind {
                     CallKind::Media(media_call) => Some((media_call, pending.input.latent())),
                     _ => None,
                 }),
@@ -620,15 +620,12 @@ impl Scheduler {
             .placement
             .affinity
             .get(&(request, component.to_owned()));
-        let (worker, bound, info) = self
+        let (worker, bound, _) = self
             .placement
             .component_candidates(self.executor.as_ref(), work, component)
             .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))?;
-        let binding = info
-            .components
-            .iter()
-            .find(|component| component.name == bound)?;
-        Some((worker, &binding.config))
+        let config = self.executor.info().component_config(worker, bound)?;
+        Some((worker, config))
     }
 
     /// Returns how many media units one call of this kind covers at once.
@@ -687,13 +684,6 @@ impl Scheduler {
 
         // A call in flight on this worker holds the ranks it was dealt to,
         // or every rank of its component when it names none.
-        let components = self
-            .executor
-            .info()
-            .workers
-            .iter()
-            .find(|(id, _)| id == worker)
-            .map(|(_, info)| &info.components)?;
         let mut held = HashSet::new();
         // The vision and text encodings run one after the other on the text
         // encoder's ranks, which are theirs from the start: between the two
@@ -725,10 +715,11 @@ impl Scheduler {
                     held.extend(range.ranks.iter().map(|rank| *rank as usize));
                 }
                 _ => held.extend(
-                    components
-                        .iter()
-                        .filter(|binding| binding.name == *name)
-                        .flat_map(|binding| binding.config.ranks.iter().copied()),
+                    self.executor
+                        .info()
+                        .component_config(worker, name)
+                        .into_iter()
+                        .flat_map(|binding| binding.ranks.iter().copied()),
                 ),
             }
         }
@@ -761,21 +752,11 @@ impl Scheduler {
     /// Returns `None` for an exclusive lane, and when `worker` is not loaded
     /// or holds no binding named `component`.
     fn device_lane_units(&self, worker: &crate::WorkerId, component: &str) -> Option<u32> {
-        self.executor
-            .info()
-            .workers
-            .iter()
-            .find(|(id, _)| id == worker)
-            .and_then(|(_, info)| {
-                info.components
-                    .iter()
-                    .find(|binding| binding.name == component)
-            })
-            .and_then(|binding| {
-                binding.config.distribution.as_ref().map(|_| {
-                    (binding.config.ranks.len() * binding.config.units_per_rank.max(1)) as u32
-                })
-            })
+        let config = self.executor.info().component_config(worker, component)?;
+        config
+            .distribution
+            .as_ref()
+            .map(|_| (config.ranks.len() * config.units_per_rank.max(1)) as u32)
     }
 
     /// Returns the lanes one media call occupies and how much of each.
@@ -841,25 +822,18 @@ impl Scheduler {
             .placement
             .affinity
             .get(&(request, component.to_owned()));
-        let Some((worker, info)) = self.executor.info().workers.iter().find(|(id, info)| {
-            owner.is_none_or(|owner| id == owner)
-                && info
-                    .components
-                    .iter()
-                    .any(|binding| binding.name == component)
+        let info = self.executor.info();
+        let Some((worker, binding)) = info.workers.iter().find_map(|(id, _)| {
+            if owner.is_some_and(|owner| id != owner) {
+                return None;
+            }
+            Some((id, info.component_config(id, component)?))
         }) else {
             return Vec::new();
         };
-        let Some(binding) = info
-            .components
-            .iter()
-            .find(|binding| binding.name == component)
-        else {
-            return Vec::new();
-        };
-        let ranks = &binding.config.ranks;
-        let per_rank = binding.config.units_per_rank.max(1) as u32;
-        let (width, tasks): (usize, Box<dyn Fn(usize) -> u32>) = match binding.config.distribution {
+        let ranks = &binding.ranks;
+        let per_rank = binding.units_per_rank.max(1) as u32;
+        let (width, tasks): (usize, Box<dyn Fn(usize) -> u32>) = match binding.distribution {
             Some(_) => (
                 (units.max(1) as usize)
                     .div_ceil(per_rank as usize)
@@ -917,7 +891,7 @@ impl Scheduler {
         let mut ledger = LaneLedger::default();
         for (id, queue) in &self.inflight.pending_calls {
             for inflight in queue {
-                let CallKind::Media(media_call) = inflight.call.code else {
+                let CallKind::Media(media_call) = inflight.call.kind else {
                     continue;
                 };
                 if inflight.call.input_image.is_some() {
@@ -1293,7 +1267,7 @@ impl Scheduler {
             request_key,
             call_id,
             component: component.to_owned(),
-            code: work,
+            kind: work,
             bounds: Bounds::default(),
             inputs,
             outputs,
@@ -1704,7 +1678,7 @@ impl Scheduler {
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .any(|call| call.call.code == CallKind::Media(MediaCall::Denoising))
+                .any(|call| call.call.kind == CallKind::Media(MediaCall::Denoising))
     }
 
     /// Counts prompt tokens accepted or present in pending forward inputs.
@@ -1749,7 +1723,7 @@ impl Scheduler {
         let mut feedback_index = state.feedback_encoder_index;
         for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
-            match call.code {
+            match call.kind {
                 // A context prefill adds its prompt tokens and vision blocks.
                 CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => {
                     let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
@@ -1760,7 +1734,7 @@ impl Scheduler {
                 }
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     physical = physical.saturating_add(call.bounds.max_tokens);
-                    if is_feedback_computation(call) {
+                    if is_feedback_call(call) {
                         feedback_index += 1;
                         if feedback_index == state.req.image_generation.feedback_encoders.len() {
                             logical = logical
@@ -1810,7 +1784,7 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .any(|pending| matches!(pending.call.code, CallKind::Forward(_)));
+            .any(|pending| matches!(pending.call.kind, CallKind::Forward(_)));
         Some(CallCoordinates {
             logical_position,
             kv_visible_len,
@@ -1858,9 +1832,9 @@ impl Scheduler {
         let mut images = 0;
         for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
-            if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+            if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                 index = 0;
-            } else if consumes_image_features(call) && is_feedback_computation(call) {
+            } else if consumes_image_features(call) && is_feedback_call(call) {
                 index += 1;
                 if index == state.req.image_generation.feedback_encoders.len() {
                     index = 0;
@@ -1904,8 +1878,8 @@ impl Scheduler {
             .find_map(|pending| select(&pending.call))
     }
 
-    /// Selects the next computation from the last pending input, or from accepted
-    /// request progress when no computation remains. No request state is replayed.
+    /// Selects the next call from the last pending input, or from accepted
+    /// request progress when no call remains. No request state is replayed.
     pub(super) fn next_generation_phase(&self, id: RequestId) -> Option<Phase> {
         let state = self.running.get(&id)?;
         let pending = self
@@ -1914,7 +1888,7 @@ impl Scheduler {
             .get(&id)
             .and_then(|queue| queue.back());
         let phase = match pending.map(|pending| &pending.call) {
-            Some(call) => match call.code {
+            Some(call) => match call.kind {
                 CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => Phase::Prefill,
                 CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     Phase::Prefill
@@ -1936,7 +1910,7 @@ impl Scheduler {
                 }
                 CallKind::Forward(ForwardMode::TokenDenoising) => Phase::Readout,
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
-                    if is_feedback_computation(call) {
+                    if is_feedback_call(call) {
                         if self.scheduled_feedback(id)?.0 == 0 {
                             Phase::DecodeUnd
                         } else {
@@ -1955,7 +1929,7 @@ impl Scheduler {
                 CallKind::Media(MediaCall::ImageDecoding) => Phase::FeedbackEncode,
                 CallKind::Media(MediaCall::VisionEncoding)
                 | CallKind::Media(MediaCall::LatentEncoding)
-                    if is_feedback_computation(call) =>
+                    if is_feedback_call(call) =>
                 {
                     Phase::FeedbackState
                 }
@@ -2018,7 +1992,7 @@ impl Scheduler {
             return self.state_predecessor(id);
         };
         // Accepted lengths are published in device request state; the successor
-        // needs the producing computation identity while its host report is pending.
+        // needs the producing call identity while its host report is pending.
         Some(call.call_id)
     }
 
@@ -2135,7 +2109,7 @@ impl Scheduler {
         // prompt/decode pipelining, using each predecessor's actual inputs.
         if target == CallKind::Forward(ForwardMode::Decode) {
             let feedback_continuation = consumes_image_features(&predecessor.call)
-                && is_feedback_computation(&predecessor.call)
+                && is_feedback_call(&predecessor.call)
                 && self
                     .scheduled_feedback(id)
                     .is_some_and(|(index, _)| index == 0)
@@ -2152,7 +2126,7 @@ impl Scheduler {
                 || (state.phase == Phase::Prefill && state.starts_gen_after_context())
                 || queue.iter().any(|call| {
                     !matches!(
-                        call.call.code,
+                        call.call.kind,
                         CallKind::Forward(ForwardMode::Prefill)
                             | CallKind::Forward(ForwardMode::Decode)
                     )
@@ -2225,7 +2199,7 @@ impl Scheduler {
         }
     }
 
-    /// Determines the next pipelined computation from its submitted predecessor.
+    /// Determines the next pipelined call from its submitted predecessor.
     ///
     /// Returns `None`, among other cases, when the request is not running or
     /// has no call in flight, has not yet submitted its whole prompt or every
@@ -2245,12 +2219,12 @@ impl Scheduler {
             return None;
         }
         let last = &self.inflight.pending_calls.get(&id)?.back()?.call;
-        let chainable = if last.code == CallKind::Media(MediaCall::ImageDecoding) {
+        let chainable = if last.kind == CallKind::Media(MediaCall::ImageDecoding) {
             state.req.feeds_back_images()
                 && state.req.image_generation.feedback_source
                     == Some(uniserve_core::FeedbackSource::DeviceProduct)
         } else if consumes_image_features(last)
-            && is_feedback_computation(last)
+            && is_feedback_call(last)
             && self.scheduled_feedback(id)?.0 == 0
         {
             state.req.image_generation.sample_feedback_continuation
@@ -2272,7 +2246,7 @@ impl Scheduler {
             Phase::FeedbackEncode => {
                 let feedback = &state.req.image_generation;
                 feedback.feedback_source.as_ref()?;
-                generation::encoder_call(
+                CallKind::Media(
                     feedback
                         .feedback_encoders
                         .get(self.scheduled_feedback(id)?.0)?
@@ -2364,7 +2338,7 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .map(|pending| output_bound(pending.call.code))
+            .map(|pending| output_bound(pending.call.kind))
             .sum::<usize>();
         let next = self
             .peek_next_call_variant(id)
@@ -2385,7 +2359,7 @@ impl Scheduler {
     /// `reserve_generation_resources`.
     pub(super) fn register_inflight(&mut self, call: Call, input: InflightInput, queue_us: u64) {
         let request_id = call.request_key.request_id;
-        let domain = self.stats.domains.get(call.code);
+        let domain = self.stats.domains.get(call.kind);
         let active = domain.active_credits.fetch_add(1, Ordering::Relaxed) + 1;
         domain.peak_credits.fetch_max(active, Ordering::Relaxed);
         domain.launched_calls.fetch_add(1, Ordering::Relaxed);
@@ -2397,11 +2371,11 @@ impl Scheduler {
             .push_back(InflightCall { call, input });
     }
 
-    /// Counts one backpressure event against the metrics domain of `computation`.
-    pub(super) fn record_domain_backpressure(&self, computation: uniserve_worker_ipc::CallKind) {
+    /// Counts one backpressure event against the metrics domain of `call`.
+    pub(super) fn record_domain_backpressure(&self, call: uniserve_worker_ipc::CallKind) {
         self.stats
             .domains
-            .get(computation)
+            .get(call)
             .backpressure_events
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -2422,13 +2396,13 @@ impl Scheduler {
     }
 
     /// Counts one returned call, and a predicated or failed status, against
-    /// the metrics domain of `computation`.
+    /// the metrics domain of `call`.
     pub(super) fn record_domain_completion(
         &self,
-        computation: uniserve_worker_ipc::CallKind,
+        call: uniserve_worker_ipc::CallKind,
         status: CallStatus,
     ) {
-        let stats = self.stats.domains.get(computation);
+        let stats = self.stats.domains.get(call);
         stats.completed_calls.fetch_add(1, Ordering::Relaxed);
         match status {
             CallStatus::Ok => {}
@@ -2446,15 +2420,11 @@ impl Scheduler {
     ///
     /// A reclaim with no active credit is logged as an accounting defect and
     /// changes no counter.
-    pub(super) fn reclaim_domain_credit(
-        &self,
-        computation: uniserve_worker_ipc::CallKind,
-        failed: bool,
-    ) {
-        let stats = self.stats.domains.get(computation);
+    pub(super) fn reclaim_domain_credit(&self, call: uniserve_worker_ipc::CallKind, failed: bool) {
+        let stats = self.stats.domains.get(call);
         let active = stats.active_credits.load(Ordering::Relaxed);
         if active == 0 {
-            tracing::error!(?computation, "domain call credit accounting underflowed");
+            tracing::error!(?call, "domain call credit accounting underflowed");
             return;
         }
         stats.active_credits.fetch_sub(1, Ordering::Relaxed);
@@ -2470,7 +2440,7 @@ impl Scheduler {
     /// calls whose credits it returns.
     pub(super) fn fail_inflight_domain_credits(&self) {
         for inflight in self.inflight.pending_calls.values().flatten() {
-            self.reclaim_domain_credit(inflight.call.code, true);
+            self.reclaim_domain_credit(inflight.call.kind, true);
         }
     }
 
@@ -2521,7 +2491,7 @@ impl Scheduler {
                     self.emit(id, event);
                 }
                 record.status = CallStatus::Error;
-                record.error_code = Some(uniserve_worker_ipc::ErrorCode::ResourceExhausted);
+                record.error_code = Some(uniserve_worker_ipc::ErrorCode::ResourceError);
                 None
             }
         };
@@ -2573,12 +2543,12 @@ impl Scheduler {
 
         // Only the final muxing call, the one that carries no media units,
         // returns the artifact; every other call returns none.
-        let media_output_valid = if call.code == CallKind::Media(MediaCall::Muxing) {
+        let media_output_valid = if call.kind == CallKind::Media(MediaCall::Muxing) {
             media.is_some() == call.inputs.is_empty()
         } else {
             media.is_none()
         };
-        let step_valid = call.code != CallKind::Media(MediaCall::Denoising)
+        let step_valid = call.kind != CallKind::Media(MediaCall::Denoising)
             || latent
                 .as_ref()
                 .is_some_and(|interval| Denoising::completes(interval, record.num_completed_steps));
@@ -2613,7 +2583,7 @@ impl Scheduler {
                 // vision features with the text encoding, the pixels with the
                 // last visual latent round, the PCM with the audio latent
                 // encoding, and the condition rows with latent preparation.
-                match call.code {
+                match call.kind {
                     CallKind::Media(MediaCall::VisionEncoding) => {
                         consumed_products
                             .extend(state.condition_media.remove(product::VISION_PIXELS));
@@ -2687,7 +2657,7 @@ impl Scheduler {
                     _ => {}
                 }
 
-                let phase = match call.code {
+                let phase = match call.kind {
                     CallKind::Media(
                         MediaCall::MediaReading
                         | MediaCall::VisionEncoding
@@ -2709,7 +2679,7 @@ impl Scheduler {
                         | MediaCall::AudioEncoding,
                     ) => "decoding",
                     CallKind::Media(MediaCall::Muxing) => "finalizing",
-                    _ => unreachable!("media request completed a non-media computation"),
+                    _ => unreachable!("media request completed a non-media call"),
                 };
                 let _ = state.output.enqueue(EngineCoreOutput::MediaProgress {
                     phase: phase.to_owned(),
@@ -2845,7 +2815,7 @@ impl Scheduler {
         call_id: CallId,
     ) -> Option<(Call, InflightInput)> {
         let inflight = self.inflight.pop_pending_call(request_key, call_id)?;
-        self.reclaim_domain_credit(inflight.call.code, false);
+        self.reclaim_domain_credit(inflight.call.kind, false);
         Some((inflight.call, inflight.input))
     }
 
@@ -2882,19 +2852,17 @@ impl Scheduler {
     /// executor errors and control-plane invariant violations remain fatal.
     ///
     /// A `WorkerFailure` is reconciled by `fail_after_worker_failure`; the
-    /// worker codes `SchedulerBug` and `InvariantViolation` also latch
-    /// engine-fatal. Losing every execution-capable worker also stops the
+    /// worker code `InvariantViolation` also latches engine-fatal. Losing every execution-capable worker also stops the
     /// engine, so later admissions cannot wait for capacity that will never
     /// return. Any other error latches engine-fatal and fails every in-flight
     /// call.
     pub(super) fn on_executor_error(&mut self, error: anyhow::Error) {
         if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
-            let execution = failure.execution.as_ref();
-            let code = execution.and_then(|value| value.code.as_deref());
-            if matches!(code, Some("SchedulerBug" | "InvariantViolation")) {
+            let code = failure.execution.as_ref().map(|value| value.code);
+            if code == Some(uniserve_worker_ipc::ErrorCode::InvariantViolation) {
                 self.fatal = true;
                 tracing::error!(worker = %failure.worker_id, ?code, "control-plane invariant failed: {error}");
-            } else if code == Some("InputError") {
+            } else if code == Some(uniserve_worker_ipc::ErrorCode::InputError) {
                 tracing::info!(worker = %failure.worker_id, ?code, "Worker rejected request: {error}");
             } else if !failure.refusals.is_empty()
                 && failure
@@ -2986,7 +2954,7 @@ impl Scheduler {
                 invalid_result = true;
                 continue;
             }
-            let Some(computation) = self
+            let Some(call) = self
                 .inflight
                 .pending_calls
                 .get(&record.request_key.request_id)
@@ -2995,13 +2963,13 @@ impl Scheduler {
                         .iter()
                         .find(|inflight| inflight.call.call_id == record.call_id)
                 })
-                .map(|inflight| inflight.call.code)
+                .map(|inflight| inflight.call.kind)
             else {
                 invalid_result = true;
                 continue;
             };
             // A group's batch timing is the maximum of each phase over its calls.
-            let component = returned_groups[super::stats::ExecutionDomainStats::index(computation)]
+            let component = returned_groups[super::stats::ExecutionDomainStats::index(call)]
                 .get_or_insert(TimingCounters::default());
             component.queued_us = component.queued_us.max(record.timing_counters.queued_us);
             component.device_us = component.device_us.max(record.timing_counters.device_us);
@@ -3029,7 +2997,7 @@ impl Scheduler {
         let forward_stats = report.forward_stats;
         for result in &report.results {
             let record = &result.output;
-            if let Some(computation) = self
+            if let Some(call) = self
                 .inflight
                 .pending_calls
                 .get(&record.request_key.request_id)
@@ -3038,9 +3006,9 @@ impl Scheduler {
                         .iter()
                         .find(|inflight| inflight.call.call_id == record.call_id)
                 })
-                .map(|inflight| inflight.call.code)
+                .map(|inflight| inflight.call.kind)
             {
-                self.record_domain_completion(computation, record.status);
+                self.record_domain_completion(call, record.status);
             }
         }
         for (index, returned) in returned_groups.into_iter().enumerate() {
@@ -3151,7 +3119,7 @@ impl Scheduler {
                     continue;
                 };
 
-                let call_variant = call.code;
+                let call_variant = call.kind;
 
                 // Media calls update their independent call progress immediately;
                 // generation calls continue through semantic validation.
@@ -3260,7 +3228,7 @@ impl Scheduler {
                     .is_some_and(|state| state.terminal_intent.is_terminal())
                     || self.inflight.pending_finishes.contains_key(&id);
                 if semantic_blocked {
-                    if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+                    if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                         self.free_request_latent(id);
                     }
                     self.finish_pending_if_idle(id);
@@ -3281,7 +3249,7 @@ impl Scheduler {
                 // An accepted forward extends the request's KV: publish the
                 // prompt pages it completed, then retire sliding-window pages
                 // no later reader needs.
-                if progress_result.is_some() && matches!(call.code, CallKind::Forward(_)) {
+                if progress_result.is_some() && matches!(call.kind, CallKind::Forward(_)) {
                     self.advance_request_kv(id);
                 }
 
@@ -3325,7 +3293,7 @@ impl Scheduler {
                 {
                     prefix.diffusion_finalized = true;
                 }
-                if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+                if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                     self.free_request_latent(id);
                 }
                 if free_flow_prefix {
@@ -3394,7 +3362,7 @@ impl Scheduler {
             for (_priority, _seq_index, id, call, record, media, public_tokens_before) in to_resolve
             {
                 let token_call = matches!(
-                    call.code,
+                    call.kind,
                     CallKind::Forward(ForwardMode::Prefill)
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)
@@ -3665,7 +3633,7 @@ impl Scheduler {
                 );
                 return;
             };
-            self.reclaim_domain_credit(inflight.call.code, true);
+            self.reclaim_domain_credit(inflight.call.kind, true);
         }
         for batch in pending {
             if batch.requests.is_empty() && batch.commands.is_empty() {

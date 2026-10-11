@@ -47,19 +47,19 @@ def test_exhausted_vmm_pool_delivers_host_fallback_and_restores_quota():
     page = allocation_granularity(device)
     events = EventPool()
     transports = make_transports(
-        ("cuda_vmm", "shm"),
+        ("cuda_vmm", "posix_shm"),
         byte_capacity=page,
         ticket_capacity=2,
         event_pool=events,
         host_slots=(0,),
     )
     consumer = make_transports(
-        ("shm",),
+        ("posix_shm",),
         byte_capacity=page,
         ticket_capacity=2,
         event_pool=events,
         acknowledgment_slot=0,
-    )["shm"]
+    )["posix_shm"]
     # One physical page fits the payload but cannot also hold the VMM chunk's
     # acknowledgment header. Its logical byte lease must survive fallback.
     source = torch.arange(page // 4, dtype=torch.float32, device=device)
@@ -126,7 +126,7 @@ def test_exhausted_vmm_pool_without_another_mechanism_refuses_the_product():
         events.close()
 
 
-@pytest.mark.parametrize("backend", ("local", "shm", "cuda_vmm"))
+@pytest.mark.parametrize("backend", ("local", "posix_shm", "cuda_vmm"))
 def test_transfer_writes_only_the_reserved_destination(backend: str) -> None:
     device = torch.device("cuda:0")
     events = EventPool()
@@ -159,7 +159,7 @@ def test_transfer_writes_only_the_reserved_destination(backend: str) -> None:
         events.close()
 
 
-@pytest.mark.parametrize("backend", ("local", "shm", "cuda_vmm"))
+@pytest.mark.parametrize("backend", ("local", "posix_shm", "cuda_vmm"))
 def test_transfer_scatters_exactly_into_disjoint_page_spans(
     backend: str,
 ) -> None:
@@ -602,10 +602,10 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
     context = mp.get_context("spawn")
     events = EventPool()
     transport = make_transport(
-        "shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
     )
     consumer = make_transport(
-        "shm", byte_capacity=4096, ticket_capacity=1, event_pool=events
+        "posix_shm", byte_capacity=4096, ticket_capacity=1, event_pool=events
     )
     readers = []
     locator = None
@@ -801,10 +801,10 @@ def test_shm_producer_failure_fails_its_pending_read_and_preserves_independent_r
     process = context.Process(target=serve_pending_publication, args=(child,))
     events = EventPool()
     consumer = make_transport(
-        "shm", byte_capacity=16384, ticket_capacity=4, event_pool=events
+        "posix_shm", byte_capacity=16384, ticket_capacity=4, event_pool=events
     )
     producer = make_transport(
-        "shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
     )
     healthy = None
     process.start()
@@ -862,10 +862,10 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
     )
     events = EventPool()
     consumer = make_transport(
-        "shm", byte_capacity=4096, ticket_capacity=1, event_pool=events
+        "posix_shm", byte_capacity=4096, ticket_capacity=1, event_pool=events
     )
     producer = make_transport(
-        "shm", byte_capacity=4096, ticket_capacity=1, event_pool=events
+        "posix_shm", byte_capacity=4096, ticket_capacity=1, event_pool=events
     )
     buffers = BufferPool(byte_capacity=4096, devices=("cpu",))
     if owner == "encoder":
@@ -1018,7 +1018,7 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
     ("backend", "fields"),
     (
         ("local", (("node", "another-node"), ("address_space", "another"))),
-        ("shm", (("node", "another-node"),)),
+        ("posix_shm", (("node", "another-node"),)),
     ),
 )
 def test_read_refuses_a_publication_addressed_elsewhere(
