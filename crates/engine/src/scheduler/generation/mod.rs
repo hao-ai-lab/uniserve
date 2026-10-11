@@ -896,7 +896,6 @@ pub(super) fn plan_diffusion_finalize(
 
 /// Derives storage bounds directly from the computation's actual inputs and outputs.
 ///
-/// `max_latent_bytes` is the largest encoder, latent, or image output.
 /// `max_completion_bytes` covers the logprob payload of a token-producing call
 /// plus, for image decoding, the base64 PNG. `max_kv_units` starts at zero;
 /// `Scheduler::plan_computation` sets it for forward calls.
@@ -905,14 +904,6 @@ fn finish_plan(
     mut call: Call,
     prompt_positions: u32,
 ) -> Result<Call, PlanningError> {
-    let max_latent_bytes = call
-        .encoder_output
-        .iter()
-        .chain(call.latent_output.iter())
-        .chain(call.image_output.iter())
-        .map(TensorRef::max_bytes)
-        .max()
-        .unwrap_or(0);
     let image_completion_bytes = if call.code == CallKind::Media(MediaCall::ImageDecoding) {
         png_base64_bound(request.image.width, request.image.height)?
     } else {
@@ -927,7 +918,6 @@ fn finish_plan(
     call.bounds = Bounds {
         max_tokens: call.bounds.max_tokens,
         max_kv_units: 0,
-        max_latent_bytes,
         max_completion_bytes: logprob_bytes.saturating_add(image_completion_bytes),
         max_transfer_bytes,
     };

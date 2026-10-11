@@ -208,9 +208,7 @@ fn image<'a>(
             width: v.width,
             seed: v.seed,
             negative_prompt,
-            max_images: v.max_images,
             image_prompts,
-            retain_images: v.retain_images,
         },
     )
 }
@@ -479,8 +477,6 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
     // The schema has no `Bounds` table: the bounds are scalar fields of the
     // `Call` table, which `call_from_table` reassembles.
     let max_tokens = v.bounds.max_tokens;
-    let max_kv_units = v.bounds.max_kv_units;
-    let max_latent_bytes = v.bounds.max_latent_bytes;
     let max_completion_bytes = v.bounds.max_completion_bytes;
     let max_transfer_bytes = v.bounds.max_transfer_bytes;
 
@@ -568,8 +564,6 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             component,
             code: Some(&code),
             max_tokens,
-            max_kv_units,
-            max_latent_bytes,
             max_completion_bytes,
             max_transfer_bytes,
             inputs,

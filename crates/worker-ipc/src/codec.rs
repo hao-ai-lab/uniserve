@@ -775,8 +775,7 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
         code: computation_from_fb(call.code())?,
         bounds: Bounds {
             max_tokens: call.max_tokens(),
-            max_kv_units: call.max_kv_units(),
-            max_latent_bytes: call.max_latent_bytes(),
+            max_kv_units: 0,
             max_completion_bytes: call.max_completion_bytes(),
             max_transfer_bytes: call.max_transfer_bytes(),
         },
@@ -1328,12 +1327,12 @@ fn image_from_table(image: fbs::ImageParams<'_>) -> CodecResult<uniserve_core::I
             .negative_prompt()
             .map(str::to_string)
             .unwrap_or_default(),
-        max_images: image.max_images(),
+        max_images: 1,
         image_prompts: image
             .image_prompts()
             .map(|items| items.iter().map(str::to_string).collect())
             .unwrap_or_default(),
-        retain_images: image.retain_images(),
+        retain_images: true,
     })
 }
 

@@ -1401,10 +1401,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                     call_id=call_id,
                     coordinates=CallCoordinates(),
                     kind=MediaCall.LATENT_PREPARATION,
-                    bounds=Bounds(
-                        max_tokens=1,
-                        max_latent_bytes=max_latent_elements * 2,
-                    ),
+                    bounds=Bounds(max_tokens=1),
                     kv_input=conditioning,
                     latent_output=initial_latent,
                     completion_output=ready,
@@ -1451,10 +1448,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                         call_id=call_id,
                         coordinates=CallCoordinates(flow_step=quantum),
                         kind=MediaCall.DENOISING,
-                        bounds=Bounds(
-                            max_tokens=1,
-                            max_latent_bytes=max_latent_elements * 2,
-                        ),
+                        bounds=Bounds(max_tokens=1),
                         kv_input=conditioning,
                         latent_input=current,
                         latent_output=output,

@@ -486,9 +486,7 @@ def test_image_context_preserves_readout_and_next_token(
                     call_id=CallId(1, 0),
                     coordinates=CallCoordinates(0, 0, 0),
                     kind=MediaCall.VISION_ENCODING,
-                    bounds=Bounds(
-                        max_tokens=soft, max_latent_bytes=feature.max_bytes
-                    ),
+                    bounds=Bounds(max_tokens=soft),
                     input_image=image,
                     encoder_output=feature,
                 ),
@@ -601,7 +599,7 @@ def _encode(batch, image, soft):
         batch,
         MediaCall.VISION_ENCODING,
         4,
-        bounds=Bounds(max_tokens=soft, max_latent_bytes=feature.max_bytes),
+        bounds=Bounds(max_tokens=soft),
         input_image=image,
         encoder_output=feature,
     )

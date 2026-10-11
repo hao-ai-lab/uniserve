@@ -170,7 +170,6 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
         code: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
-            max_latent_bytes: 8192,
             ..Bounds::default()
         },
         inputs: Vec::new(),
@@ -2697,7 +2696,6 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         code: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
-            max_latent_bytes: 8192,
             ..Bounds::default()
         },
         inputs: Vec::new(),
@@ -2827,7 +2825,6 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: feature.max_bytes(),
-            max_latent_bytes: feature.max_bytes(),
             ..Bounds::default()
         },
         inputs: Vec::new(),

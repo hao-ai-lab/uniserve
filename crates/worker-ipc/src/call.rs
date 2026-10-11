@@ -342,19 +342,19 @@ impl CallKind {
 
 /// Hard resource maxima the scheduler reserves before a call runs.
 ///
-/// [`Call::validate`] checks `max_tokens` against `input_token_ids` and
-/// `max_latent_bytes` against encoder, latent, and image outputs;
+/// [`Call::validate`] checks `max_tokens` against `input_token_ids`;
 /// [`Batch::validate`] checks `max_transfer_bytes` against installed KV
-/// inputs. Neither checks `max_kv_units` or `max_completion_bytes`.
+/// inputs. Neither checks `max_completion_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Bounds {
     /// Maximum tokens the call may process or produce.
     pub max_tokens: u32,
     /// Paged-KV units newly allocated to the request's tables and first
-    /// declared to workers by this call.
+    /// declared to workers by this call. The engine's own accounting: it is
+    /// not on the wire, since a worker learns the units from the batch's
+    /// `new_cache_units`, and a decoded call states zero.
+    #[serde(skip)]
     pub max_kv_units: u32,
-    /// Maximum latent storage in bytes.
-    pub max_latent_bytes: u64,
     /// Maximum host-visible completion data in bytes.
     pub max_completion_bytes: u64,
     /// Maximum cross-call transfer data in bytes.
@@ -694,8 +694,8 @@ impl Call {
     /// Checks identity, component, coordinates, the token bound, canonical
     /// sampling-state sets, the encoded-image source, KV publication
     /// identities, product ownership, generations, output indices, dtypes and
-    /// byte bounds, cross-request inputs, the predicate, and a positive image
-    /// index. Relationships to other calls and to the batch's allocation
+    /// cross-request inputs, the predicate, and a positive image index.
+    /// Relationships to other calls and to the batch's allocation
     /// tables belong to [`Batch::validate`].
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish call identity, component, coordinates, and token capacity.
@@ -820,17 +820,6 @@ impl Call {
             );
         }
 
-        for output in self
-            .encoder_output
-            .iter()
-            .chain(self.latent_output.iter())
-            .chain(self.image_output.iter())
-        {
-            ensure_valid!(
-                output.max_bytes() <= self.bounds.max_latent_bytes,
-                "image or trajectory output exceeds its declared byte capacity"
-            );
-        }
         if let Some(input) = &self.token_input {
             ensure_valid!(
                 self.code == CallKind::Transfer(TransferMode::Tensor),

@@ -171,12 +171,10 @@ class ImageParams:
     width: int = 512
     seed: int | None = None
     negative_prompt: str = ""
-    max_images: int = 1
     image_prompts: tuple[str, ...] = ()
-    retain_images: bool = True
 
     def __post_init__(self) -> None:
-        """Validate schedule, dimensions, guidance, image count, and seed.
+        """Validate schedule, dimensions, guidance, and seed.
 
         Raises:
             WorkerError: A field is out of range or not finite, a dimension
@@ -213,8 +211,6 @@ class ImageParams:
             raise invalid_descriptor("image.cfg_interval must be ordered")
         if not self.cfg_renorm_type.strip():
             raise invalid_descriptor("image.cfg_renorm_type must not be empty")
-        if not 1 <= self.max_images <= 256:
-            raise invalid_descriptor("image.max_images must be in 1..=256")
         if self.seed is not None:
             _nonnegative(self.seed, "image.seed")
 
@@ -224,15 +220,12 @@ class Bounds:
     """Resource ceilings the scheduler reserves before a call runs.
 
     Zero means the call may use none of that resource. The Rust
-    `Call::validate` checks `max_tokens` against the input token ids and
-    `max_latent_bytes` against encoder, latent, and image outputs;
+    `Call::validate` checks `max_tokens` against the input token ids, and
     `Batch.validate` checks `max_transfer_bytes` against installed KV
     transfers.
     """
 
     max_tokens: int = 0
-    max_kv_units: int = 0
-    max_latent_bytes: int = 0
     max_completion_bytes: int = 0
     max_transfer_bytes: int = 0
 

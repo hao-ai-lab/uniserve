@@ -115,9 +115,7 @@ table ImageParams {
   width:uint;
   seed:ulong = null;
   negative_prompt:string;
-  max_images:ushort;
   image_prompts:[string];
-  retain_images:bool = true;
 }
 
 /// One cache group of a worker's unit pool, decoded into
@@ -352,13 +350,10 @@ table Call {
   coordinates:CallCoordinates;
   component:string (required);
   code:CallKind (required);
-  // Scheduler-reserved maxima, decoded into `Bounds`. `max_tokens` and
-  // `max_latent_bytes` are checked by `Call::validate` and
-  // `max_transfer_bytes` by `Batch::validate`; neither validator checks
-  // `max_kv_units` or `max_completion_bytes`.
+  // Scheduler-reserved maxima, decoded into `Bounds`. `max_tokens` is
+  // checked by `Call::validate` and `max_transfer_bytes` by
+  // `Batch::validate`; neither validator checks `max_completion_bytes`.
   max_tokens:uint;
-  max_kv_units:uint;
-  max_latent_bytes:ulong;
   max_completion_bytes:ulong;
   max_transfer_bytes:ulong;
   inputs:[TensorRef];

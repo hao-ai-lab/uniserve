@@ -786,7 +786,6 @@ def token_call(
         kind=mode,
         bounds=Bounds(
             max_tokens=max(1, len(tokens)),
-            max_kv_units=len(added),
             max_completion_bytes=((1 << 16) - 1 if logprobs else 0),
         ),
         input_token_ids=tuple(int(value) for value in tokens),
@@ -832,7 +831,7 @@ def encode_call(
         # that encodes images from its own component names that component,
         # while one that encodes from its language backbone names "model".
         component=component,
-        bounds=Bounds(max_tokens=64, max_latent_bytes=8_192),
+        bounds=Bounds(max_tokens=64),
         input_image=image_base64,
         image_input=source_product,
         encoder_output=output_ref,
@@ -874,7 +873,7 @@ def diffusion_prepare_call(
         call_id=call_id,
         coordinates=CallCoordinates(),
         kind=MediaCall.LATENT_PREPARATION,
-        bounds=Bounds(max_tokens=1, max_latent_bytes=latent.max_bytes),
+        bounds=Bounds(max_tokens=1),
         kv_input=conditioning,
         latent_output=latent,
         completion_output=ready,
@@ -908,7 +907,7 @@ def diffusion_step_call(
         call_id=call_id,
         coordinates=CallCoordinates(),
         kind=MediaCall.DENOISING,
-        bounds=Bounds(max_tokens=int(steps), max_latent_bytes=output.max_bytes),
+        bounds=Bounds(max_tokens=int(steps)),
         kv_input=conditioning,
         latent_input=latent,
         latent_output=output,
@@ -966,7 +965,6 @@ def diffusion_finalize_call(
         coordinates=CallCoordinates(),
         kind=MediaCall.IMAGE_DECODING,
         bounds=Bounds(
-            max_latent_bytes=(3 * 16 * 16 * 2 if feedback_source else 0),
             max_completion_bytes=65_536,
         ),
         latent_input=latent,

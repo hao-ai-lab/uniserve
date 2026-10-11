@@ -545,7 +545,7 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
 ):
     worker = execution_worker(queue_depth=3)
     admission = umm_params(
-        12, ImageParams(steps=1, height=16, width=16, seed=29, max_images=2)
+        12, ImageParams(steps=1, height=16, width=16, seed=29)
     )
     try:
         conditioning = _publish_conditioning(
@@ -1627,7 +1627,6 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         kind=TransferMode.TENSOR,
         bounds=Bounds(
             max_transfer_bytes=source.max_bytes,
-            max_latent_bytes=output.max_bytes,
         ),
         vision_inputs=(VisionInput(0, source),),
         encoder_output=output,
@@ -1940,7 +1939,6 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             kind=TransferMode.TENSOR,
             bounds=Bounds(
                 max_transfer_bytes=final_latent.max_bytes,
-                max_latent_bytes=exported_latent.max_bytes,
             ),
             latent_input=final_latent,
             latent_output=exported_latent,
@@ -2117,7 +2115,7 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
     worker = execution_worker(transfer_backends=("shm",))
     admission = umm_params(
         76,
-        ImageParams(steps=1, height=16, width=16, seed=31, retain_images=True),
+        ImageParams(steps=1, height=16, width=16, seed=31),
     )
     try:
         conditioning = _publish_conditioning(
@@ -2231,9 +2229,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         understanding.request_key,
         request_pool_idx=understanding.request_pool_idx,
         generation=understanding.generation,
-        image=ImageParams(
-            steps=2, height=16, width=16, seed=29, retain_images=True
-        ),
+        image=ImageParams(steps=2, height=16, width=16, seed=29),
     )
     extend = token_call(
         admission.request_key,

@@ -426,8 +426,6 @@ impl<'py> RequestConversion<'py> {
         ))?;
         let bounds = self.types.bounds.bind(self.py).call1((
             call.bounds.max_tokens,
-            call.bounds.max_kv_units,
-            call.bounds.max_latent_bytes,
             call.bounds.max_completion_bytes,
             call.bounds.max_transfer_bytes,
         ))?;
@@ -1092,12 +1090,10 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
         intern!(py, "negative_prompt"),
         image.negative_prompt.as_str(),
     )?;
-    dict.set_item(intern!(py, "max_images"), image.max_images)?;
     dict.set_item(
         intern!(py, "image_prompts"),
         PyTuple::new(py, image.image_prompts.iter().map(|prompt| prompt.as_str()))?,
     )?;
-    dict.set_item(intern!(py, "retain_images"), image.retain_images)?;
     construct(py, "ImageParams", &dict)
 }
 
@@ -2242,7 +2238,6 @@ mod tests {
             code: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,
-                max_kv_units: 1,
                 ..Bounds::default()
             },
             inputs: Vec::new(),
@@ -2659,16 +2654,12 @@ mod tests {
                         &call,
                         &[
                             "bounds.max_tokens",
-                            "bounds.max_kv_units",
-                            "bounds.max_latent_bytes",
                             "bounds.max_completion_bytes",
                             "bounds.max_transfer_bytes",
                         ],
                     ),
                     [
                         u64::from(submitted.bounds.max_tokens),
-                        u64::from(submitted.bounds.max_kv_units),
-                        submitted.bounds.max_latent_bytes,
                         submitted.bounds.max_completion_bytes,
                         submitted.bounds.max_transfer_bytes,
                     ]
