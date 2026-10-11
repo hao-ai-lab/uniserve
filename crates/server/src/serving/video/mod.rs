@@ -377,7 +377,7 @@ mod tests {
             panic!("not an image reference");
         };
         assert_eq!((size.width, size.height), (3648, 2048));
-        assert_eq!(plan.conditions[0].video_rows, 7296);
+        assert_eq!(plan.conditions[0].latent_units(plan.canvas, 1), [7296]);
 
         let label = "<Picture 1>: ".chars().count();
         let tags = &processed.presentation.tags;

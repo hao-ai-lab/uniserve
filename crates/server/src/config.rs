@@ -89,7 +89,8 @@ pub struct EngineSettings {
     pub video_aspect_ratios: Vec<crate::profile::omni::resolution::ResolutionName>,
     /// Most denoiser rows a video request's conditions may take
     /// (`--max-condition-rows`). Video workers provision their condition
-    /// products for it, and the video service rejects requests above it.
+    /// products for it, and the worker that packs a request's conditions
+    /// refuses one above it.
     /// `None` provisions the largest condition set the deployment's
     /// denoiser admits, so no request is refused for its conditions.
     pub max_condition_rows: Option<u32>,
