@@ -604,9 +604,6 @@ class ModelExecutor:
                 owner = CUDAStream(
                     device=binding.device,
                     stream=torch.cuda.Stream(device=binding.device),
-                    sm_count=torch.cuda.get_device_properties(
-                        binding.device
-                    ).multi_processor_count,
                 )
             # Weights and runtime backing are initialized before their first
             # borrowed use. Later calls depend on tensor fences, not other
@@ -735,9 +732,6 @@ class ModelExecutor:
                             CUDAStream(
                                 device=target,
                                 stream=torch.cuda.Stream(device=target),
-                                sm_count=torch.cuda.get_device_properties(
-                                    target
-                                ).multi_processor_count,
                                 event_slots=event_slots,
                             ),
                         )
@@ -2041,15 +2035,14 @@ class ModelExecutor:
                 entry.peers[index].microbatch_joins = joins
 
     def complete_startup(self):
-        """Seal startup: check captured-graph storage budgets and stream grants.
+        """Seal startup: check captured-graph storage budgets.
 
         Afterwards no runner captures: the staged entries capture no
         further batch graphs, module entries, including ones prepared later,
         evaluate signatures without a resident graph eagerly, and the
         denoiser runner refuses capture (see ``ModelRunner``), so the graph
         storage is sealed (``GraphStorage.seal``). Raises ``CUDAGraphError``
-        when graph residency exceeds its budget, and ``CUDAError`` when a
-        lane stream has lost its SM partition.
+        when graph residency exceeds its budget.
         """
         self.graph_storage.check()
         # Resident storage by device and, for graph pools, by runner kind,
@@ -2086,8 +2079,6 @@ class ModelExecutor:
                 used / 2**30,
             )
 
-        for _, stream in self._lane_streams:
-            stream.verify()
         self.graph_storage.seal()
 
         # Warmup and capture have now prepared the call sites and resolved
