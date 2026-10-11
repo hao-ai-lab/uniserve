@@ -208,7 +208,8 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                     references,
                     Arc::clone(&tokenizer),
                 )
-                .context("failed to bind the video denoiser")?,
+                .context("failed to bind the video denoiser")?
+                .with_condition_rows(config.engine.max_condition_rows),
             )
         }
     };
