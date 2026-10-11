@@ -33,10 +33,8 @@ from uniserve_worker.protocol.batch import GenerationParams, NewRequest
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
-    DrawLayout,
     ErrorCode,
     ForwardMode,
-    Rng,
     SamplingState,
 )
 from uniserve_worker.protocol.identity import CallId
@@ -64,11 +62,6 @@ def test_logprob_reporting_does_not_change_sample_selection(device, request):
         predecessor=root_parent(first),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
-        rng=Rng(
-            seed=71,
-            semantic_index_base=2,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
     second_op = token_call(
         second.request_key,
@@ -77,11 +70,6 @@ def test_logprob_reporting_does_not_change_sample_selection(device, request):
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
         logprobs=True,
-        rng=Rng(
-            seed=71,
-            semantic_index_base=2,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
 
     result = finalized_report(

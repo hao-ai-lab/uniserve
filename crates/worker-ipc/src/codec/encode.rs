@@ -75,18 +75,6 @@ fn tensor_ref<'a>(b: &mut FlatBufferBuilder<'a>, v: &TensorRef) -> WIPOffset<fbs
     )
 }
 
-fn rng<'a>(b: &mut FlatBufferBuilder<'a>, v: &Rng) -> WIPOffset<fbs::Rng<'a>> {
-    let draw_layout = draw_layout_to_fb(v.draw_layout);
-    fbs::Rng::create(
-        b,
-        &fbs::RngArgs {
-            seed: v.seed,
-            semantic_index_base: v.semantic_index_base,
-            draw_layout,
-        },
-    )
-}
-
 fn coordinates<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &CallCoordinates,
@@ -551,7 +539,6 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
         .map(|value| tensor_ref(b, value));
     let predicate = v.predicate.as_ref().map(|value| tensor_ref(b, value));
 
-    let rng = v.rng.as_ref().map(|value| rng(b, value));
     let sampling_state = v
         .sampling_state
         .as_ref()
@@ -599,7 +586,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             completion_output,
             transition_output,
             predicate,
-            rng,
+            image_index: v.image_index.unwrap_or(0),
             sampling_state,
             input_token_ids,
             input_image,

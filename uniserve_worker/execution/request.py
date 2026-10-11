@@ -103,9 +103,7 @@ class RequestState:
     state_call_id: CallId = CallId(0, 0)
     # State one call produces and a later call reads, which the engine does not
     # track: it lives with the request rather than in a call's stated
-    # coordinates. rng_counter is the request's sampling position and is not
-    # the wire's Rng.semantic_index_base, which the engine derives per call
-    # from the logical position, the scheduled span or the image identity.
+    # coordinates. rng_counter is the request's sampling position.
     prompt_logits_ready: bool = False
     rng_counter: int = 0
     diffusion: DiffusionState | None = None

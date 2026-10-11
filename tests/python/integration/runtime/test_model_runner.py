@@ -127,7 +127,6 @@ def _prepare_media(
     call_id: CallId,
     predecessor: object,
     batch_id: int,
-    seed: int = 29,
     image_index: int = 1,
 ):
     preparation, latent = diffusion_prepare_call(
@@ -135,7 +134,6 @@ def _prepare_media(
         call_id=call_id,
         predecessor=predecessor,
         conditioning=conditioning,
-        seed=seed,
         image_index=image_index,
     )
     report = worker.submit(
@@ -1006,7 +1004,6 @@ def test_initial_flow_noise_is_stable_across_call_schedules():
             call_id=CallId(call_id, 0),
             predecessor=root_parent(admission),
             batch_id=2,
-            seed=29,
             image_index=3,
         )
         flow, output_latent = diffusion_step_call(
@@ -1088,7 +1085,6 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
             call_id=CallId(2, 0),
             predecessor=root_parent(admission),
             batch_id=2,
-            seed=31,
         )
         step = 0
         call_id = 3
@@ -1839,7 +1835,6 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
             call_id=CallId(2, 0),
             predecessor=root_parent(admission),
             conditioning=conditioning,
-            seed=31,
         )
         transitioned = finalized_report(
             producer,
@@ -2144,7 +2139,6 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             call_id=CallId(2, 0),
             predecessor=root_parent(admission),
             batch_id=2,
-            seed=31,
         )
         step, completed = diffusion_step_call(
             admission.request_key,

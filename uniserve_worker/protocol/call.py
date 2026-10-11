@@ -9,7 +9,7 @@ it reaches a rank.
 
 The PyO3 transport (`crates/worker-ipc-py`) decodes and validates a batch in
 Rust, then calls the constructors of `Call`, `CallCoordinates`, `Bounds`,
-`Rng`, and `SamplingState` positionally in field-declaration order, so their
+and `SamplingState` positionally in field-declaration order, so their
 field order is part of that contract (`ImageParams` is built from keyword
 arguments).
 """
@@ -134,23 +134,6 @@ class ErrorCode(StrEnum):
     INVALID_REQUEST = "invalid_request"
 
 
-class DrawLayout(StrEnum):
-    """Selects how a call's random draws map to semantic indices.
-
-    Draws are keyed by the request seed and a semantic index rather than by
-    execution order, so replays and recomputation reproduce identical random
-    values. The meaning of `Rng.semantic_index_base` depends on the layout:
-    with `TARGET_SAMPLING` it is the first sampled position, and for
-    stochastic sampling the token executor requires one consecutive index per
-    sampled position; with `FLOW_NOISE` it is the positive image index the
-    engine assigns, from which the diffusion executor derives the noise seed.
-    """
-
-    TARGET_SAMPLING = "target_sampling"
-    SPECULATIVE_PROPOSAL = "speculative_proposal"
-    FLOW_NOISE = "flow_noise"
-
-
 # Computations that advance a request's accepted progress; mirrors the Rust
 # `CallKind::advances_state`. `RequestPool.predecessors` chains a request's
 # calls from its latest state-advancing call (on the media path only
@@ -252,22 +235,6 @@ class Bounds:
     max_latent_bytes: int = 0
     max_completion_bytes: int = 0
     max_transfer_bytes: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class Rng:
-    """Deterministic random-draw coordinates for one call.
-
-    The engine derives them per call; see `DrawLayout` for how each layout
-    interprets `semantic_index_base`.
-    """
-
-    # Request-level seed; executors that draw from it check it against the
-    # seed the request was admitted with.
-    seed: int
-    # First semantic index covered by this call's draws.
-    semantic_index_base: int
-    draw_layout: DrawLayout
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,7 +352,10 @@ class Call:
     predicate: tensor.TensorRef | None = None
 
     # Scalar side-channel inputs carried on the wire rather than as tensors.
-    rng: Rng | None = None
+    # Index of the image a latent preparation initializes, positive and
+    # assigned by the engine; the noise seed derives from the request's
+    # admitted image seed and this index (`flow_noise_seed`).
+    image_index: int | None = None
     # Per-call sampler constraints. The token executor treats None as an empty
     # `SamplingState` and merges these finish ids with the admission's.
     sampling_state: SamplingState | None = None

@@ -43,10 +43,10 @@ use crate::schema::uniserve::ipc as fbs;
 use crate::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds,
     BufferAllocation, BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind,
-    CallStatus, CanvasStep, DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout,
+    CallStatus, CanvasStep, DType, DecodeRange, DiffusionSamplingParams, DimBound,
     ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
     ForwardStats, KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall,
-    MediaOutput, NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
+    MediaOutput, NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind,
     SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
     TransferHandle, TransferMode, TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint,
     WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
@@ -841,7 +841,7 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             .map(tensor_ref_from_table)
             .transpose()?,
         predicate: call.predicate().map(tensor_ref_from_table).transpose()?,
-        rng: call.rng().map(rng_from_table).transpose()?,
+        image_index: Some(call.image_index()).filter(|&index| index != 0),
     };
     call.validate()?;
     Ok(call)
@@ -972,15 +972,6 @@ fn tensor_ref_from_table(reference: fbs::TensorRef<'_>) -> CodecResult<TensorRef
     };
     tensor.validate()?;
     Ok(tensor)
-}
-
-/// Decodes deterministic random coordinates, rejecting an unknown draw layout.
-fn rng_from_table(rng: fbs::Rng<'_>) -> CodecResult<Rng> {
-    Ok(Rng {
-        seed: rng.seed(),
-        semantic_index_base: rng.semantic_index_base(),
-        draw_layout: draw_layout_from_fb(rng.draw_layout())?,
-    })
 }
 
 /// Decodes a batch output, preserving report order, then validates it with
@@ -1910,25 +1901,6 @@ fn dtype_from_fb(dtype: fbs::DType) -> CodecResult<DType> {
         fbs::DType::BF16 => DType::BF16,
         fbs::DType::F32 => DType::F32,
         other => codec_bail!("unknown dtype {}", other.0),
-    })
-}
-
-/// Maps a random-draw layout to its stable FlatBuffers discriminant.
-fn draw_layout_to_fb(layout: DrawLayout) -> fbs::DrawLayout {
-    match layout {
-        DrawLayout::TargetSampling => fbs::DrawLayout::TargetSampling,
-        DrawLayout::SpeculativeProposal => fbs::DrawLayout::SpeculativeProposal,
-        DrawLayout::FlowNoise => fbs::DrawLayout::FlowNoise,
-    }
-}
-
-/// Decodes a supported FlatBuffers random-draw layout.
-fn draw_layout_from_fb(layout: fbs::DrawLayout) -> CodecResult<DrawLayout> {
-    Ok(match layout {
-        fbs::DrawLayout::TargetSampling => DrawLayout::TargetSampling,
-        fbs::DrawLayout::SpeculativeProposal => DrawLayout::SpeculativeProposal,
-        fbs::DrawLayout::FlowNoise => DrawLayout::FlowNoise,
-        other => codec_bail!("unknown draw layout {}", other.0),
     })
 }
 

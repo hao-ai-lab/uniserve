@@ -39,11 +39,9 @@ from uniserve_worker.protocol.call import (
     Call,
     CallCoordinates,
     CallStatus,
-    DrawLayout,
     ForwardMode,
     ImageParams,
     MediaCall,
-    Rng,
     TransferMode,
     VisionInput,
 )
@@ -738,7 +736,6 @@ def token_call(
     block_table_delta: Sequence[int] = (),
     predicate: TensorRef | None = None,
     logprobs: bool = False,
-    rng: Rng | None = None,
 ) -> Call:
     """Build a token computation with its actual model input IDs."""
     block_table = _BLOCK_TABLES.setdefault(rk, [])
@@ -783,7 +780,6 @@ def token_call(
         input_token_ids=tuple(int(value) for value in tokens),
         token_output=token_output,
         predicate=predicate,
-        rng=rng,
     )
     return call
 
@@ -838,7 +834,6 @@ def diffusion_prepare_call(
     call_id: CallId,
     predecessor: CallId,
     conditioning: BufferId,
-    seed: int = 29,
     image_index: int = 1,
 ) -> tuple[Call, TensorRef]:
     image = _IMAGE_PARAMS[rk]
@@ -871,11 +866,7 @@ def diffusion_prepare_call(
         kv_input=conditioning,
         latent_output=latent,
         completion_output=ready,
-        rng=Rng(
-            seed=int(seed),
-            semantic_index_base=int(image_index),
-            draw_layout=DrawLayout.FLOW_NOISE,
-        ),
+        image_index=int(image_index),
     )
     _LATENT_STEPS[latent] = 0
     return call, latent

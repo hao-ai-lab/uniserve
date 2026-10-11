@@ -45,10 +45,10 @@ use uniserve_core::{
 use uniserve_worker_ipc::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
     BufferAllocation, BufferId, CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType,
-    DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCallIdentity, ErrorCode,
-    FeatureKind, FinishFlags, ForwardStats, KvGroupTransfer, KvTransfer, LatentParams, Locator,
-    MediaOutput, NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication,
-    TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
+    DecodeRange, DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode, FeatureKind,
+    FinishFlags, ForwardStats, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaOutput,
+    NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication, TensorRef,
+    TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
     WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
@@ -96,7 +96,6 @@ struct RequestTypes {
     device_dim: Py<PyAny>,
     bounds: Py<PyAny>,
     call_coordinates: Py<PyAny>,
-    rng: Py<PyAny>,
     sampling_state: Py<PyAny>,
     readout: Py<PyAny>,
     canvas_step: Py<PyAny>,
@@ -108,7 +107,6 @@ struct RequestTypes {
     free: Py<PyAny>,
     batch_from_validated: Py<PyAny>,
     dtypes: [Py<PyAny>; 7],
-    draw_layouts: [Py<PyAny>; 3],
     forward_modes: [Py<PyAny>; ForwardMode::ALL.len()],
     media_calls: [Py<PyAny>; MediaCall::ALL.len()],
     transfer_modes: [Py<PyAny>; TransferMode::ALL.len()],
@@ -212,7 +210,6 @@ impl RequestTypes {
             device_dim: class(&tensor, "DeviceDim")?,
             bounds: class(&call, "Bounds")?,
             call_coordinates: class(&call, "CallCoordinates")?,
-            rng: class(&call, "Rng")?,
             sampling_state: class(&call, "SamplingState")?,
             readout: class(&call, "Readout")?,
             canvas_step: class(&call, "CanvasStep")?,
@@ -227,20 +224,14 @@ impl RequestTypes {
                 "batch_from_validated",
             )?,
 
-            // The `dtypes` and `draw_layouts` spellings sit at the indices that
-            // `dtype` and the draw-layout match in `RequestConversion::call`
-            // hardcode (the Rust discriminant values). `kind` indexes the other
-            // three with `as usize`, which relies on each `ALL` array listing
+            // The `dtypes` spellings sit at the indices that `dtype` hardcodes
+            // (the Rust discriminant values). `kind` indexes the other three
+            // with `as usize`, which relies on each `ALL` array listing
             // variants in declaration order.
             dtypes: enum_members(
                 &tensor,
                 "DType",
                 ["u8", "i32", "i64", "f16", "bf16", "f32", "i16"],
-            )?,
-            draw_layouts: enum_members(
-                &call,
-                "DrawLayout",
-                ["target_sampling", "speculative_proposal", "flow_noise"],
             )?,
             forward_modes: enum_members(
                 &call,
@@ -458,24 +449,6 @@ impl<'py> RequestConversion<'py> {
             .as_ref()
             .map(|predicate| self.tensor_ref(predicate))
             .transpose()?;
-        let rng = call
-            .rng
-            .as_ref()
-            .map(|rng| {
-                // Indices follow the `draw_layouts` order in `RequestTypes::build`.
-                let layout = match rng.draw_layout {
-                    DrawLayout::TargetSampling => 0,
-                    DrawLayout::SpeculativeProposal => 1,
-                    DrawLayout::FlowNoise => 2,
-                };
-                self.types.rng.bind(self.py).call1((
-                    rng.seed,
-                    rng.semantic_index_base,
-                    self.types.draw_layouts[layout].bind(self.py).clone(),
-                ))
-            })
-            .transpose()?;
-
         let py = self.py;
         let sampling_state = call
             .sampling_state
@@ -592,8 +565,7 @@ impl<'py> RequestConversion<'py> {
                 predicate
                     .map(Bound::into_any)
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                rng.map(Bound::into_any)
-                    .unwrap_or_else(|| py.None().into_bound(py)),
+                call.image_index.into_pyobject(py)?.into_any(),
                 sampling_state
                     .map(Bound::into_any)
                     .unwrap_or_else(|| py.None().into_bound(py)),
@@ -2284,7 +2256,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         let block_tables = vec![BlockTable {
             request_pool_idx: 1,
@@ -2357,7 +2329,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         let latent_params = vec![LatentParams {
             request_key: media_key,
@@ -2413,7 +2385,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         // A token-denoising readout of two canvas rows of two tokens over a
         // request that already holds its prompt.

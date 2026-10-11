@@ -1299,7 +1299,7 @@ impl Scheduler {
             outputs,
             completion_output,
             predicate,
-            rng: None,
+            image_index: None,
         };
 
         // Record what this call schedules: the admission it carries, the

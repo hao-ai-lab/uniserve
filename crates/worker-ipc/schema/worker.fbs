@@ -59,8 +59,6 @@ enum ErrorCode : ubyte {
   InvalidRequest
 }
 
-enum DrawLayout : ubyte { TargetSampling, SpeculativeProposal, FlowNoise }
-
 enum ReqKind : ubyte { Info, Submit, Close }
 
 enum RespKind : ubyte { Info, Result, Ok, Error }
@@ -300,12 +298,6 @@ table TensorRef {
   dynamic_axis:int = -1;
 }
 
-table Rng {
-  seed:ulong;
-  semantic_index_base:ulong;
-  draw_layout:DrawLayout;
-}
-
 /// Per-call token-processor inputs. Every list is strictly increasing, which
 /// `Call::validate` checks.
 table SamplingState {
@@ -386,7 +378,10 @@ table Call {
   /// continuation scalar. A false predicate completes the call as
   /// `Predicated`.
   predicate:TensorRef;
-  rng:Rng;
+  /// Index of the image a latent preparation initializes; zero when the call
+  /// initializes none. The engine assigns it, and the noise seed derives from
+  /// the request's image seed and this index.
+  image_index:uint;
   sampling_state:SamplingState;
   /// Host-known input tokens; empty when a continuation reads its
   /// predecessor's token on the device.

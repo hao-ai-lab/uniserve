@@ -1244,8 +1244,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         Bounds,
         Call,
         CallCoordinates,
-        DrawLayout,
-        Rng,
     )
     from uniserve_worker.protocol.tensor import (
         DeviceDim,
@@ -1410,11 +1408,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                     kv_input=conditioning,
                     latent_output=initial_latent,
                     completion_output=ready,
-                    rng=Rng(
-                        seed=0,
-                        semantic_index_base=1,
-                        draw_layout=DrawLayout.FLOW_NOISE,
-                    ),
+                    image_index=1,
                 )
             )
 

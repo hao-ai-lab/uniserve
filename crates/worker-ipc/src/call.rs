@@ -361,30 +361,6 @@ pub struct Bounds {
     pub max_transfer_bytes: u64,
 }
 
-/// How the common sampler consumes deterministic random draws.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum DrawLayout {
-    /// One draw used to sample a target token.
-    TargetSampling = 0,
-    /// Draw sequence used to propose speculative tokens.
-    SpeculativeProposal = 1,
-    /// Draw sequence used to generate diffusion noise.
-    FlowNoise = 2,
-}
-
-/// Deterministic random-draw coordinates for one call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Rng {
-    /// Request-level random seed.
-    pub seed: u64,
-    /// First semantic draw index assigned to the call.
-    pub semantic_index_base: u64,
-    /// Mapping from semantic work to deterministic draws.
-    pub draw_layout: DrawLayout,
-}
-
 /// Branch-local token processor inputs for one sampling call.
 ///
 /// Token ids in every field are strictly increasing: [`Call::validate`]
@@ -604,8 +580,11 @@ pub struct Call {
     /// Device predicate that enables execution: a U8 flag or a packed I64
     /// continuation scalar. A false predicate yields [`CallStatus::Predicated`].
     pub predicate: Option<TensorRef>,
-    /// Deterministic sampling coordinates.
-    pub rng: Option<Rng>,
+    /// Index of the image a latent preparation initializes: positive, and
+    /// assigned by the engine, which alone knows how many images the request
+    /// generates. The worker derives the image's noise seed from its own
+    /// admitted image seed and this index.
+    pub image_index: Option<u32>,
     /// Host-side sampler constraints for this computation; absent uses admission defaults.
     pub sampling_state: Option<SamplingState>,
     /// Host-known prompt, draft, or decode input tokens in model input order,
@@ -715,8 +694,8 @@ impl Call {
     /// Checks identity, component, coordinates, the token bound, canonical
     /// sampling-state sets, the encoded-image source, KV publication
     /// identities, product ownership, generations, output indices, dtypes and
-    /// byte bounds, cross-request inputs, and the predicate. `rng` is not
-    /// checked. Relationships to other calls and to the batch's allocation
+    /// byte bounds, cross-request inputs, the predicate, and a positive image
+    /// index. Relationships to other calls and to the batch's allocation
     /// tables belong to [`Batch::validate`].
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish call identity, component, coordinates, and token capacity.

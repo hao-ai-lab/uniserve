@@ -34,8 +34,8 @@ use uniserve_core::{
     try_apply_sampling_counts,
 };
 use uniserve_worker_ipc::{
-    BatchOutput, Call, CallKind, CallStatus, DrawLayout, ErrorCode, FinishFlags, NewRequest,
-    RequestOutput, SamplingState, TensorRef, TimingCounters, WorkerInfo,
+    BatchOutput, Call, CallKind, CallStatus, ErrorCode, FinishFlags, NewRequest, RequestOutput,
+    SamplingState, TensorRef, TimingCounters, WorkerInfo,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -582,25 +582,23 @@ impl SimEngine {
         match request.sampling() {
             Some(sampling) => {
                 let draw = if sampling.temperature > 0.0 {
-                    let rng = call.rng.ok_or_else(|| {
-                        anyhow::anyhow!("stochastic sampling call has no RNG coordinates")
-                    })?;
-                    anyhow::ensure!(
-                        rng.draw_layout == DrawLayout::TargetSampling,
-                        "stochastic sampling call uses the wrong RNG layout"
-                    );
-                    anyhow::ensure!(
-                        rng.seed == sampling.seed.unwrap_or(0),
-                        "call RNG seed disagrees with admitted sampling"
-                    );
+                    // The draw follows the admitted seed and the sampled
+                    // token's logical position, which a prefill reaches past
+                    // its query tokens and a decode or verify one past its
+                    // first.
+                    let query_tokens = match call.code {
+                        CallKind::Forward(ForwardMode::Prefill) => call.bounds.max_tokens,
+                        _ => 1,
+                    };
+                    let position = u64::from(request.logical_position) + u64::from(query_tokens);
                     let key = philox::sampling_key(
-                        rng.seed,
+                        sampling.seed.unwrap_or(0),
                         call.request_key.engine_id,
                         request_id.0,
                         call.request_key.request_epoch,
                         philox::DRAW_LAYOUT_TARGET,
                     );
-                    philox::sampling_uniform(key, rng.semantic_index_base, 0, 0)
+                    philox::sampling_uniform(key, position, 0, 0)
                 } else {
                     0.0
                 };
@@ -1469,7 +1467,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         ExecutionBatch::new(
             batch_id,

@@ -176,7 +176,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut encode = Batch::new(3, Vec::new(), vec![encode]);
     encode.collective_seq = 3;
@@ -648,7 +648,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
 
         let copy = TensorRef {
@@ -688,7 +688,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         // Reads partial results until the submitted batch is done, requiring
         // every call to succeed and never to complete twice.
@@ -999,7 +999,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         inputs: vec![],
         outputs: vec![value.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut source = Batch::new(1, vec![admission], vec![produce]);
     source.buffer_allocations.push(BufferAllocation {
@@ -1045,7 +1045,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         inputs: vec![value.clone()],
         outputs: vec![copied.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut consumer = Batch::new(2, vec![], vec![consume]);
     consumer.buffer_allocations.push(BufferAllocation {
@@ -1271,7 +1271,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
         inputs: vec![value.clone()],
         outputs: vec![copied.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut refused = Batch::new(2, vec![admission], vec![consume]);
     refused.buffer_allocations.push(BufferAllocation {
@@ -2020,7 +2020,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut publish = Batch::new(10, Vec::new(), vec![call]);
     publish.collective_seq = 6;
@@ -2378,7 +2378,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         inputs: vec![input.clone()],
         outputs: vec![output.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut batch = Batch::new(3, vec![admission], vec![call]);
     batch.buffer_allocations = [(&input, 0), (&output, 256)]
@@ -2605,7 +2605,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let publish = Batch::new(6, Vec::new(), vec![publish]);
 
@@ -2650,7 +2650,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     executor.submit(bind(
         Batch::new(7, vec![admission.clone()], vec![transfer]),
@@ -2704,7 +2704,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut encode = Batch::new(8, Vec::new(), vec![encode]);
     encode
@@ -2834,7 +2834,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut retained = Batch::new(15, vec![next], vec![retained]);
     // The source product lives at offset zero on encoder-1. Its destination
@@ -3365,7 +3365,7 @@ fn token_batch(
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let input_length = tokens.len() as u32;
     let mut batch = Batch::new(batch_id, admission.into_iter().collect(), vec![call]);

@@ -69,11 +69,7 @@ fn ar_decode_call() -> Call {
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: Some(Rng {
-            seed: 99,
-            semantic_index_base: 4,
-            draw_layout: DrawLayout::TargetSampling,
-        }),
+        image_index: Some(4),
     }
 }
 
@@ -142,7 +138,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     }
 }
 
@@ -837,7 +833,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             inputs: vec![latent.clone()],
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         // A video decode range may start past the first unit, while an audio
         // decode range must start at it. Neither call may omit its range.
@@ -1893,15 +1889,7 @@ fn comprehensive_batches() -> Vec<Batch> {
                 DType::U8,
                 ShapeBound::default(),
             )),
-            rng: Some(Rng {
-                seed: 99 + index as u64,
-                semantic_index_base: 4,
-                draw_layout: match index % 3 {
-                    0 => DrawLayout::TargetSampling,
-                    1 => DrawLayout::SpeculativeProposal,
-                    _ => DrawLayout::FlowNoise,
-                },
-            }),
+            image_index: Some(4 + index as u32),
         });
         // The admissions ride on the first batch of the pass, as a scheduler
         // places them ahead of the calls that use them.
