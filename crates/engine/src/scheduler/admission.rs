@@ -71,21 +71,23 @@ impl Scheduler {
             });
             return;
         }
-        // A canvas step and a block commit each spend a whole canvas of one
-        // scheduling step's token budget.
-        if let Some(canvas) = req
-            .canvas
-            .as_ref()
-            .filter(|canvas| canvas.canvas_length as usize > self.config.max_num_batched_tokens)
-        {
-            let _ = event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: format!(
-                    "a {}-token generation canvas exceeds the {}-token step budget",
-                    canvas.canvas_length, self.config.max_num_batched_tokens
-                ),
-            });
-            return;
+        // A request the deployment generates in canvases generates text only
+        // and names the seed its draws follow.
+        if self.config.canvas.is_some() && !req.is_readout() {
+            let error = if req.generates_images() {
+                Some(GenerationRequestError::CanvasGeneratesTextOnly)
+            } else if req.sampling.seed.is_none() {
+                Some(GenerationRequestError::UnseededCanvas)
+            } else {
+                None
+            };
+            if let Some(error) = error {
+                let _ = event_tx.send(EngineCoreOutput::Rejected {
+                    kind: RejectionKind::Invalid,
+                    message: format!("invalid generation request: {error:?}"),
+                });
+                return;
+            }
         }
         if let Some(feature) = self.missing_required_feature(&req) {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
@@ -728,9 +730,14 @@ impl Scheduler {
         &self,
         request: &GenerationRequest,
     ) -> Option<uniserve_core::GenerationFeatures> {
-        self.generation_limits
-            .covers(request.required_features())
-            .err()
+        // A block-diffusion runtime generates every request it does not read
+        // out in canvases.
+        let features = if self.config.canvas.is_some() && !request.is_readout() {
+            request.canvas_features()
+        } else {
+            request.required_features()
+        };
+        self.generation_limits.covers(features).err()
     }
 
     /// Returns whether the worker tracks image-latent capacity.

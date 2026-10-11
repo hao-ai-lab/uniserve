@@ -60,6 +60,11 @@ pub struct SchedulerConfig {
     /// Prefill token budget a decode pass may co-schedule; the prefill calls
     /// still travel as their own batch. Zero disables co-scheduling.
     pub mixed_prefill_tokens: usize,
+    /// Block-diffusion sampling of every canvas the deployment generates, as
+    /// the workers are launched with. A block-diffusion runtime has no
+    /// autoregressive decode, so each request it does not read out runs
+    /// under this sampling; without it the runtime serves readouts only.
+    pub canvas: Option<uniserve_core::CanvasSampling>,
 }
 
 impl Default for SchedulerConfig {
@@ -72,6 +77,7 @@ impl Default for SchedulerConfig {
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             max_num_waiting: DEFAULT_MAX_NUM_WAITING,
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
+            canvas: None,
         }
     }
 }

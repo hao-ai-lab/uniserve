@@ -91,8 +91,8 @@ use crate::storage::{
 };
 use crossbeam_channel::Receiver;
 use uniserve_core::{
-    ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest, MediaKind,
-    PositionLogprobs, Request, SharedMedia, TokenLogprob,
+    ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest,
+    GenerationRequestError, MediaKind, PositionLogprobs, Request, SharedMedia, TokenLogprob,
 };
 use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
 use uniserve_core::{ImageIngestStep, RejectionKind, UnitId, encoder_cache_key};

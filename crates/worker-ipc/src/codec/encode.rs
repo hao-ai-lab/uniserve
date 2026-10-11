@@ -234,20 +234,6 @@ fn ar<'a>(
     let sampling = Some(sampling(b, &v.sampling));
     let negative_token_ids = Some(b.create_vector(&v.negative_token_ids));
     let finish_token_ids = Some(b.create_vector(&v.finish_token_ids));
-    let canvas = v.canvas.as_ref().map(|canvas| {
-        fbs::CanvasSampling::create(
-            b,
-            &fbs::CanvasSamplingArgs {
-                canvas_length: canvas.canvas_length,
-                max_steps: canvas.max_steps,
-                entropy_bound: canvas.entropy_bound,
-                t_min: canvas.t_min,
-                t_max: canvas.t_max,
-                confidence_threshold: canvas.confidence_threshold,
-                stability_threshold: canvas.stability_threshold,
-            },
-        )
-    });
     fbs::ArRequestParams::create(
         b,
         &fbs::ArRequestParamsArgs {
@@ -255,7 +241,6 @@ fn ar<'a>(
             negative_token_ids,
             finish_token_ids,
             initial_position: v.initial_position,
-            canvas,
         },
     )
 }

@@ -199,7 +199,6 @@ fn admission() -> NewRequest {
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![2, 7],
             initial_position: 0,
-            canvas: None,
         }),
         None,
         3,
@@ -575,8 +574,7 @@ fn a_readout_must_address_the_canvas_of_a_token_denoising_call() {
     }
 }
 
-/// A canvas step of a block-diffusion request whose admission names its
-/// canvas sampling.
+/// A canvas step of a block-diffusion request.
 fn canvas_step_batch() -> Batch {
     let call_id = CallId::new(6, 0);
     let mut call = call_for(CallKind::Forward(ForwardMode::TokenDenoising), call_id);
@@ -595,15 +593,6 @@ fn canvas_step_batch() -> Batch {
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![1, 50, 106],
             initial_position: 0,
-            canvas: Some(CanvasSampling {
-                canvas_length: 256,
-                max_steps: 48,
-                entropy_bound: 0.1,
-                t_min: 0.4,
-                t_max: 0.8,
-                confidence_threshold: 0.005,
-                stability_threshold: 1,
-            }),
         }),
         None,
         0,
@@ -612,10 +601,10 @@ fn canvas_step_batch() -> Batch {
     batch_with_calls(6, vec![admission], vec![call])
 }
 
-/// A canvas step reaches the rank with its block and step and its request's
-/// admitted sampling, and its completion returns the stopped block's tokens.
+/// A canvas step reaches the rank with its block and step, and its
+/// completion returns the stopped block's tokens.
 #[test]
-fn a_canvas_step_its_sampling_and_its_block_round_trip() {
+fn a_canvas_step_and_its_block_round_trip() {
     let batch = canvas_step_batch();
     assert_eq!(execute_round_trip(batch.clone()), batch);
 
@@ -1822,7 +1811,6 @@ fn comprehensive_batches() -> Vec<Batch> {
             negative_token_ids: vec![100, 101],
             finish_token_ids: vec![2, 7],
             initial_position: 128,
-            canvas: None,
         }),
         None,
         0,

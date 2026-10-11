@@ -814,6 +814,7 @@ impl EngineCore {
                 long_prefill_threshold: config.long_prefill_threshold.max(1),
                 mixed_prefill_tokens: config.mixed_prefill_tokens,
                 policy: config.scheduler_policy,
+                canvas: config.worker_process.canvas_sampling,
                 ..Default::default()
             },
             config.runtime_family,

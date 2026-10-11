@@ -455,13 +455,14 @@ impl CallCoordinates {
 
 /// One denoising step of a block-diffusion request's resident canvas.
 ///
-/// The request's admitted `ArRequestParams::canvas` fixes the sampling; the
-/// worker holds the canvas, its self-conditioning input and its stopping
-/// history in the request's slot. `block` counts the blocks already
-/// committed to the request's context and `step` the steps already run on
-/// this canvas; step zero starts the canvas from random tokens. The step
-/// that stops the canvas, by convergence or by reaching the admitted step
-/// limit, reports the canvas's argmax tokens as its committed tokens.
+/// The worker's launch configuration fixes the sampling, and the request's
+/// admitted `SamplingParams::seed` its draws; the worker holds the canvas,
+/// its self-conditioning input and its stopping history in the request's
+/// slot. `block` counts the blocks already committed to the request's
+/// context and `step` the steps already run on this canvas; step zero
+/// starts the canvas from random tokens. The step that stops the canvas, by
+/// convergence or by reaching the sampling's step limit, reports the
+/// canvas's argmax tokens as its committed tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CanvasStep {
     /// Blocks committed to the request's context before this canvas.
@@ -1198,12 +1199,9 @@ pub struct ArRequestParams {
     pub finish_token_ids: Vec<u32>,
     /// Logical position assigned to the first request token.
     pub initial_position: u32,
-    /// Block-diffusion sampling of a request that generates its text in
-    /// canvases; its seed is `sampling.seed`.
-    pub canvas: Option<CanvasSampling>,
 }
 
-pub use uniserve_core::{CanvasSampling, DiffusionSamplingParams};
+pub use uniserve_core::DiffusionSamplingParams;
 
 /// What a video request admits besides its sampling controls.
 ///

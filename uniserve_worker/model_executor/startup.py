@@ -53,7 +53,6 @@ from uniserve_worker.storage.block_tables import GroupTable
 from uniserve_worker.storage.kv_cache import KVCacheManager
 
 if TYPE_CHECKING:
-    from uniserve.diffusion.canvas import CanvasSampling
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.model_executor.canvas_runner import CanvasRunner
     from uniserve_worker.model_executor.graph_inputs import PrefillShape
@@ -389,17 +388,16 @@ def stage_canvas(
     tables: Sequence[Sequence[GroupTable]],
     *,
     length: int,
-    sampling: CanvasSampling | None = None,
+    generating: bool = False,
     step: int = 0,
 ) -> InputBatch:
     """Stage synthetic canvas rows through serving's staging path.
 
     Row ``i`` is a canvas of ``length`` tokens in request slot ``i + 1``
     over a one-token prefix on its scratch ``tables``, read-only and
-    non-causal as every canvas is. Without ``sampling`` the rows are
-    readout canvases of token zero reading one slot; with it they are step
-    ``step`` of block zero of the slots' resident canvases under that
-    sampling.
+    non-causal as every canvas is. Unless ``generating``, the rows are
+    readout canvases of token zero reading one slot; otherwise they are step
+    ``step`` of block zero of the slots' resident canvases.
     """
     rows = len(tables)
     prefix = 1
@@ -431,13 +429,12 @@ def stage_canvas(
             candidate_ids=(0,),
             **common,
         )
-        if sampling is None
+        if not generating
         else CanvasStepRow(
             request_pool_idx=slot,
             canvas_length=length,
             seed=slot,
             step=step,
-            sampling=sampling,
             **common,
         )
         for slot in range(1, rows + 1)
@@ -451,8 +448,7 @@ def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
     """Capture every canvas row bucket of a token denoiser, largest first.
 
     Each bucket captures readout passes at the supported canvas lengths and,
-    when the entry generates canvases, two canvas steps of the served
-    sampling over request slots one
+    when the entry generates canvases, two canvas steps over request slots one
     upward, one whose rows all start their canvas and one whose rows
     continue it; their resident state stays scratch until a request starts
     its canvas there. The rows are staged through serving's staging with the
@@ -472,23 +468,23 @@ def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
     # Readouts can have shorter numerical canvases. Generating steps keep
     # the model's length because it defines the resident sampler state.
     kinds = (
-        tuple((None, 0, length) for length in reversed(entry.readout_lengths))
+        tuple((False, 0, length) for length in reversed(entry.readout_lengths))
     ) + (
         ()
         if slots is None
         else (
-            (slots.constants, 0, entry.canvas_length),
-            (slots.constants, 1, entry.canvas_length),
+            (True, 0, entry.canvas_length),
+            (True, 1, entry.canvas_length),
         )
     )
     for rows in reversed(entry.canvas_rows if entry.pools else (1,)):
-        for sampling, step, length in kinds:
+        for generating, step, length in kinds:
             with cache.startup_units(rows * cache.page_units(1)) as scratch:
                 batch = stage_canvas(
                     entry.input_buffers,
                     scratch_tables(cache, scratch, (1,) * rows),
                     length=length,
-                    sampling=sampling,
+                    generating=generating,
                     step=step,
                 )
                 entry.capture_batch(batch, entry.batch_forward)

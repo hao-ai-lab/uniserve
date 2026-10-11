@@ -480,6 +480,9 @@ pub struct SimEngine {
     /// Readout candidate whose log-probability is reported as NaN, as a
     /// worker with a numerical defect reports it.
     non_finite_candidate: Option<u32>,
+    /// Block-diffusion sampling the simulated worker is launched with, as a
+    /// worker's launch configuration states it.
+    canvas_sampling: Option<uniserve_core::CanvasSampling>,
     /// Releases for batches that skip a predicated call: such a batch returns
     /// only after taking one release, or once the sender is dropped.
     predicated_release: Option<Receiver<()>>,
@@ -518,6 +521,7 @@ impl SimEngine {
             vocab: SYNTH_VOCAB_SIZE,
             results_on_wait: false,
             non_finite_candidate: None,
+            canvas_sampling: None,
             predicated_release: None,
             requests: HashMap::new(),
             refused: HashMap::new(),
@@ -658,6 +662,7 @@ impl SimEngine {
         text_len: usize,
         fake_eos: u32,
         non_finite_candidate: Option<u32>,
+        canvas_sampling: Option<uniserve_core::CanvasSampling>,
         call: &Call,
         request: &mut SimRequestState,
     ) -> anyhow::Result<RequestOutput> {
@@ -857,17 +862,14 @@ impl SimEngine {
                         call.call_id,
                         request.canvas
                     );
-                    let max_steps = request
-                        .admission
-                        .ar
-                        .as_ref()
-                        .and_then(|branch| branch.canvas.as_ref())
-                        .map(|canvas| canvas.max_steps)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "canvas call for a request admitted without canvas sampling"
-                            )
-                        })?;
+                    let max_steps =
+                        canvas_sampling
+                            .map(|canvas| canvas.max_steps)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "canvas call for a worker launched without canvas sampling"
+                                )
+                            })?;
                     let request_id = call.request_key.request_id;
                     if step.step < sim_canvas_stop_step(request_id, step.block, max_steps) {
                         request.canvas.step += 1;
@@ -1096,6 +1098,12 @@ impl SimEngine {
         }
     }
 
+    /// Launches the simulated worker with block-diffusion sampling: a canvas
+    /// step stops its block no later than the sampling's step limit.
+    pub fn set_canvas_sampling(&mut self, sampling: uniserve_core::CanvasSampling) {
+        self.canvas_sampling = Some(sampling);
+    }
+
     /// Reports NaN as the log-probability of readout candidate `token`,
     /// wherever a readout reads it.
     pub fn set_non_finite_candidate(&mut self, token: u32) {
@@ -1265,6 +1273,7 @@ impl SimEngine {
         let text_len = self.text_len;
         let fake_eos = self.fake_eos;
         let non_finite_candidate = self.non_finite_candidate;
+        let canvas_sampling = self.canvas_sampling;
         let refused = &self.refused;
         let mut completions = Vec::with_capacity(batch.requests.len());
         for (call, _) in batch.requests {
@@ -1326,6 +1335,7 @@ impl SimEngine {
                 text_len,
                 fake_eos,
                 non_finite_candidate,
+                canvas_sampling,
                 &call,
                 request,
             )?;
@@ -1402,7 +1412,6 @@ mod tests {
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
-                canvas: None,
             }),
             None,
             0,

@@ -27,7 +27,8 @@ use uniserve_worker_ipc::{
 };
 
 use uniserve_core::{
-    GenerationRequest, ImageEncoderInput, ImageIngestStep, ImageInput, RequestId, SamplingParams,
+    CanvasSampling, GenerationRequest, ImageEncoderInput, ImageIngestStep, ImageInput, RequestId,
+    SamplingParams,
 };
 use uniserve_worker_ipc::{
     Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, DrawLayout,
@@ -531,8 +532,8 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
 /// Plans a context prefill: prompt tokens `start..end` and the vision
 /// `blocks` of the input images between them, which write `block_tokens` KV
 /// tokens together, with a sampled-token output unless the request is a
-/// readout or generates canvases, or the context ends with a block of this
-/// call.
+/// readout or the deployment generates canvases (`generates_canvases`), or
+/// the context ends with a block of this call.
 ///
 /// The RNG coordinate is `end`, the exclusive prompt end. The prompt of a
 /// readout or of a canvas-generating request only conditions its canvases, so
@@ -548,6 +549,7 @@ pub(super) fn plan_prompt(
     blocks: Vec<VisionInput>,
     block_tokens: u32,
     sampling_state: Option<SamplingState>,
+    generates_canvases: bool,
 ) -> Result<Call, PlanningError> {
     if start > end
         || (start == end && blocks.is_empty())
@@ -568,7 +570,7 @@ pub(super) fn plan_prompt(
         .is_some_and(|block| block.offset == end.saturating_sub(start))
         && end as usize == request.prompt_token_ids.len();
     call.vision_inputs = blocks;
-    if request.is_readout() || request.is_canvas_generation() || ends_with_block {
+    if request.is_readout() || generates_canvases || ends_with_block {
         return finish_plan(request, call, 0);
     }
     call.token_output = Some(output_tensor(0, DType::I64));
@@ -644,7 +646,8 @@ pub(super) fn plan_readout(
 }
 
 /// Plans denoising step `step` of the canvas-generating `request`'s block
-/// `block`, the number of blocks already committed to its context.
+/// `block`, the number of blocks already committed to its context, under the
+/// deployment's `canvas` sampling.
 ///
 /// The call carries no tokens: the worker keeps the block's canvas and
 /// sampler state in the request's slot. Its `max_tokens` is the canvas
@@ -652,17 +655,13 @@ pub(super) fn plan_readout(
 /// committed tokens; its completion payload bound covers those tokens at
 /// four bytes each. Its completion output is true while the block continues
 /// after the step: the predicate of the next step, which the scheduler may
-/// queue before this one resolves. Fails with `NotCanvasGeneration` for a
-/// request without canvas sampling.
+/// queue before this one resolves.
 pub(super) fn plan_canvas_step(
     request: &GenerationRequest,
+    canvas: &CanvasSampling,
     block: u32,
     step: u32,
 ) -> Result<Call, PlanningError> {
-    let canvas = request
-        .canvas
-        .as_ref()
-        .ok_or(PlanningError::NotCanvasGeneration)?;
     let mut call = computation(request, CallKind::Forward(ForwardMode::TokenDenoising));
     call.bounds.max_tokens = canvas.canvas_length;
     call.canvas = Some(CanvasStep { block, step });
@@ -674,14 +673,14 @@ pub(super) fn plan_canvas_step(
 
 /// Plans the commit of a stopped block's `tokens` to the context of the
 /// canvas-generating `request`: a prefill that writes them into KV, as causal
-/// prompt, and samples nothing. Fails with `NotCanvasGeneration` for a
-/// request without canvas sampling or an empty block.
+/// prompt, and samples nothing. Fails with `EmptyCanvasCommit` for an empty
+/// block.
 pub(super) fn plan_canvas_commit(
     request: &GenerationRequest,
     tokens: &[u32],
 ) -> Result<Call, PlanningError> {
-    if !request.is_canvas_generation() || tokens.is_empty() {
-        return Err(PlanningError::NotCanvasGeneration);
+    if tokens.is_empty() {
+        return Err(PlanningError::EmptyCanvasCommit);
     }
     let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = u32::try_from(tokens.len())
@@ -998,8 +997,8 @@ pub(crate) enum PlanningError {
         end: usize,
         rows: usize,
     },
-    #[error("the request does not generate a nonempty canvas")]
-    NotCanvasGeneration,
+    #[error("a canvas commit carries no tokens")]
+    EmptyCanvasCommit,
     #[error("image generation branch is disabled")]
     GenerationBranchDisabled,
     #[error("generated-image feedback is disabled")]
@@ -1074,9 +1073,10 @@ pub(super) fn register_call(
 /// `image_kv` and `latent` are the inputs frozen when the call was submitted
 /// (`InflightInput::Generation`); `media` is the artifact payload delivered
 /// with the result. A predicated result is valid only when the call carried a
-/// predicate and the result reports no tokens and no products. Returns the
-/// first violation found; the caller finishes the request with an error on
-/// any `Err`.
+/// predicate and the result reports no tokens and no products. `canvas` is
+/// the deployment's block-diffusion sampling, which bounds a canvas step's
+/// block. Returns the first violation found; the caller finishes the request
+/// with an error on any `Err`.
 pub(crate) fn validate_generation_result(
     call: &Call,
     image_kv: Option<(u32, Option<u32>)>,
@@ -1084,6 +1084,7 @@ pub(crate) fn validate_generation_result(
     state: &RequestState,
     record: &RequestOutput,
     media: Option<&uniserve_core::SharedMedia>,
+    canvas: Option<&CanvasSampling>,
 ) -> Result<(), GenerationResultError> {
     let request = &state.req;
 
@@ -1205,10 +1206,7 @@ pub(crate) fn validate_generation_result(
                 detail: "canvas_block_length_mismatch",
             });
         }
-        let last_step = request
-            .canvas
-            .as_ref()
-            .is_none_or(|canvas| step.step.saturating_add(1) >= canvas.max_steps);
+        let last_step = canvas.is_none_or(|canvas| step.step.saturating_add(1) >= canvas.max_steps);
         if committed == 0 && last_step {
             return Err(GenerationResultError::Progress {
                 detail: "canvas_step_limit_exceeded",

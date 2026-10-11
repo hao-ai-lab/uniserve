@@ -103,7 +103,7 @@ pub struct ReadoutSlot {
     pub candidates: Vec<u32>,
 }
 
-/// Block-diffusion sampling of a generating request.
+/// Block-diffusion sampling of a deployment's canvases.
 ///
 /// Text is generated in blocks of `canvas_length` tokens. A block starts as
 /// uniformly random tokens and is denoised for at most `max_steps` steps: a
@@ -114,6 +114,9 @@ pub struct ReadoutSlot {
 /// entropy is below `confidence_threshold`. The block's argmax canvas is then
 /// committed to the request's context as causal prompt, and the next block
 /// follows it. Every draw follows the request's `SamplingParams::seed`.
+///
+/// The deployment's launch configuration owns the sampling: every request a
+/// block-diffusion runtime generates, rather than reads out, runs under it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CanvasSampling {
     /// Tokens of one block.
@@ -139,7 +142,7 @@ impl CanvasSampling {
     /// Returns the first parameter the scheduler cannot plan with, if any:
     /// an empty canvas or step limit, or a non-finite sampling value. The
     /// worker's sampler checks the sampling values' domain itself.
-    fn invalid_parameter(&self) -> Option<&'static str> {
+    pub fn invalid_parameter(&self) -> Option<&'static str> {
         if self.canvas_length == 0 {
             Some("canvas_length")
         } else if self.max_steps == 0 {
@@ -947,22 +950,12 @@ pub struct GenerationRequest {
     /// makes the request a generating one.
     #[serde(default)]
     pub readout: Vec<ReadoutRow>,
-    /// Block-diffusion sampling of a generating request, whose text is
-    /// denoised in canvases rather than decoded token by token; `None`
-    /// decodes autoregressively.
-    #[serde(default)]
-    pub canvas: Option<CanvasSampling>,
 }
 
 impl GenerationRequest {
     /// Returns whether the request reads canvas slots instead of generating.
     pub fn is_readout(&self) -> bool {
         !self.readout.is_empty()
-    }
-
-    /// Returns whether the request generates its text in denoised canvases.
-    pub fn is_canvas_generation(&self) -> bool {
-        self.canvas.is_some()
     }
 
     /// Returns the number of candidate log-probabilities a readout reports:
@@ -977,22 +970,34 @@ impl GenerationRequest {
 
     /// Returns the runtime features the request's computation reaches.
     ///
-    /// A readout or a canvas-generating request needs token denoising and
-    /// the encoders of its context images; any other request needs what its
-    /// generation graph reaches (`ImageGenerationConfig::required_features`).
+    /// A readout needs token denoising and the encoders of its context
+    /// images; any other request needs what its generation graph reaches
+    /// (`ImageGenerationConfig::required_features`). A request a
+    /// block-diffusion runtime generates in canvases needs
+    /// [`GenerationRequest::canvas_features`] instead.
     pub fn required_features(&self) -> GenerationFeatures {
-        let context_steps = self
-            .multimodal_inputs
-            .images
-            .iter()
-            .flat_map(|image| image.encoders.iter().map(|input| input.encoder));
-        if self.is_readout() || self.is_canvas_generation() {
-            return context_steps.fold(GenerationFeatures::TOKEN_DENOISING, |needs, step| {
-                needs | step.required_feature()
-            });
+        if self.is_readout() {
+            return self.canvas_features();
         }
         self.image_generation
-            .required_features(self.constraint, context_steps)
+            .required_features(self.constraint, self.context_encoders())
+    }
+
+    /// Returns the features of denoising canvases over the request's context:
+    /// token denoising and the encoders of the context images.
+    pub fn canvas_features(&self) -> GenerationFeatures {
+        self.context_encoders()
+            .fold(GenerationFeatures::TOKEN_DENOISING, |needs, step| {
+                needs | step.required_feature()
+            })
+    }
+
+    /// Returns the encoder steps of the request's context images.
+    fn context_encoders(&self) -> impl Iterator<Item = ImageIngestStep> + '_ {
+        self.multimodal_inputs
+            .images
+            .iter()
+            .flat_map(|image| image.encoders.iter().map(|input| input.encoder))
     }
 
     /// Validates image conditions, input positions, and sampling.
@@ -1010,10 +1015,6 @@ impl GenerationRequest {
         } else if self.max_und_tokens == 0 && !self.finishes_after_image() {
             return Err(GenerationRequestError::ZeroMaxUndTokens);
         }
-        if let Some(canvas) = &self.canvas {
-            validate_canvas(self, canvas)?;
-        }
-
         self.sampling
             .validate()
             .map_err(GenerationRequestError::InvalidSampling)?;
@@ -1101,24 +1102,6 @@ impl GenerationRequest {
             return Err(GenerationRequestError::EmptyStopString);
         }
         Ok(())
-    }
-}
-
-/// Validates a canvas-generating request: it generates text only, names the
-/// seed its draws follow, and its sampling parameters are in range.
-fn validate_canvas(
-    request: &GenerationRequest,
-    canvas: &CanvasSampling,
-) -> Result<(), GenerationRequestError> {
-    if request.is_readout() || request.generates_images() {
-        return Err(GenerationRequestError::CanvasGeneratesTextOnly);
-    }
-    if request.sampling.seed.is_none() {
-        return Err(GenerationRequestError::UnseededCanvas);
-    }
-    match canvas.invalid_parameter() {
-        Some(parameter) => Err(GenerationRequestError::InvalidCanvasSampling { parameter }),
-        None => Ok(()),
     }
 }
 
@@ -1256,18 +1239,14 @@ pub enum GenerationRequestError {
     /// A readout row's slot positions do not strictly increase.
     #[error("readout slots must be listed in increasing position order")]
     UnorderedReadoutSlots,
-    /// A canvas-generating request also reads slots or generates images.
+    /// A request a block-diffusion runtime generates in canvases generates
+    /// text only.
     #[error("a canvas-generating request generates text only")]
     CanvasGeneratesTextOnly,
-    /// A canvas-generating request names no seed for its draws.
+    /// A request a block-diffusion runtime generates in canvases names no
+    /// seed for its draws.
     #[error("a canvas-generating request requires a sampling seed")]
     UnseededCanvas,
-    /// A block-diffusion sampling parameter is out of range.
-    #[error("block-diffusion sampling parameter `{parameter}` is out of range")]
-    InvalidCanvasSampling {
-        /// Name of the parameter.
-        parameter: &'static str,
-    },
     /// Text sampling parameters are invalid.
     #[error("invalid sampling parameters: {0}")]
     InvalidSampling(#[source] SamplingParamsError),
@@ -1387,7 +1366,6 @@ mod tests {
             },
             image_generation: policy,
             readout: Vec::new(),
-            canvas: None,
         }
     }
 

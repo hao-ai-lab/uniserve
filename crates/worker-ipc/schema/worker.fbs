@@ -582,24 +582,11 @@ table VideoAdmission {
   conditions:[VideoCondition];
 }
 
-/// Block-diffusion sampling of a canvas-generating request, decoded into
-/// `CanvasSampling`.
-table CanvasSampling {
-  canvas_length:uint;
-  max_steps:uint;
-  entropy_bound:float;
-  t_min:float;
-  t_max:float;
-  confidence_threshold:float;
-  stability_threshold:uint;
-}
-
 table ArRequestParams {
   sampling:SamplingParams;
   negative_token_ids:[uint];
   finish_token_ids:[uint];
   initial_position:uint;
-  canvas:CanvasSampling;
 }
 
 table DiffusionSamplingParams {

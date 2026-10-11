@@ -354,7 +354,6 @@ def _scenario(slots, prompt_tokens=PROMPT):
                 seed=_request(slot),
                 block=0,
                 step=step,
-                sampling=slots.constants,
             )
             for step in range(SAMPLING.max_steps)
         )

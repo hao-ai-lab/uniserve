@@ -1213,18 +1213,15 @@ class CanvasBuffers(AttentionBuffers):
         """Stage canvas steps: their sampling coordinates and gathered state.
 
         Every row's canvas follows the previous one in the packed tokens.
-        The rows' argmax histories are staged at the depth of their shared
-        stability threshold.
+        The rows' argmax histories are staged at the depth of the
+        deployment's stability threshold.
         """
         state, backing = self._canvas_slots, self._canvas_backing
         if state is None or backing is None:
             raise ValueError("canvas steps require bound sampler state")
-        depths = {row.sampling.stability for row in rows}
-        lengths = {row.canvas_length for row in rows}
-        if len(depths) != 1 or lengths != {state.canvas_length}:
+        if {row.canvas_length for row in rows} != {state.canvas_length}:
             raise ValueError(
-                "canvas steps of one call share the resident canvas length "
-                "and one stability threshold"
+                "canvas steps of one call have the resident canvas length"
             )
 
         count, length = len(rows), state.canvas_length
@@ -1263,7 +1260,7 @@ class CanvasBuffers(AttentionBuffers):
                     max_rows=count,
                     canvas_length=length,
                     hidden_size=state.hidden_size,
-                    history_depth=depths.pop(),
+                    history_depth=state.history_depth,
                     dtype=state.banks["self_conditioning"].dtype,
                 )
             )
@@ -1291,7 +1288,6 @@ class CanvasBuffers(AttentionBuffers):
             rows_state,
             views,
             vectors["step_slots"],
-            tuple(row.sampling for row in rows),
             first=all(row.step == 0 for row in rows),
         )
 

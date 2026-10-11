@@ -526,7 +526,6 @@ mod tests {
             cache: Default::default(),
             image_generation: policy,
             readout: Vec::new(),
-            canvas: None,
         };
         let mut stream = client
             .submit_generation("req-text".to_string(), generation)
@@ -582,7 +581,6 @@ mod tests {
             cache: Default::default(),
             image_generation: ImageGenerationConfig::default(),
             readout: Vec::new(),
-            canvas: None,
         }
     }
 
@@ -695,7 +693,6 @@ mod tests {
             cache: Default::default(),
             image_generation: policy,
             readout: Vec::new(),
-            canvas: None,
         };
         request
             .validate_resources(&client.generation_limits())

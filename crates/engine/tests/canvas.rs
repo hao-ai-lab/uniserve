@@ -33,6 +33,25 @@ use uniserve_worker_ipc::{Call, CallKind, ForwardBatch, ForwardMode};
 const CANVAS: u32 = 16;
 /// Denoising steps a block runs at most.
 const MAX_STEPS: u32 = 4;
+/// The block-diffusion sampling the deployment is launched with.
+const SAMPLING: CanvasSampling = CanvasSampling {
+    canvas_length: CANVAS,
+    max_steps: MAX_STEPS,
+    entropy_bound: 0.1,
+    t_min: 0.4,
+    t_max: 0.8,
+    confidence_threshold: 0.005,
+    stability_threshold: 1,
+};
+
+/// A scheduler configuration of the deployment that generates `SAMPLING`
+/// canvases.
+fn config() -> SchedulerConfig {
+    SchedulerConfig {
+        canvas: Some(SAMPLING),
+        ..SchedulerConfig::default()
+    }
+}
 
 /// A block-diffusion worker with 16-token KV pages whose synthetic text
 /// holds `text_len` tokens before EOS.
@@ -44,6 +63,7 @@ fn worker(text_len: usize) -> SimEngine {
     ];
     sim.set_page_tokens(16);
     sim.set_text_len(text_len);
+    sim.set_canvas_sampling(SAMPLING);
     sim
 }
 
@@ -67,15 +87,6 @@ fn canvas_request(request_id: u64, prompt_len: u32, max_tokens: usize) -> Genera
         include_stop_token: false,
         image_generation: ImageGenerationConfig::default(),
         readout: Vec::new(),
-        canvas: Some(CanvasSampling {
-            canvas_length: CANVAS,
-            max_steps: MAX_STEPS,
-            entropy_bound: 0.1,
-            t_min: 0.4,
-            t_max: 0.8,
-            confidence_threshold: 0.005,
-            stability_threshold: 1,
-        }),
     }
 }
 
@@ -209,7 +220,7 @@ fn text(request: u64, range: std::ops::Range<usize>) -> Vec<u32> {
 /// the request there, uncommitted.
 #[test]
 fn blocks_are_denoised_published_and_committed_until_eos() {
-    let running = Running::start(worker(40), SchedulerConfig::default());
+    let running = Running::start(worker(40), config());
     let answer = events(running.submit(canvas_request(1, 24, 1_000)));
     let batches = running.stop();
 
@@ -301,7 +312,7 @@ fn a_blocks_steps_are_queued_behind_the_step_in_flight() {
     let mut sim = worker(40);
     sim.set_queue_depth(2);
     sim.set_results_on_wait(true);
-    let running = Running::start(sim, SchedulerConfig::default());
+    let running = Running::start(sim, config());
     let answer = events(running.submit(canvas_request(5, 24, 1_000)));
     let history = running.stop_events();
 
@@ -363,7 +374,7 @@ fn a_blocks_first_step_is_queued_behind_the_prefill_before_it() {
     let mut sim = worker(40);
     sim.set_queue_depth(2);
     sim.set_results_on_wait(true);
-    let running = Running::start(sim, SchedulerConfig::default());
+    let running = Running::start(sim, config());
     let answer = events(running.submit(canvas_request(6, 24, 1_000)));
     let history = running.stop_events();
 
@@ -424,7 +435,7 @@ fn a_blocks_commit_is_queued_behind_its_no_op_step() {
     let mut sim = worker(40);
     sim.set_queue_depth(2);
     sim.set_results_on_wait(true);
-    let running = Running::start(sim, SchedulerConfig::default());
+    let running = Running::start(sim, config());
     let answer = events(running.submit(canvas_request(7, 24, 1_000)));
     let history = running.stop_events();
 
@@ -502,7 +513,7 @@ fn the_terminal_event_does_not_wait_for_the_no_op_step() {
     sim.set_queue_depth(2);
     sim.set_results_on_wait(true);
     let release = sim.hold_predicated_batches();
-    let running = Running::start(sim, SchedulerConfig::default());
+    let running = Running::start(sim, config());
     // One block: the completion limit ends the request at the block's end.
     let receiver = running.submit(canvas_request(8, 24, CANVAS as usize));
     let answer = events_within(receiver, Duration::from_secs(5));
@@ -527,7 +538,7 @@ fn the_terminal_event_does_not_wait_for_the_no_op_step() {
 /// follows.
 #[test]
 fn the_completion_limit_truncates_inside_a_block() {
-    let running = Running::start(worker(1_000), SchedulerConfig::default());
+    let running = Running::start(worker(1_000), config());
     let answer = events(running.submit(canvas_request(2, 8, 20)));
     let batches = running.stop();
 
@@ -550,7 +561,7 @@ fn the_completion_limit_truncates_inside_a_block() {
 /// when the request includes stop tokens in its output.
 #[test]
 fn a_stop_token_ends_the_request_inside_its_block() {
-    let running = Running::start(worker(1_000), SchedulerConfig::default());
+    let running = Running::start(worker(1_000), config());
     let mut excluded = canvas_request(3, 8, 1_000);
     excluded.stop_token_ids = vec![sim_text_token(RequestId(3), 21)];
     let mut included = canvas_request(4, 8, 1_000);
@@ -570,34 +581,41 @@ fn a_stop_token_ends_the_request_inside_its_block() {
 }
 
 /// A canvas step and a block commit each need a whole canvas of one step's
-/// token budget, so a canvas longer than the budget is refused at
-/// submission, as is a canvas-generating request without a seed.
+/// token budget, so a deployment whose canvas is longer than the budget
+/// fails to start.
 #[test]
-fn unschedulable_or_unseeded_canvases_are_refused() {
+fn a_canvas_beyond_the_step_budget_fails_to_start() {
     let config = SchedulerConfig {
         max_num_batched_tokens: 8,
         long_prefill_threshold: 8,
-        ..SchedulerConfig::default()
+        ..config()
     };
-    let running = Running::start(worker(40), config);
-    let oversized = events(running.submit(canvas_request(5, 8, 64)));
-    let mut unseeded_request = canvas_request(6, 8, 64);
-    unseeded_request.sampling.seed = None;
-    let unseeded = events(running.submit(unseeded_request));
+    let executor = SimExecutor::new(worker(40));
+    let error = Scheduler::with_config(Box::new(executor), SpecialTokenIds::default(), config)
+        .err()
+        .expect("a 16-token canvas exceeds an 8-token step budget");
+    assert!(error.to_string().contains("step budget"), "{error}");
+}
+
+/// A canvas-generating request names the seed its draws follow.
+#[test]
+fn an_unseeded_canvas_request_is_refused() {
+    let running = Running::start(worker(40), config());
+    let mut request = canvas_request(6, 8, 64);
+    request.sampling.seed = None;
+    let answer = events(running.submit(request));
     running.stop();
 
-    for answer in [oversized, unseeded] {
-        assert!(
-            matches!(
-                answer.last(),
-                Some(EngineCoreOutput::Rejected {
-                    kind: RejectionKind::Invalid,
-                    ..
-                })
-            ),
-            "{answer:?}"
-        );
-    }
+    assert!(
+        matches!(
+            answer.last(),
+            Some(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
+                ..
+            })
+        ),
+        "{answer:?}"
+    );
 }
 
 /// A prompt that waits while a block denoises is prefilled within the
@@ -611,7 +629,7 @@ fn a_waiting_prompt_is_prefilled_while_a_block_denoises() {
     let config = SchedulerConfig {
         max_num_batched_tokens: 64,
         long_prefill_threshold: 64,
-        ..SchedulerConfig::default()
+        ..config()
     };
     // Both requests are queued before the scheduler starts, so the first
     // pass prefills the short prompt and the start of the long one. Request

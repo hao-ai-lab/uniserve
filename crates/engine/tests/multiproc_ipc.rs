@@ -3275,7 +3275,6 @@ fn text_admission(
             negative_token_ids: Vec::new(),
             finish_token_ids: Vec::new(),
             initial_position: 0,
-            canvas: None,
         }),
         None,
         0,

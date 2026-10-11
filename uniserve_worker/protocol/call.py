@@ -294,8 +294,9 @@ class CallCoordinates:
 class CanvasStep:
     """One denoising step of a block-diffusion request's resident canvas.
 
-    The request's admitted ``GenerationParams.canvas`` fixes the sampling;
-    the worker holds the canvas and its sampler state in the request's slot.
+    The worker's launch configuration (``WorkerConfig.canvas_sampling``)
+    fixes the sampling; the worker holds the canvas and its sampler state in
+    the request's slot.
     ``block`` counts the blocks already committed to the request's context
     and ``step`` the steps already run on this canvas; step zero starts the
     canvas from random tokens. The step that stops the canvas reports its

@@ -13,7 +13,7 @@ from typing import Generic, TypeVar
 
 import torch
 
-from uniserve.diffusion.canvas import CanvasSampling, CanvasState
+from uniserve.diffusion.canvas import CanvasState
 from uniserve.model import CanvasInput
 from uniserve_worker.protocol.call import ForwardMode, MediaCall
 from uniserve_worker.sampling.metadata import TokenSelection
@@ -235,18 +235,16 @@ class CanvasStepRow(AttentionRow):
     cached tokens and to its ``canvas_length`` canvas tokens at host int64
     ``positions``, and writes no KV. ``block`` counts the blocks the request
     has committed and ``step`` the steps already run on this canvas; step
-    zero starts the canvas. ``seed`` and ``sampling`` are the request's
-    admitted seed and the sampler constants of its canvas sampling. The
-    admitted seed is an unsigned 64-bit value; ``seed`` holds the int64 with
-    the same two's-complement bits, which the device columns store and the
-    sampler reinterprets as unsigned (see ``int64_bits``).
+    zero starts the canvas. ``seed`` is the request's admitted seed, an
+    unsigned 64-bit value; the field holds the int64 with the same
+    two's-complement bits, which the device columns store and the sampler
+    reinterprets as unsigned (see ``int64_bits``).
     """
 
     canvas_length: int = 0
     seed: int = 0
     block: int = 0
     step: int = 0
-    sampling: CanvasSampling | None = None
 
     def __post_init__(self):
         if (
@@ -260,14 +258,8 @@ class CanvasStepRow(AttentionRow):
             raise ValueError(
                 "a canvas step is a read-only noncausal canvas of its slot"
             )
-        if (
-            self.sampling is None
-            or min(self.block, self.step) < 0
-            or self.step >= self.sampling.steps
-        ):
-            raise ValueError(
-                "a canvas step runs within its request's canvas sampling"
-            )
+        if min(self.block, self.step) < 0:
+            raise ValueError("a canvas step has nonnegative counters")
 
     @property
     def query_tokens(self) -> int:
@@ -284,16 +276,15 @@ class CanvasStepInput:
     state, whose canvas and self-conditioning rows ``canvas`` reads, and
     ``views`` the same staged tensors by ``CanvasSlots`` field. ``slots``
     holds the rows' request slots as a device int64 ``[rows]`` vector,
-    through which the stepped state returns to its slots, and ``sampling``
-    each row's sampler constants. ``first`` is whether every row starts its
-    canvas (step zero), whose self-conditioning signal is zero.
+    through which the stepped state returns to its slots. ``first`` is
+    whether every row starts its canvas (step zero), whose
+    self-conditioning signal is zero.
     """
 
     canvas: CanvasInput
     state: CanvasState
     views: dict[str, torch.Tensor]
     slots: torch.Tensor
-    sampling: tuple[CanvasSampling, ...]
     first: bool = False
 
     @property

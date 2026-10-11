@@ -109,7 +109,7 @@ def _command_variant_index(command: BatchCommand) -> int:
 
 @dataclass(frozen=True, slots=True)
 class CanvasSampling:
-    """Block-diffusion sampling of a request that generates in canvases.
+    """Block-diffusion sampling of the canvases a deployment generates.
 
     A block of ``canvas_length`` tokens starts as random tokens and is
     denoised for at most ``max_steps`` steps: each samples every position at
@@ -191,8 +191,6 @@ class GenerationParams:
     # prefix-cache hit, and `RequestPool.start` begins the request with this
     # many tokens visible and computed.
     initial_position: int = 0
-    # Block-diffusion sampling of a request generating in canvases.
-    canvas: CanvasSampling | None = None
 
     def __post_init__(self) -> None:
         """Require a nonnegative initial position and canonical stop tokens.

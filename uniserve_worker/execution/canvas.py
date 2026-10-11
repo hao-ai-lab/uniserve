@@ -190,17 +190,16 @@ def prepare_step(
 
     The canvas starts at the request's logical position and reads the
     request's visible KV, like a readout canvas; its length and sampler
-    constants follow the request's admitted block-diffusion sampling
-    (``CanvasSlots.sampling``), and the step continues the canvas its slot
-    ran last (``CanvasSlots.advance``).
+    constants are the deployment's block-diffusion sampling the worker was
+    launched with (``CanvasSlots.constants``), and the step continues the
+    canvas its slot ran last (``CanvasSlots.advance``).
 
     Raises:
         WorkerError: ``invalid_descriptor`` when the worker keeps no
-            generating canvases, the request was admitted without canvas
-            sampling or a seed, the sampling does not fit the model's
-            canvases, the call's forward row is not one read-only canvas of
-            that length over the request's visible KV, or the step does not
-            continue the slot's canvas.
+            generating canvases, the request was admitted without a seed,
+            the call's forward row is not one read-only canvas of the
+            canvas length over the request's visible KV, or the step does
+            not continue the slot's canvas.
     """
     step = call.canvas
     if call.kind is not ForwardMode.TOKEN_DENOISING or step is None:
@@ -210,21 +209,17 @@ def prepare_step(
 
     request = state.pending_output(call.request_key.request_id)
     admitted = request.request.admission.generation
-    sampling = None if admitted is None else admitted.canvas
     seed = None if admitted is None else admitted.sampling.seed
-    if sampling is None or seed is None:
-        raise invalid_descriptor(
-            "a canvas step requires a request admitted with seeded canvas "
-            "sampling"
-        )
-    constants = canvas_slots.sampling(sampling)
+    if seed is None:
+        raise invalid_descriptor("a canvas step requires a seeded request")
+    constants = canvas_slots.constants
     slot, visible, _capacity = calls.cache_coordinates(
         request, tables=request_tables
     )
 
     inputs = state.batch
     descriptors = state.forward_indices.get(calls.call_identity(call), ())
-    length = sampling.canvas_length
+    length = canvas_slots.canvas_length
     if (
         len(descriptors) != 1
         or call.bounds.max_tokens != length
@@ -255,7 +250,6 @@ def prepare_step(
         seed=int64_bits(int(seed)),
         block=step.block,
         step=step.step,
-        sampling=constants,
     )
 
 

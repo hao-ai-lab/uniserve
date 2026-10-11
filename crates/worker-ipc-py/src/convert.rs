@@ -158,7 +158,6 @@ impl RequestTypes {
         records.insert("BufferAllocation", class(&module, "BufferAllocation")?);
         records.insert("NewRequest", class(&module, "NewRequest")?);
         records.insert("GenerationParams", class(&module, "GenerationParams")?);
-        records.insert("CanvasSampling", class(&module, "CanvasSampling")?);
         records.insert("DiffusionParams", class(&module, "DiffusionParams")?);
         records.insert("TensorPublication", class(&module, "TensorPublication")?);
         let module = py.import("uniserve_worker.protocol.video")?;
@@ -1020,36 +1019,7 @@ fn ar_params_to_py<'py>(py: Python<'py>, ar: &ArRequestParams) -> PyResult<Bound
         u32_tuple(py, &ar.finish_token_ids)?,
     )?;
     dict.set_item(intern!(py, "initial_position"), ar.initial_position)?;
-    dict.set_item(
-        intern!(py, "canvas"),
-        ar.canvas
-            .as_ref()
-            .map(|canvas| canvas_sampling_to_py(py, canvas))
-            .transpose()?,
-    )?;
     construct(py, "GenerationParams", &dict)
-}
-
-/// Converts block-diffusion sampling parameters into the worker's record.
-fn canvas_sampling_to_py<'py>(
-    py: Python<'py>,
-    canvas: &uniserve_worker_ipc::CanvasSampling,
-) -> PyResult<Bound<'py, PyAny>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "canvas_length"), canvas.canvas_length)?;
-    dict.set_item(intern!(py, "max_steps"), canvas.max_steps)?;
-    dict.set_item(intern!(py, "entropy_bound"), canvas.entropy_bound)?;
-    dict.set_item(intern!(py, "t_min"), canvas.t_min)?;
-    dict.set_item(intern!(py, "t_max"), canvas.t_max)?;
-    dict.set_item(
-        intern!(py, "confidence_threshold"),
-        canvas.confidence_threshold,
-    )?;
-    dict.set_item(
-        intern!(py, "stability_threshold"),
-        canvas.stability_threshold,
-    )?;
-    construct(py, "CanvasSampling", &dict)
 }
 
 /// Converts diffusion admission parameters and resolved media geometry.
@@ -2261,7 +2231,6 @@ mod tests {
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
-                canvas: None,
             }),
             None,
             2,

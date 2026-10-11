@@ -931,7 +931,6 @@ impl InputProcessor {
             cache,
             image_generation: ImageGenerationConfig::default(),
             readout: Vec::new(),
-            canvas: None,
         };
         let mut decode = TextDecodeOptions {
             skip_special_tokens: decode.skip_special_tokens,
@@ -1523,7 +1522,7 @@ mod tests {
         );
     }
 
-    /// A chat request generates its reply in canvases under the checkpoint's
+    /// A chat request generates its reply in canvases under the deployment's
     /// block-diffusion sampling, seeded by the request or, without a seed,
     /// by a fresh random one, and truncated at `max_completion_tokens`.
     #[tokio::test]
@@ -1542,9 +1541,14 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
+        // Every canvas the deployment generates runs under the profile's
+        // sampling, with which the engine and its workers are launched.
+        let ModelParameters::DiffusionGemma(profile) = &processor.config().parameters else {
+            unreachable!("the processor serves DiffusionGemma");
+        };
         assert_eq!(
-            generation.canvas,
-            Some(CanvasSampling {
+            crate::serving::canvas_sampling(profile),
+            CanvasSampling {
                 canvas_length: 256,
                 max_steps: 48,
                 entropy_bound: 0.1,
@@ -1552,7 +1556,7 @@ mod tests {
                 t_max: 0.8,
                 confidence_threshold: 0.005,
                 stability_threshold: 1,
-            })
+            }
         );
         assert_eq!(generation.sampling.seed, Some(5));
         assert_eq!(generation.max_und_tokens, 300);
