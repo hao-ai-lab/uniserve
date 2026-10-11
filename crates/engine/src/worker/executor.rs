@@ -306,6 +306,35 @@ pub(crate) fn video_unit_codecs(
     Ok(pairings)
 }
 
+/// Returns the spans a destination's ranks read a persistent dependency at.
+///
+/// A routed destination may reserve its own spans, which take precedence.
+/// Without one, a rank takes the span the producer's rank of that index held;
+/// the runtime's shared pool places a span at one offset on every rank, so a
+/// destination rank the producer's pool did not cover takes the offset the
+/// producer's ranks share. Empty when neither side holds a span.
+fn dependency_spans(
+    own: Vec<RankBuffer>,
+    produced: Vec<RankBuffer>,
+    ranks: u32,
+) -> Vec<RankBuffer> {
+    if !own.is_empty() {
+        return own;
+    }
+    let Some(first) = produced.first().copied() else {
+        return Vec::new();
+    };
+    (0..ranks)
+        .map(|rank| {
+            produced
+                .iter()
+                .find(|span| span.rank == rank)
+                .copied()
+                .unwrap_or(RankBuffer { rank, ..first })
+        })
+        .collect()
+}
+
 impl WorkerExecutor {
     /// Binds launched worker groups into one executor.
     ///
@@ -1043,10 +1072,12 @@ impl WorkerExecutor {
                     })
                     .collect::<Vec<_>>()
             };
-            let mut spans = held(worker_index);
-            if spans.is_empty() {
-                spans = producer.map(held).unwrap_or_default();
-            }
+            let produced = producer.map(held).unwrap_or_default();
+            let spans = dependency_spans(
+                held(worker_index),
+                produced,
+                self.workers[worker_index].1.world_size() as u32,
+            );
             anyhow::ensure!(
                 !spans.is_empty(),
                 "persistent dependency {:?} has no scheduler params",
@@ -2332,5 +2363,60 @@ mod placement_tests {
             message.contains("host b") && message.contains("host a"),
             "{message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dependency_span_tests {
+    use super::dependency_spans;
+    use crate::executor::RankBuffer;
+    use uniserve_core::RequestId;
+    use uniserve_worker_ipc::{BufferAllocation, BufferId, CallId, RequestKey};
+
+    fn span(rank: u32, offset: u64) -> RankBuffer {
+        RankBuffer {
+            rank,
+            allocation: BufferAllocation {
+                buffer: BufferId {
+                    owner: RequestKey::new(1, RequestId(1), 1),
+                    producer_call_id: CallId::new(1, 0),
+                    output_index: 0,
+                    generation: 1,
+                },
+                offset,
+                bytes: 256,
+            },
+        }
+    }
+
+    #[test]
+    fn a_destination_that_reserved_its_own_spans_reads_them() {
+        let own = vec![span(0, 512), span(1, 1024)];
+        let produced = vec![span(0, 0)];
+
+        assert_eq!(dependency_spans(own.clone(), produced, 2), own);
+    }
+
+    #[test]
+    fn a_destination_rank_the_producers_pool_did_not_cover_takes_the_shared_offset() {
+        // The producer ran on one rank; the destination has three.
+        let spans = dependency_spans(Vec::new(), vec![span(0, 768)], 3);
+
+        assert_eq!(spans, vec![span(0, 768), span(1, 768), span(2, 768)]);
+    }
+
+    #[test]
+    fn a_destination_rank_the_producer_covered_takes_that_ranks_span() {
+        let produced = vec![span(0, 0), span(1, 256)];
+
+        assert_eq!(
+            dependency_spans(Vec::new(), produced, 3),
+            vec![span(0, 0), span(1, 256), span(2, 0)]
+        );
+    }
+
+    #[test]
+    fn a_dependency_no_pool_placed_has_no_span() {
+        assert!(dependency_spans(Vec::new(), Vec::new(), 2).is_empty());
     }
 }
