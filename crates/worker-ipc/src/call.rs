@@ -106,7 +106,7 @@ impl TransferMode {
     }
 }
 
-/// Exactly one computation classification. The sum preserves the distinct
+/// Exactly one call classification. The sum preserves the distinct
 /// forward, media, and storage contracts without parallel opcode metadata.
 ///
 /// Serde represents a kind by its inner enum's snake_case name alone
@@ -354,7 +354,7 @@ pub struct VisionInput {
     pub feature: TensorRef,
 }
 
-/// One immutable computation with its identity, data dependencies, and output limits.
+/// One immutable call with its identity, data dependencies, and output limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {
     /// Request that owns the call.
@@ -368,7 +368,7 @@ pub struct Call {
     pub component: String,
     /// Kind performed by this call.
     pub kind: CallKind,
-    /// Scheduler-declared limits for the computation and its outputs.
+    /// Scheduler-declared limits for the call and its outputs.
     pub bounds: Bounds,
     /// Data dependencies consumed in input order.
     pub inputs: Vec<TensorRef>,
@@ -394,15 +394,15 @@ pub struct Call {
     pub latent_feature_input: Option<TensorRef>,
     /// Features produced by the selected image encoder.
     pub encoder_output: Option<TensorRef>,
-    /// Diffusion trajectory consumed by this computation.
+    /// Diffusion trajectory consumed by this call.
     pub latent_input: Option<TensorRef>,
-    /// Diffusion trajectory produced by this computation.
+    /// Diffusion trajectory produced by this call.
     pub latent_output: Option<TensorRef>,
     /// Resident image consumed by feedback encoding.
     pub image_input: Option<TensorRef>,
     /// Decoded image retained for feedback.
     pub image_output: Option<TensorRef>,
-    /// Boolean device completion consumed by a dependent computation.
+    /// Boolean device completion consumed by a dependent call.
     pub completion_output: Option<TensorRef>,
     /// Boolean device decision that selects an image transition.
     pub transition_output: Option<TensorRef>,
@@ -414,7 +414,7 @@ pub struct Call {
     /// generates. The worker derives the image's noise seed from its own
     /// admitted image seed and this index.
     pub image_index: Option<u32>,
-    /// Host-side sampler constraints for this computation; absent uses admission defaults.
+    /// Host-side sampler constraints for this call; absent uses admission defaults.
     pub sampling_state: Option<SamplingState>,
     /// Host-known prompt, draft, or decode input tokens in model input order,
     /// or a token-denoising call's canvas rows back to back. Empty when
@@ -429,14 +429,14 @@ pub struct Call {
     /// Encoded source image in base64, consumed by a vision or latent encoder.
     /// Dispatch and in-flight matching share these immutable bytes.
     pub input_image: Option<std::sync::Arc<str>>,
-    /// Published or installed cache extent consumed by this computation.
+    /// Published or installed cache extent consumed by this call.
     pub kv_input: Option<BufferId>,
-    /// Identity under which this computation publishes or installs cache state.
+    /// Identity under which this call publishes or installs cache state.
     pub kv_output: Option<BufferId>,
 }
 
 impl Call {
-    /// Tensor dependencies in the computation signature, excluding its predicate.
+    /// Tensor dependencies in the call signature, excluding its predicate.
     ///
     /// Includes `token_input` and `latent_input`, which [`Self::buffer_inputs`]
     /// omits.
@@ -450,7 +450,7 @@ impl Call {
             .chain(self.image_input.iter())
     }
 
-    /// All tensor declarations owned by this computation.
+    /// All tensor declarations owned by this call.
     ///
     /// Includes the device scalars (token, completion, transition) and
     /// `latent_output`, which [`Self::buffer_outputs`] omits.
@@ -465,7 +465,7 @@ impl Call {
             .chain(self.image_output.iter())
     }
 
-    /// Mutable declarations while assigning computation identities before submission.
+    /// Mutable declarations while assigning call identities before submission.
     pub fn tensor_outputs_mut(&mut self) -> impl Iterator<Item = &mut TensorRef> {
         self.outputs
             .iter_mut()
@@ -506,7 +506,7 @@ impl Call {
             .chain(self.kv_input)
     }
 
-    /// Resource identities published by this computation.
+    /// Resource identities published by this call.
     pub fn output_buffers(&self) -> impl Iterator<Item = BufferId> + '_ {
         self.tensor_outputs()
             .map(TensorRef::buffer_id)
@@ -537,7 +537,7 @@ impl Call {
 
         ensure_valid!(
             self.input_token_ids.len() <= self.bounds.max_tokens as usize,
-            "input token count exceeds the computation token bound"
+            "input token count exceeds the call token bound"
         );
         if let Some(state) = &self.sampling_state {
             for ids in [
@@ -612,7 +612,7 @@ impl Call {
             output.validate()?;
             ensure_valid!(
                 output.owner == self.request_key && output.producer_call_id == self.call_id,
-                "KV output is not owned by its producing computation"
+                "KV output is not owned by its producing call"
             );
             output_indices.insert(output.output_index);
         }
@@ -625,7 +625,7 @@ impl Call {
             input.validate()?;
             ensure_valid!(
                 consumes_kv && input.owner == self.request_key,
-                "KV input is incompatible with its computation or request"
+                "KV input is incompatible with its call or request"
             );
         }
         ensure_valid!(
@@ -694,7 +694,7 @@ impl Call {
             predicate.validate()?;
             ensure_valid!(
                 predicate.request_key == self.request_key,
-                "computation predicate belongs to another request"
+                "call predicate belongs to another request"
             );
             ensure_valid!(
                 matches!(predicate.dtype, DType::U8 | DType::I64)
@@ -1268,7 +1268,7 @@ impl CacheUnitAllocation {
 /// Aligned columns defining the model's forward rows, independent of wire framing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardBatch {
-    /// Physical call index for each row; logical computation IDs remain unchanged.
+    /// Physical call index for each row; logical call IDs remain unchanged.
     ///
     /// [`Batch`] flattens this struct; the serialized key matches the
     /// `forward_call_indices` field of the worker schema and of the Python
@@ -1524,7 +1524,7 @@ pub struct Batch {
 }
 
 impl Batch {
-    /// Constructs a run with admissions and calls using default metadata.
+    /// Constructs a batch with admissions and calls using default metadata.
     ///
     /// `collective_seq` is `batch_id`, or one when `batch_id` is zero;
     /// [`Self::validate`] requires it to be positive.
@@ -1555,12 +1555,12 @@ impl Batch {
         self.calls.iter()
     }
 
-    /// Returns the number of calls in this run.
+    /// Returns the number of calls in this batch.
     pub fn call_count(&self) -> usize {
         self.calls.len()
     }
 
-    /// Attaches ordered control commands to the run.
+    /// Attaches ordered control commands to the batch.
     pub fn with_commands(mut self, commands: Vec<BatchCommand>) -> Self {
         self.commands.extend(commands);
         self
@@ -1574,7 +1574,7 @@ impl Batch {
         })
     }
 
-    /// Attaches resolved input products to the run.
+    /// Attaches resolved input products to the batch.
     pub fn with_input_products(mut self, input_products: Vec<TensorPublication>) -> Self {
         self.input_products = input_products;
         self
@@ -1588,26 +1588,26 @@ impl Batch {
     /// addressing them, non-overlapping latent pages and buffer spans, and
     /// input products and KV inputs that some call declares.
     pub fn validate(&self) -> ValidationResult<()> {
-        // Establish the run envelope before validating relationships within it.
+        // Establish the batch envelope before validating relationships within it.
         ensure_valid!(
             !self.calls.is_empty() || !self.commands.is_empty(),
             "a submission batch must carry at least one call or control"
         );
         ensure_valid!(
             self.collective_seq > 0,
-            "run collective sequence must be positive"
+            "batch collective sequence must be positive"
         );
 
-        let mut computation_ids = HashSet::with_capacity(self.calls.len());
+        let mut call_ids = HashSet::with_capacity(self.calls.len());
         for call in &self.calls {
             call.validate()?;
             ensure_valid!(
                 call.call_id.batch_id == self.batch_id,
-                "computation identity belongs to another logical batch"
+                "call identity belongs to another logical batch"
             );
             ensure_valid!(
-                computation_ids.insert(call.call_id),
-                "a submission batch repeats a computation identity"
+                call_ids.insert(call.call_id),
+                "a submission batch repeats a call identity"
             );
         }
         // A batch is one numerical call on one component: every call in it
@@ -1632,7 +1632,7 @@ impl Batch {
             table.validate()?;
             ensure_valid!(
                 table_ids.insert((table.request_pool_idx, table.group_id)),
-                "run repeats a block table"
+                "batch repeats a block table"
             );
         }
 
@@ -1648,7 +1648,7 @@ impl Batch {
             let identity = (allocation.request_pool_idx, allocation.group_id);
             ensure_valid!(
                 allocation_ids.insert(identity),
-                "run repeats a cache-unit allocation"
+                "batch repeats a cache-unit allocation"
             );
             let table = tables.get(&identity).ok_or_else(|| {
                 invalid_message!("cache-unit allocation has no matching block table")
@@ -1665,7 +1665,7 @@ impl Batch {
 
         self.forward.validate(self.calls.len())?;
 
-        // Latent pages are exclusive across every trajectory placed in a run.
+        // Latent pages are exclusive across every trajectory placed in a batch.
         let mut latent_ids = HashSet::with_capacity(self.latent_params.len());
         let mut latent_pages = HashSet::new();
         for params in &self.latent_params {
@@ -1673,11 +1673,11 @@ impl Batch {
             let identity = (params.request_key, params.call_id);
             ensure_valid!(
                 latent_ids.insert(identity),
-                "run repeats a latent params identity"
+                "batch repeats a latent params identity"
             );
             let call = calls
                 .get(&identity)
-                .ok_or_else(|| invalid_message!("latent params does not name a run call"))?;
+                .ok_or_else(|| invalid_message!("latent params does not name a batch call"))?;
             let addresses_trajectory = matches!(
                 call.kind,
                 CallKind::Media(MediaCall::LatentPreparation)
@@ -1692,7 +1692,7 @@ impl Batch {
                     .page_table
                     .iter()
                     .all(|page| latent_pages.insert(*page)),
-                "run latent allocations overlap physical pages"
+                "batch latent allocations overlap physical pages"
             );
         }
 
@@ -1716,11 +1716,11 @@ impl Batch {
             let identity = (params.request_key, params.call_id);
             ensure_valid!(
                 decode_ids.insert(identity),
-                "run repeats a decode params identity"
+                "batch repeats a decode params identity"
             );
             let call = calls
                 .get(&identity)
-                .ok_or_else(|| invalid_message!("decode params does not name a run call"))?;
+                .ok_or_else(|| invalid_message!("decode params does not name a batch call"))?;
             // A video request's latent encoding also covers a range: the
             // visual condition units of one round, or its single audio call.
             ensure_valid!(
@@ -1779,7 +1779,7 @@ impl Batch {
                 params.validate()?;
                 ensure_valid!(
                     buffer_ids.insert(params.buffer),
-                    "run repeats a buffer params identity"
+                    "batch repeats a buffer params identity"
                 );
                 Ok((params.offset, params.offset + params.bytes))
             })
@@ -1788,7 +1788,7 @@ impl Batch {
 
         ensure_valid!(
             buffer_spans.windows(2).all(|pair| pair[0].1 <= pair[1].0),
-            "run buffer allocations overlap"
+            "batch buffer allocations overlap"
         );
 
         for call in &self.calls {
@@ -1882,7 +1882,7 @@ impl Batch {
             publication.validate()?;
             ensure_valid!(
                 kv_sources.insert(publication.source),
-                "run repeats a KV input"
+                "batch repeats a KV input"
             );
             let consumers = self
                 .calls()
@@ -1932,7 +1932,7 @@ impl BatchOutput {
         self.products.iter()
     }
 
-    /// Validates completion and product identities for this run.
+    /// Validates completion and product identities for this batch.
     pub fn validate(&self) -> ValidationResult<()> {
         let mut identities = HashSet::with_capacity(self.completions.len());
         for completion in &self.completions {

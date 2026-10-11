@@ -62,7 +62,7 @@ impl Scheduler {
                 }
                 Err(ExecutorSubmitError::Failed(error)) => {
                     // Failure reconciliation owns the pending identities until
-                    // every affected computation has been retired.
+                    // every affected call has been retired.
                     self.on_executor_error(error);
                     return true;
                 }
@@ -74,7 +74,7 @@ impl Scheduler {
     /// Returns whether any rank queue can still accept a batch.
     ///
     /// `queue_depth` bounds the batches in flight on one rank, not across the
-    /// instance: a batch carries one computation to one component, so a media
+    /// instance: a batch carries one call to one component, so a media
     /// pass occupies a slot on each component it touches rather than a single
     /// shared slot. Assembling stops once every rank queue is full.
     fn a_rank_queue_admits(&self) -> bool {
@@ -1734,7 +1734,7 @@ impl Scheduler {
                 }
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     physical = physical.saturating_add(call.bounds.max_tokens);
-                    if is_feedback_computation(call) {
+                    if is_feedback_call(call) {
                         feedback_index += 1;
                         if feedback_index == state.req.image_generation.feedback_encoders.len() {
                             logical = logical
@@ -1834,7 +1834,7 @@ impl Scheduler {
             let call = &pending.call;
             if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                 index = 0;
-            } else if consumes_image_features(call) && is_feedback_computation(call) {
+            } else if consumes_image_features(call) && is_feedback_call(call) {
                 index += 1;
                 if index == state.req.image_generation.feedback_encoders.len() {
                     index = 0;
@@ -1878,8 +1878,8 @@ impl Scheduler {
             .find_map(|pending| select(&pending.call))
     }
 
-    /// Selects the next computation from the last pending input, or from accepted
-    /// request progress when no computation remains. No request state is replayed.
+    /// Selects the next call from the last pending input, or from accepted
+    /// request progress when no call remains. No request state is replayed.
     pub(super) fn next_generation_phase(&self, id: RequestId) -> Option<Phase> {
         let state = self.running.get(&id)?;
         let pending = self
@@ -1910,7 +1910,7 @@ impl Scheduler {
                 }
                 CallKind::Forward(ForwardMode::TokenDenoising) => Phase::Readout,
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
-                    if is_feedback_computation(call) {
+                    if is_feedback_call(call) {
                         if self.scheduled_feedback(id)?.0 == 0 {
                             Phase::DecodeUnd
                         } else {
@@ -1929,7 +1929,7 @@ impl Scheduler {
                 CallKind::Media(MediaCall::ImageDecoding) => Phase::FeedbackEncode,
                 CallKind::Media(MediaCall::VisionEncoding)
                 | CallKind::Media(MediaCall::LatentEncoding)
-                    if is_feedback_computation(call) =>
+                    if is_feedback_call(call) =>
                 {
                     Phase::FeedbackState
                 }
@@ -1992,7 +1992,7 @@ impl Scheduler {
             return self.state_predecessor(id);
         };
         // Accepted lengths are published in device request state; the successor
-        // needs the producing computation identity while its host report is pending.
+        // needs the producing call identity while its host report is pending.
         Some(call.call_id)
     }
 
@@ -2109,7 +2109,7 @@ impl Scheduler {
         // prompt/decode pipelining, using each predecessor's actual inputs.
         if target == CallKind::Forward(ForwardMode::Decode) {
             let feedback_continuation = consumes_image_features(&predecessor.call)
-                && is_feedback_computation(&predecessor.call)
+                && is_feedback_call(&predecessor.call)
                 && self
                     .scheduled_feedback(id)
                     .is_some_and(|(index, _)| index == 0)
@@ -2199,7 +2199,7 @@ impl Scheduler {
         }
     }
 
-    /// Determines the next pipelined computation from its submitted predecessor.
+    /// Determines the next pipelined call from its submitted predecessor.
     ///
     /// Returns `None`, among other cases, when the request is not running or
     /// has no call in flight, has not yet submitted its whole prompt or every
@@ -2224,7 +2224,7 @@ impl Scheduler {
                 && state.req.image_generation.feedback_source
                     == Some(uniserve_core::FeedbackSource::DeviceProduct)
         } else if consumes_image_features(last)
-            && is_feedback_computation(last)
+            && is_feedback_call(last)
             && self.scheduled_feedback(id)?.0 == 0
         {
             state.req.image_generation.sample_feedback_continuation
@@ -2371,11 +2371,11 @@ impl Scheduler {
             .push_back(InflightCall { call, input });
     }
 
-    /// Counts one backpressure event against the metrics domain of `computation`.
-    pub(super) fn record_domain_backpressure(&self, computation: uniserve_worker_ipc::CallKind) {
+    /// Counts one backpressure event against the metrics domain of `call`.
+    pub(super) fn record_domain_backpressure(&self, call: uniserve_worker_ipc::CallKind) {
         self.stats
             .domains
-            .get(computation)
+            .get(call)
             .backpressure_events
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -2396,13 +2396,13 @@ impl Scheduler {
     }
 
     /// Counts one returned call, and a predicated or failed status, against
-    /// the metrics domain of `computation`.
+    /// the metrics domain of `call`.
     pub(super) fn record_domain_completion(
         &self,
-        computation: uniserve_worker_ipc::CallKind,
+        call: uniserve_worker_ipc::CallKind,
         status: CallStatus,
     ) {
-        let stats = self.stats.domains.get(computation);
+        let stats = self.stats.domains.get(call);
         stats.completed_calls.fetch_add(1, Ordering::Relaxed);
         match status {
             CallStatus::Ok => {}
@@ -2420,15 +2420,11 @@ impl Scheduler {
     ///
     /// A reclaim with no active credit is logged as an accounting defect and
     /// changes no counter.
-    pub(super) fn reclaim_domain_credit(
-        &self,
-        computation: uniserve_worker_ipc::CallKind,
-        failed: bool,
-    ) {
-        let stats = self.stats.domains.get(computation);
+    pub(super) fn reclaim_domain_credit(&self, call: uniserve_worker_ipc::CallKind, failed: bool) {
+        let stats = self.stats.domains.get(call);
         let active = stats.active_credits.load(Ordering::Relaxed);
         if active == 0 {
-            tracing::error!(?computation, "domain call credit accounting underflowed");
+            tracing::error!(?call, "domain call credit accounting underflowed");
             return;
         }
         stats.active_credits.fetch_sub(1, Ordering::Relaxed);
@@ -2683,7 +2679,7 @@ impl Scheduler {
                         | MediaCall::AudioEncoding,
                     ) => "decoding",
                     CallKind::Media(MediaCall::Muxing) => "finalizing",
-                    _ => unreachable!("media request completed a non-media computation"),
+                    _ => unreachable!("media request completed a non-media call"),
                 };
                 let _ = state.output.enqueue(EngineCoreOutput::MediaProgress {
                     phase: phase.to_owned(),
@@ -2958,7 +2954,7 @@ impl Scheduler {
                 invalid_result = true;
                 continue;
             }
-            let Some(computation) = self
+            let Some(call) = self
                 .inflight
                 .pending_calls
                 .get(&record.request_key.request_id)
@@ -2973,7 +2969,7 @@ impl Scheduler {
                 continue;
             };
             // A group's batch timing is the maximum of each phase over its calls.
-            let component = returned_groups[super::stats::ExecutionDomainStats::index(computation)]
+            let component = returned_groups[super::stats::ExecutionDomainStats::index(call)]
                 .get_or_insert(TimingCounters::default());
             component.queued_us = component.queued_us.max(record.timing_counters.queued_us);
             component.device_us = component.device_us.max(record.timing_counters.device_us);
@@ -3001,7 +2997,7 @@ impl Scheduler {
         let forward_stats = report.forward_stats;
         for result in &report.results {
             let record = &result.output;
-            if let Some(computation) = self
+            if let Some(call) = self
                 .inflight
                 .pending_calls
                 .get(&record.request_key.request_id)
@@ -3012,7 +3008,7 @@ impl Scheduler {
                 })
                 .map(|inflight| inflight.call.kind)
             {
-                self.record_domain_completion(computation, record.status);
+                self.record_domain_completion(call, record.status);
             }
         }
         for (index, returned) in returned_groups.into_iter().enumerate() {

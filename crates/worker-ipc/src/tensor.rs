@@ -104,7 +104,7 @@ impl ShapeBound {
 }
 
 /// Identity, element type, and bounded capacity of a tensor that survives its
-/// producing computation. Actual geometry and locations are published separately.
+/// producing call. Actual geometry and locations are published separately.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TensorRef {
     /// Request that owns the value.

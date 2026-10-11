@@ -84,7 +84,7 @@ pub struct MultimodalInputs {
 /// Canvas token `j` sits at the model position that follows the prompt's
 /// logical positions by `j`. Every canvas token attends to the whole prompt
 /// and to every token of its own row, and the pass writes no KV. The rows of
-/// one request are independent computations over the same prompt.
+/// one request are independent calls over the same prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadoutRow {
     /// Canvas token ids.
@@ -949,7 +949,7 @@ impl GenerationRequest {
             .sum()
     }
 
-    /// Returns the runtime features the request's computation reaches.
+    /// Returns the runtime features the request's call reaches.
     ///
     /// A readout needs token denoising and the encoders of its context
     /// images; any other request needs what its generation graph reaches

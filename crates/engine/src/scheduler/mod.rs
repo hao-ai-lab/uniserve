@@ -79,7 +79,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::scheduler::generation::{
-    BlockCursor, GenerationPhase as Phase, consumes_image_features, is_feedback_computation,
+    BlockCursor, GenerationPhase as Phase, consumes_image_features, is_feedback_call,
     is_prompt_extend,
 };
 

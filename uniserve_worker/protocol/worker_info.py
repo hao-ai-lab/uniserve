@@ -173,17 +173,17 @@ class WorkerInfo:
     """Describes a worker’s capabilities, topology, and resource bounds.
 
     Attributes:
-        max_batch_calls: Maximum calls in one run.
-        max_batch_tokens: Maximum text tokens represented in one run.
-        max_prefill_calls: Maximum calls in one prefill run, the rows the
-            worker's captured prefill graphs hold; a prefill run no graph
-            holds fails. Zero leaves prefill runs bounded by
+        max_batch_calls: Maximum calls in one batch.
+        max_batch_tokens: Maximum text tokens represented in one batch.
+        max_prefill_calls: Maximum calls in one prefill batch, the rows the
+            worker's captured prefill graphs hold; a prefill batch no graph
+            holds fails. Zero leaves prefill batches bounded by
             ``max_batch_calls`` alone, as when they run eagerly.
-        max_decode_calls: Maximum calls in one decode run, the rows the
+        max_decode_calls: Maximum calls in one decode batch, the rows the
             worker's largest captured decode graph holds, fewer when the KV
             pool cannot hold a page of every cache group for more rows; a
-            decode run no graph holds fails. Zero leaves decode runs bounded
-            by ``max_batch_calls`` alone, as when they run eagerly.
+            decode batch no graph holds fails. Zero leaves decode batches
+            bounded by ``max_batch_calls`` alone, as when they run eagerly.
         request_slots: Number of resident request slots.
         latent_page_units: Model-defined units stored in one latent page.
         latent_pages: Physical latent pages, including the reserved sentinel

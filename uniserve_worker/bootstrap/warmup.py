@@ -1011,7 +1011,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
         call_id: CallId,
         tokens: tuple[int, ...],
     ) -> Call:
-        """Build one prompt computation with direct token inputs."""
+        """Build one prompt call with direct token inputs."""
         nonlocal next_product_generation
         outputs = _warmup_token_output(
             keys[sid], call_id, next_product_generation

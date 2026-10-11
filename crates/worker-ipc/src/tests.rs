@@ -358,7 +358,7 @@ fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
 }
 
 #[test]
-fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
+fn call_coordinates_survive_physical_dispatch_and_reject_collisions() {
     let batch_id = u64::MAX - 7;
     let first = call_for(
         CallKind::Media(MediaCall::TextEncoding),
@@ -524,7 +524,7 @@ fn a_readout_and_its_candidate_logprobs_round_trip() {
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
             .unwrap();
-    assert_eq!(decoded.report().unwrap(), &report);
+    assert_eq!(decoded.output().unwrap(), &report);
 }
 
 /// A readout belongs to a token-denoising call and must address the canvas
@@ -608,7 +608,7 @@ fn a_canvas_step_and_its_block_round_trip() {
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
             .unwrap();
-    assert_eq!(decoded.report().unwrap(), &report);
+    assert_eq!(decoded.output().unwrap(), &report);
 }
 
 /// A canvas step belongs to a token-denoising call, which carries either a
@@ -709,7 +709,7 @@ fn malformed_call(
 }
 
 #[test]
-fn decoder_requires_one_concrete_computation() {
+fn decoder_requires_one_concrete_call() {
     use crate::schema::uniserve::ipc as fbs;
     for (forward, media) in [
         (fbs::ForwardMode::None, fbs::MediaCall::None),
@@ -722,7 +722,7 @@ fn decoder_requires_one_concrete_computation() {
 }
 
 #[test]
-fn every_computation_variant_round_trips_in_its_own_batch() {
+fn every_call_kind_round_trips_in_its_own_batch() {
     let batches = comprehensive_batches();
     assert_eq!(batches.len(), CallKind::ALL.len());
     for batch in batches {
@@ -731,7 +731,7 @@ fn every_computation_variant_round_trips_in_its_own_batch() {
 }
 
 #[test]
-fn a_batch_carries_one_computation_through_one_entry() {
+fn a_batch_carries_one_call_through_one_entry() {
     let decode = call_for(CallKind::Forward(ForwardMode::Decode), CallId::new(1, 0));
     let prefill = call_for(CallKind::Forward(ForwardMode::Prefill), CallId::new(1, 1));
     let mixed = batch_with_calls(1, Vec::new(), vec![decode.clone(), prefill]);
@@ -946,7 +946,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
         let decoded =
             decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
                 .unwrap();
-        assert_eq!(decoded.report().unwrap(), &report);
+        assert_eq!(decoded.output().unwrap(), &report);
 
         // Other product dtypes round-trip with locator byte sizes that follow
         // their element widths.
@@ -966,7 +966,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
                 &encode_response(&WorkerResponse::result(typed_report.clone())).unwrap(),
             )
             .unwrap();
-            assert_eq!(decoded.report().unwrap(), &typed_report);
+            assert_eq!(decoded.output().unwrap(), &typed_report);
         }
     }
 }
@@ -1048,7 +1048,7 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
             .unwrap();
-    assert_eq!(decoded.report().unwrap(), &report);
+    assert_eq!(decoded.output().unwrap(), &report);
 
     // A grown extent must carry the tensors of its suffix.
     let KvTransfer {
@@ -1171,7 +1171,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
         let decoded =
             decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
                 .unwrap();
-        assert_eq!(decoded.report().unwrap(), &report);
+        assert_eq!(decoded.output().unwrap(), &report);
 
         // Zero generations, a zero page size, a group starting before the
         // base, an unchanged extent with groups, and malformed or unexpected
@@ -1214,7 +1214,7 @@ fn error_completion_round_trips_with_its_error_code() {
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report)).unwrap()).unwrap();
     assert_eq!(
-        decoded.report().unwrap().completions().next().unwrap(),
+        decoded.output().unwrap().completions().next().unwrap(),
         &record
     );
 }
@@ -1483,7 +1483,7 @@ fn call_sampling_state_preserves_whitelist_presence() {
 }
 
 #[test]
-fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
+fn image_encoder_input_round_trips_and_rejects_an_incompatible_call() {
     let mut call = ar_decode_call();
     call.kind = CallKind::Media(MediaCall::VisionEncoding);
     call.input_image = Some("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGN0SGhgIAUwkaR6VMOohiGlAQCjvQFA6eri4wAAAABJRU5ErkJggg==".into());
@@ -1854,7 +1854,7 @@ fn comprehensive_batches() -> Vec<Batch> {
         batches.push(batch_with_calls(42 + index as u64, admissions, calls));
     }
     // The pass's retirement rides on its last batch.
-    let last = batches.pop().expect("one batch per computation variant");
+    let last = batches.pop().expect("one batch per call variant");
     batches.push(last.with_commands(vec![BatchCommand::Finish {
         request_key: key_for_request(201),
         retained_buffers: Vec::new(),
@@ -1868,9 +1868,9 @@ fn request_fixtures() -> Vec<WorkerRequest> {
         comprehensive_batches()
             .into_iter()
             .next()
-            .expect("one batch per computation variant"),
+            .expect("one batch per call variant"),
     );
-    submit.set_call_id(Some(91));
+    submit.set_message_id(Some(91));
     vec![WorkerRequest::info(), submit, WorkerRequest::close()]
 }
 

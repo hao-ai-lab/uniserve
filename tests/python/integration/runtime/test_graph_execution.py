@@ -47,7 +47,7 @@ def test_initial_inputs_are_ready_for_consumption_after_preparation(
                     if compute_fails:
                         raise ValueError("compute rejected")
             # This GPU consumer uses the calling stream. Copy completion must
-            # precede it even when independent preparation computation failed.
+            # precede it even when independent preparation call failed.
             actual = (destination + 1).cpu()
             torch.testing.assert_close(
                 actual, torch.full_like(source, value + 1), rtol=0, atol=0

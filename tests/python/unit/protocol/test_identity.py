@@ -51,7 +51,7 @@ def test_buffer_lookup_preserves_identity_across_reconstruction_and_versions():
     assert entries[reference.buffer_id] == "value"
 
 
-def test_computation_order_and_lookup_follow_batch_and_request_coordinates():
+def test_call_order_and_lookup_follow_batch_and_request_coordinates():
     first = CallId(9, 1)
     second = CallId(9, 2)
     third = CallId(10, 0)

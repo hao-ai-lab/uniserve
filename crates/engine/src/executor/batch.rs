@@ -14,19 +14,19 @@ use uniserve_worker_ipc::{
     ForwardBatch, LatentParams, NewRequest, RequestKey, TensorPublication,
 };
 
-/// Physical placement selected by the scheduler for a computation.
+/// Physical placement selected by the scheduler for a call.
 ///
-/// The computation itself is the shared IPC `Call`. These fields describe
+/// The call itself is the shared IPC `Call`. These fields describe
 /// its worker and allocations, which are gathered into physical batch arrays.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestPlacement {
-    /// Worker routing stays outside the computation sent across IPC.
+    /// Worker routing stays outside the call sent across IPC.
     pub worker: WorkerId,
     /// Worker-local request row when a replicated route owns its own address
     /// space. Unset placements retain the admission's canonical row;
     /// `WorkerExecutor` applies the override to the `Start` it sends the worker.
     pub request_pool_idx: Option<u32>,
-    /// KV tables and newly acquired units used by this computation.
+    /// KV tables and newly acquired units used by this call.
     pub block_tables: Vec<BlockTable>,
     pub new_cache_units: Vec<CacheUnitAllocation>,
     /// Rows use a local call index until gathered into the physical batch:
@@ -155,7 +155,7 @@ impl ExecutionBatch {
             call.validate()?;
             anyhow::ensure!(
                 call.call_id.batch_id == self.id,
-                "computation identity belongs to another logical batch"
+                "call identity belongs to another logical batch"
             );
             requests.insert(call.request_key);
             // `WorkerId`'s public field admits any string; only its

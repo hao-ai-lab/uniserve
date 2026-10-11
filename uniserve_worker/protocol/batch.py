@@ -563,18 +563,16 @@ class Batch:
             self.query_lens,
             self.write_kv,
         )
-        # Every computation belongs to this logical batch, with unique
-        # computation identities and at most one call per request.
-        computation_ids = [call.call_id for call in self.calls]
-        if any(
-            identity.batch_id != self.batch_id for identity in computation_ids
-        ):
+        # Every call belongs to this logical batch, with unique
+        # call identities and at most one call per request.
+        call_ids = [call.call_id for call in self.calls]
+        if any(identity.batch_id != self.batch_id for identity in call_ids):
             raise invalid_descriptor(
-                "computation identity belongs to another logical batch"
+                "call identity belongs to another logical batch"
             )
-        if len(set(computation_ids)) != len(computation_ids):
+        if len(set(call_ids)) != len(call_ids):
             raise invalid_descriptor(
-                "a submission batch repeats a computation identity"
+                "a submission batch repeats a call identity"
             )
         request_keys = [call.request_key for call in self.calls]
         if len(set(request_keys)) != len(request_keys):

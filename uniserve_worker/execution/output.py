@@ -573,7 +573,7 @@ class PendingOutput:
             except Exception:
                 logger.exception(
                     "completion materialization failed: request=%s "
-                    "call=%s computation=%s",
+                    "call=%s call=%s",
                     self.request_key,
                     self.call_id,
                     self.kind,

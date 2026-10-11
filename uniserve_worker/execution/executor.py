@@ -436,7 +436,7 @@ class Executor:
             self.release_buffers(freed)
 
     def advance(self) -> bool:
-        """Progress dependencies, computation and physical retirement.
+        """Progress dependencies, call and physical retirement.
 
         Returns whether any batch made progress.
         """
@@ -455,7 +455,7 @@ class Executor:
         return advanced
 
     def poll(self, submission: Submission) -> BatchOutput | None:
-        """Consume the batch's result without launching computation.
+        """Consume the batch's result without launching call.
 
         Returns None while the batch is not ready. Otherwise the batch is
         released and its output returned, or its recorded error raised. A
@@ -493,7 +493,7 @@ class Executor:
         begins (``_retire_commands``).
         """
         batch = state.batch
-        # Cooperative ranks launch computation in increasing
+        # Cooperative ranks launch call in increasing
         # ``collective_seq``; preparation and host completion may overlap.
         if self.worker.worker_config.world_size > 1 and batch.calls:
             if batch.collective_seq <= self._last_collective_seq:
@@ -515,7 +515,7 @@ class Executor:
         # A batch with calls is one numerical step of the worker: the profiler's
         # capture window counts these steps, and the step name becomes the NVTX
         # range that Nsight shows for the batch. Lifecycle-only batches carry no
-        # computation and are not counted.
+        # call and are not counted.
         step: AbstractContextManager[None]
         if self.worker.profiler is not None and batch.calls:
             first = batch.calls[0]
@@ -582,7 +582,7 @@ class Executor:
         unsupported = {
             call.kind.value
             for call in batch.calls
-            if not self.worker.supports_computation(call.kind)
+            if not self.worker.supports_call(call.kind)
         }
         if unsupported:
             raise invalid_descriptor(

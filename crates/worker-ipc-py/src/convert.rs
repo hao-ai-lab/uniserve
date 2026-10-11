@@ -87,7 +87,7 @@ pub(crate) fn execute_request_to_py<'py>(
 struct RequestTypes {
     records: HashMap<&'static str, Py<PyAny>>,
     call: Py<PyAny>,
-    computation_id: Py<PyAny>,
+    call_id: Py<PyAny>,
     request_key: Py<PyAny>,
     tensor_ref: Py<PyAny>,
     buffer_id: Py<PyAny>,
@@ -204,7 +204,7 @@ impl RequestTypes {
         Ok(Self {
             records,
             call: class(&call, "Call")?,
-            computation_id: class(&identity, "CallId")?,
+            call_id: class(&identity, "CallId")?,
             request_key: class(&identity, "RequestKey")?,
             tensor_ref: class(&tensor, "TensorRef")?,
             buffer_id: class(&identity, "BufferId")?,
@@ -316,7 +316,7 @@ struct RequestConversion<'py> {
     py: Python<'py>,
     types: &'static RequestTypes,
     request_keys: HashMap<RequestKey, Py<PyAny>>,
-    computation_ids: HashMap<CallId, Py<PyAny>>,
+    call_ids: HashMap<CallId, Py<PyAny>>,
     shape_bounds: HashMap<ShapeBound, Py<PyAny>>,
 }
 
@@ -327,7 +327,7 @@ impl<'py> RequestConversion<'py> {
             py,
             types: RequestTypes::get(py)?,
             request_keys: HashMap::new(),
-            computation_ids: HashMap::new(),
+            call_ids: HashMap::new(),
             shape_bounds: HashMap::new(),
         })
     }
@@ -337,16 +337,16 @@ impl<'py> RequestConversion<'py> {
     /// Call ids repeat across a batch, for example as call identities, as the
     /// `call_id` of latent and decode params, and as the producers named by
     /// tensor references and buffer ids.
-    fn computation_id(&mut self, id: CallId) -> PyResult<Bound<'py, PyAny>> {
-        if let Some(value) = self.computation_ids.get(&id) {
+    fn call_id(&mut self, id: CallId) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(value) = self.call_ids.get(&id) {
             return Ok(value.bind(self.py).clone());
         }
         let value = self
             .types
-            .computation_id
+            .call_id
             .bind(self.py)
             .call1((id.batch_id, id.request_index))?;
-        self.computation_ids.insert(id, value.clone().unbind());
+        self.call_ids.insert(id, value.clone().unbind());
         Ok(value)
     }
 
@@ -393,7 +393,7 @@ impl<'py> RequestConversion<'py> {
         let shape_bound = self.shape_bound(&product.shape_bound)?;
         self.types.tensor_ref.bind(self.py).call1((
             request_key,
-            self.computation_id(product.producer_call_id)?,
+            self.call_id(product.producer_call_id)?,
             product.output_index,
             product.generation,
             self.types.dtype(self.py, product.dtype),
@@ -406,13 +406,13 @@ impl<'py> RequestConversion<'py> {
         let owner = self.request_key(buffer.owner)?;
         self.types.buffer_id.bind(self.py).call1((
             owner,
-            self.computation_id(buffer.producer_call_id)?,
+            self.call_id(buffer.producer_call_id)?,
             buffer.output_index,
             buffer.generation,
         ))
     }
 
-    /// Constructs a typed Python call from its computation fields.
+    /// Constructs a typed Python call from its call fields.
     ///
     /// `Call` is constructed positionally: the argument tuple below follows
     /// the field order of the `Call` dataclass in
@@ -505,7 +505,7 @@ impl<'py> RequestConversion<'py> {
             py,
             [
                 request_key.into_any(),
-                self.computation_id(call.call_id)?,
+                self.call_id(call.call_id)?,
                 coordinates.into_any(),
                 self.types.kind(py, call.kind),
                 bounds.into_any(),
@@ -651,31 +651,31 @@ impl<'py> RequestConversion<'py> {
 /// shared between calls, commands, input products, and the per-batch
 /// parameter records. `kv_inputs` are the exception: `kv_transfer_to_py`
 /// builds their buffer ids through `buffer_id_to_py`.
-fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>> {
+fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyAny>> {
     let mut native = RequestConversion::new(py)?;
 
-    let calls = run
+    let calls = batch
         .calls
         .iter()
         .map(|call| native.call(call))
         .collect::<PyResult<Vec<_>>>()?;
-    let block_tables = run
+    let block_tables = batch
         .block_tables
         .iter()
         .map(|table| native.block_table(table))
         .collect::<PyResult<Vec<_>>>()?;
-    let new_cache_units = run
+    let new_cache_units = batch
         .new_cache_units
         .iter()
         .map(|allocation| native.cache_unit_allocation(allocation))
         .collect::<PyResult<Vec<_>>>()?;
-    let commands = run
+    let commands = batch
         .commands
         .iter()
         .map(|command| native.command(command))
         .collect::<PyResult<Vec<_>>>()?;
 
-    let input_products = record_tuple(py, &run.input_products, |payload| {
+    let input_products = record_tuple(py, &batch.input_products, |payload| {
         tensor_publication_to_py(py, payload, &mut native)
     })?;
 
@@ -687,35 +687,35 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
     let arguments = pyo3::types::PyTuple::new(
         py,
         [
-            run.batch_id.into_pyobject(py)?.into_any(),
-            run.collective_seq.into_pyobject(py)?.into_any(),
+            batch.batch_id.into_pyobject(py)?.into_any(),
+            batch.collective_seq.into_pyobject(py)?.into_any(),
             pyo3::types::PyTuple::new(py, calls)?.into_any(),
             pyo3::types::PyTuple::new(py, block_tables)?.into_any(),
             pyo3::types::PyTuple::new(py, new_cache_units)?.into_any(),
             (
-                pyo3::types::PyTuple::new(py, &run.forward.call_indices)?,
-                pyo3::types::PyTuple::new(py, &run.forward.request_pool_indices)?,
-                pyo3::types::PyTuple::new(py, &run.forward.seq_lens)?,
-                pyo3::types::PyTuple::new(py, &run.forward.query_lens)?,
-                pyo3::types::PyTuple::new(py, &run.forward.write_kv)?,
+                pyo3::types::PyTuple::new(py, &batch.forward.call_indices)?,
+                pyo3::types::PyTuple::new(py, &batch.forward.request_pool_indices)?,
+                pyo3::types::PyTuple::new(py, &batch.forward.seq_lens)?,
+                pyo3::types::PyTuple::new(py, &batch.forward.query_lens)?,
+                pyo3::types::PyTuple::new(py, &batch.forward.write_kv)?,
             )
                 .into_pyobject(py)?
                 .into_any(),
-            record_tuple(py, &run.latent_params, |params| {
+            record_tuple(py, &batch.latent_params, |params| {
                 latent_params_to_py(py, params, &mut native)
             })?
             .into_any(),
-            record_tuple(py, &run.decode_ranges, |params| {
+            record_tuple(py, &batch.decode_ranges, |params| {
                 decode_range_to_py(py, params, &mut native)
             })?
             .into_any(),
-            record_tuple(py, &run.buffer_allocations, |params| {
+            record_tuple(py, &batch.buffer_allocations, |params| {
                 buffer_allocation_to_py(py, params, &mut native)
             })?
             .into_any(),
             pyo3::types::PyTuple::new(py, commands)?.into_any(),
             input_products.into_any(),
-            record_tuple(py, &run.kv_inputs, |transfer| {
+            record_tuple(py, &batch.kv_inputs, |transfer| {
                 kv_transfer_to_py(py, transfer)
             })?
             .into_any(),
@@ -736,10 +736,7 @@ fn latent_params_to_py<'py>(
         intern!(py, "request_key"),
         context.request_key(params.request_key)?,
     )?;
-    dict.set_item(
-        intern!(py, "call_id"),
-        context.computation_id(params.call_id)?,
-    )?;
+    dict.set_item(intern!(py, "call_id"), context.call_id(params.call_id)?)?;
     dict.set_item(
         intern!(py, "page_table"),
         u32_tuple(py, &params.page_table)?,
@@ -764,10 +761,7 @@ fn decode_range_to_py<'py>(
         intern!(py, "request_key"),
         context.request_key(params.request_key)?,
     )?;
-    dict.set_item(
-        intern!(py, "call_id"),
-        context.computation_id(params.call_id)?,
-    )?;
+    dict.set_item(intern!(py, "call_id"), context.call_id(params.call_id)?)?;
     dict.set_item(intern!(py, "cursor"), params.cursor)?;
     dict.set_item(intern!(py, "max_units"), params.max_units)?;
     dict.set_item(
@@ -1331,7 +1325,7 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     if !absent_or_none(dict, intern!(py, "info"))? {
         return None;
     }
-    let report = run_result_from_py(&get(dict, intern!(py, "result"))?)?;
+    let report = batch_output_from_py(&get(dict, intern!(py, "result"))?)?;
     let identities = error_calls_from_py(dict)?;
     if !identities.is_empty()
         || opt_string(dict, intern!(py, "message"))?.is_some()
@@ -1378,7 +1372,7 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
 ///
 /// `completions` and `products` must be lists; `forward_stats` may be absent
 /// or `None`, but when present every counter is required.
-fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
+fn batch_output_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
@@ -1597,7 +1591,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
             .map(|value| value.ok()?.extract::<f32>().ok())
             .collect::<Option<Vec<_>>>()?,
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
-        call_id: computation_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
+        call_id: call_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
         status,
         error_code,
         error_message: match get(dict, intern!(py, "error_message")) {
@@ -1725,7 +1719,7 @@ fn buffer_id_mapping_from_py(value: &Bound<'_, PyAny>) -> Option<BufferId> {
     let dict = value.cast::<PyDict>().ok()?;
     Some(BufferId {
         owner: request_key_from_py(&get(dict, intern!(py, "owner"))?)?,
-        producer_call_id: computation_id_from_py(&get(dict, intern!(py, "producer_call_id"))?)?,
+        producer_call_id: call_id_from_py(&get(dict, intern!(py, "producer_call_id"))?)?,
         output_index: u16_of(&get(dict, intern!(py, "output_index"))?)?,
         generation: u32_of(&get(dict, intern!(py, "generation"))?)?,
     })
@@ -1775,7 +1769,7 @@ fn tensor_ref_from_py(value: &Bound<'_, PyAny>) -> Option<TensorRef> {
     }
     Some(TensorRef {
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
-        producer_call_id: computation_id_from_py(&get(dict, intern!(py, "producer_call_id"))?)?,
+        producer_call_id: call_id_from_py(&get(dict, intern!(py, "producer_call_id"))?)?,
         output_index: u16_of(&get(dict, intern!(py, "output_index"))?)?,
         generation: u32_of(&get(dict, intern!(py, "generation"))?)?,
         dtype,
@@ -1793,7 +1787,7 @@ fn feature_kind_from_py(value: &Bound<'_, PyAny>) -> Option<FeatureKind> {
 }
 
 /// Decodes a call id from its `batch_id` and `request_index` fields.
-fn computation_id_from_py(value: &Bound<'_, PyAny>) -> Option<CallId> {
+fn call_id_from_py(value: &Bound<'_, PyAny>) -> Option<CallId> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
     Some(CallId::new(
@@ -1819,7 +1813,7 @@ fn error_call_from_py(value: &Bound<'_, PyAny>) -> Option<ErrorCallIdentity> {
     let dict = value.cast::<PyDict>().ok()?;
     Some(ErrorCallIdentity {
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
-        call_id: computation_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
+        call_id: call_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
     })
 }
 
@@ -2181,9 +2175,9 @@ mod tests {
         }
     }
 
-    /// One submission per computation.
+    /// One submission per call.
     ///
-    /// A batch carries one computation through one component, so the native
+    /// A batch carries one call through one component, so the native
     /// conversion is exercised with a token call, a media call, a KV
     /// transfer and a token-denoising readout in four batches (batch ids 11
     /// to 14 under message ids 9 to 12) rather than one mixed submission.
@@ -2436,7 +2430,7 @@ mod tests {
             .enumerate()
             .map(|(index, batch)| {
                 let mut request = WorkerRequest::submit(batch);
-                request.set_call_id(Some(9 + index as u64));
+                request.set_message_id(Some(9 + index as u64));
                 request
             })
             .collect()
@@ -2511,7 +2505,7 @@ mod tests {
         readout.candidate_logprobs = vec![-0.5, -2.25, -9.0];
         result.completions.push(publication);
         result.completions.push(readout);
-        response.set_call_id(Some(11));
+        response.set_message_id(Some(11));
         response
     }
 
@@ -2527,7 +2521,7 @@ mod tests {
             worker_exec_us: None,
             forward_stats: None,
         });
-        response.set_call_id(Some(9 + batch_id - 11));
+        response.set_message_id(Some(9 + batch_id - 11));
         pythonize(py, &response).unwrap()
     }
 

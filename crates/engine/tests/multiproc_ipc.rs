@@ -284,7 +284,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 0,
             );
             let request = |mut request: WorkerRequest, message_id| {
-                request.set_call_id(Some(message_id));
+                request.set_message_id(Some(message_id));
                 request
             };
             let initial = client.send_request(&request(WorkerRequest::submit(batch.clone()), 1))?;
@@ -414,7 +414,7 @@ fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Resu
     let result = (|| -> anyhow::Result<()> {
         let client = ClientEndpoint::connect(&accept_reported_endpoint(&listener)?, 1 << 20, 8)?;
         let request = |mut request: WorkerRequest, message_id| {
-            request.set_call_id(Some(message_id));
+            request.set_message_id(Some(message_id));
             request
         };
         let serve = |batch_id: u64, request_id: u64, slot: u32, message_id| -> anyhow::Result<()> {
@@ -1082,7 +1082,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                             assert!(!independent_returned);
                             independent_returned = true;
                         }
-                        computation => panic!("unexpected completed computation {computation:?}"),
+                        call => panic!("unexpected completed call {call:?}"),
                     }
                 }
             }
@@ -2355,7 +2355,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Independent instances accepting the same computation must retain separate capacity.
+/// Independent instances accepting the same call must retain separate capacity.
 #[test]
 fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow::Result<()> {
     use uniserve_engine::{
@@ -2995,7 +2995,7 @@ fn spawn_rank_group_with_capacities(
 /// The components the stub model declares, over `rank_count` ranks.
 ///
 /// A placement names what a worker holds, and a worker that serves a model's
-/// whole computation holds every component it declares.
+/// whole call holds every component it declares.
 fn stub_components(
     rank_count: usize,
 ) -> std::collections::BTreeMap<String, uniserve_core::ComponentConfig> {

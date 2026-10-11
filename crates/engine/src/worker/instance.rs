@@ -1311,7 +1311,7 @@ impl WorkerGroup {
 
 /// Restrict a physical invocation to each component's actual members. Request and
 /// storage commands retain group-wide visibility, including on otherwise idle
-/// ranks; they do not create synthetic computation completions.
+/// ranks; they do not create synthetic call completions.
 fn rank_projection(
     batch: &Batch,
     components: &BTreeMap<String, crate::ComponentConfig>,

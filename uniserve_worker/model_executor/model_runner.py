@@ -282,7 +282,7 @@ class ModelRunner(Execution, ABC):
                             *inputs[0], **inputs[1], **resources
                         )
 
-                    # The eager call warms the computation and fixes the
+                    # The eager call warms the call and fixes the
                     # output shapes the borrowed backing views.
                     example = forward(static)
                     with self.graph_storage.allocate(self):
@@ -466,7 +466,7 @@ class ModelRunner(Execution, ABC):
         decoding where ``graph_inputs.greedy_decode`` applies. Inside an
         expert step the graph also joins every expert layer ``forward`` did
         not reach, so its replay makes all of the step's exchanges. Runners
-        with other captured computations override this together with
+        with other captured calls override this together with
         ``replay_graph``.
         """
         return capture_batch(

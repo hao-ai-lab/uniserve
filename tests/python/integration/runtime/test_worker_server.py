@@ -352,7 +352,7 @@ def test_a_batch_id_that_does_not_advance_is_refused_before_new_admission() -> (
     assert responses[2]["code"] == "invalid_descriptor"
     assert responses[3]["kind"] == "error"
     assert responses[3]["code"] == "invalid_descriptor"
-    # Rejected work must not admit its request; the same computation still
+    # Rejected work must not admit its request; the same call still
     # executes once its batch identity advances.
     result = responses[4]["result"]
     assert result["batch_id"] == 3

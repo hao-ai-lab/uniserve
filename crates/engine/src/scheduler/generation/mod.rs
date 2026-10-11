@@ -170,7 +170,7 @@ pub(crate) enum GenerationPhase {
     IngestState,
     /// Ingest the context: prefill prompt tokens and the vision blocks of
     /// input images between them, encoding each block first
-    /// (`Scheduler::next_context_computation`).
+    /// (`Scheduler::next_context_call`).
     Prefill,
     /// Decode understanding (text) tokens.
     DecodeUnd,
@@ -219,7 +219,7 @@ pub(super) fn consumes_image_features(call: &Call) -> bool {
 ///
 /// `plan_encode` and `plan_image_extend` declare `completion_output` only for
 /// feedback, which is what separates the feedback variants here.
-pub(super) fn is_feedback_computation(call: &Call) -> bool {
+pub(super) fn is_feedback_call(call: &Call) -> bool {
     (matches!(
         call.kind,
         CallKind::Media(MediaCall::VisionEncoding) | CallKind::Media(MediaCall::LatentEncoding)
@@ -261,7 +261,7 @@ pub(super) fn is_prompt_extend(call: &Call) -> bool {
 }
 
 impl RequestState {
-    /// Applies one validated computation in request order. Pending identities are
+    /// Applies one validated call in request order. Pending identities are
     /// consumed once before this update; inactive successors never reach it.
     ///
     /// Updates the request's cursors, KV extents, encoder indices, denoising
@@ -336,7 +336,7 @@ impl RequestState {
                 // Logical positions advance by the image's position count once,
                 // after its last encoder.
                 self.kv_visible_len = record.kv_visible_len;
-                if is_feedback_computation(call) {
+                if is_feedback_call(call) {
                     self.feedback_encoder_index = self.feedback_encoder_index.saturating_add(1);
                     self.feedback_features = None;
                     if self.feedback_encoder_index
@@ -446,7 +446,7 @@ impl RequestState {
             }
             CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding)
-                if is_feedback_computation(call) =>
+                if is_feedback_call(call) =>
             {
                 self.feedback_features = call.encoder_output.clone();
                 self.phase = GenerationPhase::FeedbackState;
@@ -488,12 +488,12 @@ fn latent_output(output_index: u16, bytes: u64, dtype: DType) -> Result<TensorRe
     ))
 }
 
-/// Builds the actual computation before assigning storage and execution identities.
+/// Builds a call of `kind` before assigning storage and execution identities.
 ///
 /// Every optional input and output is unset, the call id and the request
 /// key's engine id and epoch are zero placeholders, and the bound is one
 /// token; the `plan_*` builders fill in the rest.
-fn computation(request: &GenerationRequest, code: CallKind) -> Call {
+fn new_call(request: &GenerationRequest, kind: CallKind) -> Call {
     Call {
         consumer_slots: Vec::new(),
         token_input: None,
@@ -502,7 +502,7 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
         call_id: CallId::new(0, 0),
         coordinates: CallCoordinates::default(),
         component: DEFAULT_COMPONENT.into(),
-        kind: code,
+        kind,
         bounds: Bounds {
             max_tokens: 1,
             ..Bounds::default()
@@ -563,7 +563,7 @@ pub(super) fn plan_prompt(
             prompt_tokens: request.prompt_token_ids.len(),
         });
     }
-    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = end.saturating_sub(start).saturating_add(block_tokens);
     call.input_token_ids = request.prompt_token_ids[start as usize..end as usize].to_vec();
     // A block after the call's last prompt token, at the prompt's end.
@@ -614,7 +614,7 @@ pub(super) fn plan_readout(
             rows: request.readout.len(),
         })?;
 
-    let mut call = computation(request, CallKind::Forward(ForwardMode::TokenDenoising));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::TokenDenoising));
     let mut readout = Readout {
         slot_tokens: Vec::new(),
         candidate_offsets: vec![0],
@@ -659,7 +659,7 @@ pub(super) fn plan_canvas_step(
     block: u32,
     step: u32,
 ) -> Result<Call, PlanningError> {
-    let mut call = computation(request, CallKind::Forward(ForwardMode::TokenDenoising));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::TokenDenoising));
     call.bounds.max_tokens = canvas.canvas_length;
     call.canvas = Some(CanvasStep { block, step });
     call.completion_output = Some(output_tensor(0, DType::U8));
@@ -679,7 +679,7 @@ pub(super) fn plan_canvas_commit(
     if tokens.is_empty() {
         return Err(PlanningError::EmptyCanvasCommit);
     }
-    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = u32::try_from(tokens.len())
         .map_err(|_| PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
     call.input_token_ids = tokens.to_vec();
@@ -705,7 +705,7 @@ pub(super) fn plan_decode(
     } else {
         CallKind::Forward(ForwardMode::Verify)
     };
-    let mut call = computation(request, code);
+    let mut call = new_call(request, code);
     call.bounds.max_tokens = (1 + draft_count).min(u32::MAX as usize) as u32;
     call.input_token_ids = match spec_token_ids {
         Some(drafts) if !drafts.is_empty() => drafts,
@@ -737,7 +737,7 @@ pub(super) fn plan_image_extend(
     sampling_state: Option<SamplingState>,
 ) -> Result<Call, PlanningError> {
     let capacity = encoder.kv_token_capacity(limits)?;
-    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = capacity;
     if encoder.encoder == MediaCall::LatentEncoding {
         call.latent_feature_input = Some(feature);
@@ -776,7 +776,7 @@ pub(super) fn plan_encode(
     } else if source.is_none() && image_base64.is_empty() {
         return Err(PlanningError::MissingImageInput);
     }
-    let mut call = computation(request, CallKind::Media(step));
+    let mut call = new_call(request, CallKind::Media(step));
     if source.is_none() && !image_base64.is_empty() {
         call.input_image = Some(image_base64.into());
     }
@@ -794,7 +794,7 @@ pub(super) fn plan_close_kv(
     token: u32,
     relay_input: bool,
 ) -> Result<Call, PlanningError> {
-    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     if !relay_input {
         call.input_token_ids.push(token);
     }
@@ -815,10 +815,10 @@ pub(super) fn plan_kv_publish(
     if publication_bytes == 0 {
         return Err(PlanningError::MissingProductBound);
     }
-    let mut call = computation(request, CallKind::Transfer(TransferMode::KvPublish));
+    let mut call = new_call(request, CallKind::Transfer(TransferMode::KvPublish));
     call.bounds.max_tokens = 0;
     call.bounds.max_transfer_bytes = publication_bytes;
-    // Owner and producer are the placeholders from `computation`;
+    // Owner and producer are the placeholders from `new_call`;
     // `register_call` stamps them.
     call.kv_output = Some(BufferId {
         owner: call.request_key,
@@ -841,7 +841,7 @@ pub(super) fn plan_diffusion_prepare(
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut call = computation(request, CallKind::Media(MediaCall::LatentPreparation));
+    let mut call = new_call(request, CallKind::Media(MediaCall::LatentPreparation));
     call.kv_input = Some(conditioning);
     call.latent_output = Some(latent_output(
         0,
@@ -864,7 +864,7 @@ pub(super) fn plan_diffusion_step(
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut call = computation(request, CallKind::Media(MediaCall::Denoising));
+    let mut call = new_call(request, CallKind::Media(MediaCall::Denoising));
     call.kv_input = Some(conditioning);
     call.latent_input = Some(latent);
     call.latent_output = Some(latent_output(
@@ -884,18 +884,18 @@ pub(super) fn plan_diffusion_finalize(
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut call = computation(request, CallKind::Media(MediaCall::ImageDecoding));
+    let mut call = new_call(request, CallKind::Media(MediaCall::ImageDecoding));
     call.latent_input = Some(latent);
     call.image_output = feedback_image_output(request)?;
     call.completion_output = Some(output_tensor(2, DType::U8));
     finish_plan(request, call, 0)
 }
 
-/// Derives storage bounds directly from the computation's actual inputs and outputs.
+/// Derives storage bounds directly from the call's actual inputs and outputs.
 ///
 /// `max_completion_bytes` covers the logprob payload of a token-producing call
 /// plus, for image decoding, the base64 PNG. `max_kv_units` starts at zero;
-/// `Scheduler::plan_computation` sets it for forward calls.
+/// `Scheduler::plan_call` sets it for forward calls.
 fn finish_plan(
     request: &GenerationRequest,
     mut call: Call,
@@ -978,7 +978,7 @@ pub(crate) enum PlanningError {
     ProductGenerationExhausted,
 }
 
-/// Assigns final identities to the selected computation and its allocated outputs.
+/// Assigns final identities to the selected call and its allocated outputs.
 /// Identity exhaustion is checked before changing the shared generation counter.
 ///
 /// The caller must already have set `call.call_id` to the call's batch and
@@ -1470,7 +1470,7 @@ pub(crate) struct RequestState {
     /// the last host-observed execution result.
     pub(crate) speculative_chain_invalidated: bool,
     pub(super) output: super::output::RequestOutput,
-    /// Current accepted computation stage. Completion processing and output
+    /// Current accepted call stage. Completion processing and output
     /// resolution advance it; scheduling changes it only on an encoder-cache
     /// hit, which moves the request to `IngestState` without a call.
     pub(super) phase: Phase,
@@ -1546,7 +1546,7 @@ pub(crate) struct RequestState {
     pub(super) round_token_ids: Vec<u32>,
     /// Host image bytes retained only while artifact-based feedback needs them.
     pub(super) feedback_image_b64: Option<String>,
-    /// False after a completed computation creates state unavailable from the input.
+    /// False after a completed call creates state unavailable from the input.
     pub(super) replayable: bool,
     /// Encoder-cache entries this request holds; released when the request
     /// finishes.

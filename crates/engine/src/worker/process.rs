@@ -926,7 +926,7 @@ impl RankProcess {
     pub(crate) fn finish_startup(&mut self) -> anyhow::Result<()> {
         let message_id = self.alloc_call_id();
         let mut request = WorkerRequest::info();
-        request.set_call_id(Some(message_id));
+        request.set_message_id(Some(message_id));
         let pending =
             self.send_request_with_timeout(&request, "Worker startup", WORKER_CONNECT_TIMEOUT)?;
         let response = self
@@ -1232,7 +1232,7 @@ impl RankProcess {
         let batch_id = batch.batch_id;
         let message_id = self.alloc_call_id();
         let mut req = WorkerRequest::submit(batch);
-        req.set_call_id(Some(message_id));
+        req.set_message_id(Some(message_id));
         let pending = match self.client.send_request_attempt(&req) {
             Ok(pending) => pending,
             Err(uniserve_worker_ipc::IpcError::WouldBlock) => {
@@ -1348,7 +1348,7 @@ impl RankProcess {
             if !matches!(self.child.as_mut().map(Child::try_wait), Some(Ok(Some(_)))) {
                 let message_id = self.alloc_call_id();
                 let mut req = WorkerRequest::close();
-                req.set_call_id(Some(message_id));
+                req.set_message_id(Some(message_id));
                 acknowledgment = self.send_request_checked(&req, "shutdown").ok();
             }
         }

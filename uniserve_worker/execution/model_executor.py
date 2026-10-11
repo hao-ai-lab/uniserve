@@ -430,9 +430,7 @@ class ModelExecutor:
             )
         ]
         if len(calls) != 1:
-            raise InputError(
-                f"computation {kind.value} requires one local capability"
-            )
+            raise InputError(f"call {kind.value} requires one local capability")
         return calls[0].module
 
     def _module_call(self, name, method=None, path=None):
@@ -1048,7 +1046,7 @@ class ModelExecutor:
         policy and the component's stream allow.
         """
         if self._denoiser is None or self.latent_pool is None:
-            raise InputError("rank does not own denoising computation")
+            raise InputError("rank does not own denoising call")
         if self._diffusion is None:
             builder = cast("MediaBuilder", self.media_builder)
             name, binding, call = self._denoiser
@@ -1283,14 +1281,14 @@ class ModelExecutor:
         """Bind staged input resources and graph budgets for every capability.
 
         Creates one capability runner per (entry, path, lane) covering a
-        computation kind, with its input buffers, execution context, decode /
+        call kind, with its input buffers, execution context, decode /
         prefill capture shapes, and CUDA graph storage pools: private ones,
         except that the text and canvas runners of one lane stream share
         theirs. Prefill buckets reach the text tokens ``input_config`` stages
         per call, and ``max_calls`` and ``request_slots`` bound their live
         rows. Callable once: a second call raises ``RuntimeError`` when the
         first bound any entry. Raises ``ValueError`` when two staged entries
-        of one component cover the same computation kind, and as
+        of one component cover the same call kind, and as
         ``_initialize_streams`` does.
         """
         from uniserve_worker.model_executor.canvas_runner import (
@@ -1604,7 +1602,7 @@ class ModelExecutor:
                         continue
                     if key in self._forward_calls:
                         raise ValueError(
-                            f"computation {key} has multiple lane bindings"
+                            f"call {key} has multiple lane bindings"
                         )
                     self._forward_calls[key] = entry
             if token_runner and self.worker_config.expert_microbatches > 1:
@@ -2144,7 +2142,7 @@ class ModelExecutor:
         did not exercise choose their kernels while serving. The process's
         choice count keeps the check per call to one integer comparison;
         records are gathered only after it changes, and the table is logged
-        only when they include a new call site or kernel (a computation
+        only when they include a new call site or kernel (a call
         prepared again at another size repeats known records).
         """
         choices = kernel_choices()
@@ -2315,7 +2313,7 @@ class ModelExecutor:
     def preparing_inputs(
         self, transfers: tuple[tuple[torch.Tensor, torch.Tensor], ...]
     ) -> Iterator[None]:
-        """Overlap reserved input copies with computation, then join order.
+        """Overlap reserved input copies with call, then join order.
 
         Each ``(destination, source)`` pair is copied on the executor's
         preparation stream while the body runs on the current stream. The

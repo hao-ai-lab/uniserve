@@ -9,7 +9,7 @@ complete record. The JSON object has these fields:
 
 - ``stage``: ``startup`` or ``serving``;
 - ``rank`` and ``device``: the worker rank and its compute device;
-- ``runners``: one entry per runner (a bound computation and its call
+- ``runners``: one entry per runner (a bound call and its call
   kinds), with ``runner``, ``device`` and ``call_sites``. Each call site
   groups the layers whose records are identical apart from their module
   path: ``layers`` lists the paths, with runs of layer indices compressed as
@@ -116,7 +116,7 @@ class KernelRecords:
     A call site's records are those its runners report the last time they
     are gathered: a record that grows (an automatic selection meeting a new
     input class, a first call preparing a site) replaces its earlier form.
-    A computation retired while serving keeps the records it last reported.
+    A call retired while serving keeps the records it last reported.
     """
 
     def __init__(self) -> None:
@@ -128,7 +128,7 @@ class KernelRecords:
 
         ``runners`` are the worker's runners, each with ``name``, ``call``,
         ``device`` and ``kernels()`` (``ModelRunner.kernels``). Runners with
-        the same label (one computation prepared at several sizes) merge.
+        the same label (one call prepared at several sizes) merge.
         """
         current: dict[str, tuple[str, dict[str, dict[str, dict]]]] = {}
         for runner in runners:

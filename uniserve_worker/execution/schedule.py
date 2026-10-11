@@ -185,7 +185,7 @@ def _execute_ready_actions(
     Each call dispatches by kind to its owning module and runs inside
     ``state.scope()``, which makes the batch stream current when the batch
     has one. On a video worker (``video_postprocessor`` set), device
-    computation also lands here: a request's vision and condition latent
+    call also lands here: a request's vision and condition latent
     encodings through ``conditions``, and denoising and decode rounds
     through ``media.execute``. Calls that already have an outcome are
     skipped.

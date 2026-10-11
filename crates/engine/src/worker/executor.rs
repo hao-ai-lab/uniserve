@@ -43,7 +43,7 @@ struct PendingWorker {
     /// reconciliation when the group will send no report.
     submitted: bool,
     /// Calls whose completion this worker has not yet returned, with the
-    /// computation code the completion must carry.
+    /// call code the completion must carry.
     calls: HashMap<(RequestKey, uniserve_worker_ipc::CallId), uniserve_worker_ipc::CallKind>,
 }
 
@@ -93,7 +93,7 @@ struct WorkerSubmission {
 impl WorkerSubmission {
     /// Builds the one submission a worker receives for this batch.
     ///
-    /// A batch carries one computation to one component, so a worker receives
+    /// A batch carries one call to one component, so a worker receives
     /// it once, under one identity, and answers it once. Product inputs the
     /// worker does not yet hold travel as dependencies and hold the submission
     /// in its queue until they resolve. Inputs, KV inputs, and dependencies
@@ -837,7 +837,7 @@ impl WorkerExecutor {
         Ok(admissions)
     }
 
-    /// Includes every admitted or queued owner of this request's computation and products.
+    /// Includes every admitted or queued owner of this request's call and products.
     fn request_workers(&self, request: RequestKey) -> Vec<usize> {
         let mut owners = self
             .admitted_workers

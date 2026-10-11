@@ -89,7 +89,7 @@ class CacheExport:
 
 @dataclass(eq=False, slots=True)
 class CacheAccess:
-    """Physical unit intervals retained by one computation's completion.
+    """Physical unit intervals retained by one call's completion.
 
     Every model access that shares one ``completion`` future joins one
     access; ``requests`` names their request keys and ``ranges`` keeps one
@@ -523,7 +523,7 @@ class KVCacheManager:
         self._reap_sources()
 
         # Free retires a publication, not the request's resident KV units.
-        # Unrelated products can share that request while later computation
+        # Unrelated products can share that request while later call
         # still reads its prefix. Only request retirement waits for all such
         # call kinds; physical unit reuse separately checks their ranges.
         with self._execution_lock:

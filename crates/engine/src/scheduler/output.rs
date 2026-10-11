@@ -382,10 +382,7 @@ impl Scheduler {
 
                 // State-ingest and feedback calls use autoregressive extension
                 // transport while retaining their own completion transitions.
-                match (
-                    consumes_image_features(&call),
-                    is_feedback_computation(&call),
-                ) {
+                match (consumes_image_features(&call), is_feedback_call(&call)) {
                     // A prefill with neither image features nor a token output
                     // is the `CloseKv` write. It publishes nothing, and
                     // `process_generation_result` has already moved the request
@@ -804,7 +801,7 @@ impl Scheduler {
             }
             CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {
-                match is_feedback_computation(&call) {
+                match is_feedback_call(&call) {
                     // Input-image encoding of the next block the context needs
                     // (`next_context_encode`): the product feeds the call that
                     // writes the block and, when the request writes the

@@ -36,7 +36,7 @@ enum MediaCall : ubyte { None, MediaReading, VisionEncoding, LatentEncoding, Tex
 enum TransferMode : ubyte { None, Tensor, KvPublish, KvInstall }
 
 /// Inline encoding of the Rust `CallKind` sum: exactly one of the three tags
-/// is not `None`. `computation_from_fb` rejects zero or several set tags.
+/// is not `None`. `call_kind_from_fb` rejects zero or several set tags.
 struct CallKind {
   forward_mode:ForwardMode;
   media:MediaCall;
@@ -222,11 +222,11 @@ table WorkerInfo {
   media_components:[MediaComponent];
   host_lane_capacity:uint = 1;
   video_denoiser:VideoDenoiserInfo;
-  /// Maximum calls in one prefill run, the rows the rank's captured prefill
-  /// graphs hold; zero leaves prefill runs bounded by `max_batch_calls`.
+  /// Maximum calls in one prefill batch, the rows the rank's captured prefill
+  /// graphs hold; zero leaves prefill batches bounded by `max_batch_calls`.
   max_prefill_calls:uint;
-  /// Maximum calls in one decode run, the rows the rank's largest captured
-  /// decode graph holds; zero leaves decode runs bounded by
+  /// Maximum calls in one decode batch, the rows the rank's largest captured
+  /// decode graph holds; zero leaves decode batches bounded by
   /// `max_batch_calls`.
   max_decode_calls:uint;
 }
@@ -314,7 +314,7 @@ table VisionInput {
   feature:TensorRef (required);
 }
 
-/// One planned computation, decoded into `Call` and checked by
+/// One planned call, decoded into `Call` and checked by
 /// `Call::validate`; relationships to other calls and to the batch's tables
 /// are checked by `Batch::validate`.
 table Call {
@@ -491,7 +491,7 @@ union BatchCommand { StartCommand, FinishCommand, FreeCommand }
 /// One entry of `Batch.commands`; the decoder rejects an empty union.
 table BatchCommandEnvelope { command:BatchCommand; }
 
-// Static request admission and physical run binding.
+// Static request admission and physical batch binding.
 
 // A video request's task, presentation tags and conditions, decoded into
 // `VideoAdmission` and its `uniserve_core::VideoCondition` values, which

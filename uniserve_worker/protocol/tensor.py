@@ -188,7 +188,7 @@ class OutputInfo:
 
 @dataclass(frozen=True, slots=True)
 class TensorRef:
-    """Identifies tensor storage independently of its role in a computation.
+    """Identifies tensor storage independently of its role in a call.
 
     Carries the identity (owning request, producing call, output index,
     allocation generation) and the bounded representation (dtype and

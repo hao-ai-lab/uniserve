@@ -626,7 +626,7 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
         worker.close()
 
 
-def test_computation_identity_preserves_homogeneous_decode():
+def test_call_identity_preserves_homogeneous_decode():
     worker = execution_worker()
     admissions = (ar_params(41, block_ids=(0,)), ar_params(42, block_ids=(1,)))
     prefill_ops = []
@@ -2592,7 +2592,7 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
 
 
 def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
-    """A received Free must progress while computation waits for its storage."""
+    """A received Free must progress while call waits for its storage."""
     from concurrent.futures import ThreadPoolExecutor
 
     from tests.python.fixtures.worker_ipc import QueuedWorkerIpc

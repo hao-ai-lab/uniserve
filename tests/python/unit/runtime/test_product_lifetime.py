@@ -135,7 +135,7 @@ def _table(pool, units):
     "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
 )
 @pytest.mark.parametrize("abandoned", (False, True))
-def test_kv_computation_retains_pages_through_output_completion_and_reuse(
+def test_kv_call_retains_pages_through_output_completion_and_reuse(
     device: str, abandoned: bool
 ) -> None:
     cache = mha_pool(
@@ -180,7 +180,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
             torch.testing.assert_close(actual, independent, rtol=0, atol=0)
         assert not cache.retirement_ready(requests=(request,))
         # Releasing another product of this request does not retire its KV
-        # computation. The execution fence still protects page reuse above.
+        # call. The execution fence still protects page reuse above.
         assert cache.retirement_ready(
             buffers=(BufferId(request, CallId(2, 0), 0, 2),)
         )
@@ -229,7 +229,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
             assert torch.count_nonzero(actual).item() == 0
 
         # A subsequent lease over the same bounded output storage must retain
-        # its own computation even though the preceding future is complete.
+        # its own call even though the preceding future is complete.
         next_output = outputs.acquire(1, token_capacity=8, devices=(device,))
         next_completion = next_output.completion_future()
         cache.retain_execution(

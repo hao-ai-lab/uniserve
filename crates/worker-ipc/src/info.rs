@@ -186,7 +186,7 @@ pub struct ComponentInfo {
     pub outputs: Vec<OutputInfo>,
 }
 
-/// A computation's bounded tensor result, before request and storage binding.
+/// A call's bounded tensor result, before request and storage binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputInfo {
     /// Result name; `OutputInfo::validate` requires it to be non-empty and
@@ -350,21 +350,21 @@ pub struct WorkerInfo {
     pub components: Vec<ComponentInfo>,
     /// Call families accepted by the worker.
     pub supported_calls: Vec<CallKind>,
-    /// Maximum calls in one run.
+    /// Maximum calls in one batch.
     pub max_batch_calls: u32,
-    /// Maximum text tokens represented in one run.
+    /// Maximum text tokens represented in one batch.
     pub max_batch_tokens: u32,
-    /// Maximum calls in one prefill run: the rows the rank's captured
-    /// prefill graphs hold. A prefill run no captured graph holds fails, so
-    /// the scheduler never forms one. Zero leaves prefill runs bounded by
+    /// Maximum calls in one prefill batch: the rows the rank's captured
+    /// prefill graphs hold. A prefill batch no captured graph holds fails, so
+    /// the scheduler never forms one. Zero leaves prefill batches bounded by
     /// `max_batch_calls` alone, as when they run eagerly.
     #[serde(default)]
     pub max_prefill_calls: u32,
-    /// Maximum calls in one decode run: the rows the rank's largest captured
+    /// Maximum calls in one decode batch: the rows the rank's largest captured
     /// decode graph holds, fewer when its KV pool cannot hold a page of
-    /// every cache group for more rows. A decode run no captured graph
+    /// every cache group for more rows. A decode batch no captured graph
     /// holds fails, so the scheduler never forms one. Zero leaves decode
-    /// runs bounded by `max_batch_calls` alone, as when they run eagerly.
+    /// batches bounded by `max_batch_calls` alone, as when they run eagerly.
     #[serde(default)]
     pub max_decode_calls: u32,
     /// Number of resident request slots.
@@ -437,7 +437,7 @@ impl WorkerInfo {
                     && self.kv_cache.is_none()
                     && self.latent_pages == 0
                     && self.media_components.is_empty()),
-            "a worker without call kinds must own no request computation"
+            "a worker without call kinds must own no request call"
         );
         ensure_valid!(
             self.supported_calls

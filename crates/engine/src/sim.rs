@@ -1371,7 +1371,7 @@ impl SimEngine {
                         .copied()
                         .ok_or_else(|| {
                             anyhow::anyhow!(
-                                "computation {:?} predicate names an unresolved product",
+                                "call {:?} predicate names an unresolved product",
                                 call.call_id
                             )
                         })
@@ -1566,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    fn same_request_computations_preserve_coordinates_and_sequential_tokens() {
+    fn same_request_calls_preserve_coordinates_and_sequential_tokens() {
         let mut executor = SimExecutor::new(SimEngine::new());
         let mut selected = batch(1, 3);
         let mut successor = batch(1, 4).requests.remove(0);

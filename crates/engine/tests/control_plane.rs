@@ -177,7 +177,7 @@ fn image_input(
 /// Builds a unified generation request with a fixed image-generation policy.
 ///
 /// The policy triggers on token 1000, lets image-only requests start image
-/// computation without first generating internal text, and, for
+/// call without first generating internal text, and, for
 /// Default-constraint requests, feeds each generated image back through one
 /// ViT encode. Tests that need a different trigger use `with_trigger` or edit
 /// `image_generation` afterwards.

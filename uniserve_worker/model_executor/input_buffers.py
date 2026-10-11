@@ -97,7 +97,7 @@ class RowBufferConfig:
 
 @dataclass(frozen=True, slots=True)
 class AttentionBufferConfig(RowBufferConfig):
-    """Sequence and page-table capacities shared by attention computations.
+    """Sequence and page-table capacities shared by attention calls.
 
     ``positions`` has three axes so multimodal positions fit; staging
     fills only the leading axis for one-axis positions. ``max_tokens`` bounds
@@ -298,7 +298,7 @@ class InputBuffers:
 
         Raises:
             ValueError: The row count is zero or exceeds capacity, the rows
-                mix computations, or subclass staging rejects the rows.
+                mix calls, or subclass staging rejects the rows.
             TypeError: A row is not this staging's ``row_type``, or token or
                 diffusion staging receives unsupported attention.
             WorkerError: ``row_tables`` rejects the rows while attention
@@ -315,7 +315,7 @@ class InputBuffers:
             )
             for row in rows
         ):
-            raise ValueError("one input call requires homogeneous computations")
+            raise ValueError("one input call requires homogeneous calls")
 
         slot, host = self._request_host.acquire()
         fill_cpu_ints(host, tuple(row.request_pool_idx for row in rows))
@@ -1443,7 +1443,7 @@ def input_buffer_config(kind, limits: TokenBufferConfig):
         return VisionBuffers, RowBufferConfig(limits.max_rows)
     if kind is MediaCall.IMAGE_DECODING:
         return DecodeBuffers, RowBufferConfig(limits.max_rows)
-    raise ValueError(f"unsupported staged computation {kind}")
+    raise ValueError(f"unsupported staged call {kind}")
 
 
 def buffered_kinds(*, diffusion: bool):

@@ -1184,7 +1184,7 @@ def validate_batch(
     upper bound of forward rows' request slots, and that latent preparation
     follows its request's admission root. Buffer allocations, block tables
     and call kinds are refused by their owners (`BufferPool.bind`,
-    `BlockTables.install` and `Worker.supports_computation`).
+    `BlockTables.install` and `Worker.supports_call`).
     Violations raise `invalid_descriptor` errors.
     """
     if model_runner.bindings:
@@ -1302,7 +1302,7 @@ def _reserve_outputs(
             if call.encoder_output is not None:
                 encoder_bindings.append((call.encoder_output, device))
 
-        # A skipped computation propagates false predicates but publishes no
+        # A skipped call propagates false predicates but publishes no
         # sampled token, feature, image, or latent state.
         for scalar in (
             call.token_output,

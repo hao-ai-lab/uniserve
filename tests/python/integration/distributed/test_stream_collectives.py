@@ -111,7 +111,7 @@ def _run_collectives(rank: int, rendezvous: str):
         )
         group = mesh.get_group("tokens")
         # Identical topology can belong to independent physical ordering
-        # domains. Both must remain usable in the same captured computation.
+        # domains. Both must remain usable in the same captured call.
         independent = environment.bind(
             DeviceMesh(ranks=(1, 0), shape=(2,), axes=("tokens",), rank=rank),
             device=device,

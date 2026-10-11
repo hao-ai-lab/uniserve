@@ -847,7 +847,7 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
             )
         )
 
-    # Every computation binds to exactly one lane, and every lane id is
+    # Every call binds to exactly one lane, and every lane id is
     # distinct, so scheduling classification stays unambiguous.
     if len({lane.lane_id for lane in result}) != len(result):
         raise ValueError("lane ids must be unique")

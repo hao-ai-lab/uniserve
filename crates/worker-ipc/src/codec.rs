@@ -231,7 +231,7 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
     let kind = response_kind_from_fb(response.kind())?;
     let message_id = response.message_id();
     let info = response.info().map(info_from_table).transpose()?;
-    let result = response.result().map(run_result_from_table).transpose()?;
+    let result = response.result().map(batch_output_from_table).transpose()?;
     let payload_count = usize::from(info.is_some()) + usize::from(result.is_some());
 
     // Error metadata occupies independent optional fields on the wire.
@@ -311,14 +311,14 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
 /// Absent vectors decode as empty. Calls, admissions, commands, tensor
 /// references, and publications are also validated individually as they are
 /// decoded.
-fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
+fn batch_from_table(table: fbs::Batch<'_>) -> CodecResult<Batch> {
     // Every collection keeps its wire order: `ForwardBatch::call_indices`
     // are positions in `calls`, and `commands` are an ordered sequence.
-    let run = Batch {
-        batch_id: run.batch_id(),
-        collective_seq: run.collective_seq(),
+    let batch = Batch {
+        batch_id: table.batch_id(),
+        collective_seq: table.collective_seq(),
 
-        calls: run
+        calls: table
             .calls()
             .map(|items| {
                 items
@@ -332,39 +332,39 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
         // Scheduler-owned KV unit tables and the columnar forward rows. The
         // `ForwardBatch` columns are parallel arrays; `ForwardBatch::validate`
         // checks that their lengths agree.
-        block_tables: run
+        block_tables: table
             .block_tables()
             .map(|items| items.iter().map(block_table_from_table).collect())
             .unwrap_or_default(),
-        new_cache_units: run
+        new_cache_units: table
             .new_cache_units()
             .map(|items| items.iter().map(cache_unit_allocation_from_table).collect())
             .unwrap_or_default(),
         forward: ForwardBatch {
-            call_indices: run
+            call_indices: table
                 .forward_call_indices()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
-            request_pool_indices: run
+            request_pool_indices: table
                 .request_pool_indices()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
-            seq_lens: run
+            seq_lens: table
                 .seq_lens()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
-            query_lens: run
+            query_lens: table
                 .query_lens()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
-            write_kv: run
+            write_kv: table
                 .write_kv()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
         },
 
         // Scheduler-owned latent, decode, and persistent-buffer allocations.
-        latent_params: run
+        latent_params: table
             .latent_params()
             .map(|items| {
                 items
@@ -374,7 +374,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             })
             .transpose()?
             .unwrap_or_default(),
-        decode_ranges: run
+        decode_ranges: table
             .decode_ranges()
             .map(|items| {
                 items
@@ -384,7 +384,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             })
             .transpose()?
             .unwrap_or_default(),
-        buffer_allocations: run
+        buffer_allocations: table
             .buffer_allocations()
             .map(|items| {
                 items
@@ -396,7 +396,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             .unwrap_or_default(),
 
         // Decode ordered controls and resolved host inputs.
-        commands: run
+        commands: table
             .commands()
             .map(|items| {
                 items
@@ -406,7 +406,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             })
             .transpose()?
             .unwrap_or_default(),
-        kv_inputs: run
+        kv_inputs: table
             .kv_inputs()
             .map(|items| {
                 items
@@ -416,7 +416,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             })
             .transpose()?
             .unwrap_or_default(),
-        input_products: run
+        input_products: table
             .input_products()
             .map(|items| {
                 items
@@ -430,8 +430,8 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
 
     // Cross-collection references (call ids, buffers, products) can only be
     // checked once the whole batch is decoded.
-    run.validate()?;
-    Ok(run)
+    batch.validate()?;
+    Ok(batch)
 }
 
 /// Decodes one request admission and validates it with `NewRequest::validate`,
@@ -658,7 +658,7 @@ fn cache_unit_allocation_from_table(
 fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<LatentParams> {
     Ok(LatentParams {
         request_key: request_key_from_table(params.request_key(), "latent params.request_key")?,
-        call_id: computation_id_from_fb(params.call_id())?,
+        call_id: call_id_from_fb(params.call_id())?,
         page_table: params
             .page_table()
             .map(|items| items.iter().collect())
@@ -675,7 +675,7 @@ fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<Latent
 fn decode_range_from_table(params: fbs::DecodeRange<'_>) -> CodecResult<DecodeRange> {
     Ok(DecodeRange {
         request_key: request_key_from_table(params.request_key(), "decode params.request_key")?,
-        call_id: computation_id_from_fb(params.call_id())?,
+        call_id: call_id_from_fb(params.call_id())?,
         cursor: params.cursor(),
         max_units: params.max_units(),
         ranks: params
@@ -725,7 +725,7 @@ fn coordinates_from_table(table: Option<fbs::CallCoordinates<'_>>) -> CodecResul
 fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
     let call = Call {
         request_key: request_key_from_table(call.request_key(), "call.request_key")?,
-        call_id: computation_id_from_fb(call.call_id())?,
+        call_id: call_id_from_fb(call.call_id())?,
         coordinates: coordinates_from_table(call.coordinates())?,
         input_image: call.input_image().map(std::sync::Arc::from),
         kv_input: call.kv_input().map(buffer_id_from_table).transpose()?,
@@ -776,7 +776,7 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             force_finish: state.force_finish(),
         }),
         component: call.component().to_owned(),
-        kind: computation_from_fb(call.kind())?,
+        kind: call_kind_from_fb(call.kind())?,
         bounds: Bounds {
             max_tokens: call.max_tokens(),
             max_kv_units: 0,
@@ -979,7 +979,7 @@ fn tensor_ref_from_table(reference: fbs::TensorRef<'_>) -> CodecResult<TensorRef
 
 /// Decodes a batch output, preserving report order, then validates it with
 /// `BatchOutput::validate`.
-fn run_result_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutput> {
+fn batch_output_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutput> {
     // Completions and products are independent ordered streams;
     // `BatchOutput::validate` checks both once they are decoded.
     let report = BatchOutput {
@@ -1069,7 +1069,7 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
             .map(|values| values.iter().collect())
             .unwrap_or_default(),
         request_key: request_key_from_table(record.request_key(), "completion.request_key")?,
-        call_id: computation_id_from_fb(record.call_id())?,
+        call_id: call_id_from_fb(record.call_id())?,
         status: call_status_from_fb(record.status())?,
         error_code: record.error_code().map(error_code_from_fb).transpose()?,
         error_message: record.error_message().map(str::to_owned),
@@ -1126,7 +1126,7 @@ fn tensor_publication_from_table(
 fn error_call_from_table(call: fbs::ErrorCallIdentity<'_>) -> CodecResult<ErrorCallIdentity> {
     Ok(ErrorCallIdentity {
         request_key: request_key_from_table(call.request_key(), "error call.request_key")?,
-        call_id: computation_id_from_fb(call.call_id())?,
+        call_id: call_id_from_fb(call.call_id())?,
     })
 }
 
@@ -1176,7 +1176,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             .map(|items| {
                 items
                     .iter()
-                    .map(computation_from_fb)
+                    .map(call_kind_from_fb)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
@@ -1427,8 +1427,8 @@ where
 }
 
 /// Decodes a required call identity from its inline wire struct.
-fn computation_id_from_fb(id: Option<&fbs::CallId>) -> CodecResult<CallId> {
-    let id = id.context("computation identity is missing")?;
+fn call_id_from_fb(id: Option<&fbs::CallId>) -> CodecResult<CallId> {
+    let id = id.context("call identity is missing")?;
     Ok(CallId::new(id.batch_id(), id.request_index()))
 }
 
@@ -1436,7 +1436,7 @@ fn computation_id_from_fb(id: Option<&fbs::CallId>) -> CodecResult<CallId> {
 fn buffer_id_from_table(buffer: fbs::BufferId<'_>) -> CodecResult<BufferId> {
     let id = BufferId {
         owner: request_key_from_table(buffer.owner(), "buffer_id.owner")?,
-        producer_call_id: computation_id_from_fb(buffer.producer_call_id())?,
+        producer_call_id: call_id_from_fb(buffer.producer_call_id())?,
         output_index: buffer.output_index(),
         generation: buffer.generation(),
     };
@@ -1567,7 +1567,7 @@ fn transfer_mode_from_fb(value: fbs::TransferMode) -> CodecResult<TransferMode> 
 
 /// Encodes a call kind into the inline `CallKind` struct, setting exactly one
 /// of its three tags and leaving the others at `None`.
-fn computation_to_fb(value: CallKind) -> fbs::CallKind {
+fn call_kind_to_fb(value: CallKind) -> fbs::CallKind {
     let mut encoded = fbs::CallKind::default();
     match value {
         CallKind::Forward(mode) => encoded.set_forward_mode(forward_mode_to_fb(mode)),
@@ -1582,12 +1582,12 @@ fn computation_to_fb(value: CallKind) -> fbs::CallKind {
 /// The struct carries three independent tags whose `None` value means unset.
 /// A frame with zero or several set tags, or with an unknown value in the set
 /// tag, is malformed.
-fn computation_from_fb(value: &fbs::CallKind) -> CodecResult<CallKind> {
+fn call_kind_from_fb(value: &fbs::CallKind) -> CodecResult<CallKind> {
     let present = u8::from(value.forward_mode() != fbs::ForwardMode::None)
         + u8::from(value.media() != fbs::MediaCall::None)
         + u8::from(value.transfer() != fbs::TransferMode::None);
     if present != 1 {
-        codec_bail!("computation must select exactly one classification");
+        codec_bail!("call must select exactly one classification");
     }
     if value.forward_mode() != fbs::ForwardMode::None {
         Ok(CallKind::Forward(forward_mode_from_fb(
