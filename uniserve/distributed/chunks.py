@@ -10,6 +10,25 @@ import torch
 
 ChunkProducer = Callable[[slice, tuple[torch.Tensor, ...]], None]
 
+# Bytes of one staged row interval: large enough that each peer publication
+# amortizes its launch, small enough that consumers start on the first
+# interval while later transfers are in flight.
+_PAYLOAD_BYTES = 64 * 1024 * 1024
+# Intervals hold whole units of this many rows, a multiple of every sparse
+# attention tile, so consumers see tile-aligned intervals.
+_ROW_UNIT = 128
+
+
+def payload_rows(width: int, itemsize: int) -> int:
+    """Return the rows of one gathered interval of ``width``-element rows.
+
+    The bound is 64 MiB of one member's rows, rounded down to whole
+    128-row units and never below one unit.
+    """
+    return max(
+        _ROW_UNIT, _PAYLOAD_BYTES // (width * itemsize) // _ROW_UNIT * _ROW_UNIT
+    )
+
 
 def gather_chunks(
     group, input: torch.Tensor, workspace: torch.Tensor
@@ -36,14 +55,11 @@ def gather_chunks(
         raise ValueError("row gathering scratch cannot hold all input rows")
 
     # Scratch layout per segment: [group.size, count, width] with one member
-    # slot per rank in backend order. Segments stay near 64 MiB of staged
-    # source rows, rounded down to whole 128-row units.
+    # slot per rank in backend order.
     storage = (
         workspace.view(torch.uint8).view(-1)[:byte_count].view(input.dtype)
     )
-    segment_rows = max(
-        1, ((64 * 1024 * 1024) // (width * input.element_size()) // 128) * 128
-    )
+    segment_rows = payload_rows(width, input.element_size())
     local_rank = group.backend_order.index(group.rank)
 
     segments = []
