@@ -269,6 +269,11 @@ def test_sensenova_reader_resolves_aliases(tmp_path):
         ),
         ("num_key_value_heads", 3, "divisible by KV heads"),
         ("num_experts", 8, "sparse MoE is not supported"),
+        (
+            "rope_scaling",
+            {"rope_type": "yarn", "factor": 2.0},
+            "default rotary recipe",
+        ),
     ],
 )
 def test_sensenova_reader_rejects_inconsistent_checkpoint_math(

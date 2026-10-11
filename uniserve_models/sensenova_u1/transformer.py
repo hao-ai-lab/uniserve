@@ -23,9 +23,6 @@ from uniserve.nn.attention import (
     Attention,
     AttentionBatch,
     AxialQKVProjection,
-    DenseInput,
-    PagedInput,
-    SegmentedInput,
 )
 from uniserve.nn.linear import (
     QKVParallelLinear,
@@ -34,11 +31,7 @@ from uniserve.nn.linear import (
 )
 from uniserve.nn.mlp import GatedMLP
 from uniserve.nn.norm import RMSNorm
-from uniserve.nn.rope import (
-    DynamicScaling,
-    LongRoPEScaling,
-    RotaryEmbedding,
-)
+from uniserve.nn.rope import RotaryEmbedding
 from uniserve.nn.routing import RoutedTensor, RouteSpan
 
 from .config import TransformerConfig
@@ -103,17 +96,15 @@ class TransformerLayer(nn.Module):
         self.temporal_rotary = RotaryEmbedding(
             dim // 2,
             theta=config.rope_theta,
-            scaling=config.rope_scaling,
             max_position_embeddings=config.max_position_embeddings,
             partial_rotary_factor=config.partial_rotary_factor,
             keep_freq_range=True,
         )
         # Height and width share one rotary table with the spatial theta and
-        # context length and the same scaling recipe as the temporal axis.
+        # context length.
         self.spatial_rotary = RotaryEmbedding(
             dim // 4,
             theta=config.rope_theta_hw,
-            scaling=config.rope_scaling,
             max_position_embeddings=config.max_position_embeddings_hw,
             partial_rotary_factor=config.partial_rotary_factor,
             keep_freq_range=True,
@@ -153,44 +144,9 @@ class TransformerLayer(nn.Module):
                 "SenseNova positions require temporal, height and width axes"
             )
 
-        # Dynamic and LongRoPE scalings are functions of the full sequence
-        # length, which cached attention knows only from its host metadata.
-        # Static recipes ignore the length, so the shard width stands in.
-        dynamic = isinstance(
-            self.temporal_rotary.scaling, (DynamicScaling, LongRoPEScaling)
-        )
-        # SenseNova caches form one block table, so the batch's only entry
-        # carries the absolute sequence lengths every layer shares.
-        entry = attention.entry(None)
-        if not dynamic:
-            length: int | None = positions.shape[1]
-        elif isinstance(entry, (PagedInput, SegmentedInput)):
-            if entry.queries.host is None or entry.prefixes.host is None:
-                raise ValueError(
-                    "dynamic rotary scaling requires exact "
-                    "host sequence lengths"
-                )
-            length = max(
-                (
-                    query + prefix
-                    for query, prefix in zip(
-                        entry.queries.host,
-                        entry.prefixes.host,
-                        strict=True,
-                    )
-                ),
-                default=0,
-            )
-        else:
-            length = (
-                positions.shape[1]
-                if isinstance(entry, DenseInput)
-                else entry.queries.maximum
-            )
-        if length is None:
-            raise ValueError(
-                "dynamic rotary scaling requires exact host sequence lengths"
-            )
+        # The default recipe's factors depend only on the positions; the
+        # shard width stands in for the unused sequence length.
+        length = positions.shape[1]
 
         names = frozenset(hidden.values)
         # Height and width use the same frequency recipe. Evaluate their
