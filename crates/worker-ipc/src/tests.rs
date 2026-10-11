@@ -60,7 +60,7 @@ fn ar_decode_call() -> Call {
         request_key: request_key(),
         call_id: CallId::new(11, 0),
         component: "model".into(),
-        kind: kind,
+        kind,
         bounds: Bounds {
             max_tokens: 1,
             ..Bounds::default()
@@ -129,7 +129,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         request_key: request_key(),
         call_id,
         component: "model".into(),
-        kind: kind,
+        kind,
         bounds: Bounds {
             max_tokens: if denoises { 4 } else { 0 },
             ..Bounds::default()
@@ -692,6 +692,7 @@ fn malformed_call(
         &mut builder,
         &fbs::BatchArgs {
             batch_id: 1,
+            collective_seq: 1,
             calls: Some(calls),
             ..Default::default()
         },
@@ -1817,7 +1818,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             request_key: key,
             call_id,
             component: "model".into(),
-            kind: kind,
+            kind,
             bounds: Bounds {
                 max_tokens: 7 + index as u32,
                 max_completion_bytes: 4096,

@@ -1858,10 +1858,6 @@ impl WorkerGroup {
         if !self.is_ready() || self.pending_batches.len() >= self.depth {
             return Err(BatchSubmitError::WouldBlock(Box::new(batch)));
         }
-        batch
-            .validate()
-            .map_err(anyhow::Error::from)
-            .map_err(BatchSubmitError::Failed)?;
         let rank_batches = rank_projection(
             &batch,
             &self.process_args.components,

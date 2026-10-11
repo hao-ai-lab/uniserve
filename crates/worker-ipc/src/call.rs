@@ -1819,7 +1819,6 @@ impl Batch {
         // Admissions create request state independently of call execution.
         let mut admitted = HashSet::new();
         for admission in self.admissions() {
-            admission.validate()?;
             ensure_valid!(
                 admitted.insert(admission.request_key),
                 "a submission batch carries a duplicate admission"
@@ -1853,10 +1852,6 @@ impl Batch {
 
         // Each input product payload must be valid, declared as an input or
         // predicate by some call, and supplied at most once.
-        for payload in &self.input_products {
-            payload.validate()?;
-        }
-
         let declared_inputs = self
             .calls()
             .flat_map(|call| call.tensor_inputs().chain(call.predicate.as_ref()))

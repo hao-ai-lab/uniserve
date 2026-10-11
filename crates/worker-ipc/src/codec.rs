@@ -22,15 +22,15 @@
 //! 2. The `*_from_table` and `*_from_fb` functions copy fields into owned
 //!    values and report missing required fields, unknown discriminants, and
 //!    illegal field combinations as [`CodecError::Invalid`].
-//! 3. The domain `validate` methods (`Call`, `Batch`, `BatchOutput`,
-//!    `WorkerInfo`, and others) check semantic invariants, reported as
-//!    [`CodecError::Validation`]. Decoders run many of them as values are
-//!    assembled, and aggregate validators such as `Batch::validate` run the
-//!    nested ones again.
+//! 3. The domain `validate` methods (`Batch`, `BatchOutput`, `WorkerInfo`)
+//!    check semantic invariants, reported as [`CodecError::Validation`]. Each
+//!    decoder runs its message's aggregate validator once, after the whole
+//!    message is assembled; the aggregate reaches every nested record, so no
+//!    nested decoder validates its record again.
 //!
 //! [`encode_request`] validates a submitted batch and [`encode_response`]
-//! validates info and result payloads before building the frame, so those
-//! payloads are checked by both sender and receiver.
+//! validates info and result payloads before building the frame, so the
+//! sender never emits a message its receiver would refuse.
 
 use std::collections::BTreeMap;
 
@@ -308,9 +308,8 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
 
 /// Decodes a submitted batch and validates it with `Batch::validate`.
 ///
-/// Absent vectors decode as empty. Calls, admissions, commands, tensor
-/// references, and publications are also validated individually as they are
-/// decoded.
+/// Absent vectors decode as empty. `Batch::validate` checks every nested
+/// call, admission, command, tensor reference and publication.
 fn batch_from_table(table: fbs::Batch<'_>) -> CodecResult<Batch> {
     // Every collection keeps its wire order: `ForwardBatch::call_indices`
     // are positions in `calls`, and `commands` are an ordered sequence.
@@ -434,8 +433,8 @@ fn batch_from_table(table: fbs::Batch<'_>) -> CodecResult<Batch> {
     Ok(batch)
 }
 
-/// Decodes one request admission and validates it with `NewRequest::validate`,
-/// which also runs the sampling and image parameter checks.
+/// Decodes one request admission; `NewRequest::validate`, run by
+/// `BatchCommand::validate` from `Batch::validate`, checks it.
 fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewRequest> {
     let admission = NewRequest {
         request_key: request_key_from_table(admission.request_key(), "admission.request_key")?,
@@ -459,7 +458,6 @@ fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewReques
             .map(video_admission_from_table)
             .transpose()?,
     };
-    admission.validate()?;
     Ok(admission)
 }
 
@@ -717,11 +715,8 @@ fn coordinates_from_table(table: Option<fbs::CallCoordinates<'_>>) -> CodecResul
     })
 }
 
-/// Decodes one call and validates the invariants it carries on its own with
-/// `Call::validate`.
-///
-/// Relationships to other calls and to the batch's allocation tables are
-/// checked afterwards by `Batch::validate`.
+/// Decodes one call; `Batch::validate` checks it and its relationships to
+/// other calls and to the batch's allocation tables.
 fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
     let call = Call {
         request_key: request_key_from_table(call.request_key(), "call.request_key")?,
@@ -846,12 +841,10 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
         predicate: call.predicate().map(tensor_ref_from_table).transpose()?,
         image_index: Some(call.image_index()).filter(|&index| index != 0),
     };
-    call.validate()?;
     Ok(call)
 }
 
-/// Decodes one control-command union and validates it with
-/// `BatchCommand::validate`.
+/// Decodes one control-command union; `Batch::validate` checks it.
 fn command_from_table(envelope: fbs::BatchCommandEnvelope<'_>) -> CodecResult<BatchCommand> {
     // The FlatBuffers discriminator selects the only payload table permitted
     // to contribute command fields.
@@ -898,7 +891,6 @@ fn command_from_table(envelope: fbs::BatchCommandEnvelope<'_>) -> CodecResult<Ba
         _ => codec_bail!("batch command union is empty"),
     };
 
-    command.validate()?;
     Ok(command)
 }
 
@@ -1011,7 +1003,7 @@ fn batch_output_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOut
     Ok(report)
 }
 
-/// Decodes one call completion and validates it with `RequestOutput::validate`.
+/// Decodes one call completion; `BatchOutput::validate` checks it.
 fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<RequestOutput> {
     let finish_flags = record
         .finish_flags()
@@ -1095,9 +1087,6 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
         kv_output: record.kv_output().map(kv_transfer_from_table).transpose()?,
     };
 
-    // Domain validation applies cross-field status and generation invariants
-    // after all completion fields have been decoded.
-    record.validate()?;
     Ok(record)
 }
 
@@ -1118,7 +1107,6 @@ fn tensor_publication_from_table(
         )?,
         value,
     };
-    payload.validate()?;
     Ok(payload)
 }
 
