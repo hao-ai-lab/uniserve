@@ -283,6 +283,16 @@ def test_sensenova_reader_rejects_inconsistent_checkpoint_math(
         read_config(tmp_path, IOConfig(), sources={})
 
 
+def test_sensenova_reader_requires_the_image_sequence_limit(tmp_path):
+    from uniserve_models.sensenova_u1 import read_config
+
+    raw = neo_metadata()
+    del raw["max_image_seq_len"]
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="max_image_seq_len"):
+        read_config(tmp_path, IOConfig(), sources={})
+
+
 def test_sensenova_direct_config_rejects_mismatched_vision_features(tmp_path):
     from dataclasses import replace
 

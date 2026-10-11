@@ -137,7 +137,7 @@ class Config:
     text: TransformerConfig
     vision: vision.Config
     flow: flow.Config
-    max_image_seq_len: int = 4096
+    max_image_seq_len: int
 
     def __post_init__(self) -> None:
         _positive(self.max_image_seq_len, "max_image_seq_len", integer=True)
@@ -312,7 +312,7 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
                 raw.get("noise_scale_max_value", 1.0),
             ),
         ),
-        max_image_seq_len=raw.get("max_image_seq_len", 4096),
+        max_image_seq_len=_required(raw, "max_image_seq_len", "config"),
     )
 
 
