@@ -63,7 +63,6 @@ from uniserve_worker.protocol.transfer import (
     WorkerEndpoint,
 )
 from uniserve_worker.protocol.video import VideoAdmission, VideoTask
-from uniserve_worker.protocol.worker_info import WorkerInfo
 from uniserve_worker.transport.fetch import fetch_tensor
 
 pytestmark = pytest.mark.integration
@@ -695,7 +694,7 @@ def test_worker_reports_text_bounds_and_executes_dense_attention_without_kv():
         components=components,
         bindings=_encoder_bindings(model, components),
     ) as worker:
-        info = WorkerInfo.from_mapping(worker.info.to_mapping())
+        info = worker.info
         assert info.kv_cache is None
         component = next(
             value for value in info.components if value.name == "text_encoder"

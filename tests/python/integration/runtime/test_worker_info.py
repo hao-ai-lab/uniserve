@@ -14,7 +14,6 @@ from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.report import build_worker_layout
 from uniserve_worker.config.execution import LaneConfig, WorkerConfig
 from uniserve_worker.protocol.call import CALL_KINDS, ForwardMode
-from uniserve_worker.protocol.worker_info import WorkerInfo
 
 pytestmark = pytest.mark.integration
 
@@ -25,11 +24,10 @@ def test_expert_participant_advertises_no_request_work() -> None:
     info = build_worker_layout(
         model, WorkerConfig(role="experts", graph_policy="off")
     ).info
-    reported = WorkerInfo.from_mapping(info.to_mapping())
-    assert reported.supported_calls == ()
-    assert reported.components == ()
-    assert reported.kv_cache is None
-    assert reported.latent_pages == 0
+    assert info.supported_calls == ()
+    assert info.components == ()
+    assert info.kv_cache is None
+    assert info.latent_pages == 0
 
 
 def test_worker_info_reports_schedulable_work_and_bounds() -> None:
