@@ -96,8 +96,6 @@ _REQUEST_RELAY_ROW_BYTES = 18
 _REQUEST_RELAY_RETIREMENT_LANES = 1
 
 DEFAULT_NUM_UNITS_FALLBACK = 4096
-DEFAULT_MAX_BATCH_OPS = 1024
-DEFAULT_MAX_REQUEST_POOL_SIZE = 128
 
 
 def input_buffer_config(
@@ -904,8 +902,6 @@ def derive_runtime_kv_capacity(
 
 __all__ = [
     "ArenaCapacity",
-    "DEFAULT_MAX_BATCH_OPS",
-    "DEFAULT_MAX_REQUEST_POOL_SIZE",
     "DEFAULT_NUM_UNITS_FALLBACK",
     "RuntimeKVCapacity",
     "derive_runtime_kv_capacity",
