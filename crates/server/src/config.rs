@@ -137,7 +137,7 @@ impl Default for EngineSettings {
                 &["localhost".to_owned()],
                 "cuda",
                 1,
-                2,
+                WorkerProcessArgs::DEFAULT_QUEUE_DEPTH,
                 WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
             )],
             transfer: TransferConfig::default(),

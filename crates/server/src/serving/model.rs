@@ -674,8 +674,9 @@ impl InputProcessor {
 pub const MIN_VIDEO_SECONDS: f64 = 4.0;
 
 /// Longest explicit video duration, in seconds, the MiniMax H3 API admits. A deployment may
-/// configure a lower `max_video_seconds` capacity, never a higher one.
-pub const MAX_VIDEO_SECONDS: f64 = 15.0;
+/// configure a lower `max_video_seconds` capacity, never a higher one. Worker launches size
+/// resident media state for the same duration unless they are told otherwise.
+pub const MAX_VIDEO_SECONDS: f64 = uniserve_engine::WorkerProcessArgs::DEFAULT_MAX_VIDEO_SECONDS;
 
 /// Frame rate, in frames per second, of every MiniMax H3 video.
 pub const VIDEO_FPS: u32 = 24;
