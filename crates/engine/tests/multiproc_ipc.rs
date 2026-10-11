@@ -1725,7 +1725,6 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
 fn check_rank_ipc() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
     let info = executor.info();
-    assert_eq!(info.endpoint.rank, 0);
     assert_eq!(info.max_batch_calls, 256);
     assert_eq!(info.max_batch_tokens, 256);
 
@@ -1976,12 +1975,13 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         .context("KV publication has no physical locations")?;
     assert_eq!(publication.source, buffer);
     for tensor in publication.tensors() {
-        let ranks = tensor
+        // Each rank publishes its own location, from its own incarnation.
+        let sources = tensor
             .locations
             .iter()
-            .map(|location| location.source.rank)
+            .map(|location| location.source.incarnation.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(ranks, (0..WORLD_SIZE as u32).collect());
+        assert_eq!(sources.len(), WORLD_SIZE);
     }
     // A repeated batch id is refused.
     assert!(execute(executor, publish).is_err());
@@ -2088,7 +2088,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     let loss = loss
         .downcast_ref::<WorkerFailure>()
         .context("expected scoped WorkerGroup loss")?;
-    assert_eq!(loss.worker_id.0, initial_endpoint.worker_id);
+    assert_eq!(loss.worker_id.0, "worker");
     assert_eq!(loss.endpoints.len(), WORLD_SIZE);
     assert!(loss.endpoints.contains(&initial_endpoint));
     let requests = loss
@@ -2125,10 +2125,6 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         ),
     )?;
     assert_eq!(recovered.results[0].output.status, CallStatus::Ok);
-    assert_eq!(
-        executor.info().endpoint.worker_id,
-        initial_endpoint.worker_id
-    );
     assert_ne!(
         executor.info().endpoint.incarnation,
         initial_endpoint.incarnation
@@ -2188,11 +2184,12 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         max_batch_calls: 256,
         max_batch_tokens: 256,
         attention_backend: "torch".into(),
-        // `publisher` is the worker id `SlowShmPublication` names as the
-        // source of its segment.
-        transfer: uniserve_engine::TransferConfig::parse("publisher->worker=posix_shm")?,
+        // The segment stands in for a product that rank 0 of this worker
+        // published over shared storage.
+        transfer: uniserve_engine::TransferConfig::parse("worker->worker=posix_shm")?,
         ..config
     })?;
+    let publisher = executor.info().endpoint.clone();
 
     let slow_admission = text_admission(31, 1, 1)?;
     let mut slow = token_batch(
@@ -2220,7 +2217,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     slow.calls[0].predicate = Some(predicate.clone());
     slow.input_products.push(TensorPublication {
         product: predicate,
-        value: publication.descriptor()?,
+        value: publication.descriptor(&publisher)?,
     });
 
     let fast_admission = text_admission(32, 1, 2)?;
@@ -2330,7 +2327,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         .collect();
     batch.input_products.push(TensorPublication {
         product: input,
-        value: publication.descriptor()?,
+        value: publication.descriptor(&publisher)?,
     });
     executor.submit_batch(batch, &CallReaders::new())?;
     let transferred = executor
@@ -2919,14 +2916,6 @@ impl SlowShmPublication {
         Ok(publication)
     }
 
-    fn address_space(&self) -> String {
-        format!("rust:{}", std::process::id())
-    }
-
-    fn node(&self) -> anyhow::Result<String> {
-        Ok(std::fs::read_to_string("/etc/hostname")?.trim().to_owned())
-    }
-
     fn publish(&self) -> anyhow::Result<()> {
         let file = OpenOptions::new().write(true).open(&self.path)?;
         // The payload lands before the readiness word; each write is a system
@@ -2937,7 +2926,12 @@ impl SlowShmPublication {
         Ok(())
     }
 
-    fn descriptor(&self) -> anyhow::Result<TransferHandle> {
+    /// Describes the segment as a product published by `source`, a rank the
+    /// engine launched.
+    fn descriptor(
+        &self,
+        source: &uniserve_worker_ipc::WorkerEndpoint,
+    ) -> anyhow::Result<TransferHandle> {
         Ok(TransferHandle::DeviceProduct {
             height: 0,
             width: 0,
@@ -2945,13 +2939,7 @@ impl SlowShmPublication {
             tensor: uniserve_worker_ipc::TensorTransfer {
                 shape: vec![1],
                 locations: vec![Locator {
-                    source: uniserve_worker_ipc::WorkerEndpoint {
-                        worker_id: "publisher".into(),
-                        rank: 0,
-                        node: self.node()?,
-                        address_space: self.address_space(),
-                        incarnation: self.endpoint.clone(),
-                    },
+                    source: source.clone(),
                     transport: TransferTransport::PosixShm {
                         endpoint: self.endpoint.clone(),
                         name: self.name.clone(),
@@ -3050,7 +3038,6 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "acknowledgment_slot": 0,
     "host_slots": [0],
     "products_cross_hosts": false,
-    "worker_id": "worker",
     "queue_depth": 8,
     "model": "",
     "device": "cpu",

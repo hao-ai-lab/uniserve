@@ -596,15 +596,12 @@ fn endpoint<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &WorkerEndpoint,
 ) -> WIPOffset<fbs::WorkerEndpoint<'a>> {
-    let worker_id = Some(b.create_string(&v.worker_id));
     let node = Some(b.create_string(&v.node));
     let address_space = Some(b.create_string(&v.address_space));
     let incarnation = Some(b.create_string(&v.incarnation));
     fbs::WorkerEndpoint::create(
         b,
         &fbs::WorkerEndpointArgs {
-            worker_id,
-            rank: v.rank,
             node,
             address_space,
             incarnation,

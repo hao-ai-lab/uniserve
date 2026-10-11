@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::registration::RankRegistry;
-use super::{BatchSubmitError, PendingRank, RankProcess};
+use super::{BatchSubmitError, IncarnationRegistry, PendingRank, RankProcess};
 use crate::executor::{WorkerExecError, WorkerFailure};
 use anyhow::Context;
 use uniserve_worker_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
@@ -248,6 +248,10 @@ pub struct WorkerGroup {
     /// Which component serves each media call across every worker of the
     /// deployment; the executor states it once all workers have reported.
     media_routing: BTreeMap<uniserve_worker_ipc::MediaCall, String>,
+    /// The worker and rank each live rank incarnation of the deployment
+    /// serves. The group registers its own ranks and retires them when it
+    /// loses them; the executor makes it the deployment's one table.
+    ranks: IncarnationRegistry,
     /// Requests that may hold state on the ranks: added by a submitted call
     /// or `Start` command, removed when a batch carrying their `Finish`
     /// command is joined as done. Recovery reports them as lost.
@@ -601,6 +605,11 @@ impl WorkerGroup {
 
         let depth = process_args.queue_depth.max(1);
         let buffers = (0..n).map(|_| VecDeque::new()).collect();
+        let ranks = IncarnationRegistry::default();
+        ranks.assign(
+            &crate::WorkerId(process_args.worker_id.clone()),
+            workers.iter().map(|worker| &worker.info().endpoint),
+        );
         Ok(Self {
             launchers,
             workers,
@@ -610,6 +619,7 @@ impl WorkerGroup {
             last_progress: Instant::now(),
             pending_batches: BTreeMap::new(),
             media_routing: info.media_components.clone(),
+            ranks,
             info,
             process_args,
             resident_requests: HashSet::new(),
@@ -750,6 +760,10 @@ impl WorkerGroup {
             worker.terminate();
         }
         self.workers.clear();
+        // The lost incarnations stop resolving at once, so a publication they
+        // made is never bound as an input while the group is relaunched.
+        self.ranks
+            .assign(&crate::WorkerId(self.process_args.worker_id.clone()), []);
         self.clear_execution();
 
         let recovery = (|| -> anyhow::Result<()> {
@@ -810,6 +824,10 @@ impl WorkerGroup {
         // match its predecessor apart from the endpoint, so the group's agreed
         // info keeps everything but rank 0's new endpoint.
         self.info.endpoint = workers[0].info().endpoint.clone();
+        self.ranks.assign(
+            &crate::WorkerId(self.process_args.worker_id.clone()),
+            workers.iter().map(|worker| &worker.info().endpoint),
+        );
         self.workers = workers;
         self.last_progress = Instant::now();
         let ranks = self.process_args.ranks.len();
@@ -1271,6 +1289,16 @@ impl WorkerGroup {
         &BTreeMap<String, crate::ComponentConfig>,
     ) {
         (&self.process_args.ranks, &self.process_args.components)
+    }
+
+    /// Joins this group's ranks to the deployment's registry of live rank
+    /// incarnations, which every group of the deployment then shares.
+    pub(crate) fn share_ranks(&mut self, ranks: IncarnationRegistry) {
+        ranks.assign(
+            &crate::WorkerId(self.process_args.worker_id.clone()),
+            self.workers.iter().map(|worker| &worker.info().endpoint),
+        );
+        self.ranks = ranks;
     }
 
     /// States the deployment-wide media routing once every worker reported.
@@ -1842,6 +1870,7 @@ impl WorkerGroup {
                 .into_iter()
                 .map(|(rank, mut batch)| {
                     self.process_args.transfer.bind_inputs(
+                        &self.ranks,
                         &mut batch.input_products,
                         &mut batch.kv_inputs,
                         &self.workers[rank].info().endpoint,

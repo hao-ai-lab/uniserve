@@ -200,7 +200,7 @@ def build_worker_layout(
         else supported_calls(model, (name for name, _ in components))
     )
 
-    endpoint = endpoint or WorkerEndpoint.local(rank=int(worker_config.rank))
+    endpoint = endpoint or WorkerEndpoint.local()
 
     if state_buffers is None:
         state_buffers = media_state_buffers(

@@ -1389,8 +1389,6 @@ fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
 /// Decodes the loaded rank identity used by startup and physical products.
 fn endpoint_from_table(endpoint: fbs::WorkerEndpoint<'_>) -> CodecResult<WorkerEndpoint> {
     let value = WorkerEndpoint {
-        worker_id: required_str(endpoint.worker_id(), "endpoint.worker_id")?,
-        rank: endpoint.rank(),
         node: required_str(endpoint.node(), "endpoint.node")?,
         address_space: required_str(endpoint.address_space(), "endpoint.address_space")?,
         incarnation: required_str(endpoint.incarnation(), "endpoint.incarnation")?,

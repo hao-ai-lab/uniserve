@@ -22,7 +22,6 @@ DEFAULTS: dict[str, Any] = {
     "acknowledgment_slot": 0,
     "host_slots": [0],
     "products_cross_hosts": False,
-    "worker_id": "worker",
     "queue_depth": 2,
     "model": "model",
     "device": "cpu",

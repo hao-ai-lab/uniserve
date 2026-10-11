@@ -375,7 +375,6 @@ impl WorkerProcessArgs {
         };
 
         let mut fields = serde_json::Map::new();
-        fields.insert("worker_id".into(), json!(self.worker_id));
         fields.insert("registration_address".into(), json!(registration));
         // The placement decides the mechanism and the rank names the endpoint:
         // a rank on the head's host can offer shared storage, a rank elsewhere

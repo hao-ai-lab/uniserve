@@ -300,7 +300,6 @@ class Worker:
                 flow_prompt=loaded.flow_prompt,
                 transfer_backends=config.data_plane.backends,
                 publication_backends=config.data_plane.publication_backends,
-                worker_id=config.worker_id,
                 attention_ranks=0
                 if config.expert_parallel is None
                 else config.expert_parallel.attention_ranks,
@@ -335,7 +334,6 @@ class Worker:
         attention: str | None = None,
         transfer_backends: tuple[str, ...] = ("local",),
         publication_backends: tuple[str, ...] = ("local",),
-        worker_id: str = "worker",
         image_processor: ImageProcessor | None = None,
         flow_prompt: FlowPrompt | None = None,
         components: tuple[tuple[str, ComponentConfig], ...] = (),
@@ -445,7 +443,7 @@ class Worker:
             )
             runner.worker_config = worker_config
 
-            endpoint = WorkerEndpoint.local(worker_id, int(worker_config.rank))
+            endpoint = WorkerEndpoint.local()
 
             # Measure the remaining grant after the runner binds persistent
             # model inputs and workspaces. Sizing earlier would treat

@@ -1613,7 +1613,7 @@ def test_tensor_entry_input_preserves_values_through_output_release(
         byte_capacity=4096,
         ticket_capacity=2,
         event_pool=events,
-        source=WorkerEndpoint.local("text_encoder"),
+        source=WorkerEndpoint.local(),
     )
     worker = execution_worker(transfer_backends=(backend,))
     admission = ar_params(97, block_ids=(0,))

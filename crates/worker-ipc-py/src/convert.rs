@@ -1146,8 +1146,6 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
     // Tensor metadata is common to every transport family.
     let dict = PyDict::new(py);
     let source = PyDict::new(py);
-    source.set_item("worker_id", &locator.source.worker_id)?;
-    source.set_item("rank", locator.source.rank)?;
     source.set_item("node", &locator.source.node)?;
     source.set_item("address_space", &locator.source.address_space)?;
     source.set_item("incarnation", &locator.source.incarnation)?;
@@ -1713,8 +1711,6 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
     let source = source_value.cast::<PyDict>().ok()?;
     Some(Locator {
         source: WorkerEndpoint {
-            worker_id: string_of(&get(source, intern!(py, "worker_id"))?)?,
-            rank: u32_of(&get(source, intern!(py, "rank"))?)?,
             node: string_of(&get(source, intern!(py, "node"))?)?,
             address_space: string_of(&get(source, intern!(py, "address_space"))?)?,
             incarnation: string_of(&get(source, intern!(py, "incarnation"))?)?,

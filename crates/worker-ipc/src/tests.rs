@@ -949,13 +949,13 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
             None,
         );
 
-        // A replica differs only in its source rank. A report for another
+        // A replica differs only in its source incarnation. A report for another
         // generation names a different identity: merging it fails and leaves
         // the publication unchanged.
         let original = &mut report.products[0];
         let mut replica = original.clone();
         if let TransferHandle::DeviceProduct { tensor, .. } = &mut replica.value {
-            tensor.locations[0].source.rank = 1;
+            tensor.locations[0].source.incarnation = "replica".into();
         }
         let mut stale = replica.clone();
         stale.product.generation += 1;
@@ -1944,7 +1944,7 @@ fn full_caps() -> WorkerInfo {
             ..WorkerInfo::default().kv_cache.unwrap()
         }),
         endpoint: WorkerEndpoint {
-            rank: 1,
+            incarnation: "rank-1".into(),
             ..WorkerInfo::default().endpoint
         },
         max_batch_calls: 64,

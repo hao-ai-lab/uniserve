@@ -28,7 +28,6 @@ def execution_worker(
     device: str = "cpu",
     queue_depth: int = 1,
     transfer_backends: tuple[str, ...] = ("local",),
-    worker_id: str = "worker",
     execution: WorkerConfig | None = None,
     max_batch_tokens: int = 8192,
     max_request_pool_size: int = 128,
@@ -94,7 +93,6 @@ def execution_worker(
         # The fixture's deployment is one host: the worker's own slot and the
         # external consumer slot a test names both read over shared storage.
         host_slots=host_slots,
-        worker_id=worker_id,
         queue_depth=queue_depth,
         components=components,
         flow_prompt=flow_prompt,

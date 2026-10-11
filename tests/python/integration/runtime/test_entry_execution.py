@@ -362,7 +362,7 @@ def test_a_batch_reading_more_regions_than_read_tickets_completes():
         byte_capacity=1 << 16,
         ticket_capacity=1,
         event_pool=events,
-        source=WorkerEndpoint.local("producer"),
+        source=WorkerEndpoint.local(),
     )
     local = worker.transports["local"]
     assert local.capacity.ticket_capacity == 4

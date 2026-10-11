@@ -41,32 +41,24 @@ FABRIC_HANDLE_BYTES = 64
 class WorkerEndpoint:
     """A rank incarnation and the host address space it runs in.
 
-    `worker_id` and `rank` name the logical position and survive a restart;
-    `incarnation` is fresh for every loaded rank. `address_space` identifies
-    the process, independently of how many Worker instances it hosts, and
-    `node` is the host name. Publication addresses belong to each
+    `incarnation` is fresh for every loaded rank; the engine, which launched
+    the rank, holds which worker and rank it serves. `address_space`
+    identifies the process, independently of how many Worker instances it
+    hosts, and `node` is the host name. Publication addresses belong to each
     `Locator`'s transport handle, not to the endpoint.
     """
 
-    worker_id: str
-    rank: int
     node: str
     address_space: str
     incarnation: str
 
     def __post_init__(self) -> None:
         """Validate that every component of the endpoint identity is present."""
-        if (
-            not self.worker_id
-            or self.rank < 0
-            or not self.node
-            or not self.address_space
-            or not self.incarnation
-        ):
+        if not self.node or not self.address_space or not self.incarnation:
             raise invalid_descriptor("worker endpoint identity is incomplete")
 
     @classmethod
-    def local(cls, worker_id: str = "worker", rank: int = 0) -> WorkerEndpoint:
+    def local(cls) -> WorkerEndpoint:
         """Identify a new rank incarnation in this process.
 
         The address space is the current process's, including in a child
@@ -75,8 +67,6 @@ class WorkerEndpoint:
         import socket
 
         return cls(
-            worker_id,
-            rank,
             socket.gethostname(),
             _address_space,
             uuid.uuid4().hex,
@@ -85,8 +75,6 @@ class WorkerEndpoint:
     def to_mapping(self) -> dict[str, object]:
         """Serialize the endpoint identity for IPC."""
         return {
-            "worker_id": self.worker_id,
-            "rank": self.rank,
             "node": self.node,
             "address_space": self.address_space,
             "incarnation": self.incarnation,

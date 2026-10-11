@@ -23,7 +23,7 @@ use crate::executor::WorkerResult;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use super::{BatchSubmitError, WorkerGroup};
+use super::{BatchSubmitError, IncarnationRegistry, WorkerGroup};
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
     RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerId, logical_result,
@@ -162,6 +162,9 @@ pub struct WorkerExecutor {
     /// Worker identity to its index in `workers`.
     routing: HashMap<WorkerId, usize>,
     workers: Vec<(WorkerId, WorkerGroup)>,
+    /// The worker and rank of every live rank incarnation, which the groups
+    /// keep current as they replace ranks.
+    incarnations: IncarnationRegistry,
     executor_info: ExecutorInfo,
     /// Sum of the workers' queue depths; `submit` refuses a batch with
     /// `WouldBlock` while this many logical batches are pending.
@@ -365,8 +368,13 @@ impl WorkerExecutor {
             })
             .collect::<Vec<_>>();
         executor_info.video_codecs = video_unit_codecs(&media_routing, &placements)?;
+        // Every group registers its live incarnations in one table, so a
+        // publication's source resolves to its worker and rank whichever
+        // group produced it.
+        let incarnations = IncarnationRegistry::default();
         for (_, worker) in &mut workers {
             worker.set_media_routing(media_routing.clone());
+            worker.share_ranks(incarnations.clone());
         }
 
         // Every edge expands to the physical (source rank, destination rank)
@@ -484,6 +492,7 @@ impl WorkerExecutor {
         let worker_count = workers.len();
         Ok(Self {
             routing,
+            incarnations,
             workers,
             executor_info,
             depth,
@@ -1043,16 +1052,9 @@ impl WorkerExecutor {
                     .flat_map(|publication| publication.tensors_mut()),
             );
         for tensor in tensors {
-            tensor.locations.retain(|location| {
-                self.routing
-                    .get(&WorkerId(location.source.worker_id.clone()))
-                    .and_then(|index| {
-                        self.workers[*index]
-                            .1
-                            .rank_info(location.source.rank as usize)
-                    })
-                    .is_some_and(|owner| owner.endpoint == location.source)
-            });
+            tensor
+                .locations
+                .retain(|location| self.incarnations.position(&location.source).is_some());
         }
 
         // Routing stays on the head: the group names each call's reading

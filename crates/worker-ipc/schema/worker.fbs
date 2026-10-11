@@ -145,8 +145,6 @@ table KVCacheInfo {
 }
 
 table WorkerEndpoint {
-  worker_id:string;
-  rank:uint;
   node:string;
   address_space:string;
   incarnation:string;

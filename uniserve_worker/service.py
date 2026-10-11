@@ -305,7 +305,7 @@ class Service:
                     batch_id=None
                     if submission is None
                     else submission.batch_id,
-                    rank=self.worker.info.endpoint.rank,
+                    rank=int(self.worker.worker_config.rank),
                 )
             ):
                 response = messages.finalize_response(response)
