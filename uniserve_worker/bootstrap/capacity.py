@@ -748,7 +748,6 @@ def derive_runtime_kv_capacity(
     available_bytes: int | None = None,
     floor: int = 1,
     default_units: int | None = None,
-    resident_copies: int = 1,
     co_resident_units: int = 0,
 ) -> RuntimeKVCapacity:
     """Size one KV unit pool from explicit tokens or a host-owned byte grant.
@@ -760,15 +759,14 @@ def derive_runtime_kv_capacity(
     - ``max_total_tokens``: the units whole pages of that many tokens
       occupy in every group;
     - ``available_bytes``: the whole units the grant holds, less
-      ``co_resident_units`` units of other fixed allocations, divided among
-      ``resident_copies`` pools;
+      ``co_resident_units`` units of other fixed allocations;
     - without a device or on one other than CUDA, ``default_units`` or
       ``DEFAULT_NUM_UNITS_FALLBACK``.
 
     The pool holds at least ``floor`` units and at least the sentinel plus
     one page of every group, the least any request can be admitted with.
     Automatic CUDA sizing requires a granted budget. Whenever a grant is
-    given, the resulting pools and co-resident units must fit it.
+    given, the pool and co-resident units must fit it.
 
     Raises:
         ValueError: A dimension is out of range, ``max_total_tokens`` or
@@ -781,7 +779,6 @@ def derive_runtime_kv_capacity(
         or any(min(shape) < 1 for shape in pages)
         or size < 1
         or floor < 1
-        or resident_copies < 1
         or co_resident_units < 0
     ):
         raise ValueError("KV capacity dimensions must be positive")
@@ -794,7 +791,7 @@ def derive_runtime_kv_capacity(
             raise ValueError("configured KV token capacity must be positive")
         units = max(minimum, units_for_tokens(pages, max_total_tokens))
     elif available_bytes is not None:
-        units = (available_bytes // size - co_resident_units) // resident_copies
+        units = available_bytes // size - co_resident_units
         if units < minimum:
             raise ValueError(
                 "device storage grant cannot hold the required KV pool"
@@ -813,8 +810,7 @@ def derive_runtime_kv_capacity(
 
     if (
         available_bytes is not None
-        and (resident_copies * units + co_resident_units) * size
-        > available_bytes
+        and (units + co_resident_units) * size > available_bytes
     ):
         raise ValueError(
             "configured KV storage exceeds the device storage grant"
