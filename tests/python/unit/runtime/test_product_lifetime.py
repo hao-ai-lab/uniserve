@@ -734,7 +734,7 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
                 1,
                 staging,
                 generation=3,
-                step=2,
+                step_index=2,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -746,12 +746,14 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
         ready = Event()
         ticket.add_done_callback(ready.set)
         assert ready.wait(5)
-        pool.adopt_import(write, generation=3, step=2, height=16, width=176)
+        pool.adopt_import(
+            write, generation=3, step_index=2, height=16, width=176
+        )
         actual = pool.gather_current(
             1,
             staging,
             generation=3,
-            step=2,
+            step_index=2,
             latent_units=11,
             height=16,
             width=176,
@@ -762,7 +764,7 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
                 1,
                 pool.stage(((1, 3, 4),), (11,))[0],
                 generation=3,
-                step=2,
+                step_index=2,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -841,7 +843,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
                 request_pool_idx=1,
                 page_table=pages,
                 generation=1,
-                step=0,
+                step_index=0,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -871,7 +873,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         pool.write_inactive(
             1,
             staging,
-            expected_step=0,
+            expected_step_index=0,
             expected_generation=1,
             latent_units=11,
             height=16,
@@ -880,7 +882,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         second = latent_output(1, pages, 11, 16, 176)
         second.expected_generation = 1
         second.generation = 2
-        second.step = 1
+        second.step_index = 1
         pool.validate_updates((second,))
         pool.apply_updates((second,))
         for value in borrowed:
@@ -892,7 +894,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
                 1,
                 staging,
                 generation=2,
-                step=1,
+                step_index=1,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -914,7 +916,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
             pool.write_inactive(
                 1,
                 staging,
-                expected_step=1,
+                expected_step_index=1,
                 expected_generation=2,
                 latent_units=11,
                 height=16,
@@ -929,7 +931,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         pool.write_inactive(
             1,
             staging,
-            expected_step=1,
+            expected_step_index=1,
             expected_generation=2,
             latent_units=11,
             height=16,
@@ -937,9 +939,9 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         )
         third = latent_output(1, pages, 11, 16, 176)
         third.expected_generation = 2
-        third.expected_step = 1
+        third.expected_step_index = 1
         third.generation = 3
-        third.step = 2
+        third.step_index = 2
         pool.validate_updates((third,))
         pool.apply_updates((third,))
         torch.testing.assert_close(
@@ -947,7 +949,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
                 1,
                 staging,
                 generation=3,
-                step=2,
+                step_index=2,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -1051,7 +1053,7 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
                 2,
                 independent,
                 generation=1,
-                step=0,
+                step_index=0,
                 latent_units=4,
                 height=16,
                 width=64,
@@ -1115,7 +1117,7 @@ def test_latent_staging_preserves_live_trajectories(latent_output) -> None:
             actual = pool.gather_current(
                 slot,
                 staging,
-                step=0,
+                step_index=0,
                 generation=1,
                 latent_units=7,
                 height=16,

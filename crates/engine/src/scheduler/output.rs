@@ -688,10 +688,7 @@ impl Scheduler {
                     return;
                 };
                 let (image_id, h, w, steps, prev_sd) = {
-                    let prev = record
-                        .num_completed_steps
-                        .saturating_sub(1)
-                        .min(u32::from(u16::MAX)) as u16;
+                    let prev = record.step_index.saturating_sub(1).min(u32::from(u16::MAX)) as u16;
                     (
                         st.image_id,
                         st.req.image.height,

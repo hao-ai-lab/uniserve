@@ -695,8 +695,8 @@ pub enum TransferHandle {
         width: u32,
         /// Logical latent allocation units.
         latent_units: u32,
-        /// Denoising step represented by the tensor.
-        step: u32,
+        /// Denoising step index represented by the tensor.
+        step_index: u32,
         /// Published latent tensor.
         tensor: TensorTransfer,
     },
@@ -821,21 +821,21 @@ impl TensorPublication {
                     height,
                     width,
                     latent_units,
-                    step,
+                    step_index,
                     ..
                 },
                 TransferHandle::Latent {
                     height: other_height,
                     width: other_width,
                     latent_units: other_latent_units,
-                    step: other_step,
+                    step_index: other_step_index,
                     ..
                 },
             ) => {
                 height == other_height
                     && width == other_width
                     && latent_units == other_latent_units
-                    && step == other_step
+                    && step_index == other_step_index
             }
             _ => false,
         };

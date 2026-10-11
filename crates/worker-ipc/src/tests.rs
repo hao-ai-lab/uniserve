@@ -169,7 +169,7 @@ fn completion_record() -> CallOutput {
         timing_counters: TimingCounters::default(),
         kv_visible_len: 5,
         kv_computed_len: 5,
-        num_completed_steps: 0,
+        step_index: 0,
 
         committed_tokens: vec![271],
         candidate_logprobs: Vec::new(),
@@ -2033,7 +2033,7 @@ fn full_run_result() -> BatchOutput {
             host_us: 44,
         },
         kv_visible_len: 6,
-        num_completed_steps: 7,
+        step_index: 7,
         kv_computed_len: 8,
 
         committed_tokens: vec![271, 272],

@@ -1764,7 +1764,7 @@ def _stage_input_products(
             latent_pool.adopt_import(
                 binding,
                 generation=product.generation,
-                step=value.step,
+                step_index=value.step_index,
                 height=value.height,
                 width=value.width,
             )

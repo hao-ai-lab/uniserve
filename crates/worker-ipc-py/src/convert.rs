@@ -1252,13 +1252,13 @@ fn transfer_handle_to_py<'py>(
             height,
             width,
             latent_units,
-            step,
+            step_index,
             tensor,
         } => {
             value.set_item(intern!(py, "height"), height)?;
             value.set_item(intern!(py, "width"), width)?;
             value.set_item(intern!(py, "latent_units"), latent_units)?;
-            value.set_item(intern!(py, "step"), step)?;
+            value.set_item(intern!(py, "step_index"), step_index)?;
             value.set_item(intern!(py, "tensor"), tensor_transfer_to_py(py, tensor)?)?;
             "LatentTransferValue"
         }
@@ -1603,7 +1603,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<CallOutput> {
         timing_counters,
         kv_visible_len: u32_of(&get(dict, intern!(py, "kv_visible_len"))?)?,
         kv_computed_len: u32_of(&get(dict, intern!(py, "kv_computed_len"))?)?,
-        num_completed_steps: u32_of(&get(dict, intern!(py, "num_completed_steps"))?)?,
+        step_index: u32_of(&get(dict, intern!(py, "step_index"))?)?,
         committed_tokens: u32_vec(&get(dict, intern!(py, "committed_tokens"))?)?,
         finish_flags,
         media_output,
@@ -1644,7 +1644,7 @@ fn tensor_publication_from_py(value: &Bound<'_, PyAny>) -> Option<TensorPublicat
             height: u32_of(&get(payload, intern!(py, "height"))?)?,
             width: u32_of(&get(payload, intern!(py, "width"))?)?,
             latent_units: u32_of(&get(payload, intern!(py, "latent_units"))?)?,
-            step: u32_of(&get(payload, intern!(py, "step"))?)?,
+            step_index: u32_of(&get(payload, intern!(py, "step_index"))?)?,
             tensor: tensor_transfer_from_py(&get(payload, intern!(py, "tensor"))?)?,
         },
         _ => return None,
@@ -2463,7 +2463,7 @@ mod tests {
                 error_message: None,
                 timing_counters: TimingCounters::default(),
                 kv_visible_len: 2,
-                num_completed_steps: 0,
+                step_index: 0,
                 kv_computed_len: 2,
                 committed_tokens: vec![42],
                 candidate_logprobs: Vec::new(),

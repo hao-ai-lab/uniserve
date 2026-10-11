@@ -449,7 +449,7 @@ class PendingOutput:
         denoising = self.call.kind is MediaCall.DENOISING
         if status is not CallStatus.OK or not denoising:
             return 0
-        return int(self.latent.update.step)
+        return int(self.latent.update.step_index)
 
     def ready(self) -> bool:
         """Query host output readiness without changing request acceptance."""
@@ -665,7 +665,7 @@ class PendingOutput:
             kv_computed_len=0
             if runtime is None
             else int(runtime.kv_computed_len),
-            num_completed_steps=self.completed_steps(status),
+            step_index=self.completed_steps(status),
             committed_tokens=tokens,
             sampled_logprob=None if scores is None else scores[0],
             top_logprobs=() if scores is None else scores[1],

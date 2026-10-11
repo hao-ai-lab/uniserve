@@ -391,7 +391,7 @@ def observe_completions(worker: object, report: BatchOutput) -> None:
             and (record.request_key, record.call_id) in _PREFIX_CALLS
         ):
             steps = int(_IMAGE_PARAMS[record.request_key].steps)
-            if int(record.num_completed_steps) >= steps:
+            if int(record.step_index) >= steps:
                 _discard_flow_prefix(record.request_key)
             else:
                 _MATERIALIZED_PREFIXES.add(record.request_key)

@@ -413,7 +413,7 @@ def _error_outputs(
             kv_computed_len=(
                 0 if runtime is None else int(runtime.kv_computed_len)
             ),
-            num_completed_steps=0,
+            step_index=0,
             committed_tokens=(),
             finish_flags=FinishFlags(),
         )

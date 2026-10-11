@@ -1667,7 +1667,7 @@ fn merge_completion_record(
             && canonical.output.status == rank_completion.output.status
             && canonical.output.kv_visible_len == rank_completion.output.kv_visible_len
             && canonical.output.kv_computed_len == rank_completion.output.kv_computed_len
-            && canonical.output.num_completed_steps == rank_completion.output.num_completed_steps
+            && canonical.output.step_index == rank_completion.output.step_index
             && canonical.output.finish_flags == rank_completion.output.finish_flags,
         "completion result fields diverged"
     );

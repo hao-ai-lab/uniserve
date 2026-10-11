@@ -97,7 +97,7 @@ class CallOutput:
     # speculative positions.
     kv_computed_len: int
     # Denoising steps completed for the request.
-    num_completed_steps: int
+    step_index: int
     # Token ids the sampler accepted.
     committed_tokens: tuple[int, ...]
     finish_flags: FinishFlags
@@ -137,7 +137,7 @@ class CallOutput:
             "status": self.status.value,
             "kv_visible_len": self.kv_visible_len,
             "kv_computed_len": self.kv_computed_len,
-            "num_completed_steps": self.num_completed_steps,
+            "step_index": self.step_index,
             "committed_tokens": list(self.committed_tokens),
             "sampled_logprob": self.sampled_logprob,
             "top_logprobs": [

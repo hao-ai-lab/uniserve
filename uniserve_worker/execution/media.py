@@ -649,18 +649,18 @@ def mux_config(runner: ModelExecutor, media) -> AvMuxConfig:
     )
 
 
-def sample_generation(step: int) -> int:
+def sample_generation(step_index: int) -> int:
     """Return the pool generation of a trajectory at an accepted step.
 
     A standalone denoiser's samples are never published from the pool, and
     one request slot holds one trajectory, so its accepted step count
     versions it; zero stays the empty slot's generation.
     """
-    return int(step) + 1
+    return int(step_index) + 1
 
 
 def sample_update(
-    slot: int, params, *, step: int, previous: int | None
+    slot: int, params, *, step_index: int, previous: int | None
 ) -> LatentUpdate:
     """Describe the pool publication of a trajectory's successor.
 
@@ -673,9 +673,9 @@ def sample_update(
         expected_generation=0
         if previous is None
         else sample_generation(previous),
-        expected_step=0 if previous is None else int(previous),
-        generation=sample_generation(step),
-        step=int(step),
+        expected_step_index=0 if previous is None else int(previous),
+        generation=sample_generation(step_index),
+        step_index=int(step_index),
     )
 
 
@@ -940,7 +940,7 @@ def execute(
                     ),
                 )
         request.latent.update = sample_update(
-            slot_index, params, step=0, previous=None
+            slot_index, params, step_index=0, previous=None
         )
 
     elif call.kind is MediaCall.DENOISING:
@@ -951,11 +951,11 @@ def execute(
         # parameters against the pool's record, and names the bank holding
         # it; the runner writes the successor to the other.
         assert pool is not None
-        start_step = pool.committed_step(slot_index)
+        start_step = pool.committed_step_index(slot_index)
         source, _ = pool.step_banks(
             slot_index,
             params.page_table,
-            step=start_step,
+            step_index=start_step,
             generation=sample_generation(start_step),
             latent_units=params.latent_units,
             height=params.height,
@@ -996,7 +996,7 @@ def execute(
         request.latent.update = sample_update(
             slot_index,
             params,
-            step=start_step + 1,
+            step_index=start_step + 1,
             previous=start_step,
         )
 

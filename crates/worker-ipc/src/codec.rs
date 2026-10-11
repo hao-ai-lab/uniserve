@@ -1087,7 +1087,7 @@ fn completion_record_from_table(record: fbs::CallOutput<'_>) -> CodecResult<Call
         },
         kv_visible_len: record.kv_visible_len(),
         kv_computed_len: record.kv_computed_len(),
-        num_completed_steps: record.num_completed_steps(),
+        step_index: record.step_index(),
         committed_tokens: record
             .committed_tokens()
             .map(|items| items.iter().collect())
@@ -1758,7 +1758,7 @@ fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<Tra
                 height: transfer.height(),
                 width: transfer.width(),
                 latent_units: transfer.latent_units(),
-                step: transfer.step(),
+                step_index: transfer.step_index(),
                 tensor: tensor_transfer_from_table(
                     transfer
                         .tensor()

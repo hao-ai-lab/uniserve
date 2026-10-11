@@ -989,7 +989,7 @@ impl SimEngine {
             timing_counters: TimingCounters::default(),
             kv_visible_len: 0,
             kv_computed_len: 0,
-            num_completed_steps: 0,
+            step_index: 0,
             committed_tokens: Vec::new(),
             candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
@@ -1211,7 +1211,7 @@ impl SimEngine {
                     .image()
                     .map(|image| image.steps)
                     .unwrap_or(DEFAULT_DENOISE_STEPS);
-                record.num_completed_steps = u32::from(request.flow_step);
+                record.step_index = u32::from(request.flow_step);
                 // Denoise completion surfaces as a length finish once the flow has
                 // advanced through every scheduled step.
                 record.finish_flags.length = request.flow_step >= total;
@@ -1286,7 +1286,7 @@ impl SimEngine {
             timing_counters: TimingCounters::default(),
             kv_visible_len: request.kv_visible_len,
             kv_computed_len: request.kv_visible_len,
-            num_completed_steps: u32::from(request.flow_step),
+            step_index: u32::from(request.flow_step),
             committed_tokens: Vec::new(),
             candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),

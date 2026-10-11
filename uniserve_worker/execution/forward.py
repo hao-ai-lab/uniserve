@@ -325,7 +325,7 @@ def prepare_diffusion_step(
         guide, timestep, prefix_rows = diffusion.prepare_step(
             call,
             trajectory,
-            latent_pool.committed_step(row.request.request_pool_idx),
+            latent_pool.committed_step_index(row.request.request_pool_idx),
             request_tables=request_tables,
             model_runner=model_runner,
             latent_pool=latent_pool,
@@ -764,7 +764,7 @@ def integrate_predictions(
             staging.value[: int(params.latent_units)],
             timestep,
             tuple(values),
-            latent_pool.committed_step(row.request.request_pool_idx),
+            latent_pool.committed_step_index(row.request.request_pool_idx),
         )
         outcomes[index] = diffusion.finish(
             call,

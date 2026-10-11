@@ -796,7 +796,7 @@ def _warmup_flow_tables(
     if pool is None:
         raise invalid_descriptor("generation warmup has no latent pool")
     branches = guidance.branches(
-        trajectory.schedules["image"], pool.committed_step(main_slot)
+        trajectory.schedules["image"], pool.committed_step_index(main_slot)
     )
 
     runtime = request.accepted_progress

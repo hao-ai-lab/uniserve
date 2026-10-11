@@ -237,15 +237,15 @@ def prepare_latent(
     # batch cannot expose a partially initialized trajectory.
     request.latent.update.params = params
     request.latent.update.expected_generation = 0
-    request.latent.update.expected_step = 0
+    request.latent.update.expected_step_index = 0
     request.latent.update.generation = int(output.generation)
-    request.latent.update.step = 0
+    request.latent.update.step_index = 0
 
     products = publish_latent_transfer(
         call,
         output,
         row,
-        step=0,
+        step_index=0,
         model_runner=model_runner,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
@@ -326,11 +326,11 @@ def initialize(
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
     pool = latent_pool
-    start_step = pool.committed_step(row.request.request_pool_idx)
+    start_step = pool.committed_step_index(row.request.request_pool_idx)
     pool.gather_current(
         row.request.request_pool_idx,
         staging,
-        step=start_step,
+        step_index=start_step,
         generation=int(latent_input.generation),
         latent_units=int(params.latent_units),
         height=int(params.height),
@@ -545,12 +545,12 @@ def finish(
     ):
         raise invalid_descriptor("flow completion lost its trajectory state")
 
-    start_step = latent_pool.committed_step(row.request.request_pool_idx)
+    start_step = latent_pool.committed_step_index(row.request.request_pool_idx)
     final_step = start_step + 1
     latent_pool.write_inactive(
         row.request.request_pool_idx,
         staging,
-        expected_step=start_step,
+        expected_step_index=start_step,
         expected_generation=int(latent_input.generation),
         latent_units=int(params.latent_units),
         height=int(params.height),
@@ -558,15 +558,15 @@ def finish(
     )
     request.latent.update.params = params
     request.latent.update.expected_generation = int(latent_input.generation)
-    request.latent.update.expected_step = start_step
+    request.latent.update.expected_step_index = start_step
     request.latent.update.generation = int(latent_output.generation)
-    request.latent.update.step = final_step
+    request.latent.update.step_index = final_step
 
     products = publish_latent_transfer(
         call,
         latent_output,
         row,
-        step=final_step,
+        step_index=final_step,
         model_runner=model_runner,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
@@ -604,7 +604,7 @@ def publish_latent_transfer(
     row: PendingOutput,
     *,
     state: BatchState,
-    step: int,
+    step_index: int,
     model_runner: ModelExecutor,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
@@ -641,7 +641,7 @@ def publish_latent_transfer(
             product,
             source,
             row,
-            step=step,
+            step_index=step_index,
             latent_pool=latent_pool,
             publication_transports=publication_transports,
             state=state,

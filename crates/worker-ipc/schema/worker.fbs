@@ -487,7 +487,7 @@ table CallOutput {
   timing_counters:TimingCounters;
   kv_visible_len:uint;
   kv_computed_len:uint;
-  num_completed_steps:uint;
+  step_index:uint;
   committed_tokens:[uint];
   sampled_logprob:float = null;
   top_logprobs:[TokenLogprob];
@@ -731,7 +731,7 @@ table LatentTransfer {
   height:uint;
   width:uint;
   latent_units:uint;
-  step:uint;
+  step_index:uint;
   tensor:TensorTransfer;
 }
 

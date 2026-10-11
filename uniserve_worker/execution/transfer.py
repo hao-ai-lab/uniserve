@@ -227,13 +227,13 @@ def _publish_current_latent(
     if params is None or staging is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
-    step = latent_pool.committed_step(row.request.request_pool_idx)
+    step = latent_pool.committed_step_index(row.request.request_pool_idx)
     source = latent_pool.reserve_current_publication(
         product,
         request_pool_idx=row.request.request_pool_idx,
         page_table=params.page_table,
         generation=reference.generation,
-        step=step,
+        step_index=step,
         latent_units=params.latent_units,
         height=params.height,
         width=params.width,
@@ -243,7 +243,7 @@ def _publish_current_latent(
         product,
         source,
         row,
-        step=step,
+        step_index=step,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
         state=state,
@@ -256,7 +256,7 @@ def publish_latent_source(
     row: PendingOutput,
     *,
     state: BatchState,
-    step: int,
+    step_index: int,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
@@ -307,7 +307,7 @@ def publish_latent_source(
         height=params.height,
         width=params.width,
         latent_units=params.latent_units,
-        step=step,
+        step_index=step_index,
         tensor=TensorTransfer(shape=shape, locations=locations),
     )
     return TensorPublication(product=product, value=descriptor)

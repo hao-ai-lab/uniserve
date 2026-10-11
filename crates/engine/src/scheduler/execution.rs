@@ -2494,7 +2494,7 @@ impl Scheduler {
         // that does not advance the trajectory would be scheduled again
         // without end.
         let step_valid = call.kind != CallKind::Media(MediaCall::Denoising)
-            || record.num_completed_steps > state.denoising.completed();
+            || record.step_index > state.denoising.completed();
         let valid = record.status == CallStatus::Ok
             && record.request_key == call.request_key
             && record.call_id == call.call_id
@@ -2563,7 +2563,7 @@ impl Scheduler {
                     }
                     // `valid` requires a denoising result to advance the trajectory.
                     CallKind::Media(MediaCall::Denoising) => {
-                        let accepted = state.denoising.accept(record.num_completed_steps, None);
+                        let accepted = state.denoising.accept(record.step_index, None);
                         debug_assert!(accepted, "a valid step advances the trajectory");
                     }
                     CallKind::Media(MediaCall::VideoEncoding) => {
@@ -3219,7 +3219,7 @@ impl Scheduler {
                     && self
                         .running
                         .get(&id)
-                        .is_some_and(|state| record.num_completed_steps >= state.denoising.steps());
+                        .is_some_and(|state| record.step_index >= state.denoising.steps());
                 if call_variant == CallKind::Media(MediaCall::Denoising)
                     && record.status == CallStatus::Ok
                     && let Some(prefix) = self

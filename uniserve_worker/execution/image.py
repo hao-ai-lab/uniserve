@@ -376,7 +376,7 @@ def materialization_latent(
     current = latent_pool.gather_current(
         row.request.request_pool_idx,
         staging,
-        step=int(image_params.steps),
+        step_index=int(image_params.steps),
         generation=int(latent_input.generation),
         latent_units=int(params.latent_units),
         height=int(params.height),
@@ -446,7 +446,7 @@ def publish_image(
     )
     request.latent.update.params = params
     request.latent.update.generation = int(latent_input.generation)
-    request.latent.update.step = int(image_params.steps)
+    request.latent.update.step_index = int(image_params.steps)
     request.latent.update.release = True
     return non_state_outcome(call, completion_tasks=(image_task,), state=state)
 

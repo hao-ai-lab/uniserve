@@ -30,7 +30,7 @@ def _completion(error_code, error_message):
         timing_counters=TimingCounters(),
         kv_visible_len=0,
         kv_computed_len=0,
-        num_completed_steps=0,
+        step_index=0,
         committed_tokens=(),
         finish_flags=FinishFlags(),
     )

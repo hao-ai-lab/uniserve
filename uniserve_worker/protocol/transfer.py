@@ -658,7 +658,7 @@ class LatentTransferValue:
     height: int
     width: int
     latent_units: int
-    step: int
+    step_index: int
     tensor: TensorTransfer
 
 

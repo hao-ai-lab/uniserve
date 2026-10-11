@@ -533,16 +533,13 @@ def test_lane_and_graph_binding_preserve_token_and_flow_results(
     assert token.committed_tokens == reference_token.committed_tokens
     assert token.kv_visible_len == reference_token.kv_visible_len
     assert token.kv_computed_len == reference_token.kv_computed_len
-    assert token.num_completed_steps == reference_token.num_completed_steps
+    assert token.step_index == reference_token.step_index
 
     flow_completion = bound_flow.completions[0]
     reference_flow = plain_flow.completions[0]
     assert flow_completion.kv_visible_len == reference_flow.kv_visible_len
     assert flow_completion.kv_computed_len == reference_flow.kv_computed_len
-    assert (
-        flow_completion.num_completed_steps
-        == reference_flow.num_completed_steps
-    )
+    assert flow_completion.step_index == reference_flow.step_index
     assert bound_artifact == plain_artifact
 
 
@@ -917,7 +914,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
 
     assert failed.completions[0].status is CallStatus.ERROR
     assert failed.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
-    assert failed.completions[0].num_completed_steps == 0
+    assert failed.completions[0].step_index == 0
 
     replacement, _replacement_latent = diffusion_step_call(
         admission.request_key,
@@ -931,7 +928,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         worker.submit(execution_batch(batch_id=16, calls=(replacement,))),
     )
     assert recovered.completions[0].status is CallStatus.OK
-    assert recovered.completions[0].num_completed_steps == 1
+    assert recovered.completions[0].step_index == 1
     recovered_observation = record_completion(replacement, recovered)
     recovered_artifact = _finalized_artifact(
         worker,
@@ -1214,8 +1211,8 @@ def test_flow_run_results_cumulative_denoise_step_in_latent_len():
         ),
     )
 
-    assert first_report.completions[0].num_completed_steps == 1
-    assert second_report.completions[0].num_completed_steps == 2
+    assert first_report.completions[0].step_index == 1
+    assert second_report.completions[0].step_index == 2
 
 
 def test_trajectory_advances_across_many_generations_and_rejects_a_stale_reference(  # noqa: E501
@@ -1257,7 +1254,7 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
             ),
         )
         assert report.completions[0].status is CallStatus.OK
-        assert report.completions[0].num_completed_steps == index + 1
+        assert report.completions[0].step_index == index + 1
         releasable = current
         current = successor
         observation = record_completion(call, report)
@@ -1951,7 +1948,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
     received = prepared
     received = finalized_report(consumer, received)
     assert received.completions[0].status is CallStatus.OK
-    assert received.completions[0].num_completed_steps == 0
+    assert received.completions[0].step_index == 0
     assert _media_bytes(received.completions[0]) == source_artifact
     producer.close()
     consumer.close()
@@ -2316,7 +2313,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         ),
     )
     assert next_report.completions[0].status is CallStatus.OK
-    assert next_report.completions[0].num_completed_steps == 1
+    assert next_report.completions[0].step_index == 1
     next_observation = record_completion(next_flow, next_report)
     assert base64.b64decode(
         _finalized_artifact(
@@ -2483,7 +2480,7 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         prepared = finalized_report(worker, prepared)
         report = prepared
         assert report.completions[0].status is CallStatus.OK
-        assert report.completions[0].num_completed_steps == 3
+        assert report.completions[0].step_index == 3
     finally:
         held_header.release()
         held.close()
@@ -2573,7 +2570,7 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
                 assert responses[5]["kind"] == "result", responses[5]
                 completion = responses[5]["result"]["completions"][0]
                 assert completion["status"] == CallStatus.OK.value
-                assert completion["num_completed_steps"] == 3
+                assert completion["step_index"] == 3
                 assert responses[6]["kind"] == "result", responses[6]
             finally:
                 # Failure cleanup sends the same valid release through IPC,

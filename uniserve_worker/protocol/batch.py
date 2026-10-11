@@ -316,7 +316,7 @@ class TensorPublication:
         else:
             kind = "latent"
             value["latent_units"] = typed.latent_units
-            value["step"] = typed.step
+            value["step_index"] = typed.step_index
         return {
             "product": self.product.to_mapping(),
             "value": {"kind": kind, "value": value},

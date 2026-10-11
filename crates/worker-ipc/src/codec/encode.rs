@@ -800,7 +800,7 @@ fn transfer_handle<'a>(
             height,
             width,
             latent_units,
-            step,
+            step_index,
             tensor,
         } => {
             let tensor = Some(tensor_transfer(b, tensor));
@@ -812,7 +812,7 @@ fn transfer_handle<'a>(
                         height: *height,
                         width: *width,
                         latent_units: *latent_units,
-                        step: *step,
+                        step_index: *step_index,
                         tensor,
                     },
                 )
@@ -1088,7 +1088,7 @@ fn completion<'a>(b: &mut FlatBufferBuilder<'a>, v: &CallOutput) -> WIPOffset<fb
             timing_counters,
             kv_visible_len: v.kv_visible_len,
             kv_computed_len: v.kv_computed_len,
-            num_completed_steps: v.num_completed_steps,
+            step_index: v.step_index,
             committed_tokens,
             sampled_logprob: v.sampled_logprob,
             top_logprobs,

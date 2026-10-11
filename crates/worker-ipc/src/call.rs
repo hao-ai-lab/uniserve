@@ -874,7 +874,7 @@ pub struct CallOutput {
     /// KV extent initialized by execution, including rejected speculative positions.
     pub kv_computed_len: u32,
     /// Completed denoising steps, independent of latent tensor dimensions.
-    pub num_completed_steps: u32,
+    pub step_index: u32,
     /// Token identifiers accepted by the sampler.
     pub committed_tokens: Vec<u32>,
     /// Natural-log probability of the final accepted token, when requested.

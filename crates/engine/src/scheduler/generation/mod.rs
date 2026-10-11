@@ -407,7 +407,7 @@ impl RequestState {
                 } else {
                     let accepted = self
                         .denoising
-                        .accept(record.num_completed_steps, call.latent_output.clone());
+                        .accept(record.step_index, call.latent_output.clone());
                     if !accepted {
                         return Err(GenerationResultError::Progress {
                             detail: "denoise_step_mismatch",
