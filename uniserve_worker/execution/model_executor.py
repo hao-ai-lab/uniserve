@@ -1322,12 +1322,6 @@ class ModelExecutor:
         # units cover.
         max_rows = min(max_calls, request_slots)
         pool_rows = (kv_cache.num_units - 1) // kv_cache.row_units
-        decode_sizes = decode_captures(
-            config,
-            max_rows=max_rows,
-            row_units=kv_cache.row_units,
-            num_units=kv_cache.num_units,
-        )
         feature_injection = (
             self.processor is not None
             and self.processor.feature_injection is not None
@@ -1417,7 +1411,12 @@ class ModelExecutor:
                 # Graph pools exist only on CUDA; a decode or prefill call
                 # no captured bucket holds runs eagerly.
                 decode = (
-                    tuple(value for value in decode_sizes if value <= rows)
+                    decode_captures(
+                        config,
+                        max_rows=rows,
+                        row_units=kv_cache.row_units,
+                        num_units=kv_cache.num_units,
+                    )
                     if ForwardMode.DECODE in kinds and target.type == "cuda"
                     else ()
                 )

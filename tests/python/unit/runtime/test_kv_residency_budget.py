@@ -75,10 +75,9 @@ def test_automatic_kv_capacity_reserves_all_storage_within_the_grant():
         unit_bytes=64 * 128,
         device="cuda:0",
         available_bytes=10 * 64 * 128 + 100,
-        resident_copies=2,
         co_resident_units=2,
     )
-    assert capacity.num_units == 4
+    assert capacity.num_units == 8
 
 
 @pytest.mark.parametrize("tokens", [None, 256])

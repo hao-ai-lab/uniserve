@@ -541,7 +541,7 @@ def _token_worker_layout(
         page_shapes = tuple(
             (group.page_tokens, group.units_per_page) for group in planes.groups
         )
-        resident_copies, co_resident_units = _kv_residency_shape(
+        co_resident_units = _co_resident_units(
             worker_config,
             unit_bytes=unit_bytes,
             co_resident_bytes=fixed_bytes[worker_config.device],
@@ -552,7 +552,6 @@ def _token_worker_layout(
             unit_bytes=unit_bytes,
             device=worker_config.device,
             available_bytes=worker_config.pool_storage_bytes,
-            resident_copies=resident_copies,
             co_resident_units=co_resident_units,
         )
 
@@ -748,19 +747,17 @@ def _request_tensor_worker_layout(
     )
 
 
-def _kv_residency_shape(
+def _co_resident_units(
     worker_config: WorkerConfig,
     *,
     unit_bytes: int,
     co_resident_bytes: int,
-) -> tuple[int, int]:
-    """Describe the single KV pool and co-resident fixed allocations.
+) -> int:
+    """Return the KV units the other fixed allocations occupy.
 
-    Returns:
-        ``(resident_copies, co_resident_units)`` for
-        ``derive_runtime_kv_capacity``: one resident KV pool, and the units
-        of the graph storage budget and ``co_resident_bytes``, each rounded
-        up to whole units.
+    These are the units of the graph storage budget and of
+    ``co_resident_bytes``, each rounded up to whole units, which
+    ``derive_runtime_kv_capacity`` leaves out of the pool.
     """
     # Captured executables are held for the worker's lifetime, so they occupy
     # the same static budget as the KV pools and are reserved before the
@@ -772,4 +769,4 @@ def _kv_residency_shape(
     )
     fixed_owner_units = ceil_div(max(0, int(co_resident_bytes)), size)
 
-    return 1, graph_units + fixed_owner_units
+    return graph_units + fixed_owner_units

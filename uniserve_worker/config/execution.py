@@ -37,7 +37,6 @@ from uniserve_worker.protocol.validation import (
 
 __all__ = [
     "CanvasSampling",
-    "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
     "DEFAULT_FLOW_GRAPH_BATCH_SIZES",
     "DEFAULT_FLOW_GRAPH_SHAPES",
     "DEFAULT_GRAPH_STORAGE_FRACTION",
@@ -49,54 +48,6 @@ __all__ = [
     "worker_config_from_namespace",
 ]
 
-
-# Dense small batches, then strides of 8 up to the largest captured batch.
-DEFAULT_DECODE_GRAPH_BATCH_SIZES = (
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    10,
-    11,
-    12,
-    13,
-    14,
-    15,
-    16,
-    17,
-    18,
-    19,
-    20,
-    21,
-    22,
-    23,
-    24,
-    25,
-    26,
-    27,
-    28,
-    29,
-    30,
-    31,
-    32,
-    40,
-    48,
-    56,
-    64,
-    72,
-    80,
-    88,
-    96,
-    104,
-    112,
-    120,
-    128,
-)
 
 # Token buckets step linearly within each range, with a step that widens as the
 # counts grow. A prefill rounded up to a bucket gains less padding than the gap
@@ -173,9 +124,11 @@ DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
 DEFAULT_FLOW_GRAPH_BATCH_SIZES = (1, 2, 3, 4)
 DEFAULT_FLOW_GRAPH_SHAPES = ((1152, 2048), (2048, 1152))
 
-# Row (request) buckets for captured prefill graphs. They are not
-# configurable: ``ModelExecutor`` and bootstrap capacity planning read them
-# directly.
+# Row (request) buckets for captured prefill graphs below the admitted batch.
+# They are not configurable: ``ModelExecutor`` and bootstrap capacity planning
+# read them through ``prefill_captures``, which ends them with one bucket that
+# holds the most rows a batch admits. A bucket's padding rows are empty
+# sequences, so wide row buckets cost no compute.
 DEFAULT_PREFILL_GRAPH_ROW_BUCKETS = (8, 16, 32)
 
 # Captured graphs hold their storage for as long as they are retained, so the
@@ -335,10 +288,12 @@ class WorkerConfig:
 
     Graphs: ``graph_policy`` ``"off"`` disables every graph. Otherwise a
     decode call on a CUDA device replays a graph captured at startup for one
-    of the ``decode_graph_batch_sizes`` whose rows' pages fit the KV pool,
-    and with ``prefill_cuda_graph`` a prefill call replays a graph captured
-    over ``prefill_graph_token_sizes`` token buckets. A call no captured
-    graph holds runs eagerly, as every call does with the graphs off.
+    of the ``decode_graph_batch_sizes`` (by default every size up to the rows
+    a call may hold) whose rows' pages fit the KV pool, and with
+    ``prefill_cuda_graph`` a prefill call replays a graph captured over
+    ``prefill_graph_token_sizes`` token buckets. A call no captured graph
+    holds, such as one above a launch's explicit decode sizes, runs eagerly,
+    as every call does with the graphs off.
     Turning ``prefill_cuda_graph`` off runs prefill eagerly, for debugging.
     Without ``prefill_outputs`` the deployment's prefill calls select no
     output (``TokenSelection.CACHE``): their graphs only write the K/V
@@ -409,7 +364,11 @@ class WorkerConfig:
     mem_fraction_static: float
     lanes: tuple[LaneConfig, ...]
     graph_policy: str
-    decode_graph_batch_sizes: tuple[int, ...]
+    # Decode batch sizes captured at startup. ``None`` captures every size of
+    # ``graph_inputs.default_decode_graph_batch_sizes`` up to the rows a call
+    # may hold, so every admitted batch replays a graph; a launch that names
+    # sizes captures those and runs a batch they do not hold eagerly.
+    decode_graph_batch_sizes: tuple[int, ...] | None
     prefill_cuda_graph: bool
     # Whether any prefill call of the deployment selects logits or hidden
     # states. A deployment whose prompts only condition token-denoising
@@ -526,9 +485,10 @@ def worker_config_from_namespace(
         mem_fraction_static=float(namespace.mem_fraction_static),
         lanes=_parse_lanes(namespace.lane),
         graph_policy=str(namespace.graph_policy),
-        decode_graph_batch_sizes=_parse_positive_int_csv(
-            namespace.decode_graph_batch_sizes,
-            default=DEFAULT_DECODE_GRAPH_BATCH_SIZES,
+        decode_graph_batch_sizes=None
+        if namespace.decode_graph_batch_sizes is None
+        else _parse_positive_int_csv(
+            namespace.decode_graph_batch_sizes, default=()
         ),
         prefill_cuda_graph=bool(namespace.prefill_cuda_graph),
         prefill_outputs=bool(namespace.prefill_outputs),

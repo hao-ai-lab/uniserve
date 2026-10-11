@@ -20,28 +20,28 @@ slot's continuation flag: its state stays as the stopping step left it,
 and it reports ``STEP_SKIPPED``.
 
 On CUDA, startup captures graphs by canvas row count and call kind. Readout
-graphs also bucket the canvas length, so shorter canvases do not evaluate
-a full model canvas of padding per row. Every call replays the smallest
-bucket that holds its canvases; after startup a call no captured bucket
-holds fails. A canvas step graph holds the whole step: the pass, the head and
-the sampler of every chunk, and the commit of the stepped state, for the one
-sampling the deployment is launched with; a call whose rows all start their
-canvas replays its own graph, whose pass skips the self-conditioning signal,
-zero at step zero. A readout graph holds the pass up to the final layer's
-attention output (``TokenDenoiser.attend``), over the bucket's canvases' worth
-of tokens in up to twice as many sequences, so it serves canvases of any
-length up to the model's. The rest of the final layer, the output norm, the
-head and the log-softmax over the vocabulary evaluate the slot rows alone
-(``TokenDenoiser.finish``) in a readout tail graph per slot bucket
+graphs also bucket the canvas length, so shorter canvases do not evaluate a
+full model canvas of padding per row. Every call replays the smallest bucket
+that holds its canvases, and a call of more canvases than the largest bucket
+holds runs eagerly. A canvas step graph holds the whole step: the pass, the
+head and the sampler of every chunk, and the commit of the stepped state, for
+the one sampling the deployment is launched with; a call whose rows all start
+their canvas replays its own graph, whose pass skips the self-conditioning
+signal, zero at step zero. A readout graph holds the pass up to the final
+layer's attention output (``TokenDenoiser.attend``), over the bucket's
+canvases' worth of tokens in up to twice as many sequences, so it serves
+canvases of any length up to the model's. The rest of the final layer, the
+output norm, the head and the log-softmax over the vocabulary evaluate the slot
+rows alone (``TokenDenoiser.finish``) in a readout tail graph per slot bucket
 (``SLOT_BUCKETS``), which startup captures with the first readout bucket: the
 slot rows of the attend state are gathered into the tail's fixed rows, a call
 with more slots than the largest bucket replays it in chunks, and one gather
-after each replay reads the call's candidates, whose number varies from call
-to call. A tail that exchanges tokens with other ranks, an expert-parallel
-final layer, runs eagerly instead, once over every slot (``tail_exchanges``).
-Every sequence of a canvas graph, padding included, is at most one canvas
-long, which bounds its attention launch. Padding sequences read no prefix, and
-a padding step row starts a canvas in the sentinel slot zero.
+after each replay reads the call's candidates, whose number varies from call to
+call. A tail that exchanges tokens with other ranks, an expert-parallel final
+layer, runs eagerly instead, once over every slot (``tail_exchanges``). Every
+sequence of a canvas graph, padding included, is at most one canvas long, which
+bounds its attention launch. Padding sequences read no prefix, and a padding
+step row starts a canvas in the sentinel slot zero.
 """
 
 from __future__ import annotations
@@ -464,8 +464,9 @@ class CanvasRunner(ModelRunner):
     def select_graph_shape(self, batch, *, eligible):
         """Choose the canvas graph bucket of a call and pad the call to it.
 
-        Returns ``None`` for eager execution, without graph pools or for an
-        ineligible call. Otherwise returns ``(key, padded_batch, True)``: a
+        Returns ``None`` for eager execution: without graph pools, for an
+        ineligible call, or for a call of more canvases than the largest
+        bucket holds. Otherwise returns ``(key, padded_batch, True)``: a
         readout key is ``("canvas", rows, length)`` and its padded batch holds
         the canvas pass's input alone; a step key is ``("canvas_step", rows,
         first)``, where ``first`` is whether every row starts its
@@ -474,8 +475,7 @@ class CanvasRunner(ModelRunner):
         capacity while this local bucket keeps its own canvas shape.
 
         Raises:
-            CUDAGraphError: The call holds more canvases than every bucket,
-                or a canvas longer than the model's.
+            CUDAGraphError: The call holds a canvas longer than the model's.
         """
         if not eligible or not self.pools:
             return None
@@ -492,13 +492,12 @@ class CanvasRunner(ModelRunner):
             (value for value in buckets if value >= batch.row_count),
             None,
         )
-        if rows is None or maximum > length:
+        if rows is None:
+            return None
+        if maximum > length:
             raise CUDAGraphError(
-                f"{self.name} has no canvas graph for a call of "
-                f"{batch.row_count} canvases of up to "
-                f"{max(inputs.attention.queries.host)} tokens; its canvas "
-                f"graphs hold up to {buckets[-1] if buckets else 0} canvases "
-                f"of {length} tokens"
+                f"{self.name} has no canvas graph for a canvas of {maximum} "
+                f"tokens; its canvases hold {length}"
             )
 
         widths = self.input_buffers.table_widths
