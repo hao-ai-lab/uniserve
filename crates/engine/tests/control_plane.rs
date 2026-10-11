@@ -647,7 +647,7 @@ fn forward_batch_calls(prefill: u32, decode: u32) -> (Vec<usize>, Vec<usize>) {
         let BatchEvent::Submitted(batch) = event else {
             continue;
         };
-        match batch.requests.first().map(|(call, _)| call.code) {
+        match batch.requests.first().map(|(call, _)| call.kind) {
             Some(CallKind::Forward(ForwardMode::Prefill)) => {
                 prefill_calls.push(batch.requests.len())
             }
@@ -1890,10 +1890,10 @@ fn a_latent_image_block_is_written_by_its_own_call() {
         .collect();
     let context: Vec<_> = calls
         .iter()
-        .take_while(|call| call.code != CallKind::Forward(ForwardMode::Decode))
+        .take_while(|call| call.kind != CallKind::Forward(ForwardMode::Decode))
         .collect();
     assert_eq!(
-        context.iter().map(|call| call.code).collect::<Vec<_>>(),
+        context.iter().map(|call| call.kind).collect::<Vec<_>>(),
         vec![
             CallKind::Forward(ForwardMode::Prefill),
             CallKind::Media(MediaCall::LatentEncoding),

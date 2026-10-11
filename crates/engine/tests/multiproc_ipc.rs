@@ -166,7 +166,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
         request_key: second_key,
         call_id: CallId::new(3, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Media(MediaCall::VisionEncoding),
+        kind: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
             ..Bounds::default()
@@ -598,7 +598,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             request_key: admission.request_key,
             call_id: CallId::new(2, 0),
             component: "model".into(),
-            code: CallKind::Transfer(TransferMode::Tensor),
+            kind: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
                 max_transfer_bytes: value.max_bytes(),
                 ..Bounds::default()
@@ -638,7 +638,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             request_key: admission.request_key,
             call_id: CallId::new(3, 0),
             component: "vision_encoder".into(),
-            code: CallKind::Transfer(TransferMode::Tensor),
+            kind: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
                 max_transfer_bytes: publication.max_bytes(),
                 ..Bounds::default()
@@ -951,7 +951,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         request_key: key,
         call_id: CallId::new(1, 0),
         component: "model".into(),
-        code: CallKind::Media(MediaCall::VisionEncoding),
+        kind: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds::default(),
         inputs: vec![],
         outputs: vec![value.clone()],
@@ -994,7 +994,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         request_key: key,
         call_id: CallId::new(2, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: value.max_bytes(),
             ..Bounds::default()
@@ -1220,7 +1220,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
         request_key: key,
         call_id: CallId::new(2, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: value.max_bytes(),
             ..Bounds::default()
@@ -1955,7 +1955,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         request_key,
         call_id: CallId::new(10, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::KvPublish),
+        kind: CallKind::Transfer(TransferMode::KvPublish),
         bounds: Bounds {
             max_transfer_bytes: 4096,
             ..Bounds::default()
@@ -2313,7 +2313,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         request_key: admission.request_key,
         call_id: CallId::new(3, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: input.max_bytes(),
             ..Bounds::default()
@@ -2540,7 +2540,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         call_id: CallId::new(6, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: source.max_bytes(),
             ..Bounds::default()
@@ -2585,7 +2585,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         call_id: CallId::new(7, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: publication.max_bytes(),
             ..Bounds::default()
@@ -2638,7 +2638,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         call_id: CallId::new(8, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Media(MediaCall::VisionEncoding),
+        kind: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
             ..Bounds::default()
@@ -2767,7 +2767,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: next.request_key,
         call_id: CallId::new(15, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: feature.max_bytes(),
             ..Bounds::default()
@@ -3270,7 +3270,7 @@ fn token_batch(
         request_key,
         call_id,
         component: "model".into(),
-        code: mode,
+        kind: mode,
         bounds: Bounds {
             max_tokens: tokens.len().max(1) as u32,
             max_kv_units: u32::from(prefix_length == 0),

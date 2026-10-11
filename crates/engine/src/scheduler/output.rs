@@ -364,7 +364,7 @@ impl Scheduler {
         mut record: uniserve_worker_ipc::RequestOutput,
         media: Option<&SharedMedia>,
     ) {
-        let call_variant = call.code;
+        let call_variant = call.kind;
 
         // Prompt scores share the completion but precede its phase transition.
         if !record.prompt_logprobs.is_empty() {

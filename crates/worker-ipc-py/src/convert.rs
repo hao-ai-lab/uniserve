@@ -504,7 +504,7 @@ impl<'py> RequestConversion<'py> {
                 request_key.into_any(),
                 self.computation_id(call.call_id)?,
                 coordinates.into_any(),
-                self.types.kind(py, call.code),
+                self.types.kind(py, call.kind),
                 bounds.into_any(),
                 call.component.clone().into_pyobject(py)?.into_any(),
                 pyo3::types::PyTuple::new(py, inputs)?.into_any(),
@@ -2236,7 +2236,7 @@ mod tests {
             request_key,
             call_id: CallId::new(11, 0),
             component: "model".into(),
-            code: CallKind::Forward(ForwardMode::Prefill),
+            kind: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,
                 ..Bounds::default()
@@ -2310,7 +2310,7 @@ mod tests {
             request_key: media_key,
             call_id: CallId::new(12, 0),
             component: "model".into(),
-            code: CallKind::Media(MediaCall::LatentPreparation),
+            kind: CallKind::Media(MediaCall::LatentPreparation),
             bounds: Bounds {
                 ..Bounds::default()
             },
@@ -2354,7 +2354,7 @@ mod tests {
             request_key: kv_key,
             call_id: CallId::new(13, 0),
             component: "decoder".into(),
-            code: CallKind::Transfer(TransferMode::KvInstall),
+            kind: CallKind::Transfer(TransferMode::KvInstall),
             bounds: Bounds {
                 max_transfer_bytes: 32,
                 ..Bounds::default()
@@ -2381,7 +2381,7 @@ mod tests {
         let readout_call = Call {
             request_key: readout_key,
             call_id: CallId::new(14, 0),
-            code: CallKind::Forward(ForwardMode::TokenDenoising),
+            kind: CallKind::Forward(ForwardMode::TokenDenoising),
             input_token_ids: vec![4, 9, 4, 1],
             readout: Some(uniserve_worker_ipc::Readout {
                 slot_tokens: vec![0, 2],
@@ -2644,7 +2644,7 @@ mod tests {
                 );
                 assert_eq!(
                     field(&call, "kind.value").extract::<String>().unwrap(),
-                    submitted.code.as_str()
+                    submitted.kind.as_str()
                 );
                 assert_eq!(
                     field(&call, "component").extract::<String>().unwrap(),

@@ -60,7 +60,7 @@ fn ar_decode_call() -> Call {
         request_key: request_key(),
         call_id: CallId::new(11, 0),
         component: "model".into(),
-        code: kind,
+        kind: kind,
         bounds: Bounds {
             max_tokens: 1,
             ..Bounds::default()
@@ -129,7 +129,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         request_key: request_key(),
         call_id,
         component: "model".into(),
-        code: kind,
+        kind: kind,
         bounds: Bounds {
             max_tokens: if denoises { 4 } else { 0 },
             ..Bounds::default()
@@ -409,7 +409,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
             next_buffer_offset += bytes;
         }
         // Each forward call holds one fresh KV unit.
-        let capacity_units = u32::from(matches!(call.code, CallKind::Forward(_)));
+        let capacity_units = u32::from(matches!(call.kind, CallKind::Forward(_)));
         if capacity_units > 0 {
             // The request id doubles as the request pool slot, which forward
             // rows, block tables, and unit allocations require to be positive.
@@ -436,7 +436,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
             );
         }
         if matches!(
-            call.code,
+            call.kind,
             CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
         ) || call.latent_input.is_some()
         {
@@ -448,11 +448,11 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 height: 1,
                 width: 1,
                 start_step: 0,
-                step_count: u32::from(call.code == CallKind::Media(MediaCall::Denoising)),
+                step_count: u32::from(call.kind == CallKind::Media(MediaCall::Denoising)),
             });
         }
         if matches!(
-            call.code,
+            call.kind,
             CallKind::Media(
                 MediaCall::VideoDecoding
                     | MediaCall::VideoEncoding
@@ -682,7 +682,7 @@ fn malformed_call(
             request_key: Some(key),
             call_id: Some(&fbs::CallId::new(1, 0)),
             component: Some(component),
-            code: Some(&code),
+            kind: Some(&code),
             coordinates,
             ..Default::default()
         },
@@ -816,7 +816,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             request_key: request_key(),
             call_id: CallId::new(56 + index as u64, 0),
             component: (*entry).into(),
-            code: CallKind::Media(*stage),
+            kind: CallKind::Media(*stage),
             bounds: Bounds::default(),
             inputs: vec![latent.clone()],
             outputs: Vec::new(),
@@ -1485,7 +1485,7 @@ fn call_sampling_state_preserves_whitelist_presence() {
 #[test]
 fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
     let mut call = ar_decode_call();
-    call.code = CallKind::Media(MediaCall::VisionEncoding);
+    call.kind = CallKind::Media(MediaCall::VisionEncoding);
     call.input_image = Some("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGN0SGhgIAUwkaR6VMOohiGlAQCjvQFA6eri4wAAAABJRU5ErkJggg==".into());
     call.token_output = None;
     let batch = batch_with_calls(1, vec![admission()], vec![call.clone()]);
@@ -1506,7 +1506,7 @@ fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
         ),
     ] {
         let mut invalid = call.clone();
-        invalid.code = code;
+        invalid.kind = code;
         invalid.input_image = image;
         let request = WorkerRequest::submit(batch_with_calls(1, vec![admission()], vec![invalid]));
         assert!(encode_request(&request).is_err());
@@ -1817,7 +1817,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             request_key: key,
             call_id,
             component: "model".into(),
-            code: kind,
+            kind: kind,
             bounds: Bounds {
                 max_tokens: 7 + index as u32,
                 max_completion_bytes: 4096,

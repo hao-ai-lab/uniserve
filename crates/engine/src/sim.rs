@@ -657,7 +657,7 @@ impl SimEngine {
                     // token's logical position, which a prefill reaches past
                     // its query tokens and a decode or verify one past its
                     // first.
-                    let query_tokens = match call.code {
+                    let query_tokens = match call.kind {
                         CallKind::Forward(ForwardMode::Prefill) => call.bounds.max_tokens,
                         _ => 1,
                     };
@@ -777,7 +777,7 @@ impl SimEngine {
         };
         set_kv_lengths(&mut record, request.kv_visible_len);
 
-        match call.code {
+        match call.kind {
             work @ (CallKind::Forward(ForwardMode::Prefill)
             | CallKind::Forward(ForwardMode::Decode)
             | CallKind::Forward(ForwardMode::Verify)) => {
@@ -1412,7 +1412,7 @@ impl SimEngine {
                 request,
             )?;
             if let (CallKind::Media(_), Some(reason)) =
-                (call.code, refused.get(&call.request_key.request_id))
+                (call.kind, refused.get(&call.request_key.request_id))
             {
                 completion.status = CallStatus::Error;
                 completion.media_output = None;
@@ -1532,7 +1532,7 @@ mod tests {
             request_key,
             call_id: CallId::new(batch_id, request_index),
             component: "model".into(),
-            code: CallKind::Forward(ForwardMode::Prefill),
+            kind: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,
                 ..Bounds::default()

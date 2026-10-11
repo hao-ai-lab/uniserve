@@ -209,7 +209,7 @@ pub(crate) enum GenerationPhase {
 /// declares a completion predicate. The vision blocks of input images are
 /// instead attention blocks of a context prefill (`is_prompt_extend`).
 pub(super) fn consumes_image_features(call: &Call) -> bool {
-    call.code == CallKind::Forward(ForwardMode::Prefill)
+    call.kind == CallKind::Forward(ForwardMode::Prefill)
         && (call.latent_feature_input.is_some()
             || (!call.vision_inputs.is_empty() && call.completion_output.is_some()))
 }
@@ -221,7 +221,7 @@ pub(super) fn consumes_image_features(call: &Call) -> bool {
 /// feedback, which is what separates the feedback variants here.
 pub(super) fn is_feedback_computation(call: &Call) -> bool {
     (matches!(
-        call.code,
+        call.kind,
         CallKind::Media(MediaCall::VisionEncoding) | CallKind::Media(MediaCall::LatentEncoding)
     ) || consumes_image_features(call))
         && call.completion_output.is_some()
@@ -255,7 +255,7 @@ pub(super) fn prefill_rows(call: &Call) -> usize {
 /// canvas-generating request's block commit is a prompt extension too, of the
 /// tokens of its stopped block.
 pub(super) fn is_prompt_extend(call: &Call) -> bool {
-    call.code == CallKind::Forward(ForwardMode::Prefill)
+    call.kind == CallKind::Forward(ForwardMode::Prefill)
         && !consumes_image_features(call)
         && call.completion_output.is_none()
 }
@@ -290,13 +290,13 @@ impl RequestState {
             return Ok(());
         }
 
-        if matches!(call.code, CallKind::Forward(_)) {
+        if matches!(call.kind, CallKind::Forward(_)) {
             // A forward reports the extent it initialized, which a verifier
             // leaves above the prefix it accepted.
             self.kv_computed_len = record.kv_computed_len;
         }
 
-        match call.code {
+        match call.kind {
             // A block commit is planned only in `CommitCanvas`, and a prompt
             // chunk never is; the committed block extends the context and
             // the next block starts at step zero.
@@ -415,7 +415,7 @@ impl RequestState {
                 if call.latent_output.is_none() {
                     return Err(GenerationResultError::MissingLatentProduct);
                 }
-                if call.code == CallKind::Media(MediaCall::LatentPreparation) {
+                if call.kind == CallKind::Media(MediaCall::LatentPreparation) {
                     self.denoising.open(call.latent_output.clone());
                     self.phase = GenerationPhase::DenoiseGen;
                 } else {
@@ -502,7 +502,7 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
         call_id: CallId::new(0, 0),
         coordinates: CallCoordinates::default(),
         component: DEFAULT_COMPONENT.into(),
-        code,
+        kind: code,
         bounds: Bounds {
             max_tokens: 1,
             ..Bounds::default()
@@ -901,7 +901,7 @@ fn finish_plan(
     mut call: Call,
     prompt_positions: u32,
 ) -> Result<Call, PlanningError> {
-    let image_completion_bytes = if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+    let image_completion_bytes = if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
         png_base64_bound(request.image.width, request.image.height)?
     } else {
         0
@@ -1071,7 +1071,7 @@ pub(crate) fn validate_generation_result(
         return Ok(());
     }
 
-    let call_variant = call.code;
+    let call_variant = call.kind;
     if record.status != CallStatus::Ok {
         return Err(GenerationResultError::Status {
             detail: "call_failed",
@@ -1079,7 +1079,7 @@ pub(crate) fn validate_generation_result(
     }
 
     // Denoising must end exactly at the end of its submitted interval.
-    if call.code == CallKind::Media(MediaCall::Denoising) {
+    if call.kind == CallKind::Media(MediaCall::Denoising) {
         let interval = latent.ok_or(GenerationResultError::Progress {
             detail: "denoise_input_step_missing",
         })?;

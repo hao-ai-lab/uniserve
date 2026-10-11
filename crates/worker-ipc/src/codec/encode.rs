@@ -471,7 +471,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
     let call_id = fbs::CallId::new(v.call_id.batch_id, v.call_id.request_index);
     let coordinates = Some(coordinates(b, &v.coordinates));
     let component = Some(b.create_string(&v.component));
-    let code = computation_to_fb(v.code);
+    let code = computation_to_fb(v.kind);
 
     // The schema has no `Bounds` table: the bounds are scalar fields of the
     // `Call` table, which `call_from_table` reassembles.
@@ -561,7 +561,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             call_id: Some(&call_id),
             coordinates,
             component,
-            code: Some(&code),
+            kind: Some(&code),
             max_tokens,
             max_completion_bytes,
             max_transfer_bytes,

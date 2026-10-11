@@ -1263,7 +1263,7 @@ impl WorkerGroup {
     ) -> Vec<u32> {
         let transfer = &self.process_args.transfer;
         let worker = &self.process_args.worker_id;
-        let consuming: Vec<uniserve_worker_ipc::MediaCall> = match (routed, call.code) {
+        let consuming: Vec<uniserve_worker_ipc::MediaCall> = match (routed, call.kind) {
             (Some(readers), _) => self
                 .media_routing
                 .iter()
@@ -1646,7 +1646,7 @@ fn validate_and_order_rank_report(
                 }),
             "predicated call published a tensor"
         );
-        if planned.code
+        if planned.kind
             == uniserve_worker_ipc::CallKind::Transfer(uniserve_worker_ipc::TransferMode::KvPublish)
             && completion.output.status == uniserve_worker_ipc::CallStatus::Ok
         {

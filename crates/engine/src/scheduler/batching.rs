@@ -68,7 +68,7 @@ impl Scheduler {
     /// costs its input tokens plus one, and every other call its `max_tokens`
     /// bound.
     fn computation_token_cost(&self, call: &Call) -> usize {
-        match call.code {
+        match call.kind {
             CallKind::Media(MediaCall::Denoising) => {
                 let Some(state) = self.running.get(&call.request_key.request_id) else {
                     return 0;
@@ -99,7 +99,7 @@ impl Scheduler {
     /// capacity.
     fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<BufferSpan>> {
         let id = call.request_key.request_id;
-        if call.code == CallKind::Media(MediaCall::Denoising) && !self.ensure_flow_prefix(id) {
+        if call.kind == CallKind::Media(MediaCall::Denoising) && !self.ensure_flow_prefix(id) {
             return None;
         }
         let uses_transfer = call.bounds.max_transfer_bytes > 0;
@@ -111,7 +111,7 @@ impl Scheduler {
             .get(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
         self.placement
-            .worker_target(self.executor.as_ref(), &self.info, request_key, call.code)?;
+            .worker_target(self.executor.as_ref(), &self.info, request_key, call.kind)?;
 
         let mut buffer_allocations = Vec::new();
         for bytes in call.buffer_outputs().map(TensorRef::max_bytes) {
@@ -137,7 +137,7 @@ impl Scheduler {
         // across the trajectory's calls; a failed grow leaves the existing
         // pages allocated.
         if matches!(
-            call.code,
+            call.kind,
             CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
         ) && self.worker_tracks_image_latent()
         {
@@ -294,8 +294,8 @@ impl Scheduler {
                 // has room; otherwise it waits for a later pass, as a call
                 // without resources does below. A context prefill plans
                 // within the pass's context rows.
-                let prefill = call.code == CallKind::Forward(ForwardMode::Prefill);
-                if full(&code_batches, call.code)
+                let prefill = call.kind == CallKind::Forward(ForwardMode::Prefill);
+                if full(&code_batches, call.kind)
                     || (prefill && generation::prefill_rows(&call) > rows_left.context)
                 {
                     if let Some(state) = self.running.get_mut(&id) {
@@ -310,7 +310,7 @@ impl Scheduler {
                 // prepares the image, so it waits here, as a media call
                 // does, until those host lanes have room.
                 let image_lane =
-                    match call.code {
+                    match call.kind {
                         CallKind::Media(media_call) if call.input_image.is_some() => {
                             let Some(request_key) = self.running.get(&id).map(|state| {
                                 RequestKey::new(self.engine_id, id, state.request_epoch)
@@ -320,7 +320,7 @@ impl Scheduler {
                             let demand = self.image_lane_demand(request_key, media_call);
                             let ledger = image_lanes.get_or_insert_with(|| self.lane_occupancy());
                             if !ledger.admits(&demand, id, self) {
-                                self.record_domain_backpressure(call.code);
+                                self.record_domain_backpressure(call.kind);
                                 if let Some(state) = self.running.get_mut(&id) {
                                     state.num_kv_units_sent = state
                                         .num_kv_units_sent
@@ -340,7 +340,7 @@ impl Scheduler {
                 // row must not spend the pass before the request that holds
                 // the row, which is the one whose steps release it.
                 let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
-                    self.record_domain_backpressure(call.code);
+                    self.record_domain_backpressure(call.kind);
                     // Planning a forward advanced `num_kv_units_sent` past its
                     // fresh units; roll it back so the next plan declares them.
                     if let Some(state) = self.running.get_mut(&id) {
@@ -372,7 +372,7 @@ impl Scheduler {
 
                 // Identify the call by its batch and row, and stamp the
                 // coordinates projected through the request's in-flight calls.
-                let code = call.code;
+                let code = call.kind;
                 let batch = code_batches.entry(code).or_insert_with(|| {
                     code_order.push(code);
                     ExecutionBatch::new(
@@ -702,7 +702,7 @@ impl Scheduler {
             return None;
         };
         if self.inflight.has_pending_calls(request_id)
-            && !self.can_queue_successor(request_id, call.code)
+            && !self.can_queue_successor(request_id, call.kind)
         {
             tracing::error!(
                 request_id = request_id.0,
@@ -750,9 +750,9 @@ impl Scheduler {
                 self.fatal = true;
                 return None;
             };
-            if call.code == CallKind::Forward(ForwardMode::Decode) {
+            if call.kind == CallKind::Forward(ForwardMode::Decode) {
                 predecessor.token_output.clone()
-            } else if self.follows_unconditionally(request_id, call.code) {
+            } else if self.follows_unconditionally(request_id, call.kind) {
                 None
             } else {
                 predecessor.completion_output.clone()
@@ -775,7 +775,7 @@ impl Scheduler {
         // counts the tokens this call appends. Publication, latent preparation,
         // and denoising only read the request's KV.
         let (_, visible) = self.scheduled_token_lengths(request_id)?;
-        let kv_lengths = match call.code {
+        let kv_lengths = match call.kind {
             // A context prefill's bound counts its prompt tokens and its
             // vision blocks' exact KV lengths.
             CallKind::Forward(ForwardMode::Prefill) => Some(KvLengths {
@@ -798,7 +798,7 @@ impl Scheduler {
         // Latent preparation opens the trajectory at step zero, a denoising
         // call starts after the steps already scheduled, and image decoding
         // sits at the end of the schedule.
-        let start_step = match call.code {
+        let start_step = match call.kind {
             CallKind::Media(MediaCall::LatentPreparation) => Some(0),
             CallKind::Media(MediaCall::Denoising) => self.num_scheduled_denoise_steps(request_id),
             CallKind::Media(MediaCall::ImageDecoding) => self
@@ -1034,7 +1034,7 @@ impl Scheduler {
         // finalizes the prefix, the call also prefills a non-empty negative
         // prompt into it; the prefix's tables are resent until then and
         // whenever the prefix has gained pages.
-        if call.code == CallKind::Media(MediaCall::Denoising) {
+        if call.kind == CallKind::Media(MediaCall::Denoising) {
             let Some(KvLengths {
                 visible: conditioning_tokens,
                 ..
@@ -1103,7 +1103,7 @@ impl Scheduler {
         // Latent allocations describe the request-owned page table and the
         // exact denoising interval executed by this call.
         if matches!(
-            call.code,
+            call.kind,
             CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
         ) || call.latent_input.is_some()
         {
@@ -1131,7 +1131,7 @@ impl Scheduler {
             let Some(start_step) = start_step else {
                 tracing::error!(
                     request_id = request_id.0,
-                    call = call.code.as_str(),
+                    call = call.kind.as_str(),
                     "latent call has no submitted step"
                 );
                 self.fatal = true;
@@ -1139,7 +1139,7 @@ impl Scheduler {
             };
             // A denoising call covers one step; latent preparation and
             // image decoding cover none.
-            let step_count = u32::from(call.code == CallKind::Media(MediaCall::Denoising));
+            let step_count = u32::from(call.kind == CallKind::Media(MediaCall::Denoising));
             latent = Some(Denoising::params(
                 call.request_key,
                 call.call_id,
@@ -1349,7 +1349,7 @@ impl Scheduler {
         match planned {
             Ok(mut call) => {
                 if matches!(
-                    call.code,
+                    call.kind,
                     CallKind::Forward(ForwardMode::Prefill)
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)

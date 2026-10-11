@@ -771,7 +771,7 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             force_finish: state.force_finish(),
         }),
         component: call.component().to_owned(),
-        code: computation_from_fb(call.code())?,
+        kind: computation_from_fb(call.kind())?,
         bounds: Bounds {
             max_tokens: call.max_tokens(),
             max_kv_units: 0,

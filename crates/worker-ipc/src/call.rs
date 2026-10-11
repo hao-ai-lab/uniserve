@@ -367,7 +367,7 @@ pub struct Call {
     /// Component bound within the selected Worker.
     pub component: String,
     /// Kind performed by this call.
-    pub code: CallKind,
+    pub kind: CallKind,
     /// Scheduler-declared limits for the computation and its outputs.
     pub bounds: Bounds,
     /// Data dependencies consumed in input order.
@@ -515,7 +515,7 @@ impl Call {
 
     /// Returns whether successful execution advances request state.
     pub const fn advances_state(&self) -> bool {
-        self.code.advances_state()
+        self.kind.advances_state()
     }
 
     /// Validates the invariants one call carries on its own.
@@ -560,7 +560,7 @@ impl Call {
             ensure_valid!(
                 !image.is_empty()
                     && matches!(
-                        self.code,
+                        self.kind,
                         CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding)
                     )
                     && self.image_input.is_none(),
@@ -572,7 +572,7 @@ impl Call {
         // slots of the canvas rows it carries, or runs one step of its
         // request's resident generation canvas of `max_tokens` tokens. Either
         // way it produces no sampled token output.
-        let denoises = self.code == CallKind::Forward(ForwardMode::TokenDenoising);
+        let denoises = self.kind == CallKind::Forward(ForwardMode::TokenDenoising);
         ensure_valid!(
             u8::from(self.readout.is_some()) + u8::from(self.canvas.is_some())
                 == u8::from(denoises),
@@ -601,7 +601,7 @@ impl Call {
         // output-index space with the tensor outputs.
         let mut output_indices = HashSet::with_capacity(self.outputs.len());
         let publishes_kv = matches!(
-            self.code,
+            self.kind,
             CallKind::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
         );
         ensure_valid!(
@@ -617,7 +617,7 @@ impl Call {
             output_indices.insert(output.output_index);
         }
         let consumes_kv = matches!(
-            self.code,
+            self.kind,
             CallKind::Transfer(TransferMode::KvInstall)
                 | CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
         );
@@ -629,7 +629,7 @@ impl Call {
             );
         }
         ensure_valid!(
-            self.code != CallKind::Transfer(TransferMode::KvInstall) || self.kv_input.is_some(),
+            self.kind != CallKind::Transfer(TransferMode::KvInstall) || self.kv_input.is_some(),
             "KV installation requires a source publication"
         );
 
@@ -651,7 +651,7 @@ impl Call {
 
         if let Some(input) = &self.token_input {
             ensure_valid!(
-                self.code == CallKind::Transfer(TransferMode::Tensor),
+                self.kind == CallKind::Transfer(TransferMode::Tensor),
                 "token transfer input requires a tensor-transfer computation"
             );
             ensure_valid!(
@@ -1612,7 +1612,7 @@ impl Batch {
         // executes it as a single homogeneous group and returns one result.
         ensure_valid!(
             self.calls.windows(2).all(|pair| {
-                pair[0].code == pair[1].code && pair[0].component == pair[1].component
+                pair[0].kind == pair[1].kind && pair[0].component == pair[1].component
             }),
             "a submission batch mixes call kinds or components"
         );
@@ -1676,7 +1676,7 @@ impl Batch {
                 .get(&identity)
                 .ok_or_else(|| invalid_message!("latent params does not name a run call"))?;
             let addresses_trajectory = matches!(
-                call.code,
+                call.kind,
                 CallKind::Media(MediaCall::LatentPreparation)
                     | CallKind::Media(MediaCall::Denoising)
             ) || call.latent_input.is_some();
@@ -1695,7 +1695,7 @@ impl Batch {
 
         for call in &self.calls {
             let needs_latent = matches!(
-                call.code,
+                call.kind,
                 CallKind::Media(MediaCall::LatentPreparation)
                     | CallKind::Media(MediaCall::Denoising)
             ) || call.latent_input.is_some();
@@ -1722,7 +1722,7 @@ impl Batch {
             // visual condition units of one round, or its single audio call.
             ensure_valid!(
                 matches!(
-                    call.code,
+                    call.kind,
                     CallKind::Media(
                         MediaCall::VideoDecoding
                             | MediaCall::AudioDecoding
@@ -1737,13 +1737,13 @@ impl Batch {
             // media units as its component has ranks, and one round covers
             // them all, so an audio decode range starts at the first unit.
             ensure_valid!(
-                !matches!(call.code, CallKind::Media(MediaCall::AudioDecoding))
+                !matches!(call.kind, CallKind::Media(MediaCall::AudioDecoding))
                     || (params.cursor == 0 && params.max_units >= 1),
                 "audio decode range must start at the first media unit"
             );
             // Audio encoding consumes the assembled track as one host call.
             ensure_valid!(
-                !matches!(call.code, CallKind::Media(MediaCall::AudioEncoding))
+                !matches!(call.kind, CallKind::Media(MediaCall::AudioEncoding))
                     || (params.cursor == 0 && params.max_units == 1),
                 "audio encode range must address its single sample stream"
             );
@@ -1751,7 +1751,7 @@ impl Batch {
 
         for call in &self.calls {
             let needs_range = matches!(
-                call.code,
+                call.kind,
                 CallKind::Media(
                     MediaCall::VideoDecoding
                         | MediaCall::AudioDecoding
@@ -1887,7 +1887,7 @@ impl Batch {
                 .collect::<Vec<_>>();
             ensure_valid!(
                 consumers.len() == 1
-                    && consumers[0].code == CallKind::Transfer(TransferMode::KvInstall),
+                    && consumers[0].kind == CallKind::Transfer(TransferMode::KvInstall),
                 "KV transfer requires one installation consumer"
             );
             let bytes = publication.tensors().try_fold(0_u64, |sum, tensor| {

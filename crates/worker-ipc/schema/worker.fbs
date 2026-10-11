@@ -322,7 +322,7 @@ table Call {
   call_id:CallId;
   coordinates:CallCoordinates;
   component:string (required);
-  code:CallKind (required);
+  kind:CallKind (required);
   // Scheduler-reserved maxima, decoded into `Bounds`. `max_tokens` is
   // checked by `Call::validate` and `max_transfer_bytes` by
   // `Batch::validate`; neither validator checks `max_completion_bytes`.

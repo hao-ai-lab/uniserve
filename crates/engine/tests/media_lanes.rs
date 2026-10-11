@@ -456,7 +456,7 @@ fn media_calls(batch: &ExecutionBatch) -> Vec<ObservedCall> {
         .requests
         .iter()
         .filter_map(|(call, placement)| {
-            let CallKind::Media(media_call) = call.code else {
+            let CallKind::Media(media_call) = call.kind else {
                 return None;
             };
             Some(ObservedCall {
@@ -540,7 +540,7 @@ fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option
         match event {
             BatchEvent::Submitted(batch) => {
                 readers.extend(batch.requests.iter().filter_map(|(call, placement)| {
-                    let CallKind::Media(media_call) = call.code else {
+                    let CallKind::Media(media_call) = call.kind else {
                         return None;
                     };
                     Some((
@@ -912,7 +912,7 @@ fn call_indices(served: &Served, request: RequestId, media_call: MediaCall) -> V
         .iter()
         .enumerate()
         .filter(|(_, (call, _))| {
-            call.request_key.request_id == request && call.code == CallKind::Media(media_call)
+            call.request_key.request_id == request && call.kind == CallKind::Media(media_call)
         })
         .map(|(index, _)| index)
         .collect()
