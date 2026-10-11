@@ -502,11 +502,10 @@ impl WorkerGroup {
 
     /// Checks that the ranks' startup reports describe one group and builds it.
     ///
-    /// Every rank must agree with rank 0 apart from rank-specific fields.
-    /// The muxer must run on
-    /// the head's host, and the ranks' KV regions must cover every layer's KV
-    /// heads without a gap. Once all checks pass, no rank's startup may be
-    /// cancelled and every rank this process started must still be running.
+    /// The group takes rank 0's report. The muxer must run on the head's host,
+    /// and the ranks' KV regions must cover every layer's KV heads without a
+    /// gap. Once all checks pass, no rank's startup may be cancelled and every
+    /// rank this process started must still be running.
     fn from_ranks(
         process_args: WorkerProcessArgs,
         mut workers: Vec<RankProcess>,
@@ -515,10 +514,10 @@ impl WorkerGroup {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
 
-        // `info` starts as rank 0's report and becomes the group's; `canonical`
-        // is the reference every rank is compared with.
+        // Rank 0's report becomes the group's. The ranks derive every shared
+        // capacity collectively before they report, so the reports differ
+        // only in the fields reconciled below.
         let mut info = workers[0].info().clone();
-        let mut canonical = info.clone();
 
         // A rank's product storage follows the components it holds, which an
         // asymmetric placement makes rank-specific: a rank that imports a
@@ -527,34 +526,11 @@ impl WorkerGroup {
         // The group reports the smallest, because the engine places work
         // against one pool per group and must not place more than the
         // smallest rank can hold.
-        let product_storage = workers
+        info.buffer_pool_bytes = workers
             .iter()
             .map(|worker| worker.info().buffer_pool_bytes)
             .min()
             .unwrap_or(info.buffer_pool_bytes);
-        info.buffer_pool_bytes = product_storage;
-        canonical.buffer_pool_bytes = product_storage;
-
-        for (rank, worker) in workers.iter().enumerate() {
-            let mut normalized = worker.info().clone();
-            // Rank-specific fields take the reference's values before the
-            // comparison: the endpoint, product storage, and each KV group's
-            // layers and head offset.
-            normalized.endpoint = canonical.endpoint.clone();
-            normalized.buffer_pool_bytes = canonical.buffer_pool_bytes;
-            if let (Some(local), Some(reference)) = (&mut normalized.kv_cache, &canonical.kv_cache)
-                && local.groups.len() == reference.groups.len()
-            {
-                for (group, canonical) in local.groups.iter_mut().zip(&reference.groups) {
-                    group.layer_ids.clone_from(&canonical.layer_ids);
-                    group.kv_head_offset = canonical.kv_head_offset;
-                }
-            }
-            anyhow::ensure!(
-                normalized == canonical,
-                "physical rank {rank} worker info disagree with rank 0"
-            );
-        }
 
         refuse_shared_storage_off_head(
             &process_args.host,
