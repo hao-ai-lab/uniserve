@@ -1103,10 +1103,9 @@ def reserve_outputs(
 
 def _completion_words(scheduled: tuple[Call, ...]) -> int:
     """Compute completion-word capacity for one batch."""
-    # Capacity is counted in `OutputBuffer` elements (int64), matching the
-    # `OutputPool.max_words` bound set in `uniserve_worker.worker`: one
-    # sampling column of `SAMPLING_COMPLETION_FIELDS` elements per call, plus
-    # each call's `max_completion_bytes` rounded up at 4 bytes per element.
+    # Capacity is counted in `OutputBuffer` elements (int64): one sampling
+    # column of `SAMPLING_COMPLETION_FIELDS` elements per call, plus each
+    # call's `max_completion_bytes` rounded up at 4 bytes per element.
     return max(
         1,
         SAMPLING_COMPLETION_FIELDS * len(scheduled)
