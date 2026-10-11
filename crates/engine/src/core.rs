@@ -27,7 +27,7 @@ use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS,
 };
-use crate::scheduler::{MAX_FLOW_PREFIX_ROWS, flow_prefix_rows};
+use crate::scheduler::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats, SchedulingPolicy};
 use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
@@ -634,9 +634,9 @@ impl EngineCore {
         // Every group holds a request row for each running request the
         // scheduler may keep resident, plus the rows a runtime keeps outside
         // that limit. Only the loaded capabilities decide that reserve
-        // (`flow_prefix_rows`), so the launch sizes for the largest one.
+        // (`guidance_prefix_rows`), so the launch sizes for the largest one.
         let max_num_seqs = config.max_num_seqs.max(1);
-        let max_request_pool_size = u32::try_from(max_num_seqs + MAX_FLOW_PREFIX_ROWS)
+        let max_request_pool_size = u32::try_from(max_num_seqs + MAX_GUIDANCE_PREFIX_ROWS)
             .context("max_num_seqs exceeds the worker request-pool field")?;
 
         // Each group launches from the shared defaults with its own identity,
@@ -732,7 +732,7 @@ impl EngineCore {
             // scheduler bounds their requests by the rows they report.
             let info = executor.info().runtime_info()?;
             let request_rows = info.request_slots as usize;
-            let needed_rows = max_num_seqs + flow_prefix_rows(&info);
+            let needed_rows = max_num_seqs + guidance_prefix_rows(&info);
             anyhow::ensure!(
                 !info.uses_kv() || request_rows >= needed_rows,
                 "the workers hold {request_rows} request rows, but {max_num_seqs} running \

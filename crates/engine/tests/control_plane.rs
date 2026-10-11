@@ -439,7 +439,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     assert_eq!(second_images, 1);
 }
 
-/// Image requests waiting for the one flow-prefix request row do not starve
+/// Image requests waiting for the one guidance-prefix request row do not starve
 /// the younger request that holds it.
 ///
 /// With four request slots, three requests run and one row is left for a
@@ -453,7 +453,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
 /// its next step is planned, so each pass finds the denoiser free and tries
 /// the older requests first.
 #[test]
-fn flow_prefix_holder_progresses_while_older_images_wait() {
+fn guidance_prefix_holder_progresses_while_older_images_wait() {
     const STEPS: u16 = 12;
 
     let mut sim = SimEngine::new();

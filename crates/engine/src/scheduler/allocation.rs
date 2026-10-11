@@ -21,7 +21,7 @@ pub(super) struct Storage {
     /// against `EncoderCacheManager::budget` only for requests that reserve
     /// their worst case.
     pub(super) reserved_encoder_entries: usize,
-    /// Request-state rows of token requests and their flow prefixes, sized by
+    /// Request-state rows of token requests and their guidance prefixes, sized by
     /// the runtime's `request_slots`.
     pub(super) request_pool: RequestPool,
     pub(super) latent_pool: LatentPool,
@@ -150,7 +150,7 @@ impl Storage {
 /// acknowledgement names the same `request_key`.
 pub(super) struct RetiringRequest {
     pub(super) request_key: RequestKey,
-    /// The token request's own allocations and those of its flow prefix;
+    /// The token request's own allocations and those of its guidance prefix;
     /// empty for a media request.
     pub(super) allocations: Vec<RequestAllocations>,
     pub(super) media_allocations: Option<MediaAllocations>,
@@ -159,7 +159,7 @@ pub(super) struct RetiringRequest {
     pub(super) buffers: HashMap<BufferId, BufferSpan>,
 }
 
-/// Storage one token request, or its flow prefix, holds in the runtime's
+/// Storage one token request, or its guidance prefix, holds in the runtime's
 /// shared pools.
 pub(super) struct RequestAllocations {
     pub(super) request_slot: RequestSlot,

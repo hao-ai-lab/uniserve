@@ -18,7 +18,7 @@
 //! Token semantics (stop conditions, image-branch triggers, public events)
 //! are resolved afterwards in `output`.
 
-use super::{EncoderCachePin, FlowPrefixState, Phase, RequestAllocations, TerminalIntent};
+use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, TerminalIntent};
 use crate::kv::{BlockTable, KvAllocation};
 
 use uniserve_worker_ipc::{
@@ -167,14 +167,14 @@ pub(crate) enum GenerationPhase {
     /// Publish the visible KV range as diffusion conditioning.
     PublishKv,
     /// Prepare the initial latent of the image.
-    PrepareGen,
+    LatentPreparation,
     /// Run the image's denoising steps.
-    DenoiseGen,
+    Denoising,
     /// Decode the final latent into the image. Never stored in
     /// `RequestState::phase`: `Scheduler::next_generation_phase` projects it
     /// once every denoising step is scheduled, while the accepted phase stays
-    /// `DenoiseGen`.
-    CommitGen,
+    /// `Denoising`.
+    ImageDecoding,
     /// Encode the generated image with the next feedback encoder.
     FeedbackEncode,
     /// Write the feedback encoder's feature into KV.
@@ -394,7 +394,7 @@ impl RequestState {
             }
             CallKind::Transfer(TransferMode::KvPublish) => {
                 self.image_conditioning = call.kv_output;
-                self.phase = GenerationPhase::PrepareGen;
+                self.phase = GenerationPhase::LatentPreparation;
             }
             CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::Denoising) => {
@@ -403,7 +403,7 @@ impl RequestState {
                 }
                 if call.kind == CallKind::Media(MediaCall::LatentPreparation) {
                     self.denoising.open(call.latent_output.clone());
-                    self.phase = GenerationPhase::DenoiseGen;
+                    self.phase = GenerationPhase::Denoising;
                 } else {
                     let accepted = self
                         .denoising
@@ -1401,7 +1401,7 @@ pub(crate) struct RequestState {
     /// Negative-prompt KV prefix for multi-branch guidance, allocated for the
     /// first denoising call and freed once every denoising step completes or
     /// the request finishes.
-    pub(super) flow_prefix: Option<FlowPrefixState>,
+    pub(super) guidance_prefix: Option<GuidancePrefixState>,
     /// Admission generation used to reject results from prior request lifetimes.
     pub(crate) request_epoch: u64,
     /// Most recent accepted state-producing call.

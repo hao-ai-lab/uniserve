@@ -65,16 +65,16 @@ fn resolve_generation_limits(
 }
 
 /// Largest number of request-pool rows a runtime keeps outside
-/// `max_num_seqs` (`flow_prefix_rows`). A launch sizes worker request pools
+/// `max_num_seqs` (`guidance_prefix_rows`). A launch sizes worker request pools
 /// before the loaded capabilities decide the actual reserve.
-pub(crate) const MAX_FLOW_PREFIX_ROWS: usize = 1;
+pub(crate) const MAX_GUIDANCE_PREFIX_ROWS: usize = 1;
 
 /// Request-pool rows the runtime keeps outside `max_num_seqs`.
 ///
 /// A KV runtime with denoising keeps one row: a running request's
-/// multi-branch guidance prefix (`Scheduler::ensure_flow_prefix`) allocates
+/// multi-branch guidance prefix (`Scheduler::ensure_guidance_prefix`) allocates
 /// its own row from the same request pool. Other runtimes keep none.
-pub(crate) fn flow_prefix_rows(info: &WorkerInfo) -> usize {
+pub(crate) fn guidance_prefix_rows(info: &WorkerInfo) -> usize {
     usize::from(
         info.uses_kv()
             && info
@@ -130,14 +130,14 @@ impl Scheduler {
         config.max_num_waiting = config.max_num_waiting.map(|bound| bound.max(1));
 
         // The request pool also holds the rows the runtime keeps outside
-        // `max_num_seqs` (`flow_prefix_rows`). `EngineCore::new` launches
+        // `max_num_seqs` (`guidance_prefix_rows`). `EngineCore::new` launches
         // workers with enough rows and refuses a token runtime whose workers
         // hold fewer, so this clamp lowers the limit only for a supplied
         // executor or for workers that fit their request pools to device
         // storage.
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
-            .saturating_sub(flow_prefix_rows(&info))
+            .saturating_sub(guidance_prefix_rows(&info))
             .max(1);
 
         let requested_seqs = config.max_num_seqs.max(1);

@@ -44,7 +44,7 @@ pub use config::{
     DEFAULT_MAX_NUM_SEQS, SchedulerConfig, SchedulingPolicy,
 };
 pub(crate) use execution::generation_consuming_calls;
-pub(crate) use run::{MAX_FLOW_PREFIX_ROWS, flow_prefix_rows};
+pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,
@@ -201,13 +201,13 @@ impl TerminalIntent {
 }
 
 /// Negative-prompt KV prefix of a token request whose image generation uses
-/// more than one guidance branch (`Scheduler::ensure_flow_prefix`).
+/// more than one guidance branch (`Scheduler::ensure_guidance_prefix`).
 ///
 /// The prefix holds its own request-pool slot and KV allocation, separate
 /// from the request's main `RequestAllocations`, until
-/// `Scheduler::free_flow_prefix` releases them after the last denoising step
+/// `Scheduler::free_guidance_prefix` releases them after the last denoising step
 /// or the request finishes.
-struct FlowPrefixState {
+struct GuidancePrefixState {
     allocations: RequestAllocations,
     /// Units per KV group, as `(group_id, unit_ids)`, not yet declared to the
     /// worker; the next denoising call drains them as fresh-unit allocations.
@@ -218,7 +218,7 @@ struct FlowPrefixState {
     diffusion_finalized: bool,
 }
 
-impl FlowPrefixState {
+impl GuidancePrefixState {
     /// Returns the request-pool index.
     fn request_pool_idx(&self) -> u32 {
         self.allocations.request_slot()

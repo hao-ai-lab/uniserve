@@ -1604,16 +1604,16 @@ impl Scheduler {
         }
     }
 
-    /// Returns whether a flow prefix can be scheduled now.
+    /// Returns whether a guidance prefix can be scheduled now.
     ///
-    /// Returns `false` only while the request holds a flow prefix that no
+    /// Returns `false` only while the request holds a guidance prefix that no
     /// successful denoising completion has finalized and a denoising call is
     /// in flight.
-    pub(super) fn flow_prefix_is_schedulable(&self, id: RequestId) -> bool {
+    pub(super) fn guidance_prefix_is_schedulable(&self, id: RequestId) -> bool {
         let prefix_is_pending = self
             .running
             .get(&id)
-            .and_then(|state| state.flow_prefix.as_ref())
+            .and_then(|state| state.guidance_prefix.as_ref())
             .is_some_and(|prefix| !prefix.diffusion_finalized);
         !prefix_is_pending
             || !self
@@ -1866,9 +1866,9 @@ impl Scheduler {
                     }
                 }
                 CallKind::Forward(ForwardMode::Prefill) => Phase::PublishKv,
-                CallKind::Transfer(TransferMode::KvPublish) => Phase::PrepareGen,
+                CallKind::Transfer(TransferMode::KvPublish) => Phase::LatentPreparation,
                 CallKind::Media(MediaCall::LatentPreparation)
-                | CallKind::Media(MediaCall::Denoising) => Phase::DenoiseGen,
+                | CallKind::Media(MediaCall::Denoising) => Phase::Denoising,
                 CallKind::Media(MediaCall::ImageDecoding) => Phase::FeedbackEncode,
                 CallKind::Media(MediaCall::VisionEncoding)
                 | CallKind::Media(MediaCall::LatentEncoding)
@@ -1899,10 +1899,10 @@ impl Scheduler {
                     Phase::DecodeUnd
                 }
             }
-            Phase::DenoiseGen
+            Phase::Denoising
                 if self.num_scheduled_denoise_steps(id)? >= state.denoising.steps() =>
             {
-                Phase::CommitGen
+                Phase::ImageDecoding
             }
             phase => phase,
         })
@@ -2181,9 +2181,9 @@ impl Scheduler {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::CloseKv | Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
             Phase::PublishKv => CallKind::Transfer(TransferMode::KvPublish),
-            Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
-            Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
-            Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),
+            Phase::LatentPreparation => CallKind::Media(MediaCall::LatentPreparation),
+            Phase::Denoising => CallKind::Media(MediaCall::Denoising),
+            Phase::ImageDecoding => CallKind::Media(MediaCall::ImageDecoding),
             Phase::Readout | Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
             Phase::FeedbackEncode => {
@@ -3214,7 +3214,7 @@ impl Scheduler {
 
                 // Reclaim resources whose lifetime ends at this transition before
                 // making its public output eligible for resolution.
-                let free_flow_prefix = call_variant == CallKind::Media(MediaCall::Denoising)
+                let free_guidance_prefix = call_variant == CallKind::Media(MediaCall::Denoising)
                     && record.status == CallStatus::Ok
                     && self
                         .running
@@ -3225,15 +3225,15 @@ impl Scheduler {
                     && let Some(prefix) = self
                         .running
                         .get_mut(&id)
-                        .and_then(|state| state.flow_prefix.as_mut())
+                        .and_then(|state| state.guidance_prefix.as_mut())
                 {
                     prefix.diffusion_finalized = true;
                 }
                 if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                     self.free_request_latent(id);
                 }
-                if free_flow_prefix {
-                    self.free_flow_prefix(id);
+                if free_guidance_prefix {
+                    self.free_guidance_prefix(id);
                 }
                 if matches!(
                     call_variant,
