@@ -19,15 +19,18 @@
 //!   denoiser lane runs one request at a time, so serving never batches
 //!   denoising calls and one request reaches every shape it can run.
 //!
-//! No request reads or populates the prefix or encoder caches.
+//! No request reads or populates the prefix or encoder caches. A shape the
+//! deployment's generation limits would refuse a client, such as a guidance
+//! branch count above the model's bound, is not one serving can reach and is
+//! left unwarmed.
 
 use std::time::Duration;
 
 use anyhow::Context as _;
 use uniserve_core::{
     CachePolicy, EngineCoreOutput, FeedbackNextToken, FinishReason, GenerationConstraint,
-    GenerationFeatures, GenerationRequest, ImageGenerationConfig, ImageParams, ImageTrigger,
-    MultimodalInputs, Request, SamplingParams,
+    GenerationRequest, ImageGenerationConfig, ImageParams, ImageTrigger, MultimodalInputs, Request,
+    SamplingParams,
 };
 use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
@@ -58,23 +61,35 @@ pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<(
     let info = core.info();
     let limits = core.generation_limits();
     let supports = |kind| info.supported_calls.contains(&kind);
-    let token = |request_id, tokens: usize, constraint| {
+    let token = |tokens: usize| {
         warmup_request(
             config,
-            request_id,
-            constraint,
+            core.next_request_id(),
+            GenerationConstraint::UndOnly,
             tokens,
             ImageParams::default(),
         )
+    };
+    // Keeps the requests clients could submit.
+    let servable = |requests: Vec<GenerationRequest>| {
+        requests
+            .into_iter()
+            .filter(|request| {
+                limits.features.contains(request.required_features())
+                    && request.validate_resources(&limits).is_ok()
+            })
+            .collect::<Vec<_>>()
     };
 
     // The token scenario: a prefill followed by a decode over its token. A
     // canvas deployment generates in blocks instead, which the canvas
     // requests below run.
     if supports(CallKind::Forward(ForwardMode::Prefill)) && info.canvas_step_rows == 0 {
-        let request = token(core.next_request_id(), 2, GenerationConstraint::UndOnly);
-        run(core, "token", vec![request])?;
-        tracing::info!("completed token runtime warmup");
+        let requests = servable(vec![token(2)]);
+        if !requests.is_empty() {
+            run(core, "token", requests)?;
+            tracing::info!("completed token runtime warmup");
+        }
     }
 
     if info.canvas_step_rows > 0 {
@@ -83,25 +98,21 @@ pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<(
             .canvas_sampling
             .context("workers report canvas rows but the deployment has no canvas sampling")?;
         let length = canvas.canvas_length as usize;
-        let requests = (1..=info.canvas_step_rows as usize)
-            .map(|blocks| {
-                token(
-                    core.next_request_id(),
-                    blocks * length,
-                    GenerationConstraint::UndOnly,
-                )
-            })
-            .collect();
-        run(core, "canvas", requests)?;
-        tracing::info!("completed canvas generation warmup");
+        let requests = servable(
+            (1..=info.canvas_step_rows as usize)
+                .map(|blocks| token(blocks * length))
+                .collect(),
+        );
+        if !requests.is_empty() {
+            run(core, "canvas", requests)?;
+            tracing::info!("completed canvas generation warmup");
+        }
     }
 
-    let images = limits
-        .features
-        .contains(GenerationFeatures::IMAGE_GENERATION)
-        && supports(CallKind::Media(MediaCall::LatentPreparation))
+    let images = supports(CallKind::Media(MediaCall::LatentPreparation))
         && supports(CallKind::Media(MediaCall::Denoising));
     if images {
+        let mut warmed = false;
         for shape in &info.image_warmups {
             let image = ImageParams {
                 steps: IMAGE_STEPS,
@@ -112,16 +123,19 @@ pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<(
                 seed: Some(0),
                 ..ImageParams::default()
             };
-            let request = warmup_request(
+            let requests = servable(vec![warmup_request(
                 config,
                 core.next_request_id(),
                 GenerationConstraint::GenOnly,
                 0,
                 image,
-            );
-            run(core, "image", vec![request])?;
+            )]);
+            if !requests.is_empty() {
+                run(core, "image", requests)?;
+                warmed = true;
+            }
         }
-        if !info.image_warmups.is_empty() {
+        if warmed {
             tracing::info!("completed flow runtime warmup");
         }
     }
@@ -138,7 +152,7 @@ fn warmup_request(
     constraint: GenerationConstraint,
     tokens: usize,
     image: ImageParams,
-) -> Request {
+) -> GenerationRequest {
     GenerationRequest {
         request_id,
         prompt_token_ids: vec![config.bos],
@@ -175,18 +189,17 @@ fn warmup_request(
         },
         readout: Vec::new(),
     }
-    .into()
 }
 
 /// Submits `requests` together and waits for each to finish.
 ///
 /// The requests are all queued before any is awaited, so the scheduler
 /// batches them as it would concurrent clients.
-fn run(core: &EngineCore, group: &str, requests: Vec<Request>) -> anyhow::Result<()> {
+fn run(core: &EngineCore, group: &str, requests: Vec<GenerationRequest>) -> anyhow::Result<()> {
     let mut streams = requests
         .into_iter()
         .map(|request| {
-            core.submit(request)
+            core.submit(Request::from(request))
                 .map_err(|error| anyhow::anyhow!("{group} warmup was not accepted: {error}"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -239,11 +252,22 @@ mod tests {
         sim: SimEngine,
         canvas: Option<uniserve_core::CanvasSampling>,
     ) -> Vec<(CallKind, usize)> {
+        warmed_batches_within(sim, canvas, |_| {})
+    }
+
+    /// As `warmed_batches`, with `limits` adjusting the deployment's
+    /// generation limits.
+    fn warmed_batches_within(
+        sim: SimEngine,
+        canvas: Option<uniserve_core::CanvasSampling>,
+        limits: impl FnOnce(&mut uniserve_core::GenerationLimits),
+    ) -> Vec<(CallKind, usize)> {
         let mut executor = SimExecutor::new(sim);
         let boundary = executor.observe();
         let mut config = EngineConfig::sim("warmup");
         config.workers[0].ranks[0].device = "cuda:0".to_owned();
         config.worker_process.canvas_sampling = canvas;
+        limits(&mut config.generation_limits);
         let core = EngineCore::with_executor(config.clone(), Box::new(executor)).unwrap();
 
         warm(&core, &config).unwrap();
@@ -301,6 +325,34 @@ mod tests {
         // Two steps and one decode per shape.
         assert_eq!(count(MediaCall::Denoising), 4);
         assert_eq!(count(MediaCall::ImageDecoding), 2);
+    }
+
+    #[test]
+    fn a_shape_the_limits_refuse_is_not_warmed() {
+        let mut sim = SimEngine::new();
+        sim.mut_info_for_test().image_warmups = vec![
+            ImageWarmup {
+                height: 64,
+                width: 64,
+                cfg_text_scale: 1.0,
+                cfg_img_scale: 1.0,
+            },
+            ImageWarmup {
+                height: 64,
+                width: 64,
+                cfg_text_scale: 4.0,
+                cfg_img_scale: 2.0,
+            },
+        ];
+
+        // Two guidance branches at most: the three-branch shape cannot be
+        // submitted by a client either.
+        let batches = warmed_batches_within(sim, None, |limits| limits.max_cfg_branches = 2);
+        let steps = batches
+            .iter()
+            .filter(|(kind, _)| *kind == CallKind::Media(MediaCall::Denoising))
+            .count();
+        assert_eq!(steps, 2);
     }
 
     #[test]
