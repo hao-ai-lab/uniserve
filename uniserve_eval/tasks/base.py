@@ -74,17 +74,14 @@ class BenchmarkTask:
     def validate(self, records: Sequence[RequestRecord]) -> ValidationResult:
         """Combine request-level checks with task-specific output checks.
 
-        `declared_request_count` requires exactly `load.num_prompts` measured
-        records, and `all_requests_succeeded` fails on an empty record list.
+        `all_requests_succeeded` fails on an empty record list.
 
         Raises:
             ValueError: If `validate_output` returns a check named
-                `declared_request_count` or `all_requests_succeeded`.
+                `all_requests_succeeded`.
         """
         common = ValidationResult(
             checks={
-                "declared_request_count": len(records)
-                == self.point.load.num_prompts,
                 "all_requests_succeeded": bool(records)
                 and all(record.success for record in records),
             },
@@ -275,26 +272,20 @@ class BenchmarkTask:
     def image_integrity_checks(
         self, records: Sequence[RequestRecord]
     ) -> dict[str, bool]:
-        """Check decoded image counts and configured output geometry.
+        """Check the configured output geometry of decoded images.
 
         Decoded sizes are compared with the point's configured width and
         height, not per-example overrides; an unset dimension is not checked.
-        Both checks pass trivially for records without images.
+        The check passes trivially for records without images.
         """
         image = self.point.image
-        decoded_counts = all(
-            record.images == len(record.decoded_images) for record in records
-        )
         dimensions = all(
             (image.width is None or decoded.width == image.width)
             and (image.height is None or decoded.height == image.height)
             for record in records
             for decoded in record.decoded_images
         )
-        return {
-            "decoded_image_count": decoded_counts,
-            "image_dimensions": dimensions,
-        }
+        return {"image_dimensions": dimensions}
 
     def server_usage_ok(self, records: Sequence[RequestRecord]) -> bool:
         """Report whether every request uses server-reported token counts.

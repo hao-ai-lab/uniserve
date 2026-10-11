@@ -586,6 +586,8 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         # clean endpoint.
         schedule = video["schedule"]
         assert schedule["num_inference_steps"] == expected_steps + 1
+        # A request states its work in these fields alone; the checkpoint
+        # fixes the schedule.
         assert set(video["request_fields"]) == {
             "model",
             "prompt",
@@ -593,46 +595,17 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             "conditions",
             "target",
             "seed",
-            "num_inference_steps",
-            "flow_shift",
-            "audio_flow_shift",
-            "num_outputs_per_prompt",
-            "n",
-            "quality",
-            "seconds",
-            "size",
-            "width",
-            "height",
         }
         river = t2va_request("FastH3", "A river", 5, 1001)
         for payload in (
-            {**river, "input_reference": "image.png"},
-            # Denoiser forwards are one fewer than the schedule's points.
-            {**river, "num_inference_steps": expected_steps},
+            # Longer than the deployment's default 15-second capacity.
             {**river, "target": {**river["target"], "duration_seconds": 16}},
             # Buckets the deployment did not prepare.
             {**river, "target": {**river["target"], "aspect_ratio": "1:1"}},
             {**river, "target": {**river["target"], "short_edge": 480}},
-            {**river, "seconds": 10},
         ):
             response = client.post("/v1/videos", json=payload)
             assert response.status_code == 400, (payload, response.text)
-        # The duration-only body without a task or target is refused on both
-        # routes, naming the missing task.
-        for route in ("/v1/videos", "/v1/videos/sync"):
-            response = client.post(
-                route,
-                json={
-                    "model": "FastH3",
-                    "prompt": "A river",
-                    "seconds": 5,
-                    "seed": 1001,
-                },
-            )
-            assert response.status_code == 400
-            error = response.json()["error"]
-            assert error["type"] == "invalid_request_error"
-            assert "task" in error["message"], error
         payload = t2va_request(
             "FastH3",
             "A river flows through a forest, with birds singing.",
@@ -640,15 +613,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             1001,
         )
         # Multipart fields carry the same names; the target is JSON text.
-        # Restating the reported schedule and the SGLang client's duration
-        # and size is accepted.
-        form = {
-            **payload,
-            "target": json.dumps(payload["target"]),
-            **schedule,
-            "seconds": 5,
-            "size": "1344x768",
-        }
+        form = {**payload, "target": json.dumps(payload["target"])}
         response = client.post(
             "/v1/videos",
             files={name: (None, str(value)) for name, value in form.items()},

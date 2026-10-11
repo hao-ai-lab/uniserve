@@ -693,7 +693,6 @@ def test_run_releases_slots_before_inspection_and_retains_invalid_media(
         load=LoadConfig(
             num_prompts=2,
             max_concurrency=1,
-            warmup_requests=0,
             warmup_manifest=str(warmup),
             priming_manifest=str(priming),
         ),
@@ -772,7 +771,6 @@ def test_excluded_manifests_preserve_order_and_do_not_enter_measurements(
             request_rate=float("inf"),
             max_concurrency=1,
             submit=submit,
-            warmup_requests=0,
             warmup_rows=warmup,
         )
     )

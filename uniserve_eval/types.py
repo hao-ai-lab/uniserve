@@ -75,7 +75,10 @@ class LoadConfig:
             measured requests, or ``None`` for no limit.
         warmup_requests: Number of concurrent warmup requests, all built
             from the first row and completed before measurement; ``0`` skips
-            warmup.
+            warmup. A point with a ``warmup_manifest`` or a session trace
+            sends none of them.
+        warmup_manifest: JSON Lines file whose rows are the point's warmup
+            requests, in file order, in place of the repeated first row.
         seed: Seeds row shuffling in the datasets that shuffle, arrival
             intervals, and the image or video generation seed of rows that
             carry none. The chat sampling ``seed`` comes from
@@ -101,8 +104,6 @@ class LoadConfig:
             raise ValueError("max_concurrency must be positive")
         if self.warmup_requests < 0:
             raise ValueError("warmup_requests must be non-negative")
-        if self.warmup_manifest and self.warmup_requests:
-            raise ValueError("warmup_manifest requires warmup_requests = 0")
         if (
             not math.isfinite(self.request_timeout_s)
             or self.request_timeout_s <= 0
