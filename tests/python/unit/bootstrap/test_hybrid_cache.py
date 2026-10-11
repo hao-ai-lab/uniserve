@@ -35,7 +35,7 @@ def test_hybrid_layers_form_one_group_per_window_and_page_shape():
     # tokens; a full-attention page holds twice as many in one unit. Twelve
     # layers give two columns: five units per windowed page.
     assert windowed.kind is KvGroupKind.SLIDING_WINDOW
-    assert (windowed.window, windowed.sink) == (8, 0)
+    assert windowed.window == 8
     assert (windowed.page_tokens, windowed.units_per_page) == (16, 5)
     assert windowed.layer_ids == WINDOWED
     assert (windowed.num_kv_heads, windowed.head_dim) == (4, 4)
@@ -44,11 +44,11 @@ def test_hybrid_layers_form_one_group_per_window_and_page_shape():
     assert full.layer_ids == FULL
     assert (full.num_kv_heads, full.head_dim) == (1, 8)
     assert (info.num_units, info.dtype) == (20, "float32")
-    # Two columns of key and value planes, each 16 windowed rows of 16 FP32
-    # elements with one initialization flag.
-    assert info.unit_bytes == 2 * 2 * (16 * 16 * 4 + 1)
 
     planes = plan_cache(model, _config())
+    # Two columns of key and value planes, each 16 windowed rows of 16 FP32
+    # elements with one initialization flag.
+    assert planes.unit_bytes == 2 * 2 * (16 * 16 * 4 + 1)
     assert group_layers(model, planes) == (WINDOWED, FULL)
 
 

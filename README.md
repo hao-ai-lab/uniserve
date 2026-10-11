@@ -125,7 +125,7 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--mem-fraction-static` | `0.70` | Each rank's share of device storage |
 | `--graph-policy` | `auto` | CUDA graph policy: `auto`, `full`, or `off` |
 | `--quantization-config` | `{}`, the `quality` preset | Precision preset or per-component overrides |
-| `--attention-backend` | `auto` | Attention provider selection; explicit provider names select that implementation |
+| `--attention-backend` | `auto` | Attention provider for every call: `torch`, `flash_attn`, `flash_attn_4`, `flashinfer`, `trtllm`, `sgl_kernel` or `prefix_block`; `auto` selects a native kernel per call |
 | `--api-key` | Unset | Bearer token for public routes |
 | `--request-timeout` | Unset | Seconds until response headers; streamed bodies are not bounded |
 | `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation and System One requests; video requests use video job slots |

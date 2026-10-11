@@ -8,9 +8,9 @@
 //! targeted work to the groups of a deployment. `process` owns one rank's
 //! process and IPC channel, `registration` the addresses ranks rendezvous and
 //! report their endpoints at, `launcher` the per-host launchers that start
-//! ranks placed on other hosts, `checkpoint` the checkpoint identity every
-//! rank is checked against, and `death_watch` the Linux watcher that fires a
-//! rank channel's death wake when a rank process this engine spawned exits.
+//! ranks placed on other hosts, and `death_watch` the Linux watcher that
+//! fires a rank channel's death wake when a rank process this engine spawned
+//! exits.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod death_watch;
@@ -98,11 +98,10 @@ pub struct WorkerProcessArgs {
     /// and block tables. A worker that fits its request tensors to device
     /// storage takes this as the largest pool it may choose.
     pub max_request_pool_size: u32,
-    /// Attention implementation selected for model execution.
-    pub attention_backend: uniserve_worker_ipc::AttentionBackend,
-    /// Optional public worker capability selectors; empty uses the model default.
-    /// Startup resolves each selector to its concrete computation set.
-    pub capability_groups: Vec<String>,
+    /// Attention provider name, forwarded to the worker verbatim. The
+    /// worker's attention registry owns the names and refuses one it does
+    /// not provide; `auto` lets it select per call.
+    pub attention_backend: String,
     /// Product transport exposed by the worker pool.
     pub transfer: crate::executor::TransferConfig,
     /// Checkpoint loader format.

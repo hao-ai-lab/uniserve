@@ -77,7 +77,6 @@ def _worker(root):
         image_processor=loaded.image_processor,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_calls=None,
         queue_depth=3,
         completion_payload_bytes=1 << 16,
         attention="torch",

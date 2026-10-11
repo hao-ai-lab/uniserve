@@ -2,34 +2,21 @@
 
 A rank answers the engine's ``info`` request (`RequestKind.INFO`, served by
 `uniserve_worker.service`) with `WorkerInfo.to_mapping()`: its endpoint,
-supported calls, scheduling bounds, KV and latent pool capacity, components,
-and transfer capabilities. The worker-ipc crate's `WorkerInfo` is the wire
-counterpart: the PyO3 extension converts the mapping into it, and its
-`validate` runs whenever the crate's codec encodes or decodes the response.
-The engine also checks the description against its launch configuration and
-derives the capacity the scheduler plans against. `WorkerInfo.__post_init__`
-checks the record's internal consistency when the worker builds it in
-`uniserve_worker.bootstrap.report`.
-
-The decoding helpers at the end of this module are local variants of those in
-`uniserve_worker.protocol.validation`, without their exact-type fast paths.
+supported calls, scheduling bounds, KV and latent pool capacity, and
+components. The worker-ipc crate's `WorkerInfo` is the wire counterpart: the
+PyO3 extension converts the mapping into it, and the crate's codec validates
+the report when it encodes it. The engine derives the capacity the scheduler
+plans against from the reports.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, TypeVar, cast
 
 from uniserve_worker.config.deployment import ComponentConfig
-from uniserve_worker.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.protocol.call import (
-    CallKind,
-    ForwardMode,
-    MediaCall,
-    computation,
-)
+from uniserve_worker.errors import unsupported_setup
+from uniserve_worker.protocol.call import CallKind, MediaCall
 from uniserve_worker.protocol.tensor import OutputInfo
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 
@@ -76,11 +63,7 @@ class KvGroup:
     Attributes:
         kind: History retention policy of the group.
         window: With `KvGroupKind.SLIDING_WINDOW`, the history tokens any
-            reader of the group needs. Encoded only for a sliding window and
-            decoded as zero when absent.
-        sink: With `KvGroupKind.SLIDING_WINDOW`, prefix tokens retained
-            outside the window; the unit pool supports only zero. Encoded
-            only for a sliding window and decoded as zero when absent.
+            reader of the group needs. Encoded only for a sliding window.
         page_tokens: Tokens per logical page; a power of two.
         units_per_page: Units one logical page occupies.
         layer_ids: Global cache-layer ids of this rank's layers in the
@@ -93,7 +76,6 @@ class KvGroup:
 
     kind: KvGroupKind
     window: int
-    sink: int
     page_tokens: int
     units_per_page: int
     layer_ids: tuple[int, ...]
@@ -102,66 +84,11 @@ class KvGroup:
     kv_head_offset: int
     head_dim: int
 
-    def __post_init__(self) -> None:
-        """Validate the page shape and this rank's layers and heads."""
-        if (
-            self.page_tokens < 1
-            or self.page_tokens & (self.page_tokens - 1)
-            or self.units_per_page < 1
-            or not self.layer_ids
-            or len(set(self.layer_ids)) != len(self.layer_ids)
-            or self.num_kv_heads < 1
-            or self.head_dim < 1
-            or self.kv_head_offset + self.num_kv_heads > self.total_kv_heads
-        ):
-            raise invalid_descriptor("worker KV group is invalid")
-        if self.kind is KvGroupKind.SLIDING_WINDOW and self.sink:
-            raise invalid_descriptor(
-                "worker KV group retains sliding-window sink tokens"
-            )
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str) -> KvGroup:
-        """Decode and validate one KV group from its scheduler wire mapping.
-
-        The policy is a nested mapping tagged by its own ``kind`` key, with
-        ``window`` and ``sink`` beside the tag for a sliding window.
-        """
-        data = _map(value, where)
-        kind_data = _map(data.get("kind"), f"{where}.kind")
-        return cls(
-            kind=_enum(
-                KvGroupKind, kind_data.get("kind"), f"{where}.kind.kind"
-            ),
-            window=_uint(kind_data.get("window", 0), f"{where}.kind.window"),
-            sink=_uint(kind_data.get("sink", 0), f"{where}.kind.sink"),
-            page_tokens=_uint(data.get("page_tokens"), f"{where}.page_tokens"),
-            units_per_page=_uint(
-                data.get("units_per_page"), f"{where}.units_per_page"
-            ),
-            layer_ids=tuple(
-                _uint(item, f"{where}.layer_ids[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("layer_ids"), f"{where}.layer_ids")
-                )
-            ),
-            num_kv_heads=_uint(
-                data.get("num_kv_heads"), f"{where}.num_kv_heads"
-            ),
-            total_kv_heads=_uint(
-                data.get("total_kv_heads"), f"{where}.total_kv_heads"
-            ),
-            kv_head_offset=_uint(
-                data.get("kv_head_offset"), f"{where}.kv_head_offset"
-            ),
-            head_dim=_uint(data.get("head_dim"), f"{where}.head_dim"),
-        )
-
     def to_mapping(self) -> dict[str, object]:
         """Encode the group's policy, page shape and placement."""
         kind: dict[str, object] = {"kind": self.kind.value}
         if self.kind is KvGroupKind.SLIDING_WINDOW:
-            kind.update(window=self.window, sink=self.sink)
+            kind.update(window=self.window)
         return {
             "kind": kind,
             "page_tokens": self.page_tokens,
@@ -178,61 +105,18 @@ class KvGroup:
 class KVCacheInfo:
     """Publish the KV unit pool to the scheduler.
 
-    The pool is `num_units` units of `unit_bytes` bytes each on this rank,
-    unit zero being the padding sentinel; every group's pages draw from it.
+    The pool is `num_units` units on this rank, unit zero being the padding
+    sentinel; every group's pages draw from it.
     """
 
     num_units: int
-    unit_bytes: int
     dtype: str
     groups: tuple[KvGroup, ...]
-
-    def __post_init__(self) -> None:
-        """Validate the pool size and the groups' combined page shapes.
-
-        Requires an allocatable unit beyond the sentinel, a positive unit
-        size, a dtype, and groups whose page sizes divide the largest one and
-        whose layers are distinct.
-        """
-        if (
-            self.num_units < 2
-            or self.unit_bytes < 1
-            or not self.groups
-            or not self.dtype
-        ):
-            raise invalid_descriptor(
-                "worker info declares an incomplete KV unit pool"
-            )
-        largest = max(group.page_tokens for group in self.groups)
-        if any(largest % group.page_tokens for group in self.groups) or any(
-            group.units_per_page >= self.num_units for group in self.groups
-        ):
-            raise invalid_descriptor("worker KV group page shape is invalid")
-        layers = [layer for group in self.groups for layer in group.layer_ids]
-        if len(set(layers)) != len(layers):
-            raise invalid_descriptor("worker KV groups must not repeat a layer")
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str) -> KVCacheInfo:
-        """Decode and validate the KV unit pool from the wire mapping."""
-        data = _map(value, where)
-        return cls(
-            num_units=_uint(data.get("num_units"), f"{where}.num_units"),
-            unit_bytes=_uint(data.get("unit_bytes"), f"{where}.unit_bytes"),
-            dtype=_str(data.get("dtype"), f"{where}.dtype"),
-            groups=tuple(
-                KvGroup.from_mapping(item, f"{where}.groups[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("groups"), f"{where}.groups")
-                )
-            ),
-        )
 
     def to_mapping(self) -> dict[str, object]:
         """Encode the unit pool and its groups for scheduler discovery."""
         return {
             "num_units": self.num_units,
-            "unit_bytes": self.unit_bytes,
             "dtype": self.dtype,
             "groups": [group.to_mapping() for group in self.groups],
         }
@@ -251,35 +135,6 @@ class ComponentInfo:
     name: str
     config: ComponentConfig
     outputs: tuple[OutputInfo, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.name:
-            raise invalid_descriptor("component must have a name")
-        if len({output.name for output in self.outputs}) != len(self.outputs):
-            raise invalid_descriptor("component repeats a tensor result name")
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "component"
-    ) -> ComponentInfo:
-        """Decode one component and its tensor results from the wire mapping."""
-        data = _map(value, where)
-        return cls(
-            name=_str(data.get("name"), f"{where}.name"),
-            config=ComponentConfig.from_dict(
-                {
-                    key: value
-                    for key, value in data.items()
-                    if key not in {"name", "outputs"}
-                }
-            ),
-            outputs=tuple(
-                OutputInfo.from_mapping(output, f"{where}.outputs[{index}]")
-                for index, output in enumerate(
-                    _seq(data.get("outputs", ()), f"{where}.outputs")
-                )
-            ),
-        )
 
     def to_mapping(self) -> dict[str, object]:
         """Encode component membership and results for IPC discovery."""
@@ -317,41 +172,14 @@ class VideoDenoiserInfo:
             ],
         }
 
-    @classmethod
-    def from_mapping(cls, value: object, where: str) -> VideoDenoiserInfo:
-        data = _map(value, where)
-        return cls(
-            tasks=tuple(
-                _str(task, f"{where}.tasks")
-                for task in _seq(data.get("tasks", ()), f"{where}.tasks")
-            ),
-            schedule_points=_uint(
-                data.get("schedule_points"), f"{where}.schedule_points"
-            ),
-            video_shift=float(data.get("video_shift", 0.0)),
-            audio_shift=float(data.get("audio_shift", 0.0)),
-            canvases=tuple(
-                (
-                    _uint(canvas.get("width"), f"{where}.canvases"),
-                    _uint(canvas.get("height"), f"{where}.canvases"),
-                )
-                for canvas in (
-                    _map(item, f"{where}.canvases")
-                    for item in _seq(
-                        data.get("canvases", ()), f"{where}.canvases"
-                    )
-                )
-            ),
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class WorkerInfo:
     """Describes a worker’s capabilities, topology, and resource bounds.
 
     Attributes:
-        queue_depth: Maximum unresolved physical runs; the engine requires it
-            to equal the depth it launched the rank with.
+        queue_depth: Maximum unresolved physical runs, the depth the rank was
+            launched with.
         max_batch_calls: Maximum calls in one run.
         max_batch_tokens: Maximum text tokens represented in one run.
         max_prefill_calls: Maximum calls in one prefill run, the rows the
@@ -372,9 +200,7 @@ class WorkerInfo:
         host_lane_capacity: Concurrent host-lane tasks this rank admits.
     """
 
-    model_name: str
     endpoint: WorkerEndpoint
-    world_size: int
     supported_calls: tuple[CallKind, ...]
     queue_depth: int
     max_batch_calls: int
@@ -390,13 +216,11 @@ class WorkerInfo:
     encoder_entry_bytes: int = 0
     max_prefill_calls: int = 0
     max_decode_calls: int = 0
-    model_dtype: str = ""
-    attention_backend: str = ""
-    weight_formats: tuple[str, ...] = ()
-    activation_formats: tuple[str, ...] = ()
     components: tuple[ComponentInfo, ...] = ()
-    device: str = "cpu"
-    transfer_backends: tuple[str, ...] = ("local",)
+    # Physical ranks of this worker, which `output_rank` needs for a worker
+    # without a placed component. The engine knows its own placement, so the
+    # report does not carry it.
+    world_size: int = 1
     # Whether this rank's device exports a handle another host can import.
     # A descriptor handle reaches only this host, so the engine refuses a
     # cross-host CUDA VMM transfer edge unless both ends report fabric
@@ -441,232 +265,6 @@ class WorkerInfo:
         """Indicate whether this worker publishes a physical KV cache."""
         return self.kv_cache is not None
 
-    def __post_init__(self) -> None:
-        """Validate the advertisement's internal consistency.
-
-        Covers transfer backends, scheduling bounds, the endpoint rank, the
-        KV cache that autoregressive calls require, pool sizes, supported and
-        media calls, latent pool completeness, the model name, and the
-        checkpoint identity format. The KV layout validates itself in
-        `KVCacheInfo`. The worker-ipc crate's `WorkerInfo::validate` checks
-        most of the same relations; it also checks the components (unique
-        names, membership within the world, and parallel degrees) and
-        refuses an empty checkpoint identity from any model but the
-        weightless stub.
-        """
-        if (
-            not self.device
-            or not self.transfer_backends
-            or len(set(self.transfer_backends)) != len(self.transfer_backends)
-            or any(
-                name not in {"local", "shm", "cuda_vmm", "channel"}
-                for name in self.transfer_backends
-            )
-        ):
-            raise invalid_descriptor(
-                "worker physical transfer capabilities are incomplete"
-            )
-
-        for name in (
-            "queue_depth",
-            "max_batch_calls",
-            "max_batch_tokens",
-            "request_slots",
-            "max_unresolved_calls",
-            "host_lane_capacity",
-        ):
-            if getattr(self, name) < 1:
-                raise invalid_descriptor(f"worker info.{name} must be positive")
-
-        if self.world_size < 1 or self.endpoint.rank >= self.world_size:
-            raise invalid_descriptor(
-                "endpoint rank must satisfy 0 <= rank < world_size"
-            )
-
-        # Every token-model forward reads or extends a request's KV cache.
-        requires_kv = any(
-            isinstance(variant, ForwardMode) for variant in self.supported_calls
-        )
-        if requires_kv and self.kv_cache is None:
-            raise invalid_descriptor(
-                "worker advertises token work without a KV cache"
-            )
-
-        for name in (
-            "latent_page_units",
-            "latent_pages",
-            "buffer_pool_bytes",
-            "encoder_cache_entries",
-            "encoder_entry_bytes",
-            "max_prefill_calls",
-            "max_decode_calls",
-        ):
-            if getattr(self, name) < 0:
-                raise invalid_descriptor(
-                    f"worker info.{name} must not be negative"
-                )
-
-        if not self.supported_calls and (
-            self.components
-            or self.kv_cache is not None
-            or self.latent_pages
-            or self.media_components
-        ):
-            raise invalid_descriptor(
-                "a collective-only worker cannot advertise request resources"
-            )
-        if len(set(self.supported_calls)) != len(self.supported_calls):
-            raise invalid_descriptor("worker info repeats a call kind")
-
-        if self.media_components:
-            # A worker reports the component serving each media call it
-            # implements. The video call graph may span workers, a model
-            # worker decoding and a host worker encoding and muxing, so its
-            # completeness and its diffusion step count are the engine's
-            # checks over every worker.
-            if any(
-                not component or call not in self.supported_calls
-                for call, component in self.media_components.items()
-            ):
-                raise invalid_descriptor(
-                    "media component uses an unsupported call"
-                )
-
-        # A latent pool is either absent or has at least one usable page
-        # beyond the reserved sentinel page.
-        has_latent_geometry = bool(self.latent_page_units or self.latent_pages)
-        if has_latent_geometry:
-            if self.latent_page_units < 1 or self.latent_pages < 2:
-                raise invalid_descriptor(
-                    "worker info declares incomplete latent pool capacity"
-                )
-
-        if not self.model_name:
-            raise invalid_descriptor("worker model name is empty")
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str = "info") -> WorkerInfo:
-        """Decode a worker capability advertisement from IPC data.
-
-        The advertisement is validated during decoding.
-        """
-        data = _map(value, where)
-        return cls(
-            media_components={
-                _enum(MediaCall, call, f"{where}.media_components"): _str(
-                    component, f"{where}.media_components"
-                )
-                for call, component in _map(
-                    data.get("media_components", {}),
-                    f"{where}.media_components",
-                ).items()
-            },
-            num_inference_steps=_uint(
-                data.get("num_inference_steps", 0),
-                f"{where}.num_inference_steps",
-            ),
-            video_denoiser=None
-            if data.get("video_denoiser") is None
-            else VideoDenoiserInfo.from_mapping(
-                data["video_denoiser"], f"{where}.video_denoiser"
-            ),
-            model_dtype=_str(
-                data.get("model_dtype", ""), f"{where}.model_dtype"
-            ),
-            attention_backend=_str(
-                data.get("attention_backend", ""), f"{where}.attention_backend"
-            ),
-            activation_formats=tuple(
-                _str(value, f"{where}.activation_formats")
-                for value in _seq(
-                    data.get("activation_formats", ()),
-                    f"{where}.activation_formats",
-                )
-            ),
-            weight_formats=tuple(
-                _str(value, f"{where}.weight_formats")
-                for value in _seq(
-                    data.get("weight_formats", ()), f"{where}.weight_formats"
-                )
-            ),
-            components=tuple(
-                ComponentInfo.from_mapping(item, f"{where}.components[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("components", ()), f"{where}.components")
-                )
-            ),
-            model_name=_str(data.get("model_name", ""), f"{where}.model_name"),
-            endpoint=WorkerEndpoint.from_mapping(
-                data.get("endpoint"), f"{where}.endpoint"
-            ),
-            device=_str(data.get("device"), f"{where}.device"),
-            transfer_backends=tuple(
-                _str(name, f"{where}.transfer_backends")
-                for name in _seq(
-                    data.get("transfer_backends"), f"{where}.transfer_backends"
-                )
-            ),
-            fabric_handles=bool(data.get("fabric_handles", False)),
-            world_size=_uint(data.get("world_size"), f"{where}.world_size"),
-            supported_calls=tuple(
-                computation(item, f"{where}.supported_calls[{index}]")
-                for index, item in enumerate(
-                    _seq(
-                        data.get("supported_calls"),
-                        f"{where}.supported_calls",
-                    )
-                )
-            ),
-            queue_depth=_uint(data.get("queue_depth"), f"{where}.queue_depth"),
-            max_batch_calls=_uint(
-                data.get("max_batch_calls"), f"{where}.max_batch_calls"
-            ),
-            max_batch_tokens=_uint(
-                data.get("max_batch_tokens"), f"{where}.max_batch_tokens"
-            ),
-            max_prefill_calls=_uint(
-                data.get("max_prefill_calls", 0),
-                f"{where}.max_prefill_calls",
-            ),
-            max_decode_calls=_uint(
-                data.get("max_decode_calls", 0),
-                f"{where}.max_decode_calls",
-            ),
-            request_slots=_uint(
-                data.get("request_slots"), f"{where}.request_slots"
-            ),
-            kv_cache=(
-                None
-                if data.get("kv_cache") is None
-                else KVCacheInfo.from_mapping(
-                    data.get("kv_cache"), f"{where}.kv_cache"
-                )
-            ),
-            latent_page_units=_uint(
-                data.get("latent_page_units"), f"{where}.latent_page_units"
-            ),
-            latent_pages=_uint(
-                data.get("latent_pages"), f"{where}.latent_pages"
-            ),
-            buffer_pool_bytes=_uint(
-                data.get("buffer_pool_bytes"), f"{where}.buffer_pool_bytes"
-            ),
-            encoder_cache_entries=_uint(
-                data.get("encoder_cache_entries"),
-                f"{where}.encoder_cache_entries",
-            ),
-            encoder_entry_bytes=_uint(
-                data.get("encoder_entry_bytes"), f"{where}.encoder_entry_bytes"
-            ),
-            max_unresolved_calls=_uint(
-                data.get("max_unresolved_calls"),
-                f"{where}.max_unresolved_calls",
-            ),
-            host_lane_capacity=_uint(
-                data.get("host_lane_capacity"), f"{where}.host_lane_capacity"
-            ),
-        )
-
     def to_mapping(self) -> dict[str, object]:
         """Encode worker capabilities and resource bounds for IPC discovery."""
         return {
@@ -678,16 +276,8 @@ class WorkerInfo:
             "video_denoiser": None
             if self.video_denoiser is None
             else self.video_denoiser.to_mapping(),
-            "model_name": self.model_name,
             "endpoint": self.endpoint.to_mapping(),
-            "device": self.device,
-            "transfer_backends": list(self.transfer_backends),
             "fabric_handles": self.fabric_handles,
-            "world_size": self.world_size,
-            "model_dtype": self.model_dtype,
-            "attention_backend": self.attention_backend,
-            "weight_formats": list(self.weight_formats),
-            "activation_formats": list(self.activation_formats),
             "components": [
                 component.to_mapping() for component in self.components
             ],
@@ -709,65 +299,6 @@ class WorkerInfo:
             "max_unresolved_calls": self.max_unresolved_calls,
             "host_lane_capacity": self.host_lane_capacity,
         }
-
-
-# Local decoding helpers for the startup description; see the module
-# docstring for how they relate to `uniserve_worker.protocol.validation`.
-_E = TypeVar("_E", bound=StrEnum)
-
-
-def _enum(kind: type[_E], value: object, where: str) -> _E:
-    """Decode one string-backed enum field from scheduler metadata."""
-    if not isinstance(value, str):
-        raise invalid_descriptor(f"{where} must be a string")
-    try:
-        return kind(value)
-    except ValueError:
-        raise invalid_descriptor(
-            f"{where} has unknown value {value!r}"
-        ) from None
-
-
-def _map(value: object, where: str) -> Mapping[str, Any]:
-    """Require a metadata field to be a mapping."""
-    if not isinstance(value, Mapping):
-        raise invalid_descriptor(f"{where} must be a map")
-    return cast(Mapping[str, Any], value)
-
-
-def _seq(value: object, where: str) -> Sequence[Any]:
-    """Require a metadata field to be a non-string sequence."""
-    if not isinstance(value, Sequence) or isinstance(
-        value, (str, bytes, bytearray)
-    ):
-        raise invalid_descriptor(f"{where} must be a list")
-    return value
-
-
-def _uint(value: object, where: str) -> int:
-    """Decode a non-negative integer metadata field."""
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise invalid_descriptor(f"{where} must be a non-negative integer")
-    return value
-
-
-def _optional_uint(value: object, where: str) -> int | None:
-    """Decode an optional non-negative integer metadata field."""
-    return None if value is None else _uint(value, where)
-
-
-def _bool(value: object, where: str) -> bool:
-    """Require a metadata field to contain a boolean."""
-    if not isinstance(value, bool):
-        raise invalid_descriptor(f"{where} must be a boolean")
-    return value
-
-
-def _str(value: object, where: str) -> str:
-    """Require a metadata field to contain text."""
-    if not isinstance(value, str):
-        raise invalid_descriptor(f"{where} must be a string")
-    return value
 
 
 __all__ = [

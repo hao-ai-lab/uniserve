@@ -36,7 +36,6 @@ from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
 )
-from uniserve_worker.bootstrap.components import supported_calls
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import ResourceError
 from uniserve_worker.execution.model_executor import ModelExecutor
@@ -437,7 +436,6 @@ def test_sealed_prefill_rejects_calls_no_captured_graph_holds(tmp_path):
         worker_config=config,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_calls=supported_calls(model),
         queue_depth=2,
         completion_payload_bytes=1 << 16,
     ) as worker:
@@ -502,7 +500,6 @@ def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
         worker_config=config,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_calls=supported_calls(model),
         queue_depth=2,
         completion_payload_bytes=1 << 16,
     ) as worker:
@@ -565,7 +562,6 @@ def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
         worker_config=config,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_calls=supported_calls(model),
         queue_depth=2,
         completion_payload_bytes=1 << 16,
     ) as worker:

@@ -17,8 +17,7 @@
 //   other scalar reads its schema default when absent.
 // - Most absent vectors decode as empty. `allowed_token_ids` in
 //   SamplingParams and SamplingState decodes absence as no whitelist, and
-//   `WorkerInfo.transfer_backends` and `ComponentInfo.outputs` are rejected
-//   when absent.
+//   `ComponentInfo.outputs` is rejected when absent.
 // - Few fields carry `(required)`, which the FlatBuffers verifier enforces.
 //   The decoders reject the absence of many other fields and tables (for
 //   example `Call.coordinates` and `Locator.source`), so a field without
@@ -128,8 +127,6 @@ table KvGroup {
   kind:KvGroupKind;
   /// Read only when `kind` is `SlidingWindow`.
   window:uint;
-  /// Read only when `kind` is `SlidingWindow`.
-  sink:uint;
   page_tokens:uint;
   units_per_page:uint;
   /// Global cache-layer ids of this rank's layers, in column order.
@@ -140,11 +137,10 @@ table KvGroup {
   head_dim:uint;
 }
 
-/// Paged KV unit pool of one rank: `num_units` units of `unit_bytes` each,
-/// shared by every group's pages.
+/// Paged KV unit pool of one rank: `num_units` units shared by every
+/// group's pages.
 table KVCacheInfo {
   num_units:uint;
-  unit_bytes:ulong;
   dtype:string;
   groups:[KvGroup];
 }
@@ -224,19 +220,11 @@ table MediaComponent { call:MediaCall; component:string; }
 /// `WorkerInfo::validate` checks internal consistency; the engine checks it
 /// against the launch.
 table WorkerInfo {
-  model_name:string;
   endpoint:WorkerEndpoint;
-  device:string;
-  transfer_backends:[string];
   /// Whether this rank's device exports a fabric handle. A descriptor handle
   /// reaches only this host, so an edge that must cross hosts is refused at
   /// startup rather than failing on its first publication.
   fabric_handles:bool = false;
-  world_size:uint = 1;
-  model_dtype:string;
-  attention_backend:string;
-  weight_formats:[string];
-  activation_formats:[string];
   components:[ComponentInfo];
   supported_calls:[CallKind];
   queue_depth:uint;

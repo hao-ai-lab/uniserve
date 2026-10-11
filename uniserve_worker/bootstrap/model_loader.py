@@ -89,7 +89,6 @@ class WorkerModel:
     image_processor: ImageProcessor | None = None
     flow_prompt: FlowPrompt | None = None
     entry_points: Mapping[str, ComponentEntry] | None = None
-    model_name: str | None = None
 
 
 def prepare_worker_model(
@@ -437,7 +436,6 @@ def load_worker_model(
         experts=partition,
     )
     model = loaded.model
-    model_name = f"{type(model).__module__}.{type(model).__qualname__}"
     if dedicated:
         # Keep the actual loaded expert modules in numerical traversal order.
         # The worker owns their invocation; no model capability or KV cache
@@ -468,7 +466,6 @@ def load_worker_model(
         source.image_processor,
         source.flow_prompt,
         {} if dedicated else source.entry_points,
-        model_name,
     )
 
 

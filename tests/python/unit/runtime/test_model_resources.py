@@ -170,7 +170,6 @@ def test_worker_info_reports_capabilities_and_cache_limits():
         TEST_MODEL,
         TEST_WORKER_CONFIG,
         image_processor=image_processor(),
-        model_name="test-model",
     )
     info = layout.info
 
@@ -180,7 +179,6 @@ def test_worker_info_reports_capabilities_and_cache_limits():
     assert sum(len(group.layer_ids) for group in info.kv_cache.groups) == len(
         TEST_MODEL.cache_config.layers
     )
-    assert info.model_name == "test-model"
 
 
 def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:

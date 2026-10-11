@@ -58,13 +58,11 @@ def mha_pool(
     )
     info = KVCacheInfo(
         num_units=num_pages,
-        unit_bytes=cache.planes.unit_bytes,
         dtype=str(store_dtype or dtype).removeprefix("torch."),
         groups=(
             KvGroup(
                 kind=KvGroupKind.FULL,
                 window=0,
-                sink=0,
                 page_tokens=page_size,
                 units_per_page=1,
                 layer_ids=tuple(range(layer_offset, layer_offset + num_layers)),

@@ -18,7 +18,7 @@ use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::{
-    AttentionBackend, DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
+    DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
@@ -224,9 +224,10 @@ pub(crate) struct SharedRuntimeArgs {
     /// Compute device for the forward-only worker.
     #[arg(long, default_value = "cuda")]
     pub device: String,
-    /// Attention backend preference forwarded to the Python worker.
+    /// Attention provider the Python worker uses for every call, by the
+    /// name its attention registry gives it; `auto` selects per call.
     #[arg(long, default_value = "auto")]
-    pub attention_backend: AttentionBackend,
+    pub attention_backend: String,
     /// Python interpreter used to launch the forward-only worker.
     #[arg(long, default_value_os_t = default_worker_python(), hide = true)]
     pub worker_python: std::path::PathBuf,

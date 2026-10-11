@@ -1,10 +1,10 @@
 //! Worker identity, supported calls, and startup capacity handshake.
 //!
-//! A rank answers the engine's `Info` request with a [`WorkerInfo`]. The engine
-//! validates it, checks it against the launch configuration, and requires a
-//! replacement rank to report an identical description apart from its
-//! endpoint. The executor then derives the capacity view the scheduler plans
-//! against from the descriptions of all workers (`ExecutorInfo::runtime_info`).
+//! A rank answers the engine's `Info` request with a [`WorkerInfo`], which the
+//! codec validates, and the engine requires a replacement rank to report an
+//! identical description apart from its endpoint. The executor then derives
+//! the capacity view the scheduler plans against from the descriptions of all
+//! workers (`ExecutorInfo::runtime_info`).
 
 use super::*;
 
@@ -19,10 +19,6 @@ use super::*;
 pub struct KvCacheInfo {
     /// Allocation units in the pool, including the unit-zero sentinel.
     pub num_units: u32,
-    /// Physical bytes one unit occupies on this rank: every column plane of
-    /// the unit plus its per-unit metadata (initialization flags and, with
-    /// FP8, scales).
-    pub unit_bytes: u64,
     /// Element data type of KV tensors.
     pub dtype: KvCacheDtype,
     /// Cache groups in table order.
@@ -93,11 +89,10 @@ impl KvCacheInfo {
     ///
     /// Every page size must be a power of two that divides the largest one,
     /// so page-aligned prefix lengths agree across groups. A layer belongs to
-    /// at most one group. A sliding-window group may not retain sink tokens:
-    /// a table keeps one contiguous run of pages.
+    /// at most one group.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            self.num_units > 1 && self.unit_bytes > 0 && !self.groups.is_empty(),
+            self.num_units > 1 && !self.groups.is_empty(),
             "worker info declare an incomplete KV unit pool"
         );
 
@@ -123,10 +118,6 @@ impl KvCacheInfo {
                     && group.head_dim > 0,
                 "worker KV group head interval exceeds its logical bounds"
             );
-            ensure_valid!(
-                !matches!(group.kind, KvGroupKind::SlidingWindow { sink, .. } if sink > 0),
-                "worker KV group retains sliding-window sink tokens"
-            );
         }
         Ok(())
     }
@@ -136,8 +127,8 @@ impl KvCacheInfo {
     /// Stages must agree on dtype and on every group's retention policy and
     /// page shape; their rank-local layer ids and head placement may differ.
     /// The combined pool has the smaller unit count, because the scheduler
-    /// assigns one set of unit ids valid in both, the larger unit size, and
-    /// per group the union of both stages' layers, which bounds publications.
+    /// assigns one set of unit ids valid in both, and per group the union of
+    /// both stages' layers, which bounds publications.
     pub fn merge(&self, other: &Self) -> ValidationResult<Self> {
         ensure_valid!(
             self.dtype == other.dtype
@@ -171,7 +162,6 @@ impl KvCacheInfo {
             .collect();
         let merged = Self {
             num_units: self.num_units.min(other.num_units),
-            unit_bytes: self.unit_bytes.max(other.unit_bytes),
             dtype: self.dtype,
             groups,
         };
@@ -323,16 +313,14 @@ impl VideoDenoiserInfo {
     }
 }
 
-/// Post-load worker geometry, limits, supported work, and model identity.
+/// Post-load worker geometry, limits and supported work.
 ///
-/// [`WorkerInfo::validate`] checks only internal consistency. The engine's
-/// `RankProcess::finish_startup` additionally checks the description against
-/// the launch: `queue_depth`, rank and world size, component configuration,
-/// and non-empty resolved numerical settings.
+/// [`WorkerInfo::validate`] checks internal consistency, and the codec runs it
+/// when it encodes or decodes the report. The engine owns the launch values
+/// (placement, queue depth, transfer mechanisms) and does not check the report
+/// against them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerInfo {
-    /// Loaded model identity.
-    pub model_name: String,
     /// Model-declared finite terminal-media computation, when supported.
     #[serde(default)]
     pub media_components: std::collections::BTreeMap<MediaCall, String>,
@@ -343,10 +331,6 @@ pub struct WorkerInfo {
     pub video_denoiser: Option<VideoDenoiserInfo>,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
-    /// Rank-local primary compute device used to bind physical transfer edges.
-    pub device: String,
-    /// Physical transfer mechanisms initialized by this rank.
-    pub transfer_backends: Vec<String>,
     /// Whether this rank's device exports a fabric allocation handle.
     ///
     /// A fabric handle is importable from another host inside the fabric
@@ -354,20 +338,6 @@ pub struct WorkerInfo {
     /// this is what decides whether a transfer edge may cross hosts.
     #[serde(default)]
     pub fabric_handles: bool,
-    /// Number of physical members in this Worker.
-    pub world_size: u32,
-    /// Resolved compute dtype, compared per rank on restart.
-    #[serde(default)]
-    pub model_dtype: String,
-    /// Resolved attention selection, compared per rank on restart.
-    #[serde(default)]
-    pub attention_backend: String,
-    /// Numerical weight storage formats present on this rank.
-    #[serde(default)]
-    pub weight_formats: Vec<String>,
-    /// Resolved activation quantization formats on this physical rank.
-    #[serde(default)]
-    pub activation_formats: Vec<String>,
     /// Finalized component membership and logical degrees.
     #[serde(default)]
     pub components: Vec<ComponentInfo>,
@@ -439,28 +409,12 @@ impl WorkerInfo {
         self.kv_cache.is_some()
     }
 
-    /// Validates worker identity, capacity, call, and rank invariants.
+    /// Validates worker identity, capacity, call, and component invariants.
     pub fn validate(&self) -> ValidationResult<()> {
-        // Identity and physical transfer capabilities.
         self.endpoint.validate()?;
-        ensure_valid!(
-            !self.device.is_empty()
-                && !self.transfer_backends.is_empty()
-                && self
-                    .transfer_backends
-                    .iter()
-                    .all(|name| matches!(name.as_str(), "local" | "shm" | "cuda_vmm" | "channel"))
-                && self.transfer_backends.iter().collect::<HashSet<_>>().len()
-                    == self.transfer_backends.len(),
-            "worker physical transfer capabilities are incomplete"
-        );
-        ensure_valid!(
-            self.world_size > 0 && self.endpoint.rank < self.world_size,
-            "worker process rank is outside its world"
-        );
 
-        // Components: unique names and outputs, membership within the world,
-        // and parallel degrees consistent with membership.
+        // Components: unique names and outputs, and parallel degrees
+        // consistent with membership.
         let mut names = HashSet::new();
         for component in &self.components {
             ensure_valid!(
@@ -476,14 +430,7 @@ impl WorkerInfo {
                 );
             }
             let params = &component.config;
-            ensure_valid!(
-                !params.ranks.is_empty()
-                    && params
-                        .ranks
-                        .iter()
-                        .all(|&rank| rank < self.world_size as usize),
-                "component membership is outside the process world"
-            );
+            ensure_valid!(!params.ranks.is_empty(), "component names no member rank");
             ensure_valid!(
                 params.ranks.iter().collect::<HashSet<_>>().len() == params.ranks.len(),
                 "component repeats process ranks"
@@ -590,9 +537,6 @@ impl WorkerInfo {
                 "worker info declare incomplete latent pool capacity"
             );
         }
-
-        // Model identity remains mandatory independently of enabled resources.
-        ensure_valid!(!self.model_name.is_empty(), "worker model name is empty");
         Ok(())
     }
 }
@@ -601,7 +545,6 @@ impl Default for WorkerInfo {
     /// Returns a valid single-rank autoregressive worker description.
     fn default() -> Self {
         Self {
-            model_name: "model".to_owned(),
             media_components: Default::default(),
             num_inference_steps: 0,
             video_denoiser: None,
@@ -613,13 +556,6 @@ impl Default for WorkerInfo {
                 address_space: "simulation".into(),
                 incarnation: "simulation".into(),
             },
-            world_size: 1,
-            device: "cpu".into(),
-            transfer_backends: vec!["local".into()],
-            model_dtype: String::new(),
-            attention_backend: String::new(),
-            weight_formats: Vec::new(),
-            activation_formats: Vec::new(),
             components: Vec::new(),
             supported_calls: vec![
                 CallKind::Forward(ForwardMode::Prefill),
@@ -631,12 +567,10 @@ impl Default for WorkerInfo {
             max_prefill_calls: 0,
             max_decode_calls: 0,
             request_slots: 128,
-            // One full-attention group of 28 layers with 8 BF16 heads of 128:
-            // each 64-token page is one unit of 28 columns of 128 KiB K and V
-            // planes plus one initialization flag per plane.
+            // One full-attention group of 28 layers with 8 BF16 heads of 128,
+            // each 64-token page one unit.
             kv_cache: Some(KvCacheInfo {
                 num_units: 4096,
-                unit_bytes: 28 * 2 * (64 * 8 * 128 * 2 + 1),
                 dtype: KvCacheDtype::BFloat16,
                 groups: vec![KvCacheGroup {
                     kind: Default::default(),

@@ -492,7 +492,6 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
 @torch.inference_mode()
 def test_loaded_worker_warmup_retires_its_request_resources(tmp_path):
     from uniserve.distributed import Communicator
-    from uniserve_worker.bootstrap.components import supported_calls
     from uniserve_worker.worker import Worker
 
     _save_checkpoint(tmp_path)
@@ -516,7 +515,6 @@ def test_loaded_worker_warmup_retires_its_request_resources(tmp_path):
         worker_config=config,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_calls=supported_calls(model),
         queue_depth=2,
         completion_payload_bytes=1 << 16,
     ) as worker:

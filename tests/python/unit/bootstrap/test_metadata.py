@@ -360,12 +360,6 @@ def test_text_worker_reports_exact_cache_capacity(storage):
     assert group.kv_head_offset == 0
     assert group.head_dim == 8
     assert cache.dtype == storage
-    # A unit holds both fields of both layers for a page, with one
-    # initialization flag and, for FP8, one scale per layer and field.
-    payload = 2 * 2 * 2 * 8 * (1 if storage == "float8_e4m3fn" else 2) * 64
-    scales = 2 * 2 * 4 if storage == "float8_e4m3fn" else 0
-    initialization = 2 * 2
-    assert cache.unit_bytes == payload + scales + initialization
 
 
 def test_h3_media_units_follow_each_request_canvas():

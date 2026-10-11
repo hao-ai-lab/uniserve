@@ -39,7 +39,6 @@ REQUIRED_FIELDS = (
     "world_size",
     "components",
     "deployment_components",
-    "supported_calls",
     "transfer_backends",
     "publish_backends",
     "rendezvous_address",
@@ -64,7 +63,6 @@ REQUIRED_FIELDS = (
     "flashinfer_disable_split_kv",
     "load_format",
     "no_model",
-    "allow_stub",
 )
 
 

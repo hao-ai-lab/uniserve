@@ -32,41 +32,6 @@ from uniserve_worker.config.execution import (
     WorkerConfig,
     worker_config_from_namespace,
 )
-from uniserve_worker.protocol.call import (
-    CallKind,
-    ForwardMode,
-    MediaCall,
-    TransferMode,
-)
-
-# These launch selectors assign capabilities to a worker pool. The engine
-# sends the selected group names as one comma-separated ``supported_calls``
-# value. A media selector includes both tracks; submitted call kinds still
-# identify the concrete call.
-SUPPORTED_CALL_GROUPS: dict[str, tuple[CallKind, ...]] = {
-    "ar_extend": (ForwardMode.PREFILL,),
-    "ar_decode": (ForwardMode.DECODE,),
-    "ar_verify": (ForwardMode.VERIFY,),
-    "token_denoising": (ForwardMode.TOKEN_DENOISING,),
-    "encoder_vision": (MediaCall.VISION_ENCODING,),
-    "encoder_latent": (MediaCall.LATENT_ENCODING,),
-    "encoder_text": (MediaCall.TEXT_ENCODING,),
-    "transfer_product": (TransferMode.TENSOR,),
-    "transfer_kv_publish": (TransferMode.KV_PUBLISH,),
-    "transfer_kv_install": (TransferMode.KV_INSTALL,),
-    "diffusion_prepare": (MediaCall.LATENT_PREPARATION,),
-    "diffusion_step": (MediaCall.DENOISING,),
-    "diffusion_finalize": (MediaCall.IMAGE_DECODING, MediaCall.MUXING),
-    "diffusion_decode": (
-        MediaCall.VIDEO_DECODING,
-        MediaCall.AUDIO_DECODING,
-    ),
-    "media_read": (MediaCall.MEDIA_READING,),
-    "media_append": (
-        MediaCall.VIDEO_ENCODING,
-        MediaCall.AUDIO_ENCODING,
-    ),
-}
 
 
 def _positive_degree(name: str, value: object) -> int:
@@ -453,7 +418,6 @@ class WorkerProcessArgs:
     """Aggregates the validated launch configuration for one worker rank."""
 
     worker_id: str
-    supported_calls: frozenset[CallKind]
     ipc: WorkerIpcConfig
     local_rank: int
     distributed_backend: str | None
@@ -485,11 +449,6 @@ class WorkerProcessArgs:
                 a ``WorkerConfig`` invariant.
         """
         role = str(getattr(namespace, "role", "model"))
-        supported_calls = (
-            frozenset()
-            if role == "experts"
-            else _parse_supported_calls(namespace.supported_calls)
-        )
         expert_parallel = _expert_parallel(namespace)
         if role == "experts" and (
             expert_parallel is None
@@ -512,13 +471,8 @@ class WorkerProcessArgs:
 
         _validate_scalars(namespace)
 
-        # ``no_model`` builds the stub model, which serves synthetic outputs;
-        # it is accepted only together with ``allow_stub``.
+        # ``no_model`` builds the stub model, which serves synthetic outputs.
         use_stub_model = bool(namespace.no_model)
-        if use_stub_model and not bool(namespace.allow_stub):
-            raise ValueError(
-                "--no-model loads synthetic outputs and requires --allow-stub"
-            )
         if not use_stub_model and not model_path:
             raise ValueError("--model is required for a model worker")
 
@@ -534,7 +488,6 @@ class WorkerProcessArgs:
 
         return cls(
             worker_id=str(namespace.worker_id),
-            supported_calls=supported_calls,
             ipc=WorkerIpcConfig(
                 registration_address=str(namespace.registration_address),
                 channel_transport=str(namespace.channel_transport),
@@ -684,36 +637,6 @@ def _load_config(namespace: argparse.Namespace) -> IOConfig:
         num_threads=namespace.load_threads,
         checksum_manifest=_optional_path(namespace.checksum_manifest),
     )
-
-
-def _parse_supported_calls(value: object) -> frozenset[CallKind]:
-    """Resolve launch capability selectors to concrete call kinds.
-
-    The capability group names are a worker-side vocabulary that the launching
-    side does not model, so it narrows the set only when it has a reason to.
-    An absent selector therefore means every group this worker implements.
-    """
-    if value is None:
-        value = ",".join(SUPPORTED_CALL_GROUPS)
-
-    names = tuple(
-        part.strip() for part in str(value).split(",") if part.strip()
-    )
-    if not names:
-        raise ValueError("supported calls must list at least one group")
-    try:
-        calls = tuple(
-            call for name in names for call in SUPPORTED_CALL_GROUPS[name]
-        )
-    except KeyError as error:
-        raise ValueError(
-            f"unknown call in supported calls {value!r}"
-        ) from error
-
-    # Groups are disjoint, so a duplicate call means a repeated group name.
-    if len(set(calls)) != len(calls):
-        raise ValueError("supported calls contain duplicate entries")
-    return frozenset(calls)
 
 
 def _parse_mesh(

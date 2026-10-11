@@ -305,13 +305,11 @@ impl WorkerExecutor {
     /// Binds launched worker groups into one executor.
     ///
     /// Fails when the command wake cannot be created, `workers` is empty, a
-    /// worker identity repeats or disagrees with its loaded instance, a group
-    /// was initialized with transfer bindings other than `transfer`, a worker
-    /// reports invalid capabilities, the workers loaded different models or
-    /// checkpoints or expose different outputs for a replicated component, the
-    /// media routing or video codec pairing is refused, a transfer edge names
-    /// an unbound worker or rank, repeats a physical rank pair, or uses a
-    /// mechanism an endpoint did not initialize or that cannot serve the edge's
+    /// worker identity repeats, a group was initialized with transfer
+    /// bindings other than `transfer`, the workers expose different outputs
+    /// for a replicated component, the media routing or video codec pairing
+    /// is refused, a transfer edge names an unbound worker or rank, repeats a
+    /// physical rank pair, or uses a mechanism that cannot serve the edge's
     /// endpoints, or no runtime capacity view can be derived from the workers.
     /// As a side effect every group learns the deployment-wide media routing.
     pub fn try_new(
@@ -331,17 +329,9 @@ impl WorkerExecutor {
                 "WorkerGroup {id} was initialized with different transfer bindings"
             );
             anyhow::ensure!(
-                executor.info().endpoint.worker_id == id.0,
-                "worker binding {id} disagrees with its loaded instance identity"
-            );
-            anyhow::ensure!(
                 routing.insert(id.clone(), index).is_none(),
                 "worker identity {id} is repeated"
             );
-            executor
-                .info()
-                .validate()
-                .with_context(|| format!("worker {id} reported invalid capabilities"))?;
         }
         let mut executor_info = ExecutorInfo::from_workers(
             workers
@@ -385,20 +375,22 @@ impl WorkerExecutor {
                     "transfer edge names an unbound rank"
                 );
             }
-            for source_rank in 0..source.info().world_size {
+            for source_rank in 0..source.world_size() as u32 {
                 if edge.source_rank.is_some_and(|rank| rank != source_rank) {
                     continue;
                 }
+                let source_on_cuda = source.rank_on_cuda(source_rank as usize);
                 let source = source.rank_info(source_rank as usize).with_context(|| {
                     format!("transfer edge source has no rank {source_rank} in its world")
                 })?;
-                for destination_rank in 0..destination.info().world_size {
+                for destination_rank in 0..destination.world_size() as u32 {
                     if edge
                         .destination_rank
                         .is_some_and(|rank| rank != destination_rank)
                     {
                         continue;
                     }
+                    let destination_on_cuda = destination.rank_on_cuda(destination_rank as usize);
                     let destination = destination
                         .rank_info(destination_rank as usize)
                         .with_context(|| {
@@ -412,18 +404,10 @@ impl WorkerExecutor {
                         "physical transfer edge has conflicting bindings"
                     );
                     // An edge carries device products on one mechanism and
-                    // host products on another; both endpoints must have
-                    // initialized each one.
+                    // host products on another. The launch initialized each
+                    // rank with the mechanisms its edges name
+                    // (`TransferConfig::rank_backends`).
                     for mechanism in edge.mechanisms() {
-                        let backend = mechanism.as_str();
-                        anyhow::ensure!(
-                            source.transfer_backends.iter().any(|name| name == backend)
-                                && destination
-                                    .transfer_backends
-                                    .iter()
-                                    .any(|name| name == backend),
-                            "physical edge requires an uninitialized transfer backend {backend}"
-                        );
                         // Each mechanism decides for itself how far it reaches.
                         // An edge it cannot serve would fail on its first
                         // publication, so it is refused here by name instead.
@@ -437,8 +421,7 @@ impl WorkerExecutor {
                             ),
                             crate::executor::TransferBackend::CudaVmm => {
                                 anyhow::ensure!(
-                                    source.device.starts_with("cuda:")
-                                        && destination.device.starts_with("cuda:"),
+                                    source_on_cuda && destination_on_cuda,
                                     "CUDA VMM requires CUDA devices on both endpoints"
                                 );
                                 // A device handle crosses hosts only where the
@@ -482,10 +465,7 @@ impl WorkerExecutor {
         // workers from which it cannot be derived.
         executor_info.runtime_info()?;
 
-        let depth = workers
-            .iter()
-            .map(|worker| worker.1.info().queue_depth.max(1) as usize)
-            .sum();
+        let depth = workers.iter().map(|worker| worker.1.queue_depth()).sum();
         let worker_count = workers.len();
         Ok(Self {
             routing,
@@ -902,11 +882,9 @@ impl WorkerExecutor {
     /// single rank; false otherwise, including when either component of a
     /// pair is not loaded on the worker.
     fn shares_product_storage(&self, producer: &BufferRoute, consumer_entry: &str) -> bool {
-        let entries = &self.workers[producer.worker_index].1.info().components;
-        let source = entries
-            .iter()
-            .find(|entry| entry.name == producer.component);
-        let destination = entries.iter().find(|entry| entry.name == consumer_entry);
+        let (_, entries) = self.workers[producer.worker_index].1.placement();
+        let source = entries.get(&producer.component);
+        let destination = entries.get(consumer_entry);
         if producer.component == consumer_entry {
             // A consumer call on the component that produced the product runs on
             // the same ranks, and each rank reads the copy it holds when every
@@ -919,12 +897,12 @@ impl WorkerExecutor {
             // ranks read the product's publication. Without a description of
             // the component, its ranks are taken to hold their own copies.
             return !producer.declared_output
-                || source.is_none_or(|source| source.config.publishes_on_every_rank());
+                || source.is_none_or(|source| source.publishes_on_every_rank());
         }
         source
             .zip(destination)
             .is_some_and(|(source, destination)| {
-                source.config.ranks.len() == 1 && source.config.ranks == destination.config.ranks
+                source.ranks.len() == 1 && source.ranks == destination.ranks
             })
     }
 
@@ -1582,10 +1560,9 @@ impl Executor for WorkerExecutor {
                         .contains(&variant),
                     "target worker does not support call {variant:?}"
                 );
-                let entries = &self.workers[call_worker].1.info().components;
+                let (_, entries) = self.workers[call_worker].1.placement();
                 anyhow::ensure!(
-                    entries.is_empty()
-                        || entries.iter().any(|binding| binding.name == call.component),
+                    entries.is_empty() || entries.contains_key(&call.component),
                     "call targets unloaded component {}",
                     call.component
                 );

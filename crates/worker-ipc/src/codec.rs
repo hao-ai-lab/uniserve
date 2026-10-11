@@ -1154,32 +1154,12 @@ fn error_call_from_table(call: fbs::ErrorCallIdentity<'_>) -> CodecResult<ErrorC
 
 /// Decodes worker capabilities and validates them with `WorkerInfo::validate`.
 ///
-/// Absent `model_dtype` and `attention_backend` decode as empty strings, and
-/// absent optional vectors as empty. A media call bound more than once is a
-/// malformed frame.
+/// Absent optional vectors decode as empty. A media call bound more than once
+/// is a malformed frame.
 fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
     let info = WorkerInfo {
-        model_name: required_str(info.model_name(), "info.model_name")?,
         endpoint: endpoint_from_table(info.endpoint().context("info has no endpoint")?)?,
-        device: required_str(info.device(), "info.device")?,
         fabric_handles: info.fabric_handles(),
-        transfer_backends: info
-            .transfer_backends()
-            .context("info has no transfer backends")?
-            .iter()
-            .map(str::to_owned)
-            .collect(),
-        world_size: info.world_size(),
-        model_dtype: info.model_dtype().unwrap_or_default().to_owned(),
-        attention_backend: info.attention_backend().unwrap_or_default().to_owned(),
-        weight_formats: info
-            .weight_formats()
-            .map(|values| values.iter().map(str::to_owned).collect())
-            .unwrap_or_default(),
-        activation_formats: info
-            .activation_formats()
-            .map(|values| values.iter().map(str::to_owned).collect())
-            .unwrap_or_default(),
         components: info
             .components()
             .map(|items| {
@@ -1425,15 +1405,13 @@ fn map_from_table(
 }
 
 /// Decodes one KV cache group: its retention kind, page shape, and this
-/// rank's layers and heads. `window` and `sink` are read only for sliding
-/// windows.
+/// rank's layers and heads. `window` is read only for sliding windows.
 fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
     let kind = if group.kind() == fbs::KvGroupKind::Full {
         KvGroupKind::Full
     } else if group.kind() == fbs::KvGroupKind::SlidingWindow {
         KvGroupKind::SlidingWindow {
             window: group.window(),
-            sink: group.sink(),
         }
     } else {
         codec_bail!("unknown KV group kind {}", group.kind().0)
@@ -1539,7 +1517,6 @@ fn token_logprob_from_fb(entry: &fbs::TokenLogprob) -> TokenLogprob {
 fn kv_cache_from_table(config: fbs::KVCacheInfo<'_>) -> CodecResult<KvCacheInfo> {
     Ok(KvCacheInfo {
         num_units: config.num_units(),
-        unit_bytes: config.unit_bytes(),
         groups: config
             .groups()
             .map(|items| {

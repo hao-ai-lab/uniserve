@@ -32,9 +32,7 @@ from uniserve.model import (
     VideoDenoiser,
     VideoPostprocessor,
 )
-from uniserve.nn import Linear
 from uniserve.processing import ImageProcessor
-from uniserve.quantization import QuantizedTensor
 from uniserve.runtime.prefix_cache import Planes
 from uniserve.tensors import BufferConfig
 from uniserve_worker.bootstrap.cache import (
@@ -86,7 +84,7 @@ from uniserve_worker.model_executor.input_buffers import (
     input_buffer_config as call_buffer_config,
 )
 from uniserve_worker.model_executor.resources import media_state_buffers
-from uniserve_worker.protocol.call import CALL_KINDS, CallKind
+from uniserve_worker.protocol.call import CALL_KINDS
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import (
     ComponentInfo,
@@ -157,24 +155,19 @@ def build_worker_layout(
     worker_config: WorkerConfig,
     *,
     image_processor: ImageProcessor | None = None,
-    model_name: str | None = None,
     queue_depth: int = 1,
     completion_payload_bytes: int = 1 << 20,
     endpoint: WorkerEndpoint | None = None,
     capacity_group: Communicator | None = None,
-    allowed_calls: frozenset[CallKind] | None = None,
-    transfer_backends: tuple[str, ...] = ("local",),
     components: tuple[tuple[str, ComponentConfig], ...] = (),
-    attention_backend: str = "",
     bindings: Mapping[str, ComponentBinding] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> WorkerLayout:
     """Resolve resource dimensions and the capacity report used by the worker.
 
     Model dimensions determine storage reservations. Admission additionally
-    obeys the configured call set and every lane's bounds; these
-    restrictions do not shrink the storage needed by warmup and graph
-    capture.
+    obeys every lane's bounds; these restrictions do not shrink the storage
+    needed by warmup and graph capture.
 
     ``state_buffers`` defaults to the media request state derived from
     ``bindings``; a non-empty value, or a ``VideoPostprocessor`` in the model,
@@ -183,8 +176,7 @@ def build_worker_layout(
     count through a collective, so every member must call this.
 
     Raises:
-        WorkerError: ``queue_depth`` is not positive, or the model serves none
-            of ``allowed_calls``.
+        WorkerError: ``queue_depth`` is not positive.
         ValueError: ``completion_payload_bytes`` is not positive, or the KV
             pool does not fit the storage grant. Errors from the sizing
             helpers propagate.
@@ -201,19 +193,7 @@ def build_worker_layout(
         if dedicated
         else supported_calls(model, (name for name, _ in components))
     )
-    if allowed_calls is not None:
-        supported = supported & allowed_calls
 
-    if not supported and not dedicated:
-        raise unsupported_setup(
-            "worker model implements none of the requested call kinds"
-        )
-
-    model_name = (
-        f"{type(model).__module__}.{type(model).__qualname__}"
-        if model_name is None
-        else model_name
-    )
     endpoint = endpoint or WorkerEndpoint.local(rank=int(worker_config.rank))
 
     if state_buffers is None:
@@ -229,7 +209,6 @@ def build_worker_layout(
             worker_config,
             state_buffers=state_buffers,
             bindings=bindings,
-            model_name=model_name,
             queue_depth=queue_depth,
             completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
@@ -239,7 +218,6 @@ def build_worker_layout(
             model,
             worker_config,
             image_processor=image_processor,
-            model_name=model_name,
             queue_depth=queue_depth,
             completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
@@ -259,42 +237,14 @@ def build_worker_layout(
 
     # The per-path layouts report every call and media route the model
     # declares; the fields below narrow them to this placement's held
-    # components and allowed calls.
+    # components.
     outputs = resolve_outputs(model, worker_config)
     held = tuple(name for name, _ in components)
     info = replace(
         layout.info,
-        model_dtype=worker_config.model_dtype,
-        attention_backend=attention_backend
-        or worker_config.attention_backend
-        or "auto",
-        # Loading owns quantization selection. Report actual storage formats,
-        # independently of parameter names and module structure.
-        weight_formats=tuple(
-            sorted(
-                {
-                    value.quantizer.format
-                    if isinstance(value, QuantizedTensor)
-                    else "dense"
-                    for value in model.parameters()
-                }
-            )
-        ),
-        activation_formats=tuple(
-            sorted(
-                {
-                    child.input_quantizer.format
-                    if child.input_quantizer is not None
-                    else "dense"
-                    for child in model.modules()
-                    if isinstance(child, Linear)
-                }
-            )
-        ),
         supported_calls=tuple(code for code in CALL_KINDS if code in supported),
-        # Advertised routing and advertised work describe the same placement,
-        # including a deployment narrowed to a subset of its call kinds: a
-        # call this worker will not accept is a call it does not route.
+        # Advertised routing and advertised work describe the same placement:
+        # a call this worker will not accept is a call it does not route.
         media_components={}
         if dedicated
         else {
@@ -302,7 +252,6 @@ def build_worker_layout(
             for call, component in media_components(model, held).items()
             if call in supported
         },
-        transfer_backends=transfer_backends,
         fabric_handles=_exports_fabric_handles(worker_config.device),
         max_batch_calls=max_calls,
         max_batch_tokens=max_tokens,
@@ -325,7 +274,6 @@ def _token_worker_layout(
     worker_config: WorkerConfig,
     *,
     image_processor: ImageProcessor | None,
-    model_name: str,
     queue_depth: int,
     completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
@@ -350,10 +298,10 @@ def _token_worker_layout(
         else 0
     )
 
-    # A minimal cache description supplies the unit geometry;
-    # ``resize_cache`` attaches the granted unit count at the end. The
-    # minimal pool holds the unit-zero sentinel and one page of the group
-    # whose page spans the most units.
+    # The planned pool supplies the unit size and a minimal cache
+    # description the group geometry; ``resize_cache`` attaches the granted
+    # unit count at the end. The minimal pool holds the unit-zero sentinel
+    # and one page of the group whose page spans the most units.
     text = capability(model, CausalLM)
     owns_kv = text is not None
     planes: Planes | None = None
@@ -365,7 +313,7 @@ def _token_worker_layout(
             worker_config,
             num_units=1 + max(group.units_per_page for group in planes.groups),
         )
-    unit_bytes = 0 if cache is None else cache.unit_bytes
+    unit_bytes = 0 if planes is None else planes.unit_bytes
 
     flow = image_builder(model)
     plan = latent_pool_plan(model, worker_config) if flow is not None else None
@@ -712,9 +660,7 @@ def _token_worker_layout(
         )
     )
     info = WorkerInfo(
-        model_name=model_name,
         endpoint=endpoint,
-        device=str(worker_config.device),
         world_size=int(worker_config.world_size),
         supported_calls=supported,
         queue_depth=int(queue_depth),
@@ -789,7 +735,6 @@ def _request_tensor_worker_layout(
     worker_config: WorkerConfig,
     *,
     state_buffers: Mapping[str, BufferConfig],
-    model_name: str,
     queue_depth: int,
     completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
@@ -812,9 +757,7 @@ def _request_tensor_worker_layout(
     builder = media_builder(model, worker_config)
 
     info = WorkerInfo(
-        model_name=model_name,
         endpoint=endpoint,
-        device=str(worker_config.device),
         world_size=int(worker_config.world_size),
         supported_calls=tuple(
             code for code in CALL_KINDS if code in supported_calls(model)

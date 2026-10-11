@@ -1596,10 +1596,6 @@ fn worker_info_round_trips() {
         };
         let count = config.world_size().unwrap();
         let info = WorkerInfo {
-            world_size: count as u32,
-            model_dtype: "bfloat16".into(),
-            attention_backend: "torch".into(),
-            weight_formats: vec!["dense".into()],
             kv_cache: Some(KvCacheInfo {
                 groups: vec![KvCacheGroup {
                     layer_ids: (11..20).collect(),
@@ -1695,24 +1691,18 @@ fn worker_info_rejects_duplicate_set_members() {
 }
 
 /// A KV pool needs an allocatable unit; every page size must be a power of
-/// two dividing the largest one; a layer belongs to one group; heads stay
-/// within their logical bounds; and a sliding window retains no sink.
+/// two dividing the largest one; a layer belongs to one group; and heads stay
+/// within their logical bounds.
 #[test]
 fn worker_info_rejects_inconsistent_kv_groups() {
     let valid = full_caps();
     assert!(encode_response(&WorkerResponse::info(valid.clone())).is_ok());
-    let cases: [fn(&mut KvCacheInfo); 6] = [
+    let cases: [fn(&mut KvCacheInfo); 5] = [
         |cache| cache.num_units = 1,
         |cache| cache.groups[1].page_tokens = 48,
         |cache| cache.groups[1].layer_ids.push(0),
         |cache| cache.groups[0].layer_ids.clear(),
         |cache| cache.groups[0].kv_head_offset = 1,
-        |cache| {
-            cache.groups[1].kind = KvGroupKind::SlidingWindow {
-                window: 4096,
-                sink: 64,
-            }
-        },
     ];
     for invalidate in cases {
         let mut info = valid.clone();
@@ -1721,18 +1711,16 @@ fn worker_info_rejects_inconsistent_kv_groups() {
     }
 }
 
-/// Stages combine into the narrowest pool with the largest unit and the
-/// union of their layers, and must agree on every group's page shape.
+/// Stages combine into the narrowest pool with the union of their layers,
+/// and must agree on every group's page shape.
 #[test]
 fn kv_stages_merge_into_the_narrowest_pool() {
     let first = full_caps().kv_cache.unwrap();
     let mut second = first.clone();
     second.num_units = 1024;
-    second.unit_bytes = first.unit_bytes * 2;
     second.groups[0].layer_ids = vec![28, 29];
     let merged = first.merge(&second).unwrap();
     assert_eq!(merged.num_units, 1024);
-    assert_eq!(merged.unit_bytes, first.unit_bytes * 2);
     assert_eq!(merged.groups[0].layer_ids.len(), 16);
     assert_eq!(merged.groups[1].layer_ids, first.groups[1].layer_ids);
 
@@ -1959,10 +1947,7 @@ fn full_caps() -> WorkerInfo {
                     ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
                 },
                 KvCacheGroup {
-                    kind: KvGroupKind::SlidingWindow {
-                        window: 4096,
-                        sink: 0,
-                    },
+                    kind: KvGroupKind::SlidingWindow { window: 4096 },
                     page_tokens: 32,
                     units_per_page: 2,
                     layer_ids: (14..28).collect(),
@@ -1975,7 +1960,6 @@ fn full_caps() -> WorkerInfo {
             rank: 1,
             ..WorkerInfo::default().endpoint
         },
-        world_size: 2,
         queue_depth: 2,
         max_batch_calls: 64,
         max_batch_tokens: 4096,
@@ -1985,7 +1969,6 @@ fn full_caps() -> WorkerInfo {
         max_unresolved_calls: 3,
         latent_page_units: 64,
         latent_pages: 17,
-        model_name: "test-model".into(),
         ..WorkerInfo::default()
     }
 }
@@ -2215,25 +2198,6 @@ fn ipc_decode_rejects_malformed_frames() {
     let mut response = encode_response(&WorkerResponse::ok()).unwrap();
     response.truncate(response.len() / 2);
     assert!(decode_response(&response).is_err());
-}
-
-#[test]
-fn a_rank_may_transfer_over_every_mechanism_its_edges_name() {
-    let mut info = WorkerInfo {
-        transfer_backends: vec![
-            "cuda_vmm".to_owned(),
-            "shm".to_owned(),
-            "channel".to_owned(),
-        ],
-        ..WorkerInfo::default()
-    };
-    assert!(info.validate().is_ok());
-
-    // `socket` is not a transfer mechanism name (`local`, `shm`, `cuda_vmm`,
-    // or `channel`).
-    info.transfer_backends = vec!["cuda_vmm".to_owned(), "socket".to_owned()];
-    let error = info.validate().unwrap_err().to_string();
-    assert!(error.contains("transfer capabilities"), "{error}");
 }
 
 #[test]

@@ -34,8 +34,9 @@ from torch import nn
 
 from uniserve.distributed.mesh import Communicator
 from uniserve.model import CausalLM, VideoPostprocessor
+from uniserve.nn import Linear
 from uniserve.processing import FlowPrompt, ImageProcessor
-from uniserve.quantization import Quantizer
+from uniserve.quantization import QuantizedTensor, Quantizer
 from uniserve.runtime import EventPool, PrefixCache
 from uniserve.runtime.device import canonical_device, device_storage_budget
 from uniserve.runtime.process_groups import (
@@ -120,6 +121,39 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _log_numerics(
+    model: nn.Module, config: WorkerConfig, attention: str
+) -> None:
+    """Log the compute dtype, attention provider and storage formats in use.
+
+    Loading chooses the weight and activation formats; they are read from the
+    loaded parameters and from each ``Linear``'s input quantizer, ``dense``
+    where none quantizes, independently of parameter names and module
+    structure.
+    """
+    weights = {
+        value.quantizer.format
+        if isinstance(value, QuantizedTensor)
+        else "dense"
+        for value in model.parameters()
+    }
+    activations = {
+        child.input_quantizer.format
+        if child.input_quantizer is not None
+        else "dense"
+        for child in model.modules()
+        if isinstance(child, Linear)
+    }
+    logger.info(
+        "resolved numerics: %s compute, %s attention, weights %s, "
+        "activations %s",
+        config.model_dtype,
+        attention,
+        ", ".join(sorted(weights)) or "none",
+        ", ".join(sorted(activations)) or "none",
+    )
 
 
 class Worker:
@@ -268,11 +302,9 @@ class Worker:
                 tokenizer=loaded.tokenizer,
                 image_processor=loaded.image_processor,
                 flow_prompt=loaded.flow_prompt,
-                allowed_calls=config.supported_calls,
                 transfer_backends=config.data_plane.backends,
                 publication_backends=config.data_plane.publication_backends,
                 worker_id=config.worker_id,
-                model_name=loaded.model_name,
                 attention_ranks=0
                 if config.expert_parallel is None
                 else config.expert_parallel.attention_ranks,
@@ -301,7 +333,6 @@ class Worker:
         worker_config: WorkerConfig,
         sampling_group: Communicator | None,
         tokenizer: Any | None,
-        allowed_calls: frozenset[CallKind],
         queue_depth: int,
         completion_payload_bytes: int,
         acknowledgment_slot: int = 0,
@@ -316,7 +347,6 @@ class Worker:
         components: tuple[tuple[str, ComponentConfig], ...] = (),
         process_groups: ProcessGroups | None = None,
         bindings: Mapping[str, ComponentBinding] | None = None,
-        model_name: str | None = None,
         attention_ranks: int = 0,
         entry_points=None,
     ) -> None:
@@ -449,11 +479,7 @@ class Worker:
                 bindings=bindings,
                 queue_depth=int(queue_depth),
                 completion_payload_bytes=int(completion_payload_bytes),
-                allowed_calls=allowed_calls,
-                transfer_backends=transfer_backends,
                 components=components,
-                model_name=model_name,
-                attention_backend=runner.attention.name,
                 # The scheduler's page indices address every rank's resident
                 # layer and head regions, including stages with different
                 # storage grants, so a multi-rank token worker's ranks agree
@@ -464,6 +490,7 @@ class Worker:
                     else sampling_group
                 ),
             )
+            _log_numerics(model, worker_config, runner.attention.name)
 
             # Only the token-worker layout reports fixed device bytes; with a
             # KV cache, its primary-device bytes were charged against the KV
