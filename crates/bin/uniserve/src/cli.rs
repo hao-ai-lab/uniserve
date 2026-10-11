@@ -310,6 +310,11 @@ pub(crate) struct SharedRuntimeArgs {
     /// Maximum number of concurrently resident requests.
     #[arg(long = "max-running-requests", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_seqs: Option<usize>,
+    /// Maximum number of requests the scheduler holds waiting, or finished
+    /// with undelivered events; a submission beyond it is rejected as
+    /// overloaded. Unbounded when unset.
+    #[arg(long = "max-queued-requests", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub max_num_waiting: Option<usize>,
     /// Maximum number of prompt tokens processed per request in one prefill step.
     #[arg(long = "chunked-prefill-size", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub long_prefill_threshold: Option<usize>,
@@ -493,6 +498,7 @@ impl SharedRuntimeArgs {
                 .max_num_batched_tokens
                 .unwrap_or(DEFAULT_MAX_NUM_BATCHED_TOKENS),
             max_num_seqs: self.max_num_seqs.unwrap_or(DEFAULT_MAX_NUM_SEQS),
+            max_num_waiting: self.max_num_waiting,
             long_prefill_threshold: self
                 .long_prefill_threshold
                 .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),

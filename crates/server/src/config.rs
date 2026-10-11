@@ -59,6 +59,10 @@ pub struct EngineSettings {
     pub max_num_batched_tokens: usize,
     /// Maximum number of concurrently running requests.
     pub max_num_seqs: usize,
+    /// Most requests the scheduler holds waiting, or finished with
+    /// undelivered events, before it rejects a submission as overloaded;
+    /// `None` queues without bound.
+    pub max_num_waiting: Option<usize>,
     /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
     /// Reuse and retain prompt KV prefixes across requests. Per-request cache
@@ -113,6 +117,7 @@ impl Default for EngineSettings {
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
+            max_num_waiting: None,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
@@ -355,6 +360,10 @@ impl EngineSettings {
             "max_num_batched_tokens must be greater than 0"
         );
         anyhow::ensure!(self.max_num_seqs > 0, "max_num_seqs must be greater than 0");
+        anyhow::ensure!(
+            self.max_num_waiting != Some(0),
+            "max_num_waiting must be greater than 0"
+        );
         anyhow::ensure!(
             self.max_model_len.map(|len| len > 0).unwrap_or(true),
             "max_model_len must be greater than 0"

@@ -178,6 +178,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_batch: config.engine.max_batch,
         max_num_batched_tokens: config.engine.max_num_batched_tokens,
         max_num_seqs: config.engine.max_num_seqs,
+        max_num_waiting: config.engine.max_num_waiting,
         long_prefill_threshold: config.engine.long_prefill_threshold,
         prefix_cache: config.engine.prefix_cache,
         scheduler_policy: config.engine.scheduler_policy,

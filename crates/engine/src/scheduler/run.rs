@@ -225,7 +225,7 @@ impl Scheduler {
             .saturating_mul(max_batch_calls)
             .clamp(1, MAX_INFLIGHT_TRANSFERS);
 
-        config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
+        config.max_num_waiting = config.max_num_waiting.map(|bound| bound.max(1));
 
         // The request pool also holds the rows the runtime keeps outside
         // `max_num_seqs` (`flow_prefix_rows`). `EngineCore::new` launches
@@ -238,7 +238,7 @@ impl Scheduler {
             .saturating_sub(flow_prefix_rows(&info))
             .max(1);
 
-        let requested_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
+        let requested_seqs = config.max_num_seqs.max(1);
         if requested_seqs > main_request_capacity {
             tracing::warn!(
                 requested = requested_seqs,
@@ -341,7 +341,7 @@ impl Scheduler {
 
     /// Caps waiting and terminal-output-retained request state.
     pub fn set_max_num_waiting(&mut self, n: usize) {
-        self.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
+        self.config.max_num_waiting = Some(n.max(1));
     }
 
     /// Returns the executor's aggregate worker capabilities.

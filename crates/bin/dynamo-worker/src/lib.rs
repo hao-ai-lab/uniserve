@@ -250,6 +250,7 @@ impl DynamoFastH3Engine {
                 max_batch: DEFAULT_MAX_BATCH,
                 max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
                 max_num_seqs: self.args.max_running_requests,
+                max_num_waiting: None,
                 long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
                 prefix_cache: true,
                 scheduler_policy: SchedulingPolicy::Fcfs,

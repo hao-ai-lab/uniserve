@@ -118,6 +118,7 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--max-model-len` | The checkpoint's `max_position_embeddings`; 16384 prompt tokens for a MiniMax-H3 pipeline; 8192 when neither exists | Context-length ceiling |
 | `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities prepared at startup |
 | `--max-running-requests` | `128`, clamped to worker capacity | Scheduler active-request bound |
+| `--max-queued-requests` | Unbounded | Requests the scheduler holds waiting or with undelivered events before it rejects a submission as overloaded |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
 | `--page-size` | Chosen by the worker | Base KV page size supported by every cache group's attention readers. |
 | `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |

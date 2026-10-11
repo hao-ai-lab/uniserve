@@ -39,8 +39,6 @@ mod config;
 mod stats;
 pub(crate) mod stats_report;
 
-pub(crate) use config::MAX_NUM_SEQS;
-use config::MAX_NUM_WAITING;
 pub use config::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, SchedulerConfig, SchedulingPolicy,

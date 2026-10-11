@@ -27,7 +27,7 @@ use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS,
 };
-use crate::scheduler::{MAX_FLOW_PREFIX_ROWS, MAX_NUM_SEQS, flow_prefix_rows};
+use crate::scheduler::{MAX_FLOW_PREFIX_ROWS, flow_prefix_rows};
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats, SchedulingPolicy};
 use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
@@ -343,6 +343,10 @@ pub struct EngineConfig {
     /// Maximum number of concurrently running requests. `EngineCore::new`
     /// sizes every worker's request pool from it.
     pub max_num_seqs: usize,
+    /// Most requests, waiting or finished with undelivered events, the
+    /// scheduler holds before it rejects a submission as overloaded; `None`
+    /// queues without bound.
+    pub max_num_waiting: Option<usize>,
     /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
     /// Reuse and retain prompt KV prefixes across requests. Disabling this
@@ -410,6 +414,7 @@ impl EngineConfig {
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
+            max_num_waiting: None,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
@@ -630,7 +635,7 @@ impl EngineCore {
         // scheduler may keep resident, plus the rows a runtime keeps outside
         // that limit. Only the loaded capabilities decide that reserve
         // (`flow_prefix_rows`), so the launch sizes for the largest one.
-        let max_num_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
+        let max_num_seqs = config.max_num_seqs.max(1);
         let max_request_pool_size = u32::try_from(max_num_seqs + MAX_FLOW_PREFIX_ROWS)
             .context("max_num_seqs exceeds the worker request-pool field")?;
 
@@ -790,6 +795,7 @@ impl EngineCore {
                 max_batch: config.max_batch,
                 max_num_batched_tokens: config.max_num_batched_tokens.max(1),
                 max_num_seqs: config.max_num_seqs.max(1),
+                max_num_waiting: config.max_num_waiting,
                 long_prefill_threshold: config.long_prefill_threshold.max(1),
                 policy: config.scheduler_policy,
                 canvas: config.worker_process.canvas_sampling,

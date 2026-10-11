@@ -119,7 +119,11 @@ impl Scheduler {
         // whose events are still undelivered; `enqueue_media` applies the
         // same count.
         let waiting = self.pending_request_count() + self.output.retained_len();
-        if waiting >= self.config.max_num_waiting {
+        if self
+            .config
+            .max_num_waiting
+            .is_some_and(|bound| waiting >= bound)
+        {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
                 kind: RejectionKind::Overloaded,
                 message: "scheduler waiting queue is full".into(),
@@ -476,8 +480,11 @@ impl Scheduler {
             );
             return;
         }
-        if self.waiting.len() + self.waiting_media.len() + self.output.retained_len()
-            >= self.config.max_num_waiting
+        let waiting = self.waiting.len() + self.waiting_media.len() + self.output.retained_len();
+        if self
+            .config
+            .max_num_waiting
+            .is_some_and(|bound| waiting >= bound)
         {
             reject(
                 RejectionKind::Overloaded,
