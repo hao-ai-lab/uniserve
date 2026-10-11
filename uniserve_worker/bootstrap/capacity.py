@@ -313,18 +313,22 @@ def local_product_storage_bytes(
 ) -> int:
     """Size the persistent products this rank backs, from its placement.
 
-    A rank backs every product it produces and every product a consumer it
-    holds reads, each at its complete declared extent. The engine reserves a
-    request's products whole when it admits the request, and the store returns
-    a product's storage only once every reader on this rank has retired it, so
-    a product that streams in rounds of media units is still backed whole: the
-    rounds a consumer has not yet read stay bound while later rounds land.
-    Producers and remote consumers each need the complete logical allocation
-    because disjoint regions may subsequently be imported into it. Alignment
-    follows BufferPool's allocation rules.
+    A rank backs every product of a component it executes and every product a
+    consumer it holds reads, each at its complete declared extent. The engine
+    reserves a request's products whole in the pool of each such rank when it
+    admits the request, and the store returns a product's storage only once
+    every reader on this rank has retired it, so a product that streams in
+    rounds of media units is still backed whole: the rounds a consumer has not
+    yet read stay bound while later rounds land. Producers and remote
+    consumers each need the complete allocation because disjoint regions may
+    subsequently be imported into it. Alignment follows BufferPool's
+    allocation rules.
 
-    A rank produces an entry's products when it is one of the producer's
-    ``output_ranks``. Empty ``bindings`` count every entry's products.
+    A rank executes a component when it is one of its members, whether or
+    not it publishes the component's products: every member is handed a span
+    for each persistent output of the call it executes. Empty ``bindings``
+    count every entry's products. The engine's `MediaStorage` derives the same
+    sets from the component placement.
 
     Returns:
         Bytes of one request's products backed on this rank.
@@ -343,10 +347,7 @@ def local_product_storage_bytes(
     for entry, outputs in entry_outputs.items():
         if bindings:
             producer = bindings.get(entry)
-            produces = (
-                producer is not None
-                and producer.process_group.rank in producer.output_ranks
-            )
+            produces = producer is not None and producer.owns
             consumes = any(
                 consumer in bindings and bindings[consumer].owns
                 for consumer in consumers.get(entry, ())

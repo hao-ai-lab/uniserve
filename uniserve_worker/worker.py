@@ -638,15 +638,11 @@ class Worker:
             )
             startup.callback(self.output_pool.close)
 
-            # A rank that backs only the products it produces or consumes has
-            # a physical arena smaller than the engine's logical pool;
-            # `compact` then places bindings first-fit instead of at the
-            # scheduler's offsets.
+            # The engine places buffers in this rank's own pool, whose bytes
+            # the rank reports in `info.buffer_pool_bytes`.
             self.buffer_pool = BufferPool(
-                byte_capacity=int(layout.physical_buffer_pool_bytes),
+                byte_capacity=int(info.buffer_pool_bytes),
                 devices=owner_devices,
-                compact=layout.physical_buffer_pool_bytes
-                < info.buffer_pool_bytes,
             )
             startup.callback(self.buffer_pool.close)
 

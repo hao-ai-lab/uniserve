@@ -619,9 +619,9 @@ class TensorStore:
         This store rejects repeated or registered identities and missing
         allocations and enforces, for features, the dtype, byte, and device
         limits;
-        `BufferPool.bind` validates and places each allocation, first-fit
-        when the pool is compact. On any failure every binding made by this
-        call is released and no record remains.
+        `BufferPool.bind` validates and places each allocation. On any
+        failure every binding made by this call is released and no record
+        remains.
         """
         keys = tuple(
             _reference_key(reference) for reference, _device in bindings

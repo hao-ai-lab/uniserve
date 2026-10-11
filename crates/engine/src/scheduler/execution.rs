@@ -1336,7 +1336,7 @@ impl Scheduler {
 
         // Place the call, recording the request's residency on the selected
         // worker, then bind each distinct input and output buffer to its
-        // reserved span in that worker's address space.
+        // reserved span in the buffer pool of each rank that backs it.
         let (worker, selected_component) = self
             .placement
             .select_worker(self.executor.as_ref(), &self.info, &call)
@@ -1350,7 +1350,7 @@ impl Scheduler {
             .buffer_inputs()
             .chain(call.buffer_outputs())
             .filter(|product| bound.insert(product.buffer_id()))
-            .map(|product| {
+            .flat_map(|product| {
                 let (component, index, start) = &state.buffer_bindings[&product.buffer_id()];
                 state.allocations.tensors[&(component.clone(), *index)]
                     .bind(product, *start, &worker)

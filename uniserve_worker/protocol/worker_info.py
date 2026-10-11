@@ -238,7 +238,8 @@ class WorkerInfo:
         latent_page_units: Model-defined units stored in one latent page.
         latent_pages: Physical latent pages, including the reserved sentinel
             page that `latent_capacity_units` excludes.
-        buffer_pool_bytes: Persistent buffer-pool capacity in bytes.
+        buffer_pool_bytes: Bytes of the persistent buffer pool this rank
+            backs, which the engine places this rank's buffers in.
         max_unresolved_calls: Maximum unresolved calls per request.
         host_lane_capacity: Concurrent host-lane tasks this rank admits.
         transfer_tickets: Transfer entries this rank's transport holds in

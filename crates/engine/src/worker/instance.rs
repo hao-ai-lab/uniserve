@@ -20,7 +20,7 @@
 //! locally or through the host launchers in `launcher`, before any group
 //! waits for its ranks' endpoint reports and startup capabilities.
 
-use crate::executor::{CallResult, WorkerResult};
+use crate::executor::{CallResult, RankBuffer, WorkerResult};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
@@ -524,17 +524,19 @@ impl WorkerGroup {
         let mut info = workers[0].info().clone();
 
         // A rank's product storage follows the components it holds, which an
-        // asymmetric placement makes rank-specific: a rank that imports a
-        // component's product reserves the whole logical allocation for it,
-        // and a rank that neither produces nor consumes it reserves nothing.
-        // The group reports the smallest, because the engine places work
-        // against one pool per group and must not place more than the
-        // smallest rank can hold.
+        // asymmetric placement makes rank-specific: a rank that executes or
+        // reads a component reserves the whole allocation of its products,
+        // and a rank that does neither reserves nothing. The executor
+        // places media buffers rank by rank from each rank's own report
+        // (`ExecutorInfo::rank_buffer_bytes`). The runtime's shared pool is
+        // one layout every rank holds, so the group reports the smallest
+        // nonzero pool, which no rank that holds products falls short of.
         info.buffer_pool_bytes = workers
             .iter()
             .map(|worker| worker.info().buffer_pool_bytes)
+            .filter(|bytes| *bytes > 0)
             .min()
-            .unwrap_or(info.buffer_pool_bytes);
+            .unwrap_or(0);
 
         refuse_shared_storage_off_head(
             &process_args.host,
@@ -1310,12 +1312,20 @@ impl WorkerGroup {
 /// Restrict a physical invocation to each component's actual members. Request and
 /// storage commands retain group-wide visibility, including on otherwise idle
 /// ranks; they do not create synthetic call completions.
+///
+/// `placed` holds the persistent spans of each rank's own buffer pool; a
+/// rank's projection keeps those of the buffers its calls read and write.
 fn rank_projection(
     batch: &Batch,
     components: &BTreeMap<String, crate::ComponentConfig>,
     rank_count: usize,
+    placed: &[RankBuffer],
     consumer_slots: impl Fn(&uniserve_worker_ipc::Call, &[usize], usize) -> Vec<u32>,
 ) -> anyhow::Result<Vec<(usize, Batch)>> {
+    anyhow::ensure!(
+        batch.buffer_allocations.is_empty(),
+        "a group batch carries no buffer spans; each rank's spans arrive beside it"
+    );
     let members = batch
         .calls
         .iter()
@@ -1432,9 +1442,11 @@ fn rank_projection(
             )
             .map(|product| product.buffer_id())
             .collect::<HashSet<_>>();
-        projection
-            .buffer_allocations
-            .retain(|allocation| buffers.contains(&allocation.buffer));
+        projection.buffer_allocations = placed
+            .iter()
+            .filter(|span| span.rank as usize == rank && buffers.contains(&span.allocation.buffer))
+            .map(|span| span.allocation)
+            .collect();
         if projection.calls.is_empty() && projection.commands.is_empty() {
             continue;
         }
@@ -1832,10 +1844,15 @@ impl WorkerGroup {
     /// `readers` names, for the batch's routed media calls, the worker each
     /// consuming component was routed to; each call's products then name
     /// only those workers' reading ranks (see `media_consumer_slots`).
+    ///
+    /// `buffers` places the batch's persistent buffers in each rank's own
+    /// pool; a rank receives the spans of the buffers its calls read and
+    /// write. The batch itself carries no spans.
     pub fn submit_batch(
         &mut self,
         batch: Batch,
         readers: &CallReaders,
+        buffers: &[RankBuffer],
     ) -> Result<(), BatchSubmitError> {
         if self.closed {
             return Err(BatchSubmitError::Failed(anyhow::anyhow!(
@@ -1860,6 +1877,7 @@ impl WorkerGroup {
             &batch,
             &self.process_args.components,
             self.workers.len(),
+            buffers,
             |call, members, rank| {
                 let routed = readers.get(&(call.request_key, call.call_id));
                 self.consumer_slots(call, routed, members, rank)

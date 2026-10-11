@@ -103,6 +103,7 @@ impl SimExecutor {
     /// Panics if the simulator thread cannot be spawned.
     pub fn new(mut engine: SimEngine) -> Self {
         let info = engine.info().clone();
+        let info_buffer_bytes = info.buffer_pool_bytes;
         let results_on_wait = engine.results_on_wait;
         let depth = engine.queue_depth;
         let placement = PoolPlacement {
@@ -148,6 +149,16 @@ impl SimExecutor {
             workers: vec![(id.clone(), info)],
             ..ExecutorInfo::default()
         };
+        // Every rank the components name backs the simulated pool.
+        let ranks = placement
+            .components
+            .values()
+            .flat_map(|config| config.ranks.iter().copied())
+            .max()
+            .map_or(1, |rank| rank + 1);
+        executor_info
+            .rank_buffer_bytes
+            .insert(id.clone(), vec![info_buffer_bytes; ranks]);
         executor_info.placements.insert(id, placement);
         Self {
             executor_info,

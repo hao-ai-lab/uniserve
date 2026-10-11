@@ -502,12 +502,13 @@ impl Scheduler {
 
     /// Reserves a media request's row and output buffers on every routed worker.
     ///
-    /// Every declared output is reserved in full on every routed worker, not
-    /// only on the worker whose component produces it; spans are sized from
-    /// the shape bound's maximum element count and 256-byte aligned.
+    /// Every declared output is reserved in full in the buffer pool of each
+    /// rank that backs it on each routed worker, not only on the worker whose
+    /// component produces it; spans are sized from the shape bound's maximum
+    /// element count and 256-byte aligned.
     ///
     /// Returns `Ok(None)`, with nothing reserved, when a request row or buffer
-    /// span cannot be allocated on some worker now; `admit_media` then leaves
+    /// span cannot be allocated on some rank now; `admit_media` then leaves
     /// the request at the head of the queue. Returns `Err` when a routed
     /// worker has no media storage, after releasing what was already reserved
     /// on known workers.
@@ -549,12 +550,16 @@ impl Scheduler {
                     reserved.free(&mut self.storage)?;
                     return Err(UnknownMediaWorker(worker.clone()));
                 };
-                let Ok(buffer) = storage.buffers.allocate(request_key, bytes, 256) else {
-                    reserved.tensors.insert((component, index), tensor);
-                    reserved.free(&mut self.storage)?;
-                    return Ok(None);
-                };
-                tensor.allocations.insert(worker.clone(), buffer);
+                for rank in storage.holders(&component).to_vec() {
+                    let Ok(buffer) =
+                        storage.buffers[rank as usize].allocate(request_key, bytes, 256)
+                    else {
+                        reserved.tensors.insert((component, index), tensor);
+                        reserved.free(&mut self.storage)?;
+                        return Ok(None);
+                    };
+                    tensor.allocations.insert((worker.clone(), rank), buffer);
+                }
             }
             reserved.tensors.insert((component, index), tensor);
         }

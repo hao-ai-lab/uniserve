@@ -123,10 +123,6 @@ class WorkerLayout:
             worker. With a KV cache, the primary device's entry is already
             charged against the KV grant; ``Worker.__init__`` checks each
             other CUDA device against its own grant.
-        physical_buffer_pool_bytes: Bytes this rank's ``BufferPool`` backs.
-            On a request-tensor rank that backs only some products it is
-            smaller than ``info.buffer_pool_bytes``, and the worker builds a
-            compact pool.
         planes: The K/V unit pool plan the worker allocates its pool from
             with ``info.kv_cache.num_units`` units; ``None`` without a
             ``CausalLM``.
@@ -140,7 +136,6 @@ class WorkerLayout:
     arena: ArenaCapacity
     input_config: TokenBufferConfig | None
     fixed_device_bytes: tuple[tuple[str, int], ...]
-    physical_buffer_pool_bytes: int
     planes: Planes | None
     latent_pool: LatentPoolPlan | None
 
@@ -616,7 +611,6 @@ def _token_worker_layout(
         arena=arena,
         input_config=input_config,
         fixed_device_bytes=tuple(fixed_bytes.items()),
-        physical_buffer_pool_bytes=buffer_pool_bytes,
         planes=planes,
         latent_pool=plan,
     )
@@ -696,10 +690,10 @@ def _request_tensor_worker_layout(
 ) -> WorkerLayout:
     """Describe request tensors, products, and persistent capacity.
 
-    ``info.buffer_pool_bytes`` covers every product of every resident request
-    and is the logical pool the engine assigns buffer offsets in; the physical
-    pool backs only the products this rank produces or holds a consumer of
-    (``local_product_storage_bytes``).
+    ``info.buffer_pool_bytes`` is the pool this rank backs: the products of
+    every resident request that this rank's components produce or that
+    components it holds read (``local_product_storage_bytes``). The engine
+    places each rank's buffers in that rank's own pool.
     """
     slots = int(worker_config.max_request_pool_size)
     depth = int(queue_depth)
@@ -740,7 +734,13 @@ def _request_tensor_worker_layout(
         latent_page_units=0 if plan is None else plan.page_units,
         latent_pages=0 if plan is None else plan.num_pages,
         buffer_pool_bytes=slots
-        * product_storage_bytes(resolve_outputs(model, worker_config)),
+        * local_product_storage_bytes(
+            resolve_outputs(model, worker_config),
+            bindings=bindings or {},
+            media_components=media_components(
+                model, worker_config.deployment_components
+            ),
+        ),
         max_unresolved_calls=unresolved_window,
         media_components=dict(
             media_components(model, worker_config.deployment_components)
@@ -763,14 +763,6 @@ def _request_tensor_worker_layout(
         fixed_device_bytes=(),
         planes=None,
         latent_pool=plan,
-        physical_buffer_pool_bytes=slots
-        * local_product_storage_bytes(
-            resolve_outputs(model, worker_config),
-            bindings=bindings or {},
-            media_components=media_components(
-                model, worker_config.deployment_components
-            ),
-        ),
     )
 
 

@@ -1117,6 +1117,12 @@ impl Scheduler {
             InflightInput::Generation { image_kv },
             submitted_us.saturating_sub(planned_us),
         );
+        // The runtime's buffer pool is one address space, so every rank of
+        // the worker holds each span at the same offset.
+        let buffers = RankBuffer::on_every_rank(
+            &call_buffers,
+            self.executor.info().rank_count(&worker) as u32,
+        );
         batch.requests.push((
             call,
             RequestPlacement {
@@ -1127,7 +1133,7 @@ impl Scheduler {
                 forward: call_forward,
                 latent,
                 decode: None,
-                buffers: call_buffers,
+                buffers,
                 readers: Default::default(),
             },
         ));

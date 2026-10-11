@@ -470,7 +470,8 @@ pub struct WorkerInfo {
     /// Physical latent pages including the reserved sentinel page, which
     /// [`WorkerInfo::latent_capacity_units`] excludes.
     pub latent_pages: u32,
-    /// Persistent buffer-pool capacity in bytes.
+    /// Bytes of the persistent buffer pool this rank backs, which the engine
+    /// places this rank's buffers in.
     pub buffer_pool_bytes: u64,
     /// Maximum simultaneously retained encoder feature products.
     pub encoder_cache_entries: u32,

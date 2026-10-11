@@ -60,7 +60,7 @@ def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() 
     assert pool.reserved == 0
 
 
-def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
+def test_buffer_pool_binds_each_buffer_at_its_engine_offset() -> None:
     reference = TensorRef(
         request_key=RequestKey(1, 1, 1),
         producer_call_id=CallId(1, 0),
@@ -69,59 +69,53 @@ def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(32),)),
     )
-    second = replace(reference, producer_call_id=CallId(2, 0))
-    third = replace(reference, producer_call_id=CallId(3, 0))
-    buffers = BufferPool(byte_capacity=512, devices=("cpu",), compact=True)
-    first_binding = buffers.bind(
+    neighbour = replace(reference, producer_call_id=CallId(2, 0))
+    beyond = replace(reference, producer_call_id=CallId(3, 0))
+    buffers = BufferPool(byte_capacity=512, devices=("cpu",))
+    first = buffers.bind(
         reference,
-        BufferAllocation(reference.buffer_id, 4096, 512),
+        BufferAllocation(reference.buffer_id, 256, 128),
         device="cpu",
         dtype=torch.float32,
         shape=(32,),
     )
-    second_binding = buffers.bind(
-        second,
-        BufferAllocation(second.buffer_id, 8192, 512),
-        device="cpu",
-        dtype=torch.float32,
-        shape=(32,),
-    )
-    first_binding.tensor.fill_(1)
-    second_binding.tensor.fill_(2)
-
     try:
-        torch.testing.assert_close(
-            first_binding.tensor,
-            torch.full_like(first_binding.tensor, 1),
-            rtol=0,
-            atol=0,
-        )
-        with pytest.raises(WorkerError, match="exceeds the worker buffer pool"):
+        # The binding occupies the engine's span, not a place the pool chose.
+        first.tensor.fill_(1)
+        assert (first.offset, first.bytes) == (256, 128)
+
+        with pytest.raises(WorkerError, match="overlaps a live worker buffer"):
             buffers.bind(
-                third,
-                BufferAllocation(third.buffer_id, 12288, 512),
+                neighbour,
+                BufferAllocation(neighbour.buffer_id, 320, 128),
                 device="cpu",
                 dtype=torch.float32,
                 shape=(32,),
             )
-        buffers.release(first_binding)
-        third_binding = buffers.bind(
-            third,
-            BufferAllocation(third.buffer_id, 12288, 512),
+        with pytest.raises(WorkerError, match="exceeds the worker buffer pool"):
+            buffers.bind(
+                beyond,
+                BufferAllocation(beyond.buffer_id, 448, 128),
+                device="cpu",
+                dtype=torch.float32,
+                shape=(32,),
+            )
+
+        # A span below the live one binds beside it without disturbing it.
+        below = buffers.bind(
+            neighbour,
+            BufferAllocation(neighbour.buffer_id, 0, 128),
             device="cpu",
             dtype=torch.float32,
             shape=(32,),
         )
-        third_binding.tensor.fill_(3)
+        below.tensor.fill_(2)
         torch.testing.assert_close(
-            second_binding.tensor,
-            torch.full_like(second_binding.tensor, 2),
-            rtol=0,
-            atol=0,
+            first.tensor, torch.full_like(first.tensor, 1), rtol=0, atol=0
         )
-        buffers.release(third_binding)
+        buffers.release(below)
     finally:
-        buffers.release(second_binding)
+        buffers.release(first)
         buffers.close()
 
 

@@ -1242,3 +1242,61 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
         events => panic!("the oversized canvas was not refused: {events:?}"),
     }
 }
+
+/// A video worker's ranks each back only the results of the components they
+/// execute and of the components that read them, and the engine places
+/// buffers in each rank's own pool: a rank that holds fewer results packs
+/// them from its own offset zero rather than at the offsets another rank's
+/// larger set implies.
+#[test]
+fn media_buffers_are_placed_in_the_pool_of_each_rank_that_backs_them() {
+    use std::collections::BTreeSet;
+
+    let served = serve(video_worker(3, 1), vec![video_request(1, 4)]);
+    served.assert_completed(RequestId(1));
+
+    // The ranks holding a span of what a call of this kind produces.
+    let ranks = |media_call: MediaCall| {
+        served
+            .calls
+            .iter()
+            .filter(|(call, _)| call.kind == CallKind::Media(media_call))
+            .flat_map(|(call, placement)| {
+                let outputs = call
+                    .buffer_outputs()
+                    .map(|product| product.buffer_id())
+                    .collect::<Vec<_>>();
+                placement
+                    .buffers
+                    .iter()
+                    .filter(move |span| outputs.contains(&span.allocation.buffer))
+            })
+            .map(|span| span.rank)
+            .collect::<BTreeSet<_>>()
+    };
+
+    // The text encoder and its reader, the denoiser, are placed on rank 0
+    // alone, so no other rank backs the encoder's conditioning.
+    assert_eq!(ranks(MediaCall::TextEncoding), BTreeSet::from([0]));
+    // The decoder and the video codec that reads its units run on three ranks.
+    assert_eq!(ranks(MediaCall::VideoDecoding), BTreeSet::from([0, 1, 2]));
+    // The audio decoder and the muxer's audio encoding run on rank 0 alone.
+    assert_eq!(ranks(MediaCall::AudioDecoding), BTreeSet::from([0]));
+
+    // A rank that backs fewer results starts its own pool at zero: rank 2
+    // holds only the decoder's, the codec's and the denoiser's products.
+    for rank in 0..3 {
+        let lowest = served
+            .calls
+            .iter()
+            .flat_map(|(_, placement)| placement.buffers.iter())
+            .filter(|span| span.rank == rank)
+            .map(|span| span.allocation.offset)
+            .min();
+        assert_eq!(
+            lowest,
+            Some(0),
+            "rank {rank} packs from its own offset zero"
+        );
+    }
+}

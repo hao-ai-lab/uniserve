@@ -26,7 +26,8 @@ use std::time::Duration;
 use super::{BatchSubmitError, IncarnationRegistry, WorkerGroup};
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerId, logical_result,
+    RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerId,
+    logical_result,
 };
 use anyhow::Context;
 use uniserve_core::CommandWaker;
@@ -185,8 +186,9 @@ pub struct WorkerExecutor {
     /// call, until the buffer is freed or its request finishes without
     /// retaining it.
     buffer_routes: HashMap<BufferId, BufferRoute>,
-    /// Persistent buffer addresses are local to a physical Worker address space.
-    buffer_allocations: HashMap<(usize, BufferId), BufferAllocation>,
+    /// Persistent buffer addresses are local to the buffer pool of one rank of
+    /// a physical Worker, keyed by worker index, rank, and buffer.
+    buffer_allocations: HashMap<(usize, u32, BufferId), BufferAllocation>,
     /// Every worker that produces or reads a buffer: the targets of its `Free`.
     buffer_workers: HashMap<BufferId, HashSet<usize>>,
     /// Tensor publications returned by producing workers, merged across the
@@ -355,6 +357,17 @@ impl WorkerExecutor {
                         components: components.clone(),
                     },
                 )
+            })
+            .collect();
+        // Each rank reports the buffer bytes it backs.
+        executor_info.rank_buffer_bytes = workers
+            .iter()
+            .map(|(id, worker)| {
+                let bytes = (0..worker.world_size())
+                    .filter_map(|rank| worker.rank_info(rank))
+                    .map(|info| info.buffer_pool_bytes)
+                    .collect();
+                (id.clone(), bytes)
             })
             .collect();
         // The video graph may span workers, so each group learns the whole
@@ -741,7 +754,7 @@ impl WorkerExecutor {
         if lost {
             self.admitted_workers.retain(|(worker, _)| *worker != index);
             self.buffer_allocations
-                .retain(|(worker, _), _| *worker != index);
+                .retain(|(worker, _, _), _| *worker != index);
             for workers in self.buffer_workers.values_mut() {
                 workers.remove(&index);
             }
@@ -992,7 +1005,7 @@ impl WorkerExecutor {
         let collective_seq = self.worker_collective_seqs[worker_index]
             .checked_add(1)
             .context("collective sequence space exhausted")?;
-        let mut wire = ExecutionBatch {
+        let (mut wire, mut rank_buffers) = ExecutionBatch {
             id: batch.id,
             requests: batch.requests.clone(),
             commands,
@@ -1014,28 +1027,38 @@ impl WorkerExecutor {
             }
             // A routed destination may reserve a different address from its
             // producer, and that allocation takes precedence. Without one the
-            // producer's allocation is used.
-            let params = self
-                .buffer_allocations
-                .get(&(worker_index, *dependency))
-                .or_else(|| {
-                    let producer = self.buffer_routes.get(dependency)?;
-                    self.buffer_allocations
-                        .get(&(producer.worker_index, *dependency))
-                })
-                .copied()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "persistent dependency {:?} has no scheduler params",
-                        dependency
-                    )
-                })?;
-            if !wire
-                .buffer_allocations
-                .iter()
-                .any(|existing| existing.buffer == params.buffer)
-            {
-                wire.buffer_allocations.push(params);
+            // producer's allocation is used. Spans are per rank, so each rank
+            // takes its own.
+            let producer = self
+                .buffer_routes
+                .get(dependency)
+                .map(|route| route.worker_index);
+            let held = |worker: usize| {
+                self.buffer_allocations
+                    .iter()
+                    .filter(move |((owner, _, buffer), _)| owner == &worker && buffer == dependency)
+                    .map(|((_, rank, _), allocation)| RankBuffer {
+                        rank: *rank,
+                        allocation: *allocation,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut spans = held(worker_index);
+            if spans.is_empty() {
+                spans = producer.map(held).unwrap_or_default();
+            }
+            anyhow::ensure!(
+                !spans.is_empty(),
+                "persistent dependency {:?} has no scheduler params",
+                dependency
+            );
+            for span in spans {
+                if !rank_buffers.iter().any(|existing| {
+                    existing.rank == span.rank
+                        && existing.allocation.buffer == span.allocation.buffer
+                }) {
+                    rank_buffers.push(span);
+                }
             }
         }
 
@@ -1067,7 +1090,10 @@ impl WorkerExecutor {
                 Some(((call.request_key, call.call_id), readers))
             })
             .collect();
-        match self.workers[worker_index].1.submit_batch(wire, &readers) {
+        match self.workers[worker_index]
+            .1
+            .submit_batch(wire, &readers, &rank_buffers)
+        {
             Ok(()) => {}
             Err(BatchSubmitError::WouldBlock(_)) => return Ok(Dispatch::Deferred),
             Err(BatchSubmitError::Failed(error)) => {
@@ -1460,7 +1486,7 @@ impl WorkerExecutor {
                     BatchCommand::Free { buffer } => {
                         self.buffer_workers.remove(&buffer);
                         self.buffer_allocations
-                            .retain(|(_, identity), _| *identity != buffer);
+                            .retain(|(_, _, identity), _| *identity != buffer);
                         self.buffer_routes.retain(|identity, _| *identity != buffer);
                         self.kv_transfers.remove(&buffer);
                         self.transfer_products
@@ -1491,7 +1517,7 @@ impl WorkerExecutor {
         self.kv_transfers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
         self.buffer_allocations
-            .retain(|(_, buffer), _| buffer.owner != request || retained.contains(buffer));
+            .retain(|(_, _, buffer), _| buffer.owner != request || retained.contains(buffer));
         self.buffer_workers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
     }
@@ -1652,13 +1678,13 @@ impl Executor for WorkerExecutor {
                         .insert(call_worker);
                 }
                 for params in &placement.buffers {
-                    if let Some(existing) = self
-                        .buffer_allocations
-                        .insert((call_worker, params.buffer), *params)
-                    {
+                    if let Some(existing) = self.buffer_allocations.insert(
+                        (call_worker, params.rank, params.allocation.buffer),
+                        params.allocation,
+                    ) {
                         anyhow::ensure!(
-                            existing == *params,
-                            "buffer identity was assigned conflicting worker-local allocations"
+                            existing == params.allocation,
+                            "buffer identity was assigned conflicting rank-local allocations"
                         );
                     }
                 }
@@ -1667,7 +1693,7 @@ impl Executor for WorkerExecutor {
                         placement
                             .buffers
                             .iter()
-                            .any(|params| params.buffer == output.buffer_id()),
+                            .any(|params| params.allocation.buffer == output.buffer_id()),
                         "persistent product {:?} has no scheduler params",
                         output
                     );

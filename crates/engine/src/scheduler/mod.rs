@@ -70,7 +70,7 @@ pub(crate) use crate::executor::{
     BatchResult, ExecutionBatch, Executor, ExecutorSubmitError, RequestPlacement,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -100,7 +100,7 @@ use uniserve_worker_ipc::{
     ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
 
-use crate::executor::WorkerFailure;
+use crate::executor::{RankBuffer, WorkerFailure};
 use crate::scheduler::image_artifact::png_artifact_info;
 use allocation::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,

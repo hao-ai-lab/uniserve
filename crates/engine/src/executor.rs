@@ -36,7 +36,7 @@ use uniserve_worker_ipc::{
 
 mod batch;
 
-pub use batch::{ExecutionBatch, RequestPlacement};
+pub use batch::{ExecutionBatch, RankBuffer, RequestPlacement};
 
 /// What the engine launched one pool with.
 ///
@@ -63,6 +63,14 @@ pub struct ExecutorInfo {
     /// `WorkerExecutor::try_new` and `SimExecutor` fill this from their
     /// launch; `from_workers` leaves it empty.
     pub placements: BTreeMap<WorkerId, PoolPlacement>,
+    /// For each pool, the persistent buffer bytes each rank backs, in rank
+    /// order, as the ranks reported them. A pool absent from the map is one
+    /// rank backing its reported `buffer_pool_bytes`.
+    ///
+    /// Each rank has its own buffer pool, sized to the products of the
+    /// components it executes and the components that read them, so the
+    /// engine places a pool's buffers rank by rank.
+    pub rank_buffer_bytes: BTreeMap<WorkerId, Vec<u64>>,
     /// For each worker that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
@@ -109,6 +117,28 @@ impl ExecutorInfo {
     /// `worker`, or `None` when the pool launched no such component.
     pub fn component_config(&self, worker: &WorkerId, name: &str) -> Option<&ComponentConfig> {
         self.placements.get(worker)?.components.get(name)
+    }
+
+    /// Returns the persistent buffer bytes each rank of `worker` backs, in
+    /// rank order; empty for a pool this info does not hold.
+    pub fn rank_buffer_bytes(&self, worker: &WorkerId) -> Vec<u64> {
+        if let Some(bytes) = self.rank_buffer_bytes.get(worker) {
+            return bytes.clone();
+        }
+        self.workers
+            .iter()
+            .find(|(id, _)| id == worker)
+            .map(|(_, info)| vec![info.buffer_pool_bytes])
+            .unwrap_or_default()
+    }
+
+    /// Returns the number of ranks `worker` launched; one for a pool this
+    /// info does not hold.
+    pub fn rank_count(&self, worker: &WorkerId) -> usize {
+        self.rank_buffer_bytes
+            .get(worker)
+            .map_or(1, Vec::len)
+            .max(1)
     }
 
     /// Returns the batches the pools admit in flight together: the sum of

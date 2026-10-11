@@ -1610,7 +1610,30 @@ impl Batch {
     /// kind and component per batch, allocation tables that match the calls
     /// addressing them, non-overlapping latent pages and buffer spans, and
     /// input products and KV inputs that some call declares.
+    ///
+    /// This is the contract of a batch a worker rank receives, whose buffer
+    /// spans address that rank's pool.
     pub fn validate(&self) -> ValidationResult<()> {
+        self.validate_batch(true)
+    }
+
+    /// Validates a batch before any rank's buffer spans are chosen.
+    ///
+    /// A worker group's ranks each back their own buffer pool, so one batch
+    /// carries no single set of spans. This checks everything
+    /// [`Self::validate`] does except buffer spans, and requires the batch to
+    /// carry none; each rank's projection then passes [`Self::validate`] with
+    /// the spans of that rank's pool.
+    pub fn validate_unplaced(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.buffer_allocations.is_empty(),
+            "an unplaced batch carries no buffer allocations"
+        );
+        self.validate_batch(false)
+    }
+
+    /// Validates the batch, including its buffer spans when `placed`.
+    fn validate_batch(&self, placed: bool) -> ValidationResult<()> {
         // Establish the batch envelope before validating relationships within it.
         ensure_valid!(
             !self.calls.is_empty() || !self.commands.is_empty(),
@@ -1782,42 +1805,44 @@ impl Batch {
             );
         }
 
-        // Persistent buffers use non-overlapping half-open spans and cover every
-        // declared output. `BufferAllocation::validate` has already rejected
-        // an overflowing span end, so the addition below cannot wrap.
-        let mut buffer_ids = HashSet::with_capacity(self.buffer_allocations.len());
-        let mut buffer_spans = self
-            .buffer_allocations
-            .iter()
-            .map(|params| {
-                params.validate()?;
-                ensure_valid!(
-                    buffer_ids.insert(params.buffer),
-                    "batch repeats a buffer params identity"
-                );
-                Ok((params.offset, params.offset + params.bytes))
-            })
-            .collect::<ValidationResult<Vec<_>>>()?;
-        buffer_spans.sort_unstable();
+        if placed {
+            // Persistent buffers use non-overlapping half-open spans and cover every
+            // declared output. `BufferAllocation::validate` has already rejected
+            // an overflowing span end, so the addition below cannot wrap.
+            let mut buffer_ids = HashSet::with_capacity(self.buffer_allocations.len());
+            let mut buffer_spans = self
+                .buffer_allocations
+                .iter()
+                .map(|params| {
+                    params.validate()?;
+                    ensure_valid!(
+                        buffer_ids.insert(params.buffer),
+                        "batch repeats a buffer params identity"
+                    );
+                    Ok((params.offset, params.offset + params.bytes))
+                })
+                .collect::<ValidationResult<Vec<_>>>()?;
+            buffer_spans.sort_unstable();
 
-        ensure_valid!(
-            buffer_spans.windows(2).all(|pair| pair[0].1 <= pair[1].0),
-            "batch buffer allocations overlap"
-        );
+            ensure_valid!(
+                buffer_spans.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+                "batch buffer allocations overlap"
+            );
 
-        for call in &self.calls {
-            for output in call.buffer_outputs() {
-                let params = self
-                    .buffer_allocations
-                    .iter()
-                    .find(|params| params.buffer == output.buffer_id())
-                    .ok_or_else(|| {
-                        invalid_message!("persistent call output has no buffer params")
-                    })?;
-                ensure_valid!(
-                    params.bytes >= output.max_bytes(),
-                    "buffer params is smaller than its declared output"
-                );
+            for call in &self.calls {
+                for output in call.buffer_outputs() {
+                    let params = self
+                        .buffer_allocations
+                        .iter()
+                        .find(|params| params.buffer == output.buffer_id())
+                        .ok_or_else(|| {
+                            invalid_message!("persistent call output has no buffer params")
+                        })?;
+                    ensure_valid!(
+                        params.bytes >= output.max_bytes(),
+                        "buffer params is smaller than its declared output"
+                    );
+                }
             }
         }
 

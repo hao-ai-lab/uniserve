@@ -31,7 +31,7 @@ pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank, Worker
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
     ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, ParallelConfig,
-    PoolPlacement, RequestPlacement, SequenceParallel, TransferBackend, TransferConfig,
+    PoolPlacement, RankBuffer, RequestPlacement, SequenceParallel, TransferBackend, TransferConfig,
     TransferConfigError, TransferEdge, WorkerExecError, WorkerFailure, WorkerId, WorkerResult,
 };
 pub use crate::handle::{

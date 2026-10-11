@@ -110,12 +110,20 @@ impl Scheduler {
                     .any(|kind| matches!(kind, CallKind::Media(_)))
             })
             .map(|(id, worker)| {
+                let pools = executor.info();
+                let no_components = BTreeMap::new();
+                let components = pools
+                    .placements
+                    .get(id)
+                    .map_or(&no_components, |placement| &placement.components);
                 (
                     id.clone(),
-                    MediaStorage {
-                        requests: RequestPool::new(worker.request_slots as usize),
-                        buffers: BufferPool::new(worker.buffer_pool_bytes),
-                    },
+                    MediaStorage::new(
+                        worker.request_slots as usize,
+                        &pools.rank_buffer_bytes(id),
+                        components,
+                        &info.media_components,
+                    ),
                 )
             })
             .collect();
