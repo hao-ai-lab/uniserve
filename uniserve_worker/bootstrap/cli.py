@@ -63,7 +63,6 @@ REQUIRED_FIELDS = (
     "flashinfer_disable_split_kv",
     "load_format",
     "no_model",
-    "allow_stub",
 )
 
 

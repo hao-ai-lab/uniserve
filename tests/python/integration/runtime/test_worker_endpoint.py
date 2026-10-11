@@ -107,7 +107,6 @@ def _stub_config(
         max_batch_calls=2,
         device="cpu",
         no_model=True,
-        allow_stub=True,
         rank=rank,
         local_rank=rank,
         world_size=world_size,

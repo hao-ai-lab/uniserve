@@ -3182,7 +3182,6 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "mesh": null,
     "lane": [],
     "no_model": true,
-    "allow_stub": true,
     "load_format": "auto",
     "download_dir": null,
     "load_threads": null,

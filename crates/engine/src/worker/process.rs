@@ -435,10 +435,7 @@ impl WorkerProcessArgs {
                     .collect::<Vec<_>>()
             ),
         );
-        // The worker refuses `no_model` without `allow_stub`, so a stub
-        // launch states both.
         fields.insert("no_model".into(), json!(self.stub));
-        fields.insert("allow_stub".into(), json!(self.stub));
         fields.insert("load_format".into(), json!(self.load_format));
         fields.insert("download_dir".into(), json!(self.download_dir));
         fields.insert("load_threads".into(), json!(self.load_threads));

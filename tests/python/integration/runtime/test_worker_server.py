@@ -450,7 +450,6 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
         max_batch_tokens=256,
         max_batch_calls=2,
         no_model=True,
-        allow_stub=True,
         kv_token_capacity=4096,
     )
     request = {"kind": "info", "message_id": 1}

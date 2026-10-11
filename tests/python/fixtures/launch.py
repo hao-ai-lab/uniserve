@@ -40,7 +40,6 @@ DEFAULTS: dict[str, Any] = {
     "mesh": None,
     "lane": [],
     "no_model": False,
-    "allow_stub": False,
     "load_format": "auto",
     "download_dir": None,
     "load_threads": None,

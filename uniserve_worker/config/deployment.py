@@ -471,13 +471,8 @@ class WorkerProcessArgs:
 
         _validate_scalars(namespace)
 
-        # ``no_model`` builds the stub model, which serves synthetic outputs;
-        # it is accepted only together with ``allow_stub``.
+        # ``no_model`` builds the stub model, which serves synthetic outputs.
         use_stub_model = bool(namespace.no_model)
-        if use_stub_model and not bool(namespace.allow_stub):
-            raise ValueError(
-                "--no-model loads synthetic outputs and requires --allow-stub"
-            )
         if not use_stub_model and not model_path:
             raise ValueError("--model is required for a model worker")
 
