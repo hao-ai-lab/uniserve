@@ -42,139 +42,6 @@ use crate::serving::video::plan::VisionConfig;
 use crate::serving::video::{ProcessedVideo, VideoService};
 use crate::serving::{Result, ServeError, cache_isolation_key};
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-/// Public API endpoint supported by a resolved model.
-pub enum ServedEndpoint {
-    /// OpenAI-compatible chat-completions endpoint.
-    ChatCompletions,
-    /// OpenAI-compatible image-generations endpoint.
-    ImageGenerations,
-    /// OpenAI-compatible video-generations endpoint.
-    VideoGenerations,
-    /// TypeSafe System One decision-readout endpoint (`POST /v1/systemone`).
-    SystemOne,
-}
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-/// Input or output modality supported by a resolved model.
-pub enum ServedModality {
-    /// Tokenized or decoded text.
-    Text,
-    /// Encoded or generated images.
-    Image,
-    /// Encoded or generated video.
-    Video,
-    /// Encoded or generated audio.
-    Audio,
-}
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-/// Optional serving feature supported by a resolved model.
-pub enum ServedFeature {
-    /// Incremental response streaming.
-    Streaming,
-    /// Token and resource usage reporting.
-    Usage,
-    /// Prompt and generated-token log probabilities.
-    Logprobs,
-    /// Structured reasoning output.
-    Reasoning,
-    /// Structured function-tool calls.
-    ToolCalling,
-    /// Repeated transitions between generated modalities.
-    RepeatedInterleave,
-}
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-/// Sampling control accepted by a resolved model.
-pub enum ServedSamplingControl {
-    /// Deterministic highest-probability sampling.
-    Greedy,
-    /// Temperature scaling.
-    Temperature,
-    /// Top-k candidate truncation.
-    TopK,
-    /// Nucleus candidate truncation.
-    TopP,
-    /// Minimum relative-probability truncation.
-    MinP,
-    /// Multiplicative repetition penalty.
-    RepetitionPenalty,
-    /// Frequency-based repetition penalty.
-    FrequencyPenalty,
-    /// Presence-based repetition penalty.
-    PresencePenalty,
-    /// Per-token additive logit adjustment.
-    LogitBias,
-    /// Explicit token allowlist.
-    AllowedTokenIds,
-    /// Text-sequence denylist.
-    BadWords,
-    /// Minimum generated-token count.
-    MinTokens,
-    /// Candidate log-probability reporting.
-    Logprobs,
-    /// Additional stop-token identifiers.
-    StopTokenIds,
-    /// End-of-sequence stopping policy.
-    Eos,
-    /// Decoded stop strings.
-    StopStrings,
-}
-
-impl ServedSamplingControl {
-    /// Sampling controls supported by token-generating model profiles.
-    ///
-    /// `EngineClient::served_sampling_controls` advertises this full set when the worker
-    /// supports token sampling and no controls otherwise.
-    pub const ALL: [Self; 16] = [
-        Self::Greedy,
-        Self::Temperature,
-        Self::TopK,
-        Self::TopP,
-        Self::MinP,
-        Self::RepetitionPenalty,
-        Self::FrequencyPenalty,
-        Self::PresencePenalty,
-        Self::LogitBias,
-        Self::AllowedTokenIds,
-        Self::BadWords,
-        Self::MinTokens,
-        Self::Logprobs,
-        Self::StopTokenIds,
-        Self::Eos,
-        Self::StopStrings,
-    ];
-}
-
-/// Exact public route declaration for one load-bound model, built by
-/// [`InputProcessor::support`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelSupport {
-    /// Public endpoints served by the model.
-    pub endpoints: Vec<ServedEndpoint>,
-    /// Input modalities accepted by the model.
-    pub input_modalities: Vec<ServedModality>,
-    /// Output modalities produced by the model.
-    pub output_modalities: Vec<ServedModality>,
-    /// Optional serving behaviors implemented by the model path.
-    pub features: Vec<ServedFeature>,
-    /// Sampling controls accepted by the model path.
-    pub sampling_controls: Vec<ServedSamplingControl>,
-}
-
 /// Owns the tokenizer and template resources used to produce final engine inputs.
 /// Runtime capabilities are fixed at construction, before this value is shared.
 ///
@@ -188,7 +55,6 @@ pub struct InputProcessor {
     pub(super) renderer: Option<HfChatRenderer>,
     // Worker-advertised generation features and resource limits.
     pub(super) limits: GenerationLimits,
-    sampling_controls: Vec<ServedSamplingControl>,
     pub(super) parse_reasoning: bool,
     // What the deployment's video denoiser serves; set exactly for MiniMax H3.
     video: Option<VideoService>,
@@ -477,8 +343,6 @@ impl ModelConfig {
 pub struct WorkerCapabilities {
     /// Runtime generation features and resource limits.
     pub limits: GenerationLimits,
-    /// Sampling controls the engine exposes to served requests.
-    pub sampling_controls: Vec<ServedSamplingControl>,
     /// Effective context ceiling after intersecting model and worker limits.
     pub max_model_tokens: u32,
 }
@@ -508,7 +372,6 @@ impl InputProcessor {
     ) -> Result<Self> {
         let WorkerCapabilities {
             limits,
-            sampling_controls,
             max_model_tokens,
         } = worker;
 
@@ -563,7 +426,6 @@ impl InputProcessor {
             tokenizer,
             renderer,
             limits,
-            sampling_controls,
             parse_reasoning,
             video,
             qwen3_tool_calls,
@@ -644,86 +506,25 @@ impl InputProcessor {
         )
     }
 
-    /// Declares the endpoints, modalities, features, and sampling controls this model serves.
-    ///
-    /// Within the server, `validate_generation_features` consults its `features` to refuse
-    /// tool-calling and reasoning requests when the model does not declare those features.
-    pub fn support(&self) -> ModelSupport {
-        if matches!(self.config.parameters, ModelParameters::MiniMaxH3 { .. }) {
-            return ModelSupport {
-                endpoints: vec![ServedEndpoint::VideoGenerations],
-                input_modalities: vec![ServedModality::Text],
-                output_modalities: vec![ServedModality::Video, ServedModality::Audio],
-                features: Vec::new(),
-                sampling_controls: Vec::new(),
-            };
+    /// Returns whether the model parses tool calls from its output.
+    pub fn supports_tool_calling(&self) -> bool {
+        match self.config.parameters {
+            ModelParameters::Qwen3 => self.qwen3_tool_calls,
+            ModelParameters::DiffusionGemma(_) => true,
+            ModelParameters::SenseNova(_)
+            | ModelParameters::Bagel(_)
+            | ModelParameters::MiniMaxH3 { .. } => false,
         }
-        if matches!(self.config.parameters, ModelParameters::DiffusionGemma(_)) {
-            // Block diffusion commits whole denoised canvases, so of the token
-            // sampling controls only the stopping ones apply; temperature,
-            // truncation, penalties, and logprobs have no meaning there.
-            let sampling_controls = self
-                .sampling_controls
-                .iter()
-                .copied()
-                .filter(|control| {
-                    matches!(
-                        control,
-                        ServedSamplingControl::Eos | ServedSamplingControl::StopStrings
-                    )
-                })
-                .collect();
-            return ModelSupport {
-                endpoints: vec![ServedEndpoint::SystemOne, ServedEndpoint::ChatCompletions],
-                input_modalities: vec![ServedModality::Text, ServedModality::Image],
-                output_modalities: vec![ServedModality::Text],
-                features: vec![
-                    ServedFeature::Streaming,
-                    ServedFeature::Usage,
-                    ServedFeature::Reasoning,
-                    ServedFeature::ToolCalling,
-                ],
-                sampling_controls,
-            };
-        }
-        let mut endpoints = vec![ServedEndpoint::ChatCompletions];
-        let mut input_modalities = vec![ServedModality::Text];
-        let mut output_modalities = vec![ServedModality::Text];
-        let sampling_controls = self.sampling_controls.clone();
-        let mut features = vec![ServedFeature::Streaming, ServedFeature::Usage];
-        if sampling_controls.contains(&ServedSamplingControl::Logprobs) {
-            features.push(ServedFeature::Logprobs);
-        }
-        match &self.config.parameters {
-            ModelParameters::Qwen3 => {
-                features.push(ServedFeature::Reasoning);
-                if self.qwen3_tool_calls {
-                    features.push(ServedFeature::ToolCalling);
-                }
-            }
-            ModelParameters::SenseNova(_) => {
-                endpoints.push(ServedEndpoint::ImageGenerations);
-                input_modalities.push(ServedModality::Image);
-                output_modalities.push(ServedModality::Image);
-                features.push(ServedFeature::Reasoning);
-                features.push(ServedFeature::RepeatedInterleave);
-            }
-            ModelParameters::Bagel(_) => {
-                endpoints.push(ServedEndpoint::ImageGenerations);
-                input_modalities.push(ServedModality::Image);
-                output_modalities.push(ServedModality::Image);
-            }
-            ModelParameters::MiniMaxH3 { .. } | ModelParameters::DiffusionGemma(_) => {
-                unreachable!("media and block-diffusion support returned above")
-            }
-        }
-        ModelSupport {
-            endpoints,
-            input_modalities,
-            output_modalities,
-            features,
-            sampling_controls,
-        }
+    }
+
+    /// Returns whether the model produces structured reasoning output.
+    pub fn supports_reasoning(&self) -> bool {
+        matches!(
+            self.config.parameters,
+            ModelParameters::Qwen3
+                | ModelParameters::SenseNova(_)
+                | ModelParameters::DiffusionGemma(_)
+        )
     }
 
     /// Validates the prompt and requested modalities against the loaded model.
@@ -752,7 +553,6 @@ impl InputProcessor {
         if modalities.includes_image() && !self.supports_image_output() {
             return Err(reject("image_output"));
         }
-        let declared = self.support();
         if let PromptInput::Chat(chat) = prompt {
             // Tool definitions, prior assistant tool calls, and tool responses all require a
             // model that parses tool calls.
@@ -767,12 +567,10 @@ impl InputProcessor {
                     crate::serving::chat::ChatMessage::ToolResponse { .. } => true,
                     _ => false,
                 });
-            if uses_tools && !declared.features.contains(&ServedFeature::ToolCalling) {
+            if uses_tools && !self.supports_tool_calling() {
                 return Err(reject("tool_calling"));
             }
-            if chat.chat_options.reasoning_effort.is_some()
-                && !declared.features.contains(&ServedFeature::Reasoning)
-            {
+            if chat.chat_options.reasoning_effort.is_some() && !self.supports_reasoning() {
                 return Err(reject("reasoning"));
             }
         }
@@ -1217,17 +1015,6 @@ impl InputProcessor {
         };
         super::sampling::apply_sampling(&self.tokenizer, sampling, stop, &mut core)?;
 
-        // Logprob requests need `Logprobs` among the served sampling controls, which
-        // `EngineClient::served_sampling_controls` includes only when the worker supports
-        // token sampling.
-        if (stop.logprobs.is_some() || stop.prompt_logprobs.is_some())
-            && !self
-                .sampling_controls
-                .contains(&ServedSamplingControl::Logprobs)
-        {
-            return Err(crate::serving::TokenizeError::UnsupportedLogprobs);
-        }
-
         Ok((core, max_tokens, stop_token_ids))
     }
 }
@@ -1261,10 +1048,7 @@ mod tests {
     use crate::Config;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
     use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
-    use crate::serving::{
-        InputProcessor, ServeRequestId, ServedEndpoint, ServedFeature, ServedModality,
-        ServedSamplingControl, WorkerCapabilities,
-    };
+    use crate::serving::{InputProcessor, ServeRequestId, WorkerCapabilities};
 
     /// Writes a checkpoint laid out as DiffusionGemma publishes it: a root
     /// transformers `config.json` whose `model_type` is `root_model_type`,
@@ -1435,7 +1219,6 @@ mod tests {
                     encoder_cache_entries: u32::MAX,
                     ..Default::default()
                 },
-                sampling_controls: ServedSamplingControl::ALL.to_vec(),
                 max_model_tokens,
             },
             None,
@@ -1454,41 +1237,6 @@ mod tests {
             .unwrap()
             .extend(fields.as_object().unwrap().clone());
         serde_json::from_value(request).unwrap()
-    }
-
-    /// DiffusionGemma declares the System One readout and chat completions,
-    /// with only the stopping controls of token sampling.
-    #[tokio::test]
-    async fn diffusion_gemma_declares_its_endpoints() {
-        let directory = indexed_checkpoint("diffusion_gemma");
-        let processor = diffusion_gemma_processor(&directory, 65_536).await;
-
-        let support = processor.support();
-        assert_eq!(
-            support.endpoints,
-            [ServedEndpoint::SystemOne, ServedEndpoint::ChatCompletions]
-        );
-        assert_eq!(
-            support.input_modalities,
-            [ServedModality::Text, ServedModality::Image]
-        );
-        assert_eq!(support.output_modalities, [ServedModality::Text]);
-        assert_eq!(
-            support.features,
-            [
-                ServedFeature::Streaming,
-                ServedFeature::Usage,
-                ServedFeature::Reasoning,
-                ServedFeature::ToolCalling
-            ]
-        );
-        assert_eq!(
-            support.sampling_controls,
-            [
-                ServedSamplingControl::Eos,
-                ServedSamplingControl::StopStrings
-            ]
-        );
     }
 
     /// A chat request generates its reply in canvases under the checkpoint's

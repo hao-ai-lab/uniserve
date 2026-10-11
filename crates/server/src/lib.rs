@@ -262,7 +262,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         renderer,
         crate::serving::WorkerCapabilities {
             limits: engine.generation_limits(),
-            sampling_controls: engine.served_sampling_controls(),
             max_model_tokens: route_max_model_len,
         },
         video,

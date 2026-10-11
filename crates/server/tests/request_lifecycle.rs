@@ -15,8 +15,7 @@ use uniserve_server::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use uniserve_server::serving::media::{ImageFetchPolicy, ImageFetcher};
 use uniserve_server::serving::{
-    FinishStatus, InputProcessor, RequestOutput, ServedSamplingControl, ServingRuntime, StopCause,
-    TextPromptRequest,
+    FinishStatus, InputProcessor, RequestOutput, ServingRuntime, StopCause, TextPromptRequest,
 };
 
 /// Builds a serving runtime over a default `SimEngine`.
@@ -81,7 +80,6 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRun
         ),
         uniserve_server::serving::WorkerCapabilities {
             limits: client.generation_limits(),
-            sampling_controls: ServedSamplingControl::ALL.to_vec(),
             max_model_tokens: 4096,
         },
         None,

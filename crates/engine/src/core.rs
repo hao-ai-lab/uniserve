@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(feature = "testing", test))]
 use uniserve_worker_ipc::DEFAULT_COMPONENT;
-use uniserve_worker_ipc::{ForwardMode, MediaCall};
+use uniserve_worker_ipc::MediaCall;
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -883,21 +883,6 @@ impl EngineCore {
     /// Returns the generation limits resolved against worker capabilities.
     pub fn generation_limits(&self) -> GenerationLimits {
         self.generation_limits.clone()
-    }
-
-    /// Returns whether the reported capabilities include a decode or verify
-    /// forward; with several WorkerGroups, whether any group serves one.
-    ///
-    /// The server advertises request sampling controls only when this holds
-    /// (`EngineClient::served_sampling_controls`).
-    pub fn supports_token_sampling(&self) -> bool {
-        self.info.supported_calls.iter().any(|mode| {
-            matches!(
-                mode,
-                uniserve_worker_ipc::CallKind::Forward(ForwardMode::Decode)
-                    | uniserve_worker_ipc::CallKind::Forward(ForwardMode::Verify)
-            )
-        })
     }
 
     /// Returns live scheduler statistics shared with the scheduler thread.

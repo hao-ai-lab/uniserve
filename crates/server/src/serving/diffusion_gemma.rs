@@ -275,9 +275,7 @@ mod tests {
     use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
     use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
     use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
-    use crate::serving::{
-        FinishStatus, InputProcessor, RequestOutput, ServedSamplingControl, ServingRuntime,
-    };
+    use crate::serving::{FinishStatus, InputProcessor, RequestOutput, ServingRuntime};
     use futures::StreamExt;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer};
@@ -376,7 +374,6 @@ mod tests {
             ),
             crate::serving::WorkerCapabilities {
                 limits: client.generation_limits(),
-                sampling_controls: ServedSamplingControl::ALL.to_vec(),
                 max_model_tokens: 4096,
             },
             None,

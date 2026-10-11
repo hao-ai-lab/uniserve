@@ -68,8 +68,7 @@ pub use input::{
 pub use media::ImageInput;
 pub(crate) use model::LoadedModel;
 pub use model::{
-    InputProcessor, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ModelSupport, ServedEndpoint,
-    ServedFeature, ServedModality, ServedSamplingControl, VIDEO_FPS, WorkerCapabilities,
+    InputProcessor, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, VIDEO_FPS, WorkerCapabilities,
     validate_video_capacity, video_frame_count,
 };
 pub use preprocessing::chat_image_urls;
@@ -197,9 +196,6 @@ pub enum TokenizeError {
         /// Effective maximum generated-token count.
         max_tokens: u32,
     },
-    /// The selected model path cannot report token log probabilities.
-    #[error("this model does not support logprobs")]
-    UnsupportedLogprobs,
     /// The request contains an invalid combination of serving controls.
     #[error("{0}")]
     Invalid(String),
