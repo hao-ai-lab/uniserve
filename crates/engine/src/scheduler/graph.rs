@@ -3,7 +3,7 @@
 //! Admission builds a [`VideoGraph`] from the request's task and conditions:
 //! which media calls the request runs, the products each one publishes with
 //! their exact leading extents, and which calls read them. A `t2va` request
-//! is text encoding, latent preparation, the denoising ladder, both decoders,
+//! is text encoding, latent preparation, denoising, both decoders,
 //! both encoders and the muxer. A conditioned request first reads its
 //! condition media on a host rank (`MediaReading`), encodes the vision blocks
 //! the presentation names (`VisionEncoding`) ahead of the text encoding that

@@ -109,7 +109,7 @@ def _inputs(schedules, sample, size, steps):
 
 
 def _bind(runner, schedules, size, steps, slot):
-    """Bind a slot's ladder over the runner's samples."""
+    """Bind a slot's steps over the runner's samples."""
     sample = runner.samples.view(-1)[: size.width]
     return runner.bind(
         size,
@@ -180,16 +180,16 @@ def test_denoising_steps_read_the_committed_bank_and_write_the_other(
             try:
                 sample = runner.samples.view(-1)[:width]
                 sample.copy_(reference)
-                ladder = _bind(runner, schedules, size, 2, slot)
-                runner.warmup(ladder)
+                steps = _bind(runner, schedules, size, 2, slot)
+                runner.warmup(steps)
                 torch.testing.assert_close(sample, reference, rtol=0, atol=0)
                 if graphs:
-                    runner.capture(ladder)
+                    runner.capture(steps)
                 bank = 1
                 for step in (0, 1):
                     committed = _committed(pool, bank, slot, size).clone()
                     reference.add_(0.5 * (reference * 0.25 + size.offset))
-                    actual, path = runner.step(ladder, step, bank)
+                    actual, path = runner.step(steps, step, bank)
                     assert path == ("graph_replay" if graphs else "eager")
                     torch.testing.assert_close(
                         actual["image"][0], reference, rtol=1e-6, atol=1e-6
@@ -217,13 +217,13 @@ def test_denoising_steps_read_the_committed_bank_and_write_the_other(
 
 
 @torch.inference_mode()
-def test_captured_ladders_replay_on_every_slot_with_eager_values():
-    """Startup capture leaves one ladder resident that every slot replays.
+def test_captured_steps_replay_on_every_slot_with_eager_values():
+    """Startup capture leaves one graph resident that every slot replays.
 
-    Warmup captures one graph per ladder step from one slot's pages; the
+    Warmup captures one graph per solver step from one slot's pages; the
     graph reads whichever pages the device rows name, so the steps a request
     runs on either slot replay rather than capture, and their values match an
-    eager evaluation of the same ladder from the same samples.
+    eager evaluation of the same steps from the same samples.
     """
     device = torch.device("cuda:0")
     model = LinearDenoiser().to(device)
@@ -232,7 +232,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
     size = Size(32, 2.0)
     slots = (1, 2)
 
-    def ladder(runner, pool):
+    def evaluate(runner, pool):
         values, paths = {}, []
         for slot in slots:
             _committed(pool, 1, slot, size).fill_(7.0)
@@ -248,7 +248,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
     pool = _pool(2, device=device)
     eager = _runner(model, size, device=device, stream=None, pool=pool)
     try:
-        expected, _ = ladder(eager, pool)
+        expected, _ = evaluate(eager, pool)
     finally:
         torch.cuda.current_stream(device).synchronize()
         eager.close()
@@ -275,7 +275,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
             atol=0,
         )
 
-        actual, paths = ladder(runner, pool)
+        actual, paths = evaluate(runner, pool)
         assert paths == ["graph_replay"] * (len(slots) * steps)
         for slot in slots:
             torch.testing.assert_close(

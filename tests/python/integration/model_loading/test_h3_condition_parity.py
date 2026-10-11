@@ -345,7 +345,7 @@ def test_conditioned_request_computes_the_model_first_step(workers, root, case):
     assert diffusion.captures
     schedules = media.open_state(runner, size).schedules
     samples = builder.sample_views(size, diffusion.samples)
-    ladder = diffusion.bind(
+    steps = diffusion.bind(
         layout,
         tuple(
             builder.bind(size, views, samples, schedules, index)
@@ -357,7 +357,7 @@ def test_conditioned_request_computes_the_model_first_step(workers, root, case):
         pages=builder.slot_pages(1),
     )
     first = {name: value.clone() for name, value in initial.items()}
-    result = runner.run_denoising(ladder, 0, 1)
+    result = runner.run_denoising(steps, 0, 1)
     assert result.stats.cuda_graph_runtime_mode_counts == {"eager": 1}
     successor = builder.sample_views(
         size, worker.pool.bank_view(0, builder.slot_pages(1))

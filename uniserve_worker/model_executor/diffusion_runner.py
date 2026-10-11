@@ -1,4 +1,4 @@
-"""Run the Denoiser capability: predictions, solver updates and ladders."""
+"""Run the Denoiser capability: predictions, solver updates and steps."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def restore_samples(inputs: DenoiserInput):
 
 
 @dataclass(frozen=True)
-class Ladder:
+class DenoisingSteps:
     """One request's bound denoising steps over its slot and its pages.
 
     The latents view the runner's samples, which each step fills from the
@@ -61,7 +61,7 @@ class Ladder:
     # The layout every step evaluates, one the runner has prepared.
     layout: Hashable
     # One typed input per solver step; ``inputs[i].step`` views
-    # ``Schedule.step(i)`` of the ladder's schedules.
+    # ``Schedule.step(i)`` of the schedules.
     inputs: tuple[DenoiserInput, ...]
     schedules: Mapping[str, Schedule]
     state: Mapping[str, torch.Tensor]
@@ -79,7 +79,8 @@ class Ladder:
     # (the step index and timesteps among them), in one order for every
     # step; a replay copies the step's tensors into the graph's inputs.
     temporal: tuple[tuple[torch.Tensor, ...], ...]
-    # The runner storage the latents view; a ladder serves only its runner.
+    # The runner storage the latents view; bound steps serve only their
+    # runner.
     samples: torch.Tensor
 
 
@@ -103,13 +104,13 @@ class LayoutEntry:
 
 
 @dataclass
-class LadderBucket(GraphBucket):
+class LayoutBucket(GraphBucket):
     """Slot staging and the captured step of one layout.
 
     ``graphs[None]`` is the layout's captured step, which evaluates every
     solver step: the step index, timesteps and schedules are graph inputs
-    that a replay copies from the ladder's step. ``signature`` is the
-    structure every ladder replaying it must share.
+    that a replay copies from the bound step. ``signature`` is the
+    structure every set of bound steps replaying it must share.
     ``state`` holds one staging view per banked field, and each ``gathers``
     entry pairs a bank's [slots, span] column view with its stage viewed as
     [1, numel], so a graph copies the selected slot's span into the stage.
@@ -141,9 +142,9 @@ class DiffusionRunner(ModelRunner):
       request's samples from its committed pages of the latent pool,
       evaluates the fused prediction, solver update and pipeline feedback on
       them, and scatters the successor to the pages' other bank. ``bind``
-      states a request's ladder over its slot of the request bank and its
-      pages once; ``step`` advances it, replaying the layout's graph when
-      ``capture`` made it resident and evaluating the same call
+      states a request's denoising steps over its slot of the request bank
+      and its pages once; ``step`` advances it, replaying the layout's graph
+      when ``capture`` made it resident and evaluating the same call
       eagerly when the runner does not capture. A captured graph addresses
       the step through a device index and the pages and the slot through
       device indices, so one graph serves every step, slot and request of
@@ -215,13 +216,13 @@ class DiffusionRunner(ModelRunner):
         ``maximum`` is the largest layout the runner will serve: every
         other layout's workspace and state must fit its extents dimension by
         dimension, and ``prepare`` must prepare it first; banked state
-        fits the bank's slot rows. ``pages`` is the
-        pool pages the runner's samples span, which covers the samples of
-        every layout. ``devices`` lists the devices graphs may allocate on;
-        without them, or without a ``stream``, the runner evaluates every
-        step eagerly. Capturing runners borrow ``bank``, the request bank of
-        ``slots`` rows their ladders gather state from. Every runner borrows
-        ``pool``, whose leading pages of a request hold a layout's samples.
+        fits the bank's slot rows. ``pages`` is the pool pages the runner's
+        samples span, which covers the samples of every layout. ``devices``
+        lists the devices graphs may allocate on; without them, or without a
+        ``stream``, the runner evaluates every step eagerly. Capturing
+        runners borrow ``bank``, the request bank of ``slots`` rows their
+        bound steps gather state from. Every runner borrows ``pool``, whose
+        leading pages of a request hold a layout's samples.
         Preparation, the shared storage included, is charged to ``storage``,
         whose budget it must fit; ``prepare`` adds each layout.
         """
@@ -473,10 +474,10 @@ class DiffusionRunner(ModelRunner):
         )
 
     @torch.inference_mode()
-    def warmup(self, ladder: Ladder):
+    def warmup(self, steps: DenoisingSteps):
         """Prepare a layout's kernels, plans and scratch for its steps.
 
-        Runs the ladder's first step eagerly, restores the samples it
+        Runs the bound steps' first step eagerly, restores the samples it
         mutated, and synchronizes the runner's stream (or the device's
         current stream) on CUDA before returning; a layout already warm is
         left as it is. Every step of a layout evaluates the same shapes, so
@@ -491,16 +492,16 @@ class DiffusionRunner(ModelRunner):
             RuntimeError: A graph is already resident and this layout is not
                 warm.
         """
-        if not self.binds(ladder):
-            raise ValueError("the ladder was bound by another runner")
-        context, entry = self.context, self.layout(ladder.layout)
+        if not self.binds(steps):
+            raise ValueError("the steps were bound by another runner")
+        context, entry = self.context, self.layout(steps.layout)
         if entry.warmed:
             return
         if self.buckets:
             raise RuntimeError(
                 "warm every denoiser layout before capturing any"
             )
-        live = ladder.inputs[0]
+        live = steps.inputs[0]
         if context.stream is not None:
             context.stream.wait(torch.cuda.current_stream(self.device))
         # The warm step allocates the context's shared scratch and the
@@ -509,7 +510,7 @@ class DiffusionRunner(ModelRunner):
         with context.activate(), self.graph_storage.allocate(self):
             restore = restore_samples(live)
             try:
-                self._call(entry, live, ladder.schedules, ladder.state)()
+                self._call(entry, live, steps.schedules, steps.state)()
             finally:
                 restore()
         if self.device.type == "cuda":
@@ -520,8 +521,8 @@ class DiffusionRunner(ModelRunner):
 
     def bind(
         self, layout, inputs, schedules, *, state, slot, pages: Sequence[int]
-    ) -> Ladder:
-        """Bind a request's complete ladder to its slot and its pages.
+    ) -> DenoisingSteps:
+        """Bind a request's complete denoising steps to its slot and pages.
 
         ``layout`` is the prepared layout every step evaluates. Every latent
         must view the runner's samples. State field names come from the
@@ -532,14 +533,14 @@ class DiffusionRunner(ModelRunner):
         """
         samples, entry = self.samples, self.layout(layout)
         if samples is None or self.pool is None:
-            raise ValueError("a ladder requires the runner's sample pages")
+            raise ValueError("bound steps require the runner's sample pages")
         if (
             not 1 <= slot <= self.slots
             or not inputs
             or len(pages) < entry.pages
         ):
             raise ValueError(
-                "a ladder requires a valid slot, its layout's pages and "
+                "bound steps require a valid slot, their layout's pages and "
                 "solver steps"
             )
         inputs = tuple(inputs)
@@ -556,9 +557,7 @@ class DiffusionRunner(ModelRunner):
             }
             for index, value in enumerate(inputs)
         ):
-            raise ValueError(
-                "ladder inputs must enumerate solver steps in order"
-            )
+            raise ValueError("step inputs must enumerate solver steps in order")
 
         latents = {
             id(value.tensor): value.tensor
@@ -614,7 +613,7 @@ class DiffusionRunner(ModelRunner):
             )
             for step in inputs
         )
-        return Ladder(
+        return DenoisingSteps(
             layout,
             inputs,
             schedules,
@@ -628,28 +627,28 @@ class DiffusionRunner(ModelRunner):
             samples,
         )
 
-    def binds(self, ladder: Ladder) -> bool:
-        """Whether ``ladder`` was bound over this runner's samples."""
-        return ladder.samples is self.samples and ladder.layout in self.layouts
+    def binds(self, steps: DenoisingSteps) -> bool:
+        """Whether ``steps`` were bound over this runner's samples."""
+        return steps.samples is self.samples and steps.layout in self.layouts
 
-    def _bucket(self, ladder: Ladder) -> LadderBucket:
-        """Return the ladder's layout bucket, creating its staging once.
+    def _bucket(self, steps: DenoisingSteps) -> LayoutBucket:
+        """Return the layout bucket of ``steps``, creating its staging once.
 
         Staging views the runner's shared staging: a replay gathers the
         slot's banked state into it before any read.
         """
-        # This runner stores only ladder buckets, created here.
-        bucket = cast(LadderBucket | None, self.buckets.get(ladder.layout))
+        # This runner stores only layout buckets, created here.
+        bucket = cast(LayoutBucket | None, self.buckets.get(steps.layout))
         if bucket is None:
             staging = cast(TensorBuffers, self._staging)
             stages = staging.view(
                 {
                     name: BufferConfig(shape, self.bank[name].dtype)
-                    for name, (_, shape) in ladder.spans.items()
+                    for name, (_, shape) in steps.spans.items()
                 }
             )
             gathers = []
-            for name, (start, _) in ladder.spans.items():
+            for name, (start, _) in steps.spans.items():
                 stage = stages[name]
                 if stage.numel():
                     rows = self.bank[name].view(self.slots, -1)
@@ -659,15 +658,15 @@ class DiffusionRunner(ModelRunner):
                             stage.view(1, -1),
                         )
                     )
-            bucket = LadderBucket(
-                signature=ladder.signature,
+            bucket = LayoutBucket(
+                signature=steps.signature,
                 state=stages,
                 gathers=tuple(gathers),
             )
-            self.buckets[ladder.layout] = bucket
-        elif bucket.signature != ladder.signature:
+            self.buckets[steps.layout] = bucket
+        elif bucket.signature != steps.signature:
             raise ValueError(
-                "a ladder's structure differs from its layout's captured steps"
+                "the steps' structure differs from their layout's captured step"
             )
         return bucket
 
@@ -727,17 +726,17 @@ class DiffusionRunner(ModelRunner):
         return self._slot_values[slot]
 
     @torch.inference_mode()
-    def capture(self, ladder: Ladder) -> None:
+    def capture(self, steps: DenoisingSteps) -> None:
         """Make the layout's step graph resident without advancing samples.
 
-        The ladder's layout must be warmed (``warmup``). One graph serves
+        The layout of ``steps`` must be warmed (``warmup``). One graph serves
         every solver step, slot and request of the layout: the step index,
         timesteps and schedules are its inputs, which a replay copies from
-        the ladder's step, and it gathers the slot the device slot index
+        the bound step, and it gathers the slot the device slot index
         names and the pages the device rows name, so any request of the
-        layout whose ladder has the same structure replays it. Capture is
+        layout whose steps have the same structure replays it. Capture is
         collective across the component's ranks and belongs to startup,
-        while no request owns the ladder's pages; the owner retains a
+        while no request owns the pages of ``steps``; the owner retains a
         capturing runner for the worker's lifetime and checks the graph
         storage budget once its captures end.
         """
@@ -747,15 +746,15 @@ class DiffusionRunner(ModelRunner):
             raise CUDAGraphError(
                 "denoising capture is outside startup preparation"
             )
-        entry = self.layout(ladder.layout)
+        entry = self.layout(steps.layout)
         if not entry.warmed:
             raise RuntimeError("warm a layout before capturing its steps")
-        bucket = self._bucket(ladder)
+        bucket = self._bucket(steps)
         if None in bucket.graphs:
             return
-        # The first step stands for every step: all of a ladder's steps share
+        # The first step stands for every step: all steps of a request share
         # one structure, and a replay copies its own step's inputs in.
-        live = ladder.inputs[0]
+        live = steps.inputs[0]
         slot_index = cast(torch.Tensor, self._slot_index)
         context = self.context
         if context.stream is not None:
@@ -764,9 +763,9 @@ class DiffusionRunner(ModelRunner):
             # Bank tensors are gathered in the graph. Other numerical
             # tensors, including the step index and timesteps, have
             # graph-owned copies.
-            sources = ladder.temporal[0]
+            sources = steps.temporal[0]
             with self.graph_storage.allocate(self):
-                temporal = clone_inputs((ladder.schedules, sources))
+                temporal = clone_inputs((steps.schedules, sources))
             replacements = {
                 id(value): staged
                 for value, staged in zip(sources, temporal[1], strict=True)
@@ -781,8 +780,8 @@ class DiffusionRunner(ModelRunner):
             stepped = map_tensors(
                 live,
                 lambda value: (
-                    bucket.state[ladder.fields[id(value)]]
-                    if id(value) in ladder.fields
+                    bucket.state[steps.fields[id(value)]]
+                    if id(value) in steps.fields
                     else value
                     if id(value) in samples
                     else replacements[id(value)]
@@ -796,12 +795,10 @@ class DiffusionRunner(ModelRunner):
                 entry.constants,
                 entry.workspace,
             )
-            # Capture addresses the ladder's pages as a fresh trajectory's,
+            # Capture addresses the pages of ``steps`` as a fresh trajectory's,
             # committed in bank one; replay sets the request's own rows.
-            entry.rows.copy_(
-                self._row_value(1, ladder.pages), non_blocking=True
-            )
-            slot_index.copy_(self._slot_value(ladder.slot), non_blocking=True)
+            entry.rows.copy_(self._row_value(1, steps.pages), non_blocking=True)
+            slot_index.copy_(self._slot_value(steps.slot), non_blocking=True)
 
             def compute(_):
                 return self._advance(entry, call, bucket.gathers, slot_index)
@@ -818,7 +815,7 @@ class DiffusionRunner(ModelRunner):
             )
 
     @torch.inference_mode()
-    def step(self, ladder: Ladder, index: int, bank: int):
+    def step(self, steps: DenoisingSteps, index: int, bank: int):
         """Advance a bound step; the worker commits request progress.
 
         ``bank`` holds the request's committed samples; the successor is
@@ -828,15 +825,15 @@ class DiffusionRunner(ModelRunner):
         ``capture`` made resident, and ``"eager"`` for any other layout,
         such as one prepared while serving, or for a runner without graphs.
         """
-        if not self.binds(ladder):
-            raise ValueError("the ladder was bound by another runner")
-        entry = self.layout(ladder.layout)
-        live = ladder.inputs[index]
-        bucket = cast(LadderBucket | None, self.buckets.get(ladder.layout))
+        if not self.binds(steps):
+            raise ValueError("the steps were bound by another runner")
+        entry = self.layout(steps.layout)
+        live = steps.inputs[index]
+        bucket = cast(LayoutBucket | None, self.buckets.get(steps.layout))
         graph = None if bucket is None else bucket.graphs.get(None)
-        if bucket is not None and bucket.signature != ladder.signature:
+        if bucket is not None and bucket.signature != steps.signature:
             raise ValueError(
-                "a ladder's structure differs from its layout's captured steps"
+                "the steps' structure differs from their layout's captured step"
             )
         context = self.context
         stream = context.stream
@@ -845,22 +842,22 @@ class DiffusionRunner(ModelRunner):
         try:
             with context.activate():
                 entry.rows.copy_(
-                    self._row_value(bank, ladder.pages), non_blocking=True
+                    self._row_value(bank, steps.pages), non_blocking=True
                 )
                 if graph is None:
                     return self._advance(
                         entry,
-                        self._call(entry, live, ladder.schedules, ladder.state),
+                        self._call(entry, live, steps.schedules, steps.state),
                     ), "eager"
 
                 # The graph's inputs are the step's schedules and its tensors
-                # other than samples and banked fields (``ladder.temporal``),
+                # other than samples and banked fields (``steps.temporal``),
                 # the step index among them. Replay copies them by PyTree
-                # path, so every step of any ladder of this layout, with its
+                # path, so every step of any request of this layout, with its
                 # own schedule objects, maps onto the same captured inputs.
-                temporal = ladder.schedules, ladder.temporal[index]
+                temporal = steps.schedules, steps.temporal[index]
                 cast(torch.Tensor, self._slot_index).copy_(
-                    self._slot_value(ladder.slot), non_blocking=True
+                    self._slot_value(steps.slot), non_blocking=True
                 )
                 graph.replay(temporal)
             return {

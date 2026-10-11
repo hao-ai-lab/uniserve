@@ -6,10 +6,10 @@ denoising step per call, and video and audio decode rounds. A video decode
 round also converts its media unit to RGB and publishes it as a host product;
 ``uniserve_worker.execution.host_media`` encodes and muxes those products.
 
-Each request keeps a ``DiffusionState`` whose ``SlotLadder`` holds views of
+Each request keeps a ``DiffusionState`` whose ``SlotState`` holds views of
 its request slot (the denoising state: tables, noise draws and retained
 conditioning; or the video overlap state on a video decoding rank) and its
-bound ladder. The solver samples live in the worker's ``LatentPool``:
+bound steps. The solver samples live in the worker's ``LatentPool``:
 preparation writes them to bank one of the request's pages, each step gathers
 the committed bank and writes its successor to the other bank, and the batch
 commit publishes each result through the ``LatentUpdate`` the call leaves on
@@ -39,7 +39,7 @@ from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.diffusion_state import (
     DiffusionState,
-    SlotLadder,
+    SlotState,
 )
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.media.mux import AvMuxConfig
@@ -215,7 +215,7 @@ def decode_audio(
     )
 
 
-def slot_ladder(trajectory: DiffusionState) -> SlotLadder:
+def bound_slot(trajectory: DiffusionState) -> SlotState:
     """Return the slot state of a standalone denoiser's request."""
     if trajectory.slot is None:
         raise invalid_descriptor("video diffusion requires request slot state")
@@ -244,7 +244,7 @@ def prepare_call(
     does not denoise, or when views must be taken and ``storage`` is ``None``;
     errors of ``prepare_module`` and ``component`` propagate.
     """
-    kind, size, slot = call.kind, trajectory.size, slot_ladder(trajectory)
+    kind, size, slot = call.kind, trajectory.size, bound_slot(trajectory)
 
     if kind in {MediaCall.LATENT_PREPARATION, MediaCall.DENOISING}:
         if not runner.denoises:
@@ -352,7 +352,7 @@ def prepare_denoising(
         diffusion = runner.diffusion
         schedules = open_state(runner, builder.maximum).schedules
 
-        def ladder(layout, *, staged):
+        def bound_steps(layout, *, staged):
             # A placeholder request filling the layout's text capacity on
             # slot one. ``storage[0]`` is slot one's tensors; no request
             # owns a slot while this pass runs. Capture records the step
@@ -401,13 +401,13 @@ def prepare_denoising(
         maximum = builder.maximum_layout
         warm = layouts if maximum in layouts else (maximum, *layouts)
         for layout in warm:
-            diffusion.warmup(ladder(layout, staged=True))
+            diffusion.warmup(bound_steps(layout, staged=True))
             runner.graph_storage.check()
         warmed = time.perf_counter()
         if diffusion.captures:
             # One graph per layout evaluates every solver step.
             for layout in layouts:
-                diffusion.capture(ladder(layout, staged=False))
+                diffusion.capture(bound_steps(layout, staged=False))
                 runner.graph_storage.check()
         resident = sum(runner.graph_storage.pool_bytes().values())
         finished = time.perf_counter()
@@ -785,7 +785,7 @@ def begin_noise(
     if runner.noise_draws is None or not runner.state_buffers:
         return
     trajectory = video_state(runner, request)
-    slot = slot_ladder(trajectory)
+    slot = bound_slot(trajectory)
     if "denoising" not in slot.tensors:
         slot.tensors["denoising"] = request_pool.storage.tensors(
             request.request_pool_idx
@@ -878,7 +878,7 @@ def execute(
         # Without a staging future from ``begin_noise``, the seeded draw and
         # the request's tables are staged here on the service thread.
         encoded = conditioning.tensor
-        staging = slot_ladder(trajectory).staging
+        staging = bound_slot(trajectory).staging
         if staging is None:
             builder.stage_request(numerical_shape, slot, seed=media.seed)
         else:
@@ -960,15 +960,15 @@ def execute(
             width=params.width,
         )
 
-        # The ladder is bound over the request's slot views and the
+        # The steps are bound over the request's slot views and the
         # runner's samples once, in the request's capacity layout, and
         # replayed by every later step.
-        slot_state = slot_ladder(trajectory)
+        slot_state = bound_slot(trajectory)
         layout = builder.layout(numerical_shape)
         diffusion = model_runner.diffusion
-        if slot_state.ladder is None or not diffusion.binds(slot_state.ladder):
+        if slot_state.steps is None or not diffusion.binds(slot_state.steps):
             samples = builder.sample_views(numerical_shape, diffusion.samples)
-            slot_state.ladder = diffusion.bind(
+            slot_state.steps = diffusion.bind(
                 layout,
                 tuple(
                     builder.bind(
@@ -986,7 +986,7 @@ def execute(
                 pages=params.page_table,
             )
         result = model_runner.run_denoising(
-            slot_state.ladder, start_step, source
+            slot_state.steps, start_step, source
         )
         if result.stats is None:
             raise RuntimeError("module output has no execution statistics")

@@ -228,7 +228,7 @@ class UniformGrid(FixedGrid):
 
 @dataclass(frozen=True, slots=True)
 class RungGrid(FixedGrid):
-    """A distilled student's trained rungs (a DMD ladder).
+    """A distilled student's trained rungs.
 
     Each rung is an unshifted noise level on a ``num_train_timesteps``-step
     training schedule, strictly decreasing; divided by

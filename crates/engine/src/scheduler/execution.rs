@@ -976,7 +976,7 @@ impl Scheduler {
         let request_key = state.admission.request_key;
         let stateful = work.advances_state();
 
-        // A video request advances its ladder one step per call.
+        // A video request advances one denoising step per call.
         let step = self.scheduled_steps(id, &state.denoising);
         let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step);
         let units = state.graph.condition_units();

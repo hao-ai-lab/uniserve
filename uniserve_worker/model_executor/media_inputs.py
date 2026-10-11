@@ -2,7 +2,7 @@
 
 ``MediaBuilder`` wraps a standalone ``VideoDenoiser`` for serving: it bounds
 admitted sizes, maps each size to the capacity layout whose prepared
-constants and captured ladder it shares, describes a request slot's storage,
+constants and captured steps it shares, describes a request slot's storage,
 and places a request's solver samples in latent pool pages (``SamplePages``).
 """
 
@@ -119,7 +119,7 @@ class MediaBuilder:
     canvas the deployment prepares, each with every frame count the worker
     admits and every text capacity. A request evaluates in the smallest
     capacity layout that holds it (``layout``), so every request of one
-    layout binds the same shapes and replays the same captured ladder, and no
+    layout binds the same shapes and replays the same captured steps, and no
     admitted size needs a layout of its own. What distinguishes the request
     within its layout is state the builder stages with its samples.
 

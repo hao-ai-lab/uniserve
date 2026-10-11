@@ -236,7 +236,7 @@ def test_a_condition_capacity_bounds_each_conditioned_layout():
     A worker serving conditions sizes the slot storage and the layout its
     runner prepares first by its condition capacity; each conditioned
     request takes the smallest text capacity with its own condition tiles,
-    and text-only requests keep the prepared ladder.
+    and text-only requests keep the prepared layout.
     """
     with torch.device("meta"):
         denoiser = Model(base_config()).transformer

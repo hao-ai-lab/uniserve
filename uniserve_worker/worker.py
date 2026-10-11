@@ -611,7 +611,7 @@ class Worker:
                 )
                 startup.callback(self.latent_pool.close)
             if runner.denoises:
-                # Ladders gather a request's tables from its slot and its
+                # Bound steps gather a request's tables from its slot and its
                 # samples from its pages, so runners borrow both owners.
                 assert self.latent_pool is not None
                 runner.bind_diffusion_storage(

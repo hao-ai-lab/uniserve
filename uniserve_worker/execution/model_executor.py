@@ -344,7 +344,7 @@ class ModelExecutor:
         # An expert-only rank's executions, one per microbatch exchange.
         self._expert_executions: tuple[Execution, ...] = ()
         # A standalone denoiser's component, binding and call, the request
-        # bank and latent pool its ladders gather through, and the one
+        # bank and latent pool its bound steps gather through, and the one
         # runner that serves every layout the media builder admits.
         self._denoiser = None
         self.diffusion_bank: Mapping[str, torch.Tensor] = {}
@@ -996,13 +996,13 @@ class ModelExecutor:
 
     @property
     def denoises(self) -> bool:
-        """Whether this rank advances a standalone denoiser's ladders."""
+        """Whether this rank advances a standalone denoiser's bound steps."""
         return self._denoiser is not None
 
     def bind_diffusion_storage(
         self, bank: Mapping[str, torch.Tensor], pool: LatentPool
     ) -> None:
-        """Borrow the storage the standalone denoiser's ladders gather.
+        """Borrow the storage the standalone denoiser's bound steps gather.
 
         The request bank holds each request's state and the latent pool its
         samples. The runner borrows both when it is built, so they are bound
@@ -1122,8 +1122,8 @@ class ModelExecutor:
         serving[layout] = None
         return entry
 
-    def run_denoising(self, ladder, index, bank):
-        """Run one denoising step of a bound ladder and time it.
+    def run_denoising(self, steps, index, bank):
+        """Run one denoising step of bound steps and time it.
 
         ``bank`` holds the request's committed samples; see
         ``DiffusionRunner.step``.
@@ -1134,7 +1134,7 @@ class ModelExecutor:
             f"uniserve.model.denoise rank={self.worker_config.rank} "
             "work=denoiser"
         ):
-            values, path = runner.step(ladder, index, bank)
+            values, path = runner.step(steps, index, bank)
         return replace(
             ModelRunner.result(values),
             stats=_observations("denoiser", started, path),
