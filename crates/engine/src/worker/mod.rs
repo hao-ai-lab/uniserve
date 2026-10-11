@@ -8,9 +8,9 @@
 //! targeted work to the groups of a deployment. `process` owns one rank's
 //! process and IPC channel, `registration` the addresses ranks rendezvous and
 //! report their endpoints at, `launcher` the per-host launchers that start
-//! ranks placed on other hosts, `checkpoint` the checkpoint identity every
-//! rank is checked against, and `death_watch` the Linux watcher that fires a
-//! rank channel's death wake when a rank process this engine spawned exits.
+//! ranks placed on other hosts, and `death_watch` the Linux watcher that
+//! fires a rank channel's death wake when a rank process this engine spawned
+//! exits.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod death_watch;
