@@ -101,6 +101,8 @@ class Buffer:
         wait forever. One launch visits layer-major, then microbatch order on
         every expert rank, matching the attention calls' cooperative order.
         """
+        # FIXME: `mega_moe_m2n_eg` takes a fixed four lane buffers, so the
+        # kernel serves at most four microbatches.
         if not 1 <= len(buffers) <= 4:
             raise ValueError("split MegaMoE serves one to four microbatches")
         if any(

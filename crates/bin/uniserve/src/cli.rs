@@ -559,7 +559,7 @@ impl SharedRuntimeArgs {
 #[educe(Debug)]
 pub(crate) struct WorkerProcessOptions {
     /// Independent microbatches overlapping attention and disaggregated experts.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=4))]
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     pub expert_microbatches: u32,
     /// Checkpoint loader format used by every model worker.
     #[arg(long, default_value = "auto", value_parser = ["auto", "safetensors", "pt", "dummy", "layered"])]

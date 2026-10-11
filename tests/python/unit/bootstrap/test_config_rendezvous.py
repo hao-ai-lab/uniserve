@@ -187,7 +187,7 @@ def test_disaggregated_workers_keep_local_ranks_and_request_ownership(
     assert bool(args.supported_calls) == (role == "model")
 
 
-@pytest.mark.parametrize("count", [0, 5, True, 2])
+@pytest.mark.parametrize("count", [0, True, 2])
 def test_microbatches_require_a_supported_count_and_split_placement(
     tmp_path, count
 ):

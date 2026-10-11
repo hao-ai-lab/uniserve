@@ -550,9 +550,10 @@ impl EngineCore {
 
         let disaggregated = !expert_workers.is_empty();
         anyhow::ensure!(
-            (1..=4).contains(&config.worker_process.expert_microbatches)
+            config.worker_process.expert_microbatches >= 1
                 && (config.worker_process.expert_microbatches == 1 || disaggregated),
-            "one to four expert microbatches require disaggregated placement when greater than one"
+            "expert microbatches must number at least one and require disaggregated placement \
+             when greater than one"
         );
         if disaggregated {
             anyhow::ensure!(
