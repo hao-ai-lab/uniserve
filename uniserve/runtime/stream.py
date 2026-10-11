@@ -70,10 +70,6 @@ class CUDAStream:
         """
         return cls(device=stream.device, stream=stream, event_slots=event_slots)
 
-    @property
-    def full_device(self) -> bool:
-        return self.green is None
-
     def wait(self, producer: torch.cuda.Stream) -> None:
         """Order this stream after a producer.
 

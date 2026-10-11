@@ -93,14 +93,6 @@ class Communicator:
             )
         return self._group
 
-    @property
-    def _backend_name(self) -> str | None:
-        """Expose a non-owning collective identity.
-
-        For tensor-layout metadata.
-        """
-        return None if self.size == 1 else self._require().group_name
-
     def _peer(self, peer: int) -> int:
         if not 0 <= peer < self.size:
             raise ValueError(

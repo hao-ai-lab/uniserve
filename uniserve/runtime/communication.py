@@ -54,8 +54,6 @@ class StreamCollectives(Protocol):
         self, output: torch.Tensor, value: torch.Tensor, dst: int, src: int
     ) -> None: ...
 
-    def close(self) -> None: ...
-
 
 _BOUND_COLLECTIVES: ContextVar[Mapping[str, StreamCollectives] | None] = (
     ContextVar("stream_collectives", default=None)
