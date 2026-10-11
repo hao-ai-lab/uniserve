@@ -416,7 +416,7 @@ impl WorkerExecutor {
         let incarnations = IncarnationRegistry::default();
         for (_, worker) in &mut workers {
             worker.set_media_routing(media_routing.clone());
-            worker.share_ranks(incarnations.clone());
+            worker.share_incarnations(incarnations.clone());
         }
 
         // Every edge expands to the physical (source rank, destination rank)

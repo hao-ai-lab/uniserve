@@ -1060,7 +1060,7 @@ impl TransferConfig {
     /// `destination`: a location survives when the first edge matching its
     /// source and `destination` carries the mechanism it was published on, or,
     /// with no matching edge, when it is a local location on `destination`
-    /// itself. An endpoint's worker and rank are the ones `ranks` holds for
+    /// itself. An endpoint's worker and rank are the ones `incarnations` holds for
     /// its incarnation; a location whose source is not a live incarnation
     /// matches no edge. `WorkerGroup` calls this for each rank's projected
     /// batch.
@@ -1074,18 +1074,18 @@ impl TransferConfig {
     /// tensor keeps its filtered locations.
     pub(crate) fn bind_inputs(
         &self,
-        ranks: &crate::worker::IncarnationRegistry,
+        incarnations: &crate::worker::IncarnationRegistry,
         products: &mut [uniserve_worker_ipc::TensorPublication],
         kv_inputs: &mut [uniserve_worker_ipc::KvTransfer],
         destination: &uniserve_worker_ipc::WorkerEndpoint,
     ) -> Result<(), UnroutableInputs> {
-        let position = ranks.position(destination);
+        let position = incarnations.position(destination);
         let mut unroutable = Vec::new();
         for payload in products.iter_mut() {
             let buffer = payload.product.buffer_id();
             let mut bound = true;
             for tensor in payload.value.tensors_mut() {
-                bound &= self.bind_locations(ranks, tensor, destination, position.as_ref());
+                bound &= self.bind_locations(incarnations, tensor, destination, position.as_ref());
             }
             if !bound {
                 unroutable.push(buffer);
@@ -1094,7 +1094,7 @@ impl TransferConfig {
         for publication in kv_inputs.iter_mut() {
             let mut bound = true;
             for tensor in publication.tensors_mut() {
-                bound &= self.bind_locations(ranks, tensor, destination, position.as_ref());
+                bound &= self.bind_locations(incarnations, tensor, destination, position.as_ref());
             }
             if !bound {
                 unroutable.push(publication.source);
@@ -1116,7 +1116,7 @@ impl TransferConfig {
     /// `bind_inputs` selects them, and reports whether any remain.
     fn bind_locations(
         &self,
-        ranks: &crate::worker::IncarnationRegistry,
+        incarnations: &crate::worker::IncarnationRegistry,
         tensor: &mut uniserve_worker_ipc::TensorTransfer,
         destination: &uniserve_worker_ipc::WorkerEndpoint,
         destination_position: Option<&(WorkerId, u32)>,
@@ -1133,7 +1133,7 @@ impl TransferConfig {
                 TransferTransport::CudaVmm { .. } => TransferBackend::CudaVmm,
                 TransferTransport::Channel { .. } => TransferBackend::Channel,
             };
-            let source = ranks.position(&location.source);
+            let source = incarnations.position(&location.source);
             self.edges
                 .iter()
                 .find(|edge| {
