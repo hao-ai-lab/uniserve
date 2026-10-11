@@ -226,6 +226,17 @@ def service_name(id: str) -> str:
     """
     ...
 
+def call_kinds() -> list[str]:
+    """Return the spelling of every call kind in the schema's order.
+
+    A worker report lists its supported calls in this order.
+    """
+    ...
+
+def state_advancing_calls() -> list[str]:
+    """Return the spelling of every call kind that advances request state."""
+    ...
+
 def product_edges() -> list[tuple[str, str]]:
     """Return each ``(producer, reader)`` pair of media calls whose products
     travel through persistent tensor storage, as the schema's graph states them.

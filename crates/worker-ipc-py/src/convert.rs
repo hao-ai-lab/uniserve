@@ -129,6 +129,12 @@ fn enum_members<const N: usize>(
     values: [&str; N],
 ) -> PyResult<[Py<PyAny>; N]> {
     let class = module.getattr(name)?;
+    if class.len()? != N {
+        return Err(PyValueError::new_err(format!(
+            "the Python enum {name} has {} members and the schema spells {N}",
+            class.len()?
+        )));
+    }
     let mut members: Vec<Py<PyAny>> = Vec::with_capacity(N);
     for value in values {
         members.push(class.call1((value,))?.unbind());
@@ -204,6 +210,10 @@ impl RequestTypes {
         records.insert("TensorTransfer", class(&module, "TensorTransfer")?);
         records.insert("KvGroupTransfer", class(&module, "KvGroupTransfer")?);
         records.insert("KvTransfer", class(&module, "KvTransfer")?);
+
+        // `CallStatus` members travel as their spelling and are never
+        // indexed; a member the schema does not spell is refused here.
+        enum_members(&call, "CallStatus", CallStatus::ALL.map(CallStatus::as_str))?;
         Ok(Self {
             records,
             call: class(&call, "Call")?,
@@ -227,15 +237,9 @@ impl RequestTypes {
             free: class(&batch, "Free")?,
             batch: class(&batch, "Batch")?,
 
-            // The `dtypes` spellings sit at the indices that `dtype` hardcodes
-            // (the Rust discriminant values). `kind` indexes the other three
-            // with `as usize`, which relies on each `ALL` array listing
-            // variants in declaration order.
-            dtypes: enum_members(
-                &tensor,
-                "DType",
-                ["u8", "i32", "i64", "f16", "bf16", "f32", "i16"],
-            )?,
+            // Every table is indexed with `as usize`, which relies on each
+            // `ALL` array listing variants in declaration order.
+            dtypes: enum_members(&tensor, "DType", DType::ALL.map(DType::as_str))?,
             forward_modes: enum_members(
                 &call,
                 "ForwardMode",
@@ -277,16 +281,7 @@ impl RequestTypes {
 
     /// Returns the Python enum member for an element type.
     fn dtype<'py>(&self, py: Python<'py>, dtype: DType) -> Bound<'py, PyAny> {
-        let index = match dtype {
-            DType::U8 => 0,
-            DType::I32 => 1,
-            DType::I64 => 2,
-            DType::F16 => 3,
-            DType::BF16 => 4,
-            DType::F32 => 5,
-            DType::I16 => 6,
-        };
-        self.dtypes[index].bind(py).clone()
+        self.dtypes[dtype as usize].bind(py).clone()
     }
 }
 
@@ -1530,12 +1525,10 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
     // The status is a closed string enum; an unknown spelling rejects the
     // record.
     let status = str_field(dict, intern!(py, "status"))?;
-    let status = match status.to_str().ok()? {
-        "ok" => CallStatus::Ok,
-        "predicated" => CallStatus::Predicated,
-        "error" => CallStatus::Error,
-        _ => return None,
-    };
+    let status = status.to_str().ok()?;
+    let status = CallStatus::ALL
+        .into_iter()
+        .find(|candidate| candidate.as_str() == status)?;
     let error_code = match get(dict, intern!(py, "error_code"))? {
         value if value.is_none() => None,
         value => Some(error_code_of(&value)?),
@@ -1740,16 +1733,10 @@ fn tensor_ref_from_py(value: &Bound<'_, PyAny>) -> Option<TensorRef> {
     let dict = value.cast::<PyDict>().ok()?;
 
     let dtype = str_field(dict, intern!(py, "dtype"))?;
-    let dtype = match dtype.to_str().ok()? {
-        "u8" => DType::U8,
-        "i32" => DType::I32,
-        "i64" => DType::I64,
-        "f16" => DType::F16,
-        "bf16" => DType::BF16,
-        "f32" => DType::F32,
-        "i16" => DType::I16,
-        _ => return None,
-    };
+    let dtype = dtype.to_str().ok()?;
+    let dtype = DType::ALL
+        .into_iter()
+        .find(|candidate| candidate.as_str() == dtype)?;
 
     // Each dimension is `{"kind": "static", "value": extent}` or
     // `{"kind": "device", "value": {"max": bound}}`.

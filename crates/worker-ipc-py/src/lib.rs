@@ -533,6 +533,27 @@ fn service_name(id: &str) -> String {
 }
 
 #[pyfunction]
+/// Returns the spelling of every call kind in the schema's order, the order
+/// of a worker report's supported calls.
+fn call_kinds() -> Vec<&'static str> {
+    uniserve_worker_ipc::CallKind::ALL
+        .into_iter()
+        .map(uniserve_worker_ipc::CallKind::as_str)
+        .collect()
+}
+
+#[pyfunction]
+/// Returns the spelling of every call kind whose successful completion
+/// advances its request's state.
+fn state_advancing_calls() -> Vec<&'static str> {
+    uniserve_worker_ipc::CallKind::ALL
+        .into_iter()
+        .filter(|kind| kind.advances_state())
+        .map(uniserve_worker_ipc::CallKind::as_str)
+        .collect()
+}
+
+#[pyfunction]
 /// Returns each `(producer, reader)` pair of media calls whose products travel
 /// through persistent tensor storage: a reader's inputs the producer declares,
 /// excluding the readers of resident denoiser state.
@@ -605,6 +626,8 @@ fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStreamSignal>()?;
     m.add_class::<PyErrorCode>()?;
     m.add_function(wrap_pyfunction!(service_name, m)?)?;
+    m.add_function(wrap_pyfunction!(call_kinds, m)?)?;
+    m.add_function(wrap_pyfunction!(state_advancing_calls, m)?)?;
     m.add_function(wrap_pyfunction!(product_edges, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_store_u32, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_load_u32, m)?)?;

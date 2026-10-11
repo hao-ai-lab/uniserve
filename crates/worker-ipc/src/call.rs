@@ -123,8 +123,8 @@ pub enum CallKind {
 impl CallKind {
     /// Computations accepted as individual scheduled request items.
     ///
-    /// Mirrored, in the same order, by `CALL_KINDS` in
-    /// `uniserve_worker.protocol.call`; the worker's reports list supported
+    /// The Python worker takes `CALL_KINDS` from this array
+    /// (`uniserve_worker.protocol.call`); the worker's reports list supported
     /// calls in this order.
     pub const ALL: [Self; 19] = [
         Self::Forward(ForwardMode::Prefill),
@@ -150,7 +150,7 @@ impl CallKind {
 
     /// Returns whether a call of this kind advances its request's state.
     ///
-    /// The worker mirrors this set in `uniserve_worker.protocol.call`; its
+    /// The Python worker reads this set through the extension; its
     /// `RequestPool` uses it to choose the call a request's next call follows
     /// and the `Ok` results that move the request's `state_call_id`.
     pub const fn advances_state(self) -> bool {
@@ -724,6 +724,20 @@ pub enum CallStatus {
     Predicated = 1,
     /// Execution failed with a deterministic error code.
     Error = 2,
+}
+
+impl CallStatus {
+    /// Every status in declaration order, which is its discriminant.
+    pub const ALL: [Self; 3] = [Self::Ok, Self::Predicated, Self::Error];
+
+    /// Returns the spelling the Python worker's `CallStatus` members carry.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Predicated => "predicated",
+            Self::Error => "error",
+        }
+    }
 }
 
 /// The failure classes of a worker, carried by a call's completion and by an

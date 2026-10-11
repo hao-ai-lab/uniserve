@@ -21,6 +21,7 @@ from enum import StrEnum
 from typing import TypeAlias
 
 from uniserve.model import DEFAULT_COMPONENT
+from uniserve_worker import _uniserve_ipc as _ipc
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import identity, tensor
 
@@ -68,12 +69,14 @@ class TransferMode(StrEnum):
 
 CallKind: TypeAlias = ForwardMode | MediaCall | TransferMode
 
-# Every call kind a worker may execute, in the order of the Rust
-# `CallKind::ALL`. Worker reports list supported calls in this order.
-CALL_KINDS: tuple[CallKind, ...] = (
-    *ForwardMode,
-    *MediaCall,
-    *TransferMode,
+_COMPUTATION_BY_VALUE: dict[str, CallKind] = {
+    member.value: member for member in (*ForwardMode, *MediaCall, *TransferMode)
+}
+
+# Every call kind a worker may execute, in the schema's order, which the
+# extension states. Worker reports list supported calls in this order.
+CALL_KINDS: tuple[CallKind, ...] = tuple(
+    _COMPUTATION_BY_VALUE[value] for value in _ipc.call_kinds()
 )
 
 
@@ -122,14 +125,8 @@ class CallStatus(StrEnum):
 # join the chain), and `RequestPool.apply_result` moves the request's
 # `state_call_id` only on an OK result of one of these.
 _STATE_ADVANCING_WORK = frozenset(
-    {
-        *ForwardMode,
-        MediaCall.LATENT_PREPARATION,
-        MediaCall.DENOISING,
-    }
+    _COMPUTATION_BY_VALUE[value] for value in _ipc.state_advancing_calls()
 )
-
-_COMPUTATION_BY_VALUE = {member.value: member for member in CALL_KINDS}
 
 
 @dataclass(frozen=True, slots=True)
