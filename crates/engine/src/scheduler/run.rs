@@ -247,11 +247,11 @@ impl Scheduler {
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
 
         // The request pool also holds the rows the runtime keeps outside
-        // `max_num_seqs` (`flow_prefix_rows`); `set_max_num_seqs` applies the
-        // same reserve. `EngineCore::new` launches workers with enough rows
-        // and refuses a token runtime whose workers hold fewer, so this clamp
-        // lowers the limit only for a supplied executor or for workers that
-        // fit their request pools to device storage.
+        // `max_num_seqs` (`flow_prefix_rows`). `EngineCore::new` launches
+        // workers with enough rows and refuses a token runtime whose workers
+        // hold fewer, so this clamp lowers the limit only for a supplied
+        // executor or for workers that fit their request pools to device
+        // storage.
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
             .saturating_sub(flow_prefix_rows(&info))
@@ -322,11 +322,6 @@ impl Scheduler {
         })
     }
 
-    /// Returns the active scheduling policy.
-    pub fn policy(&self) -> SchedulingPolicy {
-        self.config.policy
-    }
-
     /// Returns the effective scheduler configuration.
     pub fn config(&self) -> &SchedulerConfig {
         &self.config
@@ -339,13 +334,6 @@ impl Scheduler {
         }
     }
 
-    /// Selects the hash algorithm used for prefix-cache keys.
-    pub fn set_hash_algo(&mut self, algo: HashAlgo) {
-        if let Some(cache) = self.storage.cache.as_mut() {
-            cache.set_hash_algo(algo);
-        }
-    }
-
     /// Configures the per-step token budget.
     pub fn set_token_budget(&mut self, tokens: usize) {
         self.config.max_num_batched_tokens = tokens.max(1);
@@ -354,19 +342,6 @@ impl Scheduler {
     /// Sets the token threshold above which prefill is chunked.
     pub fn set_long_prefill_threshold(&mut self, n: usize) {
         self.config.long_prefill_threshold = n.max(1);
-    }
-
-    /// Sets the resident sequence limit within the worker slot capacity.
-    ///
-    /// Keeps the flow-prefix slot reserve applied at construction.
-    pub fn set_max_num_seqs(&mut self, n: usize) {
-        let capacity = self
-            .storage
-            .request_pool
-            .capacity()
-            .saturating_sub(flow_prefix_rows(&self.info))
-            .max(1);
-        self.config.max_num_seqs = n.clamp(1, capacity);
     }
 
     /// Caps waiting and terminal-output-retained request state.

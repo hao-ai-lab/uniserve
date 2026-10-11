@@ -93,8 +93,8 @@ use uniserve_core::{
     ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest, MediaKind,
     PositionLogprobs, Request, SharedMedia, TokenLogprob,
 };
-use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
 use uniserve_core::{ImageIngestStep, RejectionKind, UnitId, encoder_cache_key};
+use uniserve_core::{RequestId, RuntimeFamily};
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,

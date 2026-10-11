@@ -979,22 +979,6 @@ impl KvCacheGroup {
     }
 }
 
-/// Algorithm used to derive prefix-cache block keys.
-///
-/// The engine's `block_hash` chains each page's key through its parent's key
-/// with either algorithm. FNV-1a is a non-cryptographic hash, while SHA-256
-/// is a cryptographic digest truncated to the cache's 64-bit key space. Both
-/// keys can collide, so a prefix hit also compares the page's tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum HashAlgo {
-    /// 64-bit FNV-1a hashing.
-    #[default]
-    Fnv1a,
-    /// SHA-256 truncated to the cache's 64-bit key space.
-    Sha256,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
