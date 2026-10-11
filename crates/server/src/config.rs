@@ -117,7 +117,7 @@ impl Default for EngineSettings {
             prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
-            max_video_seconds: 15.0,
+            max_video_seconds: crate::serving::MAX_VIDEO_SECONDS,
             video_resolutions: crate::profile::video::VideoRasters::default()
                 .resolutions()
                 .to_vec(),

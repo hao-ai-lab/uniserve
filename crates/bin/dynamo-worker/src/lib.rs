@@ -48,7 +48,10 @@ use uniserve_server::{
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
     profile::omni::resolution::ResolutionName,
     profile::video::{VideoRasters, VideoResolution},
-    serving::{FinishStatus, RequestOutput, ServeRequestId, VIDEO_FPS, video_frame_count},
+    serving::{
+        FinishStatus, MAX_VIDEO_SECONDS, RequestOutput, ServeRequestId, VIDEO_FPS,
+        video_frame_count,
+    },
 };
 
 // The served canvases come from `--video-resolutions` and
@@ -94,7 +97,7 @@ struct Args {
     #[arg(long, default_value_t = 16_384, value_parser = clap::value_parser!(u32).range(1..))]
     max_model_len: u32,
 
-    #[arg(long, default_value_t = 15.0)]
+    #[arg(long, default_value_t = MAX_VIDEO_SECONDS)]
     max_video_seconds: f64,
 
     #[arg(long, value_delimiter = ',', default_value = "768p")]
