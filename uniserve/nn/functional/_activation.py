@@ -55,7 +55,7 @@ def _act_and_mul(
     activation: str,
     out: torch.Tensor | None,
     *,
-    rounding: Rounding = Rounding.ONCE,
+    rounding: Rounding,
 ) -> torch.Tensor:
     """Evaluate packed gating into a plain or row-scaled FP8 output.
 
@@ -140,14 +140,14 @@ def silu_and_mul(
     x: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
-    rounding: Rounding = Rounding.ONCE,
+    rounding: Rounding,
 ) -> torch.Tensor:
     """Apply SiLU to the first channel half and multiply by the second.
 
     ``x`` packs ``[gate, value]`` along its final axis. A row-scaled FP8
     ``QuantizedTensor`` output receives the encoded activation directly.
-    ``rounding`` selects whether the activated gate rounds to ``x.dtype``
-    before the product.
+    ``rounding`` states whether the activated gate rounds to ``x.dtype``
+    before the product, as the model's reference evaluates it.
     """
     return _act_and_mul("silu_and_mul", x, "silu", out, rounding=rounding)
 
@@ -172,6 +172,8 @@ def gelu_and_mul(
         x,
         "gelu_tanh" if approximate == "tanh" else "gelu",
         out,
+        # GELU gating has no per-operation kernel; it rounds once.
+        rounding=Rounding.ONCE,
     )
 
 

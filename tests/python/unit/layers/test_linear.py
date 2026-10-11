@@ -6,6 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.nn.functional import Rounding
 from uniserve.nn.linear import (
     ColumnParallelLinear,
     Linear,
@@ -278,7 +279,7 @@ def test_merged_projection_rejects_bias_outside_its_branch_channels():
 
 
 def test_gated_mlp_uses_named_gate_and_up_branches():
-    model = GatedMLP(4, 8, bias=True)
+    model = GatedMLP(4, 8, bias=True, rounding=Rounding.ONCE)
     source = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4) / 16
     gate = model.gate_up.projections["gate"]
     up = model.gate_up.projections["up"]

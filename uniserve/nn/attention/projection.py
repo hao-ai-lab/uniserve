@@ -71,6 +71,7 @@ class RotaryQKVProjection(QKVProjection):
                 sin,
                 eps=self.query_norm.eps,
                 axis_dims=(q.shape[-1],),
+                rounding=functional.Rounding.ONCE,
             )
 
         return (
@@ -176,6 +177,7 @@ class AxialQKVProjection(QKVProjection):
                 sin,
                 eps=domains[0][0].eps,
                 axis_dims=self.axis_dims,
+                rounding=functional.Rounding.ONCE,
             )
 
         # General path: normalize each norm domain, then rotate each axis.

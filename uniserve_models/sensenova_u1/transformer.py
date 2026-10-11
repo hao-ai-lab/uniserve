@@ -27,6 +27,7 @@ from uniserve.nn.attention import (
     PagedInput,
     SegmentedInput,
 )
+from uniserve.nn.functional import Rounding
 from uniserve.nn.linear import (
     QKVParallelLinear,
     RowParallelLinear,
@@ -85,10 +86,15 @@ class TransformerLayer(nn.Module):
                 bias=config.attention_bias,
             )
             self.post_attention_norms[route] = RMSNorm(hidden, eps)
+            # The reference module computes ``act_fn(gate) * up`` in the
+            # activation dtype, rounding after each operation.
             self.mlps[route] = GatedMLP(
                 hidden,
                 config.intermediate_size,
                 activation=config.hidden_act,
+                rounding=Rounding.STEPWISE
+                if config.hidden_act == "silu"
+                else None,
             )
 
         # One attention module serves both routes. Its cache name is its
