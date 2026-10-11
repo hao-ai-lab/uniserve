@@ -1322,16 +1322,16 @@ fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(),
         let images = count(|kind| kind == ConditionType::Image);
         let audios = count(|kind| kind == ConditionType::Audio);
         let videos = count(|kind| matches!(kind, ConditionType::Video | ConditionType::VideoAudio));
-        for (kind, found, limit) in [
-            ("image", images, MAX_IMAGE_REFERENCES),
-            ("video", videos, MAX_VIDEO_REFERENCES),
-            ("audio", audios, MAX_AUDIO_REFERENCES),
-            ("reference", references().count(), MAX_REFERENCES),
+        for (what, found, limit) in [
+            ("image references", images, MAX_IMAGE_REFERENCES),
+            ("video references", videos, MAX_VIDEO_REFERENCES),
+            ("audio references", audios, MAX_AUDIO_REFERENCES),
+            ("references", references().count(), MAX_REFERENCES),
         ] {
             if found > limit {
                 return Err(VideoInputError::invalid(
                     RequestField::Conditions,
-                    format!("at most {limit} {kind} references, got {found}"),
+                    format!("at most {limit} {what}, got {found}"),
                 ));
             }
         }
