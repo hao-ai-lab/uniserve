@@ -14,9 +14,9 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 )
 from safetensors.torch import save_file
 
+from tests.python.fixtures.h3 import transformer_config
 from uniserve import loading
 from uniserve.loading import checkpoint, weights
-from uniserve_models.minimax_h3 import TransformerConfig
 from uniserve_models.minimax_h3.conditioning import Conditioner, assignments
 from uniserve_models.minimax_h3.modulation import TimestepEmbedding
 
@@ -24,7 +24,7 @@ pytestmark = pytest.mark.integration
 
 
 def _config():
-    return TransformerConfig(
+    return transformer_config(
         hidden_size=64,
         num_attention_heads=2,
         head_dim=32,

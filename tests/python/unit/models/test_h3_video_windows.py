@@ -9,9 +9,8 @@ only unpacking a window from the packed latent depends on the frame count.
 import pytest
 import torch
 
-from tests.python.fixtures.h3 import WIDE
+from tests.python.fixtures.h3 import WIDE, video_vae_config
 from uniserve.media import video
-from uniserve_models.minimax_h3 import video_vae
 from uniserve_models.minimax_h3.config import DenseAttention, SparseAttention
 from uniserve_models.minimax_h3.decoding import VideoDecoder
 from uniserve_models.minimax_h3.packing import video_latent_frames, video_order
@@ -30,7 +29,7 @@ ATTENTION = {
 def _decoder(attention) -> VideoDecoder:
     # Unpacking reads no parameter, so the VAE stays on the meta device.
     with torch.device("meta"):
-        return VideoDecoder(video_vae.Config(), attention=attention)
+        return VideoDecoder(video_vae_config(), attention=attention)
 
 
 def test_every_duration_decodes_one_segment_per_canvas():

@@ -12,7 +12,7 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 from safetensors.torch import save_file
 from torch.nn import functional as F
 
-from tests.python.fixtures.h3 import WIDE, dmd_denoiser
+from tests.python.fixtures.h3 import WIDE, dmd_denoiser, transformer_config
 from uniserve import loading
 from uniserve.diffusion import DenoisingStep, normal_noise
 from uniserve.distributed import DeviceMesh, communication_axes
@@ -34,7 +34,6 @@ from uniserve_models.minimax_h3 import (
     Denoiser,
     DenoiserInput,
     DenoiserSize,
-    TransformerConfig,
 )
 from uniserve_models.minimax_h3.conditioning import (
     assignments as conditioning_assignments,
@@ -48,7 +47,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 def _config():
-    return TransformerConfig(
+    return transformer_config(
         hidden_size=64,
         num_attention_heads=4,
         num_hidden_layers=2,

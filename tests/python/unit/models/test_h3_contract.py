@@ -292,16 +292,17 @@ def test_h3_reader_reports_missing_decoder_field(checkpoint):
 
 
 def test_h3_direct_configuration_preserves_cross_component_dimensions():
-    from dataclasses import replace
-
-    from tests.python.fixtures.h3 import dmd_denoiser
-    from uniserve_models.minimax_h3 import audio_vae, video_vae
-    from uniserve_models.minimax_h3.encoder import TextEncoderConfig
+    from tests.python.fixtures.h3 import (
+        audio_vae_config,
+        dmd_denoiser,
+        text_encoder_config,
+        video_vae_config,
+    )
 
     with pytest.raises(ValueError, match="conditioning width"):
         Config(
-            text_encoder=replace(TextEncoderConfig(), hidden_size=4096),
+            text_encoder=text_encoder_config(hidden_size=4096),
             denoisers={"transformer": dmd_denoiser()},
-            video_vae=video_vae.Config(),
-            audio_vae=audio_vae.Config(),
+            video_vae=video_vae_config(),
+            audio_vae=audio_vae_config(),
         )
