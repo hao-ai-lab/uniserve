@@ -58,12 +58,18 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
     path = tmp_path / "ema.safetensors"
     save_file({"latent_pos_embed.pos_embed": torch.zeros(9, 16)}, path)
 
-    raw = {
-        **(towers if inline else {}),
-        "start_of_image_id": 62,
-        "end_of_image_id": 63,
-    }
+    raw = towers if inline else {}
     (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "added_tokens": [
+                    {"id": 62, "content": "<|vision_start|>"},
+                    {"id": 63, "content": "<|vision_end|>"},
+                ]
+            }
+        )
+    )
     config = _bagel_config(tmp_path)
 
     assert config.text.hidden_size == 16
@@ -74,6 +80,7 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
     assert config.vae.latent_channels == 4
     assert config.vae.downsample * config.latent_patch_size == 4
     assert config.max_latent_size == 3
+    assert (config.start_of_image_id, config.end_of_image_id) == (62, 63)
 
     # Released checkpoints may serialize a constructor default; actual learned
     # positions determine both numerical packing and allocation bounds.

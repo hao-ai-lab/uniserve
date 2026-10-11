@@ -160,7 +160,8 @@ def _bagel_processor() -> ImageProcessor:
             32, 48, 2, 4, 2, 37, 1e-6, 1_000_000.0, 8, True, 64
         ),
         siglip.Config(14, 980, 3, siglip.TransformerConfig(32, 4, 48, 1, 1e-6)),
-        vae.Config(8, 3, 2, 32, 3, (1, 1), 1, 2, 0.5, 0.25),
+        # The released 8x autoencoder with 2x2 latent patches strides 16.
+        vae.Config(8, 3, 8, 32, 3, (1, 1, 1, 1), 1, 2, 0.5, 0.25),
         35,
         36,
         2,
