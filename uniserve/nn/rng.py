@@ -22,10 +22,9 @@ _PHILOX_KEY_BUMP_0 = 0x9E3779B9
 _PHILOX_KEY_BUMP_1 = 0xBB67AE85
 
 # Draw layout identifiers, matching ``DRAW_LAYOUT_*`` of ``uniserve-core``'s
-# ``philox`` module. They separate the proposal and target draw spaces so
-# rejected proposals cannot shift target coordinates.
+# ``philox`` module. They separate the token-sampling and flow-noise draw
+# spaces so activity in one cannot shift the other's coordinates.
 DRAW_LAYOUT_TARGET = 0
-DRAW_LAYOUT_PROPOSAL = 1
 DRAW_LAYOUT_FLOW_NOISE = 2
 
 
@@ -148,7 +147,6 @@ def _splitmix_coordinate(seed: int, coordinate: int) -> int:
 
 __all__ = [
     "DRAW_LAYOUT_FLOW_NOISE",
-    "DRAW_LAYOUT_PROPOSAL",
     "DRAW_LAYOUT_TARGET",
     "flow_noise_seed",
     "normal_noise",
