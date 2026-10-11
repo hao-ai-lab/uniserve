@@ -10,7 +10,6 @@ are imported directly; this package re-exports nothing.
 - `call`: the per-request call descriptors in a batch.
 - `batch`: the submitted `Batch`, its lifecycle commands, and its
   allocation records.
-- `construction`: assembly of batches the Rust decoder already validated.
 - `output`: per-batch completion records.
 - `messages`: request decoding and response envelopes.
 - `worker_info`: startup information the worker reports to the scheduler.

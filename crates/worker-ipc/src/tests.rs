@@ -321,6 +321,12 @@ fn reference_conditions() -> Vec<uniserve_core::VideoCondition> {
 }
 
 /// Encodes `batch` as a submit request, decodes it, and returns the decoded batch.
+/// Reports whether the receiving end of the wire refuses `request`: the
+/// decoder validates every frame, and encoding checks nothing.
+fn is_refused_on_decode(request: &WorkerRequest) -> bool {
+    decode_request(&encode_request(request).unwrap()).is_err()
+}
+
 fn execute_round_trip(batch: Batch) -> Batch {
     let request = WorkerRequest::submit(batch);
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
@@ -346,14 +352,14 @@ fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
     // row naming a call outside the batch are each rejected on encode.
     let mut missing_length = run.clone();
     missing_length.forward.seq_lens.pop();
-    assert!(encode_request(&WorkerRequest::submit(missing_length)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(missing_length)));
 
     let mut short_sequence = run.clone();
     short_sequence.forward.seq_lens[2] = 3;
-    assert!(encode_request(&WorkerRequest::submit(short_sequence)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(short_sequence)));
 
     run.forward.call_indices[2] = 1;
-    assert!(encode_request(&WorkerRequest::submit(run)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(run)));
 }
 
 #[test]
@@ -381,7 +387,7 @@ fn call_coordinates_survive_physical_dispatch_and_reject_collisions() {
 
     let mut collision = run;
     collision.calls[1].call_id = first.call_id;
-    assert!(encode_request(&WorkerRequest::submit(collision)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(collision)));
 }
 
 /// Builds a batch around `calls` with the planner columns `Batch::validate`
@@ -1258,13 +1264,10 @@ fn request_retirement_requires_unique_buffers_from_its_request() {
             request_key: request_key(),
             retained_buffers,
         };
-        assert!(
-            encode_request(&WorkerRequest::submit(
-                batch_with_calls(3, vec![admission()], vec![ar_decode_call()])
-                    .with_commands(vec![command]),
-            ))
-            .is_err()
-        );
+        assert!(is_refused_on_decode(&WorkerRequest::submit(
+            batch_with_calls(3, vec![admission()], vec![ar_decode_call()])
+                .with_commands(vec![command]),
+        )));
     }
 }
 
@@ -1523,7 +1526,7 @@ fn image_encoder_input_round_trips_and_rejects_an_incompatible_call() {
         invalid.kind = code;
         invalid.input_image = image;
         let request = WorkerRequest::submit(batch_with_calls(1, vec![admission()], vec![invalid]));
-        assert!(encode_request(&request).is_err());
+        assert!(is_refused_on_decode(&request));
     }
 }
 

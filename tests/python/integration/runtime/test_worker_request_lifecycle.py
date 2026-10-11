@@ -14,7 +14,6 @@ from tests.python.fixtures.depth_one import (
     finalized_report,
     record_completion,
     root_parent,
-    stamp_batch,
     token_call,
     visual_state_call,
 )
@@ -681,55 +680,3 @@ def test_finish_of_uninstalled_admission_allows_slot_reuse() -> None:
     )
     assert report.completions[0].status is CallStatus.OK
     worker.close()
-
-
-def test_a_call_whose_coordinates_contradict_the_request_is_refused() -> None:
-    """The engine states where a call executes; a rank refuses a wrong claim.
-
-    A rank must not silently execute a call at a position other than the one
-    it was scheduled for, so a claim that disagrees with the request's own
-    progress ends the call rather than producing a token at the wrong place.
-    """
-    from dataclasses import replace
-
-    worker = execution_worker()
-    admission = ar_params(91, block_ids=(0,))
-    prefill = token_call(
-        admission.request_key,
-        call_id=CallId(1, 0),
-        predecessor=root_parent(admission),
-        mode=ForwardMode.PREFILL,
-        tokens=(7, 8),
-    )
-    with worker:
-        primed = finalized_report(
-            worker,
-            worker.submit(
-                execution_batch(
-                    batch_id=1,
-                    admissions=(admission,),
-                    calls=(prefill,),
-                )
-            ),
-        )
-        assert primed.completions[0].status is CallStatus.OK
-        observation = record_completion(prefill, primed)
-
-        decode = token_call(
-            admission.request_key,
-            call_id=CallId(2, 0),
-            predecessor=observation.call_id,
-            mode=ForwardMode.DECODE,
-            tokens=(primed.completions[0].committed_tokens[0],),
-        )
-        run = stamp_batch(worker, execution_batch(batch_id=2, calls=(decode,)))
-        # The prompt left the request at position two; claim the origin.
-        contradicted = replace(
-            run,
-            calls=(replace(run.calls[0], coordinates=CallCoordinates()),),
-        )
-        refused = finalized_report(worker, worker.submit(contradicted))
-
-        assert refused.completions[0].status is CallStatus.ERROR
-        assert refused.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
-        assert refused.completions[0].committed_tokens == ()

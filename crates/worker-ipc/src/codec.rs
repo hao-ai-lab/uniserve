@@ -145,15 +145,12 @@ macro_rules! codec_ensure {
     };
 }
 
-/// Validates a worker request and encodes it as a FlatBuffers payload.
+/// Encodes a worker request as a FlatBuffers payload.
 ///
-/// Only a `Submit` request carries a payload to validate; `Batch::validate`
-/// failures return [`CodecError::Validation`]. The returned bytes are the
-/// frame payload without the transport `Header`.
+/// The sender validates a batch where it builds it, and the receiver's
+/// [`decode_request`] validates every frame, so encoding checks nothing. The
+/// returned bytes are the frame payload without the transport `Header`.
 pub fn encode_request(request: &WorkerRequest) -> CodecResult<Vec<u8>> {
-    if let Some(batch) = request.batch() {
-        batch.validate()?;
-    }
     let mut builder = FlatBufferBuilder::new();
     let root = encode::request(&mut builder, request);
     builder.finish(root, None);

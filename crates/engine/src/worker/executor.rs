@@ -1029,7 +1029,6 @@ impl WorkerExecutor {
                 wire.buffer_allocations.push(params);
             }
         }
-        wire.validate()?;
 
         // Drop every location whose source endpoint is not the current
         // incarnation of a bound rank.

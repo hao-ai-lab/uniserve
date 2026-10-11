@@ -12,8 +12,8 @@
 //!   `uniserve_worker.protocol.batch.Batch`. Python classes and enum members
 //!   are resolved once per process (`RequestTypes`); outside `kv_inputs`,
 //!   each distinct request key, call id, and shape bound is constructed once
-//!   per batch (`RequestConversion`); and `batch_from_validated` assembles the
-//!   batch without running `Batch.__post_init__`.
+//!   per batch (`RequestConversion`). The decoder validated the frame, so
+//!   the records carry no second validation.
 //! - Outbound, [`try_completion_response_from_py`] decodes the mappings the
 //!   worker's `to_mapping` methods emit. That encoding differs from the serde
 //!   form: for example `Locator.to_mapping` writes a plain `transport` string
@@ -22,7 +22,7 @@
 //!
 //! The encoder constructs many records positionally, so its argument order is
 //! coupled to the field order of the Python dataclasses in
-//! `uniserve_worker.protocol` and to the parameters of `batch_from_validated`.
+//! `uniserve_worker.protocol`.
 //! The round-trip test at the bottom of this file reads the fields of each
 //! native batch back by name.
 //!
@@ -106,7 +106,7 @@ struct RequestTypes {
     start: Py<PyAny>,
     finish: Py<PyAny>,
     free: Py<PyAny>,
-    batch_from_validated: Py<PyAny>,
+    batch: Py<PyAny>,
     dtypes: [Py<PyAny>; 7],
     forward_modes: [Py<PyAny>; ForwardMode::ALL.len()],
     media_calls: [Py<PyAny>; MediaCall::ALL.len()],
@@ -120,7 +120,9 @@ static REQUEST_TYPES: std::sync::OnceLock<RequestTypes> = std::sync::OnceLock::n
 ///
 /// Members are looked up by value (`Enum(value)`), so each spelling must be a
 /// value of the Python enum `name`, and the array order is the order of
-/// `values`.
+/// `values`. The Python enum has exactly these members: a member the schema
+/// does not spell fails the lookup, and an extra Python member is refused here
+/// instead of reaching the wire.
 fn enum_members<const N: usize>(
     module: &Bound<'_, PyModule>,
     name: &str,
@@ -223,10 +225,7 @@ impl RequestTypes {
             start: class(&batch, "Start")?,
             finish: class(&batch, "Finish")?,
             free: class(&batch, "Free")?,
-            batch_from_validated: class(
-                &py.import("uniserve_worker.protocol.construction")?,
-                "batch_from_validated",
-            )?,
+            batch: class(&batch, "Batch")?,
 
             // The `dtypes` spellings sit at the indices that `dtype` hardcodes
             // (the Rust discriminant values). `kind` indexes the other three
@@ -679,49 +678,69 @@ fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyAny
         tensor_publication_to_py(py, payload, &mut native)
     })?;
 
-    // `batch_from_validated` sets these fields on a bare `Batch` without
-    // running `Batch.__post_init__`, because the frame was validated when it
-    // was decoded. Arguments are positional and follow its parameter order;
-    // the forward tuple is unpacked by index into `forward_call_indices`,
-    // `request_pool_indices`, `seq_lens`, `query_lens`, and `write_kv`.
-    let arguments = pyo3::types::PyTuple::new(
-        py,
-        [
-            batch.batch_id.into_pyobject(py)?.into_any(),
-            batch.collective_seq.into_pyobject(py)?.into_any(),
-            pyo3::types::PyTuple::new(py, calls)?.into_any(),
-            pyo3::types::PyTuple::new(py, block_tables)?.into_any(),
-            pyo3::types::PyTuple::new(py, new_cache_units)?.into_any(),
-            (
-                pyo3::types::PyTuple::new(py, &batch.forward.call_indices)?,
-                pyo3::types::PyTuple::new(py, &batch.forward.request_pool_indices)?,
-                pyo3::types::PyTuple::new(py, &batch.forward.seq_lens)?,
-                pyo3::types::PyTuple::new(py, &batch.forward.query_lens)?,
-                pyo3::types::PyTuple::new(py, &batch.forward.write_kv)?,
-            )
-                .into_pyobject(py)?
-                .into_any(),
-            record_tuple(py, &batch.latent_params, |params| {
-                latent_params_to_py(py, params, &mut native)
-            })?
-            .into_any(),
-            record_tuple(py, &batch.decode_ranges, |params| {
-                decode_range_to_py(py, params, &mut native)
-            })?
-            .into_any(),
-            record_tuple(py, &batch.buffer_allocations, |params| {
-                buffer_allocation_to_py(py, params, &mut native)
-            })?
-            .into_any(),
-            pyo3::types::PyTuple::new(py, commands)?.into_any(),
-            input_products.into_any(),
-            record_tuple(py, &batch.kv_inputs, |transfer| {
-                kv_transfer_to_py(py, transfer)
-            })?
-            .into_any(),
-        ],
+    // The batch's fields are passed by name.
+    let fields = PyDict::new(py);
+    fields.set_item(intern!(py, "batch_id"), batch.batch_id)?;
+    fields.set_item(intern!(py, "collective_seq"), batch.collective_seq)?;
+    fields.set_item(intern!(py, "calls"), pyo3::types::PyTuple::new(py, calls)?)?;
+    fields.set_item(
+        intern!(py, "block_tables"),
+        pyo3::types::PyTuple::new(py, block_tables)?,
     )?;
-    native.types.batch_from_validated.bind(py).call1(arguments)
+    fields.set_item(
+        intern!(py, "new_cache_units"),
+        pyo3::types::PyTuple::new(py, new_cache_units)?,
+    )?;
+    fields.set_item(
+        intern!(py, "forward_call_indices"),
+        pyo3::types::PyTuple::new(py, &batch.forward.call_indices)?,
+    )?;
+    fields.set_item(
+        intern!(py, "request_pool_indices"),
+        pyo3::types::PyTuple::new(py, &batch.forward.request_pool_indices)?,
+    )?;
+    fields.set_item(
+        intern!(py, "seq_lens"),
+        pyo3::types::PyTuple::new(py, &batch.forward.seq_lens)?,
+    )?;
+    fields.set_item(
+        intern!(py, "query_lens"),
+        pyo3::types::PyTuple::new(py, &batch.forward.query_lens)?,
+    )?;
+    fields.set_item(
+        intern!(py, "write_kv"),
+        pyo3::types::PyTuple::new(py, &batch.forward.write_kv)?,
+    )?;
+    fields.set_item(
+        intern!(py, "latent_params"),
+        record_tuple(py, &batch.latent_params, |params| {
+            latent_params_to_py(py, params, &mut native)
+        })?,
+    )?;
+    fields.set_item(
+        intern!(py, "decode_ranges"),
+        record_tuple(py, &batch.decode_ranges, |params| {
+            decode_range_to_py(py, params, &mut native)
+        })?,
+    )?;
+    fields.set_item(
+        intern!(py, "buffer_allocations"),
+        record_tuple(py, &batch.buffer_allocations, |params| {
+            buffer_allocation_to_py(py, params, &mut native)
+        })?,
+    )?;
+    fields.set_item(
+        intern!(py, "commands"),
+        pyo3::types::PyTuple::new(py, commands)?,
+    )?;
+    fields.set_item(intern!(py, "input_products"), input_products)?;
+    fields.set_item(
+        intern!(py, "kv_inputs"),
+        record_tuple(py, &batch.kv_inputs, |transfer| {
+            kv_transfer_to_py(py, transfer)
+        })?,
+    )?;
+    native.types.batch.bind(py).call((), Some(&fields))
 }
 
 /// Converts one trajectory's raster geometry and latent page table into a

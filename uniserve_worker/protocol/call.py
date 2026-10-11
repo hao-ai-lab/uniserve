@@ -16,7 +16,6 @@ arguments).
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TypeAlias
@@ -24,9 +23,6 @@ from typing import TypeAlias
 from uniserve.model import DEFAULT_COMPONENT
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import identity, tensor
-from uniserve_worker.protocol.validation import (
-    _nonnegative,
-)
 
 
 class ForwardMode(StrEnum):
@@ -120,11 +116,11 @@ class CallStatus(StrEnum):
     ERROR = "error"
 
 
-# Computations that advance a request's accepted progress; mirrors the Rust
-# `CallKind::advances_state`. `RequestPool.predecessors` chains a request's
-# calls from its latest state-advancing call (on the media path only
-# state-advancing calls join the chain), and `RequestPool.apply_result` moves
-# the request's `state_call_id` only on an OK result of one of these.
+# Computations that advance a request's accepted progress, as the schema
+# states them. `RequestPool.predecessors` chains a request's calls from its
+# latest state-advancing call (on the media path only state-advancing calls
+# join the chain), and `RequestPool.apply_result` moves the request's
+# `state_call_id` only on an OK result of one of these.
 _STATE_ADVANCING_WORK = frozenset(
     {
         *ForwardMode,
@@ -143,8 +139,7 @@ class ImageParams:
     Covers the diffusion schedule (steps, timestep shift), classifier-free
     guidance scales and renormalization, output dimensions, and the negative
     prompt.
-    `NewRequest.image` holds one; `__post_init__` mirrors the limits of the
-    Rust `ImageParams::validate`.
+    `NewRequest.image` holds one; the Rust decoder validates its ranges.
     """
 
     steps: int = 50
@@ -159,47 +154,6 @@ class ImageParams:
     seed: int | None = None
     negative_prompt: str = ""
 
-    def __post_init__(self) -> None:
-        """Validate schedule, dimensions, guidance, and seed.
-
-        Raises:
-            WorkerError: A field is out of range or not finite, a dimension
-                is not a multiple of 16, the CFG interval is unordered, or
-                the renorm type is blank.
-        """
-        if not 1 <= self.steps <= 1000:
-            raise invalid_descriptor("image.steps must be in 1..=1000")
-
-        for name in ("height", "width"):
-            dimension = int(getattr(self, name))
-            if not 16 <= dimension <= 4096 or dimension % 16:
-                raise invalid_descriptor(
-                    f"image.{name} must be a multiple of 16 in 16..=4096"
-                )
-
-        for name in ("cfg_text_scale", "cfg_img_scale"):
-            scale = float(getattr(self, name))
-            if not math.isfinite(scale) or not 0 <= scale <= 100:
-                raise invalid_descriptor(
-                    f"image.{name} must be finite and in [0, 100]"
-                )
-
-        for name, value in (
-            ("cfg_renorm_min", self.cfg_renorm_min),
-            ("cfg_interval[0]", self.cfg_interval[0]),
-            ("cfg_interval[1]", self.cfg_interval[1]),
-            ("timestep_shift", self.timestep_shift),
-        ):
-            if not math.isfinite(float(value)):
-                raise invalid_descriptor(f"image.{name} must be finite")
-
-        if self.cfg_interval[0] > self.cfg_interval[1]:
-            raise invalid_descriptor("image.cfg_interval must be ordered")
-        if not self.cfg_renorm_type.strip():
-            raise invalid_descriptor("image.cfg_renorm_type must not be empty")
-        if self.seed is not None:
-            _nonnegative(self.seed, "image.seed")
-
 
 @dataclass(frozen=True, slots=True)
 class Bounds:
@@ -207,7 +161,7 @@ class Bounds:
 
     Zero means the call may use none of that resource. The Rust
     `Call::validate` checks `max_tokens` against the input token ids, and
-    `Batch.validate` checks `max_transfer_bytes` against installed KV
+    `Batch::validate` checks `max_transfer_bytes` against installed KV
     transfers.
     """
 
@@ -250,10 +204,6 @@ class CanvasStep:
     block: int
     step: int
 
-    def __post_init__(self) -> None:
-        _nonnegative(self.block, "canvas block")
-        _nonnegative(self.step, "canvas step")
-
 
 @dataclass(frozen=True, slots=True)
 class Readout:
@@ -286,9 +236,6 @@ class VisionInput:
 
     offset: int
     feature: tensor.TensorRef
-
-    def __post_init__(self) -> None:
-        _nonnegative(self.offset, "vision input offset")
 
 
 @dataclass(frozen=True, slots=True)
