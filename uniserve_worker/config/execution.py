@@ -385,7 +385,7 @@ class WorkerConfig:
     CUDA device sets ``pool_storage_bytes`` from the device storage grant and
     may shrink the request-slot and batch bounds; and an unset
     ``block_size`` is resolved from the model's cache layers and attention
-    kernels (``bootstrap.cache.resolve_page_size``) before the unit pool is
+    kernels (``bootstrap.cache.resolve_block_size``) before the unit pool is
     planned.
 
     Graphs: ``graph_policy`` ``"off"`` disables every graph. Otherwise every
