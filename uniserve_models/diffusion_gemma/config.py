@@ -443,8 +443,6 @@ def read_config(
             inconsistent special tokens.
     """
     config = json.loads((root / "config.json").read_text())
-    if config.get("model_type") != "diffusion_gemma":
-        raise ValueError("DiffusionGemma requires model_type diffusion_gemma")
     text = config.get("text_config")
     vision = config.get("vision_config")
     if not isinstance(text, Mapping) or not isinstance(vision, Mapping):

@@ -148,7 +148,6 @@ def test_null_dense_kv_heads_mean_one_per_query_head(tmp_path):
 @pytest.mark.parametrize(
     "metadata,message",
     [
-        (_DENSE | {"model_type": "qwen3_moe"}, "model_type"),
         (_DENSE | {"architectures": ["LlamaForCausalLM"]}, "architectures"),
         (_DENSE | {"num_experts": 4}, "expert fields"),
         (_DENSE | {"use_sliding_window": True}, "sliding-window"),
@@ -170,7 +169,6 @@ def test_null_dense_kv_heads_mean_one_per_query_head(tmp_path):
         ),
     ],
     ids=[
-        "family-mismatch",
         "unknown-architecture",
         "dense-with-experts",
         "dense-window",

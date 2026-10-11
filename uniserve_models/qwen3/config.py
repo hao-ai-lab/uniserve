@@ -265,10 +265,10 @@ def read_config(
 ) -> Config:
     """Normalize checkpoint metadata into immutable decoder configuration.
 
-    ``architectures`` selects the family: ``Qwen3ForCausalLM`` (dense,
-    ``model_type`` qwen3) or ``Qwen3MoeForCausalLM`` (``model_type``
-    qwen3_moe). Each family's absent fields take Transformers' defaults for
-    that family, so a field means the same here as in the reference.
+    ``architectures`` selects the family: ``Qwen3ForCausalLM`` (dense) or
+    ``Qwen3MoeForCausalLM`` (mixture of experts). Each family's absent
+    fields take Transformers' defaults for that family, so a field means the
+    same here as in the reference.
 
     Args:
         root: Local checkpoint directory containing ``config.json``.
@@ -281,12 +281,11 @@ def read_config(
         The validated ``Config``.
 
     Raises:
-        ValueError: For invalid metadata, including an unknown or
-            inconsistent architecture and ``model_type``, a missing required
-            field, a field of the wrong type or value, conflicting aliases,
-            sliding-window attention, a rotary recipe other than default or
-            YaRN, a partial rotary width, and expert fields in a dense
-            checkpoint.
+        ValueError: For invalid metadata, including an unknown architecture,
+            a missing required field, a field of the wrong type or value,
+            conflicting aliases, sliding-window attention, a rotary recipe
+            other than default or YaRN, a partial rotary width, and expert
+            fields in a dense checkpoint.
     """
     config = json.loads((root / "config.json").read_text())
 
@@ -304,11 +303,6 @@ def read_config(
             f"{sorted(_FAMILIES)}"
         )
     family = _FAMILIES[architectures[0]]
-    if config.get("model_type", family.model_type) != family.model_type:
-        raise ValueError(
-            f"{architectures[0]} checkpoint has model_type "
-            f"{config['model_type']!r}, not {family.model_type!r}"
-        )
 
     hidden_size = _required_int(config, "hidden_size")
     num_attention_heads = _required_int(config, "num_attention_heads")
@@ -461,15 +455,14 @@ class _Family:
     attention width; ``experts`` is None for dense checkpoints.
     """
 
-    model_type: str
     default_head_dim: int | None
     experts: _Experts | None
 
 
 # Defaults follow Transformers' Qwen3Config and Qwen3MoeConfig.
 _FAMILIES = {
-    "Qwen3ForCausalLM": _Family("qwen3", 128, None),
-    "Qwen3MoeForCausalLM": _Family("qwen3_moe", None, _Experts(128, 8, 768)),
+    "Qwen3ForCausalLM": _Family(128, None),
+    "Qwen3MoeForCausalLM": _Family(None, _Experts(128, 8, 768)),
 }
 
 _EXPERT_FIELDS = frozenset(
