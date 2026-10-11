@@ -38,11 +38,6 @@ from ..types import (
 )
 from .base import BenchmarkTask
 
-# Every MiniMax-H3 output runs at 24 frames per second.
-VIDEO_FPS = 24
-# The only target short edge the canvas rule serves, in pixels.
-TARGET_SHORT_EDGE = 768
-
 # Media types of the condition files the request API accepts, by suffix:
 # JPEG, PNG and WEBP images, MP4 and QuickTime videos, MP3 and WAV audio.
 MEDIA_TYPES = {
@@ -196,6 +191,8 @@ class VideoTask(BenchmarkTask):
                 cannot be sent them as the same work.
             OSError: A condition media file cannot be read.
         """
+        from uniserve_models.minimax_h3 import processing
+
         video = self.point.video
         seconds = float(
             example.seconds if example.seconds is not None else video.seconds
@@ -217,7 +214,8 @@ class VideoTask(BenchmarkTask):
             "task": video.task,
             "conditions": conditions,
             "target": {
-                "short_edge": TARGET_SHORT_EDGE,
+                # The only short edge the canvas rule serves.
+                "short_edge": processing.CANVAS_SHORT_EDGE,
                 "aspect_ratio": video.aspect_ratio,
                 "duration_seconds": seconds,
             },
@@ -333,6 +331,10 @@ class VideoTask(BenchmarkTask):
         resolved to (``RequestRecord.video_shape``); a record without one
         fails every shape check.
         """
+        from uniserve_models.minimax_h3 import processing
+
+        # The model generates every output at this frame rate.
+        fps = processing.FPS
         outputs = [record.decoded_video for record in records]
         shapes = [record.video_shape for record in records]
         present = (
@@ -353,7 +355,7 @@ class VideoTask(BenchmarkTask):
         # one frame period. A one-frame-short video with full-length audio is
         # therefore valid, while a missing or truncated stream is not.
         frame_tolerance = 1
-        duration_tolerance_s = 1.0 / VIDEO_FPS
+        duration_tolerance_s = 1.0 / fps
         return ValidationResult(
             checks={
                 "decoded_video": present,
@@ -367,7 +369,7 @@ class VideoTask(BenchmarkTask):
                 # The container frame rate is a rational; require exactly 24.
                 "24fps_video": present
                 and all(
-                    video.fps_numerator == VIDEO_FPS * video.fps_denominator
+                    video.fps_numerator == fps * video.fps_denominator
                     for video in videos
                 ),
                 "aligned_frame_count": present
@@ -384,7 +386,7 @@ class VideoTask(BenchmarkTask):
                 ),
                 "aligned_audio_duration": present
                 and all(
-                    abs(video.audio_duration_s - shape.frames / VIDEO_FPS)
+                    abs(video.audio_duration_s - shape.frames / fps)
                     <= duration_tolerance_s
                     for video, shape in pairs
                 ),
