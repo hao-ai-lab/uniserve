@@ -1159,15 +1159,7 @@ fn error_call_from_table(call: fbs::ErrorCallIdentity<'_>) -> CodecResult<ErrorC
 fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
     let info = WorkerInfo {
         endpoint: endpoint_from_table(info.endpoint().context("info has no endpoint")?)?,
-        device: required_str(info.device(), "info.device")?,
         fabric_handles: info.fabric_handles(),
-        transfer_backends: info
-            .transfer_backends()
-            .context("info has no transfer backends")?
-            .iter()
-            .map(str::to_owned)
-            .collect(),
-        world_size: info.world_size(),
         components: info
             .components()
             .map(|items| {

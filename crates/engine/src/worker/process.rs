@@ -6,7 +6,7 @@
 //! Once the rank reports its endpoint through `registration::RankRegistry`,
 //! `PendingRank::adopt` binds a `RankChannel` to it and yields a
 //! `RankProcess`, which `WorkerGroup` (in `instance`) drives:
-//! `finish_startup` validates the rank's startup report, `submit_batch` and
+//! `finish_startup` receives the rank's startup report, `submit_batch` and
 //! `poll_batch` exchange batches and results, and `close_ranks` or
 //! `terminate` retires the rank.
 //!
@@ -545,12 +545,10 @@ pub(super) struct RankProcess {
     /// lifetime; dropping it deletes the file.
     _launch_descriptor: tempfile::TempDir,
     /// Most requests outstanding at once. `adopt` also sizes the channel
-    /// with it (see `RankChannel::connect`), and `finish_startup` requires
-    /// the worker to report the same `queue_depth`.
+    /// with it (see `RankChannel::connect`).
     depth: usize,
+    /// The rank this process was launched as.
     rank: u32,
-    world_size: u32,
-    expected_components: std::collections::BTreeMap<String, uniserve_core::ComponentConfig>,
     /// Submitted batches awaiting a response, by message identity.
     pending: HashMap<u64, PendingRecord>,
     /// Routed results and errors, in arrival order, that `poll_batch` has
@@ -591,7 +589,9 @@ pub(super) struct PendingRank {
     /// this value drops, as it does when the launch fails.
     child: PendingChild,
     rank: u32,
-    world_size: u32,
+    /// Channel mechanism the launch descriptor asked this rank to serve its
+    /// endpoint over.
+    transport: &'static str,
     /// Channel sizing `adopt` passes to `RankChannel::connect`.
     depth: usize,
     /// Largest frame payload in bytes, in either direction.
@@ -602,7 +602,6 @@ pub(super) struct PendingRank {
     /// transfers it to the `RankProcess`, which keeps it for the rank's
     /// lifetime.
     launch_descriptor: tempfile::TempDir,
-    components: std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
 }
 
 /// The process of a launched rank that has not been adopted yet, when this
@@ -798,12 +797,11 @@ impl PendingRank {
             return Ok(Self {
                 child: PendingChild(None),
                 rank,
-                world_size,
+                transport: args.channel_transport(rank),
                 depth,
                 max_payload,
                 startup_abort,
                 launch_descriptor: descriptor_directory,
-                components: args.components.clone(),
             });
         }
         let child = cmd.spawn().context("spawning python worker")?;
@@ -811,18 +809,12 @@ impl PendingRank {
         Ok(Self {
             child: PendingChild(Some(child)),
             rank,
-            world_size,
+            transport: args.channel_transport(rank),
             depth,
             max_payload,
             startup_abort,
             launch_descriptor: descriptor_directory,
-            components: args.components.clone(),
         })
-    }
-
-    /// Returns the rank this process was launched as.
-    pub(crate) fn rank(&self) -> u32 {
-        self.rank
     }
 
     /// Fails by name when the rank exited before reporting its endpoint.
@@ -847,13 +839,15 @@ impl PendingRank {
         }
     }
 
-    /// Binds this rank's channel to the endpoint and mechanism the rank reported.
+    /// Binds this rank's channel to the endpoint the rank reported, over the
+    /// mechanism the launch asked it to serve.
     ///
     /// The returned `RankProcess` owns the rank's process, when this engine
     /// spawned it, and a death watcher for it when one can be started. Its
     /// `info` stays the default until `RankProcess::finish_startup` runs.
-    pub(crate) fn adopt(self, transport: &str, endpoint: &str) -> anyhow::Result<RankProcess> {
+    pub(crate) fn adopt(self, endpoint: &str) -> anyhow::Result<RankProcess> {
         let rank = self.rank;
+        let transport = self.transport;
         // The process stays owned here until the channel exists, so a failed
         // connection terminates the rank instead of orphaning it.
         let client = RankChannel::connect(
@@ -864,8 +858,7 @@ impl PendingRank {
             CHANNEL_CONNECT_TIMEOUT,
         )
         .with_context(|| format!("connecting to the channel rank {rank} reported"))?;
-        // The mechanism and endpoint are the rank's choice, so the head records
-        // what it bound.
+        // The rank names its own endpoint, so the head records what it bound.
         tracing::info!(
             rank,
             transport,
@@ -876,12 +869,11 @@ impl PendingRank {
         let PendingRank {
             child,
             rank,
-            world_size,
+            transport: _,
             depth,
             max_payload: _,
             startup_abort,
             launch_descriptor,
-            components,
         } = self;
         let child = child.release();
         // A watcher observes a process identifier, so only a rank this engine
@@ -902,8 +894,6 @@ impl PendingRank {
             _launch_descriptor: launch_descriptor,
             depth,
             rank,
-            world_size,
-            expected_components: components,
             pending: HashMap::new(),
             ready: VecDeque::new(),
             next_message_id: 1,
@@ -925,14 +915,14 @@ impl Drop for PendingChild {
 }
 
 impl RankProcess {
-    /// Waits for the rank's startup report and checks it against the launch.
+    /// Waits for the rank's startup report.
     ///
     /// The rank answers the info request only once its model is built and
     /// warmed up, so once the request is sent this blocks for the rank's
     /// whole preparation, bounded by the rank's liveness and the startup
-    /// cancellation flag rather than a deadline. The report must be valid
-    /// and match the launched queue depth, rank, world size, and components.
-    /// On success it becomes `info`; on failure `info` is unchanged.
+    /// cancellation flag rather than a deadline. The codec has validated the
+    /// report when it decoded it. On success it becomes `info`; on failure
+    /// `info` is unchanged.
     pub(crate) fn finish_startup(&mut self) -> anyhow::Result<()> {
         let message_id = self.alloc_call_id();
         let mut request = WorkerRequest::info();
@@ -956,32 +946,6 @@ impl RankProcess {
             }
             other => bail!("unexpected startup response: {:?}", other.kind()),
         };
-
-        info.validate()
-            .context("worker reported invalid worker info during startup")?;
-        let host_depth = self.depth as u32;
-        anyhow::ensure!(
-            info.queue_depth == host_depth,
-            "worker queue_depth {} does not match launched depth {}",
-            info.queue_depth,
-            host_depth
-        );
-        anyhow::ensure!(
-            info.endpoint.rank == self.rank && info.world_size == self.world_size,
-            "worker process rank/world_size ({}/{}) does not match launched topology ({}/{})",
-            info.endpoint.rank,
-            info.world_size,
-            self.rank,
-            self.world_size
-        );
-        anyhow::ensure!(
-            info.components
-                .iter()
-                .map(|entry| (entry.name.clone(), entry.config.clone()))
-                .collect::<std::collections::BTreeMap<_, _>>()
-                == self.expected_components,
-            "worker resolved component configuration disagrees with configuration"
-        );
 
         self.check_worker("Worker startup")?;
         self.info = info;

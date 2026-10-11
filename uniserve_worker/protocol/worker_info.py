@@ -2,14 +2,13 @@
 
 A rank answers the engine's ``info`` request (`RequestKind.INFO`, served by
 `uniserve_worker.service`) with `WorkerInfo.to_mapping()`: its endpoint,
-supported calls, scheduling bounds, KV and latent pool capacity, components,
-and transfer capabilities. The worker-ipc crate's `WorkerInfo` is the wire
-counterpart: the PyO3 extension converts the mapping into it, and its
-`validate` runs whenever the crate's codec encodes or decodes the response.
-The engine also checks the description against its launch configuration and
-derives the capacity the scheduler plans against. `WorkerInfo.__post_init__`
-checks the record's internal consistency when the worker builds it in
-`uniserve_worker.bootstrap.report`.
+supported calls, scheduling bounds, KV and latent pool capacity, and
+components. The worker-ipc crate's `WorkerInfo` is the wire counterpart: the
+PyO3 extension converts the mapping into it, and its `validate` runs whenever
+the crate's codec encodes or decodes the response. The engine derives the
+capacity the scheduler plans against from the reports.
+`WorkerInfo.__post_init__` checks the record's internal consistency when the
+worker builds it in `uniserve_worker.bootstrap.report`.
 
 The decoding helpers at the end of this module are local variants of those in
 `uniserve_worker.protocol.validation`, without their exact-type fast paths.
@@ -332,8 +331,8 @@ class WorkerInfo:
     """Describes a worker’s capabilities, topology, and resource bounds.
 
     Attributes:
-        queue_depth: Maximum unresolved physical runs; the engine requires it
-            to equal the depth it launched the rank with.
+        queue_depth: Maximum unresolved physical runs, the depth the rank was
+            launched with.
         max_batch_calls: Maximum calls in one run.
         max_batch_tokens: Maximum text tokens represented in one run.
         max_prefill_calls: Maximum calls in one prefill run, the rows the
@@ -355,7 +354,6 @@ class WorkerInfo:
     """
 
     endpoint: WorkerEndpoint
-    world_size: int
     supported_calls: tuple[CallKind, ...]
     queue_depth: int
     max_batch_calls: int
@@ -372,8 +370,10 @@ class WorkerInfo:
     max_prefill_calls: int = 0
     max_decode_calls: int = 0
     components: tuple[ComponentInfo, ...] = ()
-    device: str = "cpu"
-    transfer_backends: tuple[str, ...] = ("local",)
+    # Physical ranks of this worker, which `output_rank` needs for a worker
+    # without a placed component. The engine knows its own placement, so the
+    # report does not carry it.
+    world_size: int = 1
     # Whether this rank's device exports a handle another host can import.
     # A descriptor handle reaches only this host, so the engine refuses a
     # cross-host CUDA VMM transfer edge unless both ends report fabric
@@ -421,28 +421,15 @@ class WorkerInfo:
     def __post_init__(self) -> None:
         """Validate the advertisement's internal consistency.
 
-        Covers transfer backends, scheduling bounds, the endpoint rank, the
-        KV cache that autoregressive calls require, pool sizes, supported and
-        media calls, and latent pool completeness. The KV layout validates
+        Covers scheduling bounds, the KV cache that autoregressive calls
+        require, pool sizes, supported and media calls, and latent pool
+        completeness. The KV layout validates
         itself in `KVCacheInfo`. The worker-ipc crate's `WorkerInfo::validate`
         checks most of the same relations; it also checks the components
         (unique names, membership within the world, and parallel degrees) and
         refuses an empty checkpoint identity from any model but the
         weightless stub.
         """
-        if (
-            not self.device
-            or not self.transfer_backends
-            or len(set(self.transfer_backends)) != len(self.transfer_backends)
-            or any(
-                name not in {"local", "shm", "cuda_vmm", "channel"}
-                for name in self.transfer_backends
-            )
-        ):
-            raise invalid_descriptor(
-                "worker physical transfer capabilities are incomplete"
-            )
-
         for name in (
             "queue_depth",
             "max_batch_calls",
@@ -453,11 +440,6 @@ class WorkerInfo:
         ):
             if getattr(self, name) < 1:
                 raise invalid_descriptor(f"worker info.{name} must be positive")
-
-        if self.world_size < 1 or self.endpoint.rank >= self.world_size:
-            raise invalid_descriptor(
-                "endpoint rank must satisfy 0 <= rank < world_size"
-            )
 
         # Every token-model forward reads or extends a request's KV cache.
         requires_kv = any(
@@ -552,15 +534,7 @@ class WorkerInfo:
             endpoint=WorkerEndpoint.from_mapping(
                 data.get("endpoint"), f"{where}.endpoint"
             ),
-            device=_str(data.get("device"), f"{where}.device"),
-            transfer_backends=tuple(
-                _str(name, f"{where}.transfer_backends")
-                for name in _seq(
-                    data.get("transfer_backends"), f"{where}.transfer_backends"
-                )
-            ),
             fabric_handles=bool(data.get("fabric_handles", False)),
-            world_size=_uint(data.get("world_size"), f"{where}.world_size"),
             supported_calls=tuple(
                 computation(item, f"{where}.supported_calls[{index}]")
                 for index, item in enumerate(
@@ -632,10 +606,7 @@ class WorkerInfo:
             if self.video_denoiser is None
             else self.video_denoiser.to_mapping(),
             "endpoint": self.endpoint.to_mapping(),
-            "device": self.device,
-            "transfer_backends": list(self.transfer_backends),
             "fabric_handles": self.fabric_handles,
-            "world_size": self.world_size,
             "components": [
                 component.to_mapping() for component in self.components
             ],

@@ -152,7 +152,6 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
     // pages of samples per request slot.
     info.latent_page_units = 256;
     info.latent_pages = 2 * info.request_slots + 1;
-    info.world_size = decoder_ranks as u32;
     info.host_lane_capacity = host_lane_capacity;
     info.components = vec![
         component(

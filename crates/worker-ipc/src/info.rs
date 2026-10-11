@@ -1,10 +1,10 @@
 //! Worker identity, supported calls, and startup capacity handshake.
 //!
-//! A rank answers the engine's `Info` request with a [`WorkerInfo`]. The engine
-//! validates it, checks it against the launch configuration, and requires a
-//! replacement rank to report an identical description apart from its
-//! endpoint. The executor then derives the capacity view the scheduler plans
-//! against from the descriptions of all workers (`ExecutorInfo::runtime_info`).
+//! A rank answers the engine's `Info` request with a [`WorkerInfo`], which the
+//! codec validates, and the engine requires a replacement rank to report an
+//! identical description apart from its endpoint. The executor then derives
+//! the capacity view the scheduler plans against from the descriptions of all
+//! workers (`ExecutorInfo::runtime_info`).
 
 use super::*;
 
@@ -315,10 +315,10 @@ impl VideoDenoiserInfo {
 
 /// Post-load worker geometry, limits and supported work.
 ///
-/// [`WorkerInfo::validate`] checks only internal consistency. The engine's
-/// `RankProcess::finish_startup` additionally checks the description against
-/// the launch: `queue_depth`, rank and world size, and component
-/// configuration.
+/// [`WorkerInfo::validate`] checks internal consistency, and the codec runs it
+/// when it encodes or decodes the report. The engine owns the launch values
+/// (placement, queue depth, transfer mechanisms) and does not check the report
+/// against them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerInfo {
     /// Model-declared finite terminal-media computation, when supported.
@@ -331,10 +331,6 @@ pub struct WorkerInfo {
     pub video_denoiser: Option<VideoDenoiserInfo>,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
-    /// Rank-local primary compute device used to bind physical transfer edges.
-    pub device: String,
-    /// Physical transfer mechanisms initialized by this rank.
-    pub transfer_backends: Vec<String>,
     /// Whether this rank's device exports a fabric allocation handle.
     ///
     /// A fabric handle is importable from another host inside the fabric
@@ -342,8 +338,6 @@ pub struct WorkerInfo {
     /// this is what decides whether a transfer edge may cross hosts.
     #[serde(default)]
     pub fabric_handles: bool,
-    /// Number of physical members in this Worker.
-    pub world_size: u32,
     /// Finalized component membership and logical degrees.
     #[serde(default)]
     pub components: Vec<ComponentInfo>,
@@ -415,28 +409,12 @@ impl WorkerInfo {
         self.kv_cache.is_some()
     }
 
-    /// Validates worker identity, capacity, call, and rank invariants.
+    /// Validates worker identity, capacity, call, and component invariants.
     pub fn validate(&self) -> ValidationResult<()> {
-        // Identity and physical transfer capabilities.
         self.endpoint.validate()?;
-        ensure_valid!(
-            !self.device.is_empty()
-                && !self.transfer_backends.is_empty()
-                && self
-                    .transfer_backends
-                    .iter()
-                    .all(|name| matches!(name.as_str(), "local" | "shm" | "cuda_vmm" | "channel"))
-                && self.transfer_backends.iter().collect::<HashSet<_>>().len()
-                    == self.transfer_backends.len(),
-            "worker physical transfer capabilities are incomplete"
-        );
-        ensure_valid!(
-            self.world_size > 0 && self.endpoint.rank < self.world_size,
-            "worker process rank is outside its world"
-        );
 
-        // Components: unique names and outputs, membership within the world,
-        // and parallel degrees consistent with membership.
+        // Components: unique names and outputs, and parallel degrees
+        // consistent with membership.
         let mut names = HashSet::new();
         for component in &self.components {
             ensure_valid!(
@@ -452,14 +430,7 @@ impl WorkerInfo {
                 );
             }
             let params = &component.config;
-            ensure_valid!(
-                !params.ranks.is_empty()
-                    && params
-                        .ranks
-                        .iter()
-                        .all(|&rank| rank < self.world_size as usize),
-                "component membership is outside the process world"
-            );
+            ensure_valid!(!params.ranks.is_empty(), "component names no member rank");
             ensure_valid!(
                 params.ranks.iter().collect::<HashSet<_>>().len() == params.ranks.len(),
                 "component repeats process ranks"
@@ -585,9 +556,6 @@ impl Default for WorkerInfo {
                 address_space: "simulation".into(),
                 incarnation: "simulation".into(),
             },
-            world_size: 1,
-            device: "cpu".into(),
-            transfer_backends: vec!["local".into()],
             components: Vec::new(),
             supported_calls: vec![
                 CallKind::Forward(ForwardMode::Prefill),

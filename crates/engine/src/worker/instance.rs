@@ -196,7 +196,7 @@ impl WorkerProcessArgs {
             mut ranks,
             mut launchers,
         } = launched;
-        let reports = registry.collect(&self.worker_id, ranks.len(), || {
+        let reports = registry.collect(ranks.len(), || {
             // A rank this process spawned is checked here; a rank another
             // host started reaches the head as an exit report from the
             // launcher that owns it, which fails the launch by name rather
@@ -221,15 +221,7 @@ impl WorkerProcessArgs {
         ranks
             .into_iter()
             .zip(reports)
-            .map(|(pending, report)| {
-                anyhow::ensure!(
-                    pending.rank() == report.rank,
-                    "rank {} adopted the endpoint reported by rank {}",
-                    pending.rank(),
-                    report.rank
-                );
-                pending.adopt(&report.transport, &report.endpoint)
-            })
+            .map(|(pending, report)| pending.adopt(&report.endpoint))
             .collect::<anyhow::Result<Vec<_>>>()
             .map(|ranks| (ranks, launchers.take()))
     }
@@ -516,9 +508,8 @@ impl WorkerGroup {
 
     /// Checks that the ranks' startup reports describe one group and builds it.
     ///
-    /// Every rank must report valid info naming its launched rank, the group's
-    /// world size and worker identity, and must agree with rank 0 apart from
-    /// rank-specific fields. The muxer must run on
+    /// Every rank must agree with rank 0 apart from rank-specific fields.
+    /// The muxer must run on
     /// the head's host, and the ranks' KV regions must cover every layer's KV
     /// heads without a gap. Once all checks pass, no rank's startup may be
     /// cancelled and every rank this process started must still be running.
@@ -529,8 +520,6 @@ impl WorkerGroup {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
-        let world_size =
-            u32::try_from(n).context("process world size exceeds the IPC representation")?;
 
         // `info` starts as rank 0's report and becomes the group's; `canonical`
         // is the reference every rank is compared with.
@@ -553,27 +542,11 @@ impl WorkerGroup {
         canonical.buffer_pool_bytes = product_storage;
 
         for (rank, worker) in workers.iter().enumerate() {
-            let rank_info = worker.info();
-            rank_info
-                .validate()
-                .with_context(|| format!("physical rank {rank} reported invalid worker info"))?;
-            anyhow::ensure!(
-                rank_info.endpoint.rank == rank as u32 && rank_info.world_size == world_size,
-                "physical rank {rank} reported topology ({}/{}) for launched topology ({rank}/{world_size})",
-                rank_info.endpoint.rank,
-                rank_info.world_size,
-            );
-            let mut normalized = rank_info.clone();
-            anyhow::ensure!(
-                rank_info.endpoint.worker_id == process_args.worker_id,
-                "physical rank {rank} reported another WorkerGroup identity"
-            );
+            let mut normalized = worker.info().clone();
             // Rank-specific fields take the reference's values before the
-            // comparison: the endpoint, device, transfer backends, product
-            // storage, and each KV group's layers and head offset.
+            // comparison: the endpoint, product storage, and each KV group's
+            // layers and head offset.
             normalized.endpoint = canonical.endpoint.clone();
-            normalized.device = canonical.device.clone();
-            normalized.transfer_backends = canonical.transfer_backends.clone();
             normalized.buffer_pool_bytes = canonical.buffer_pool_bytes;
             if let (Some(local), Some(reference)) = (&mut normalized.kv_cache, &canonical.kv_cache)
             {
@@ -657,7 +630,7 @@ impl WorkerGroup {
             worker.check_worker("WorkerGroup readiness")?;
         }
 
-        let depth = info.queue_depth.max(1) as usize;
+        let depth = process_args.queue_depth.max(1);
         let buffers = (0..n).map(|_| VecDeque::new()).collect();
         Ok(Self {
             launchers,
@@ -1760,14 +1733,9 @@ fn validate_replacement_info(
     actual: &WorkerInfo,
     rank: usize,
 ) -> anyhow::Result<()> {
-    actual
-        .validate()
-        .with_context(|| format!("replacement rank {rank} reported invalid worker info"))?;
     let mut normalized_expected = expected.clone();
     anyhow::ensure!(
-        actual.endpoint.worker_id == expected.endpoint.worker_id
-            && actual.endpoint.rank == rank as u32
-            && actual.endpoint.incarnation != expected.endpoint.incarnation,
+        actual.endpoint.incarnation != expected.endpoint.incarnation,
         "replacement rank {rank} did not establish a new endpoint incarnation"
     );
     normalized_expected.endpoint = actual.endpoint.clone();
@@ -1818,6 +1786,25 @@ impl WorkerGroup {
     /// Returns the group's agreed worker metadata.
     pub fn info(&self) -> &WorkerInfo {
         &self.info
+    }
+
+    /// Returns the launched number of physical ranks.
+    pub(crate) fn world_size(&self) -> usize {
+        self.process_args.ranks.len()
+    }
+
+    /// Returns the physical runs the group admits at once: the queue depth it
+    /// launched its ranks with, counted as at least one.
+    pub(crate) fn queue_depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Returns whether the device `rank` was placed on is a CUDA device.
+    ///
+    /// `rank` must index the launched ranks.
+    pub(crate) fn rank_on_cuda(&self, rank: usize) -> bool {
+        let device = self.process_args.ranks[rank].device.as_str();
+        device == "cuda" || device.starts_with("cuda:")
     }
 
     /// Return the same bindings used to initialize this instance's transports.

@@ -479,7 +479,6 @@ class Worker:
                 bindings=bindings,
                 queue_depth=int(queue_depth),
                 completion_payload_bytes=int(completion_payload_bytes),
-                transfer_backends=transfer_backends,
                 components=components,
                 # The scheduler's page indices address every rank's resident
                 # layer and head regions, including stages with different

@@ -7,11 +7,11 @@
 //!
 //! The head decides the mechanism from the placement and passes it to the rank
 //! in its launch descriptor (`channel_transport`); the rank binds a
-//! [`RankServer`] for it, names the endpoint, and reports both at registration.
-//! The engine's registration refuses any mechanism other than
-//! [`SHARED_STORAGE_CHANNEL`] and [`SOCKET_CHANNEL`], and `PendingRank::adopt`
-//! then connects a [`RankChannel`] to whatever the report named. On the rank
-//! side the PyO3 `Server` in `worker-ipc-py` owns the [`RankServer`].
+//! [`RankServer`] for it, names the endpoint, and reports the endpoint at
+//! registration. `PendingRank::adopt` then connects a [`RankChannel`] of that
+//! mechanism to the reported endpoint, refusing any mechanism other than
+//! [`SHARED_STORAGE_CHANNEL`] and [`SOCKET_CHANNEL`]. On the rank side the
+//! PyO3 `Server` in `worker-ipc-py` owns the [`RankServer`].
 //!
 //! The two mechanisms differ in ways the enums do not hide: a shared-storage
 //! request can be sent before any server exists (see
@@ -117,7 +117,7 @@ impl RankChannel {
                 timeout,
             )?))),
             other => Err(IpcError::Transport(format!(
-                "rank offers the unsupported channel transport {other}"
+                "unsupported channel transport {other}"
             ))),
         }
     }

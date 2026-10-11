@@ -32,18 +32,13 @@ def test_expert_participant_advertises_no_request_work() -> None:
     assert reported.latent_pages == 0
 
 
-@pytest.mark.parametrize("backends", (("local",), ("local", "shm")))
-def test_worker_info_reports_schedulable_work_and_bounds(
-    backends: tuple[str, ...],
-) -> None:
-    worker = execution_worker(transfer_backends=backends)
+def test_worker_info_reports_schedulable_work_and_bounds() -> None:
+    worker = execution_worker()
     try:
         info = worker.info.to_mapping()
     finally:
         worker.close()
 
-    assert info["device"] == "cpu"
-    assert tuple(info["transfer_backends"]) == backends
     assert set(info["supported_calls"]) == {
         "prefill",
         "decode",
@@ -95,7 +90,6 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (
         == "encoder-0"
     )
     assert first["endpoint"]["rank"] == second["endpoint"]["rank"] == 0
-    assert first["world_size"] == second["world_size"] == 1
     assert first["endpoint"]["node"] == second["endpoint"]["node"]
     assert (
         first["endpoint"]["address_space"]

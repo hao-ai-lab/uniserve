@@ -1596,7 +1596,6 @@ fn worker_info_round_trips() {
         };
         let count = config.world_size().unwrap();
         let info = WorkerInfo {
-            world_size: count as u32,
             kv_cache: Some(KvCacheInfo {
                 groups: vec![KvCacheGroup {
                     layer_ids: (11..20).collect(),
@@ -1961,7 +1960,6 @@ fn full_caps() -> WorkerInfo {
             rank: 1,
             ..WorkerInfo::default().endpoint
         },
-        world_size: 2,
         queue_depth: 2,
         max_batch_calls: 64,
         max_batch_tokens: 4096,
@@ -2200,25 +2198,6 @@ fn ipc_decode_rejects_malformed_frames() {
     let mut response = encode_response(&WorkerResponse::ok()).unwrap();
     response.truncate(response.len() / 2);
     assert!(decode_response(&response).is_err());
-}
-
-#[test]
-fn a_rank_may_transfer_over_every_mechanism_its_edges_name() {
-    let mut info = WorkerInfo {
-        transfer_backends: vec![
-            "cuda_vmm".to_owned(),
-            "shm".to_owned(),
-            "channel".to_owned(),
-        ],
-        ..WorkerInfo::default()
-    };
-    assert!(info.validate().is_ok());
-
-    // `socket` is not a transfer mechanism name (`local`, `shm`, `cuda_vmm`,
-    // or `channel`).
-    info.transfer_backends = vec!["cuda_vmm".to_owned(), "socket".to_owned()];
-    let error = info.validate().unwrap_err().to_string();
-    assert!(error.contains("transfer capabilities"), "{error}");
 }
 
 #[test]

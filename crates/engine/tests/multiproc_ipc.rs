@@ -6,9 +6,8 @@
 //! `ClientEndpoint` when the worker's own protocol handling is under test.
 //! The interpreter comes from `UNISERVE_WORKER_PYTHON` or the repository's
 //! `.venv/bin/python`. Several tests replace that interpreter with a small
-//! wrapper script that records a rank's process id, exits a chosen rank,
-//! reports a registration with an unsupported channel transport, or runs a
-//! fixture from `tests/python/fixtures` instead of the worker module.
+//! wrapper script that records a rank's process id, exits a chosen rank, or
+//! runs a fixture from `tests/python/fixtures` instead of the worker module.
 //!
 //! Faults and delays are injected at the OS boundary:
 //! `/proc/thread-self/children` and `/proc/<pid>/cmdline` locate a rank
@@ -249,46 +248,6 @@ fn accept_reported_endpoint(listener: &std::net::TcpListener) -> anyhow::Result<
         .as_str()
         .context("rank registration named no endpoint")?
         .to_owned())
-}
-
-#[test]
-fn launch_refuses_a_rank_that_offers_an_unsupported_channel() -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    // A rank names its own endpoint, so the mechanism it offers is data the
-    // head has to check rather than a value it chose.
-    let directory = tempfile::tempdir()?;
-    let wrapper = directory.path().join("worker");
-    std::fs::write(
-        &wrapper,
-        r#"#!/usr/bin/env python3
-import json, socket, sys
-
-descriptor = json.load(open(sys.argv[sys.argv.index("--launch-descriptor") + 1]))
-host, _, port = descriptor["registration_address"].rpartition(":")
-report = {
-    "worker_id": descriptor["worker_id"],
-    "rank": descriptor["rank"],
-    "transport": "socket",
-    "endpoint": "unreachable",
-}
-with socket.create_connection((host, int(port)), timeout=60) as connection:
-    connection.sendall(json.dumps(report).encode() + b"\n")
-"#,
-    )?;
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-
-    let mut args = rank_group_args(1 << 20, 8 << 20);
-    args.python = wrapper;
-    let reported = match WorkerGroup::spawn(args) {
-        Ok(_) => anyhow::bail!("an unsupported channel transport was accepted"),
-        Err(error) => format!("{error:#}"),
-    };
-    assert!(
-        reported.contains("unsupported channel transport socket"),
-        "launch failure did not name the offered transport: {reported}"
-    );
-    Ok(())
 }
 
 #[test]
@@ -1779,7 +1738,6 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
     let info = executor.info();
     assert_eq!(info.endpoint.rank, 0);
-    assert_eq!(info.world_size, WORLD_SIZE as u32);
     assert_eq!(info.max_batch_calls, 256);
     assert_eq!(info.max_batch_tokens, 256);
     assert_eq!(info.queue_depth as usize, QUEUE_DEPTH);

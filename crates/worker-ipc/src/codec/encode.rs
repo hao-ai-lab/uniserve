@@ -18,8 +18,7 @@
 //! `allowed_token_ids` is written only when `Some`, because absence (no
 //! whitelist) and an empty vector mean different things, and `locator`
 //! writes only the vectors of the selected transport. The decoders read most
-//! absent vectors as empty, but reject an absent
-//! `WorkerInfo.transfer_backends` or `ComponentInfo.outputs`.
+//! absent vectors as empty, but reject an absent `ComponentInfo.outputs`.
 
 use super::*;
 use flatbuffers::WIPOffset;
@@ -1433,15 +1432,6 @@ fn component_info<'a>(
 
 fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::WorkerInfo<'a>> {
     let endpoint = Some(endpoint(b, &v.endpoint));
-    let device = Some(b.create_string(&v.device));
-    let transfer_backends = {
-        let items = v
-            .transfer_backends
-            .iter()
-            .map(|s| b.create_string(s))
-            .collect::<Vec<_>>();
-        Some(b.create_vector(&items))
-    };
     let components = {
         let items = v
             .components
@@ -1507,10 +1497,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
         b,
         &fbs::WorkerInfoArgs {
             endpoint,
-            device,
-            transfer_backends,
             fabric_handles: v.fabric_handles,
-            world_size: v.world_size,
             components,
             supported_calls,
             queue_depth: v.queue_depth,

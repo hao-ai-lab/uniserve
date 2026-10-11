@@ -75,9 +75,10 @@ def endpoint_name(config: WorkerProcessArgs) -> str:
 def register_endpoint(config: WorkerProcessArgs, endpoint: str) -> None:
     """Report this rank's bound endpoint to the head's registration address.
 
-    One JSON line carries the report (``worker_id``, ``rank``, ``transport``
-    and ``endpoint``); the connection carries nothing else and closes after
-    the write. ``endpoint`` is what the channel actually bound.
+    One JSON line carries the report (``rank`` and ``endpoint``); the
+    connection carries nothing else and closes after the write. ``endpoint``
+    is what the channel actually bound. The head registers one worker group
+    per address and chose the channel mechanism, so neither is reported.
 
     A socket endpoint binds every interface, so its bound address names no
     interface the head can dial. The report therefore replaces the host part
@@ -95,9 +96,7 @@ def register_endpoint(config: WorkerProcessArgs, endpoint: str) -> None:
             _, bound_port = endpoint.rsplit(":", 1)
             endpoint = f"{connection.getsockname()[0]}:{bound_port}"
         report = {
-            "worker_id": config.worker_id,
             "rank": int(config.execution.rank),
-            "transport": config.ipc.channel_transport,
             "endpoint": endpoint,
         }
         connection.sendall(json.dumps(report).encode("utf-8") + b"\n")

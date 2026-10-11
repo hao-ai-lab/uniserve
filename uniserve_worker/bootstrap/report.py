@@ -160,7 +160,6 @@ def build_worker_layout(
     completion_payload_bytes: int = 1 << 20,
     endpoint: WorkerEndpoint | None = None,
     capacity_group: Communicator | None = None,
-    transfer_backends: tuple[str, ...] = ("local",),
     components: tuple[tuple[str, ComponentConfig], ...] = (),
     bindings: Mapping[str, ComponentBinding] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
@@ -254,7 +253,6 @@ def build_worker_layout(
             for call, component in media_components(model, held).items()
             if call in supported
         },
-        transfer_backends=transfer_backends,
         fabric_handles=_exports_fabric_handles(worker_config.device),
         max_batch_calls=max_calls,
         max_batch_tokens=max_tokens,
@@ -664,7 +662,6 @@ def _token_worker_layout(
     )
     info = WorkerInfo(
         endpoint=endpoint,
-        device=str(worker_config.device),
         world_size=int(worker_config.world_size),
         supported_calls=supported,
         queue_depth=int(queue_depth),
@@ -773,7 +770,6 @@ def _request_tensor_worker_layout(
 
     info = WorkerInfo(
         endpoint=endpoint,
-        device=str(worker_config.device),
         world_size=int(worker_config.world_size),
         supported_calls=tuple(
             code for code in CALL_KINDS if code in supported_calls(model)

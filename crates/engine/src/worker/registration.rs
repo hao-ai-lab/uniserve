@@ -28,21 +28,17 @@ const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(300);
 const ACCEPT_INTERVAL: Duration = Duration::from_millis(20);
 /// Deadline for one accepted connection to deliver its report line.
 const REPORT_READ_TIMEOUT: Duration = Duration::from_secs(30);
-// The two channel mechanisms a rank may report; `collect` refuses any other.
-use uniserve_worker_ipc::{SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL};
 
 /// One rank's report of the channel endpoint the engine connects to.
 ///
 /// `register_endpoint` in `uniserve_worker.bootstrap.launch` writes it as one
-/// JSON line with these field names.
+/// JSON line with these field names. One registry serves one worker group and
+/// the launch descriptor names the channel mechanism, so the report carries
+/// neither.
 #[derive(Debug, Deserialize)]
 pub(crate) struct RankReport {
-    /// Worker identity the rank was launched under.
-    pub worker_id: String,
-    /// Global rank within that worker.
+    /// Global rank within the worker group.
     pub rank: u32,
-    /// Channel mechanism the endpoint names.
-    pub transport: String,
     /// Endpoint the engine binds this rank's channel to.
     pub endpoint: String,
 }
@@ -143,11 +139,10 @@ impl RankRegistry {
     /// skipped. Failures include an error from `alive`, the deadline passing
     /// with ranks unreported (named in the error), an accept or read failure
     /// (including a read exceeding `REPORT_READ_TIMEOUT`), a malformed report,
-    /// and a report naming another worker, an unsupported transport, a rank
-    /// outside `0..expected`, or a rank that already reported.
+    /// and a report naming a rank outside `0..expected` or a rank that
+    /// already reported.
     pub(crate) fn collect(
         &self,
-        worker_id: &str,
         expected: usize,
         mut alive: impl FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<Vec<RankReport>> {
@@ -196,23 +191,6 @@ impl RankRegistry {
 
             let report: RankReport = serde_json::from_str(line.trim())
                 .with_context(|| format!("parsing the rank registration {line:?}"))?;
-            anyhow::ensure!(
-                report.worker_id == worker_id,
-                "rank registration names worker {} instead of {worker_id}",
-                report.worker_id
-            );
-            // A rank on the head's host offers shared storage and a rank
-            // elsewhere offers a socket. Any other mechanism is refused by
-            // name rather than bound with the wrong transport.
-            anyhow::ensure!(
-                matches!(
-                    report.transport.as_str(),
-                    SHARED_STORAGE_CHANNEL | SOCKET_CHANNEL
-                ),
-                "rank {} offers the unsupported channel transport {}",
-                report.rank,
-                report.transport
-            );
             let rank = report.rank as usize;
             anyhow::ensure!(
                 rank < expected,
