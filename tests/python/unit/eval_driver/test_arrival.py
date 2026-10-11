@@ -146,10 +146,11 @@ def test_closed_loop_sessions_wait_for_their_own_previous_response(concurrency):
                 request_rate=float("inf"),
                 max_concurrency=concurrency,
                 submit=submit,
-                warmup_requests=0,
             ),
             timeout=5,
         )
+        # Each session's first request is measured, not repeated as warmup.
+        assert result.warmup_outputs == ()
         assert [record.request_id for record in result.outputs] == [
             row.id for row in rows
         ]
@@ -163,7 +164,6 @@ def test_closed_loop_sessions_wait_for_their_own_previous_response(concurrency):
     [
         {"request_rate": 1.0},
         {"max_concurrency": 1},
-        {"warmup_requests": 1},
     ],
 )
 def test_closed_loop_sessions_reject_incompatible_arrival_settings(settings):
@@ -173,7 +173,6 @@ def test_closed_loop_sessions_reject_incompatible_arrival_settings(settings):
     arguments = {
         "request_rate": float("inf"),
         "max_concurrency": 2,
-        "warmup_requests": 0,
         **settings,
     }
     with pytest.raises(ValueError, match="session"):

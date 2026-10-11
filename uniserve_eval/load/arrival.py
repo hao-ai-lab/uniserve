@@ -105,9 +105,9 @@ async def run_load(
     its arrival time and waits for all of them. When every row has a
     ``session_id``, sessions run concurrently and each awaits its previous
     response before submitting its next row. Session traces require an
-    infinite request rate, zero repeated-row warmup, and, if specified, a
-    concurrency equal to their session count. Initial cold requests are
-    measured as part of the trace.
+    infinite request rate and, if specified, a concurrency equal to their
+    session count. A trace measures each session's initial cold request, so
+    it has no repeated-row warmup.
 
     Args:
         rows: Examples in submission order.
@@ -116,7 +116,8 @@ async def run_load(
         max_concurrency: Maximum in-flight submissions, or ``None`` (or
             ``0``) for no limit.
         submit: Coroutine that sends one example; see ``Submit``.
-        warmup_requests: Number of warmup submissions; ``0`` skips warmup.
+        warmup_requests: Number of first-row warmup submissions; ``0`` skips
+            them, and so does a session trace.
         warmup_rows: Explicit excluded corpus, replacing first-row repetition.
         inspect_warmup: Inspect excluded outputs after their slots are released
             and before checking warmup success.
@@ -156,11 +157,6 @@ async def run_load(
             raise ValueError(
                 "closed-loop session count must equal max_concurrency"
             )
-        if warmup_requests:
-            raise ValueError(
-                "session traces require warmup_requests=0; "
-                "include each session's initial cold request in the trace"
-            )
 
     # Warmup and measurement share the declared in-flight limit. The arrival
     # timestamp is taken before the semaphore, so time queued here appears
@@ -175,10 +171,15 @@ async def run_load(
             return await submit(row, scheduled)
 
     # Warmup exercises the same request path outside the reported duration.
+    # Repeating the first row is the warmup of a load that names no corpus;
+    # in a session trace that row is a session's measured cold request.
     warmup_outputs: list[T] = []
-    excluded = (
-        warmup_rows if warmup_rows is not None else [rows[0]] * warmup_requests
-    )
+    if warmup_rows is not None:
+        excluded = warmup_rows
+    elif sessions:
+        excluded = []
+    else:
+        excluded = [rows[0]] * warmup_requests
     if excluded:
         warmup_outputs = await asyncio.gather(
             *[limited(row, None) for row in excluded]
