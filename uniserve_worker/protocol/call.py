@@ -359,8 +359,8 @@ class Call:
     def buffer_outputs(self) -> tuple[tensor.TensorRef, ...]:
         """Return outputs backed by scheduler-allocated persistent buffers.
 
-        `Batch.validate` requires a `BufferAllocation` for each of these that
-        is at least as large as the output's `max_bytes`.
+        The Rust `Batch::validate` requires a `BufferAllocation` for each of
+        these that is at least as large as the output's `max_bytes`.
         """
         return (
             *self.outputs,

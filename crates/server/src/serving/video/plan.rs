@@ -20,8 +20,8 @@
 //!   reference video's timeline at the output frame rate `fps` (24 for the
 //!   released checkpoint) and the first `floor(s * rate + 0.5)` samples of
 //!   its soundtrack;
-//! - a reference video needs at least 22 frames (one `17n + 5` VAE window)
-//!   on that timeline after the start offset;
+//! - a reference video needs at least the frame rule's `min_frames` (one VAE
+//!   window) on that timeline after the start offset;
 //! - `ref2va` keyframes are fitted to the target canvas like `fl2va` ones
 //!   (the first stretched, a second cover-cropped) and do not enter the
 //!   conditioner;
@@ -799,7 +799,7 @@ pub struct RequestPlan {
     /// The requested duration in seconds: `target.duration_seconds`, or the
     /// soundtrack's length after its start offset when that sets it.
     pub duration_seconds: f64,
-    /// Generated frames, of the form `17n + 5`.
+    /// Generated frames, a legal count of the deployment's frame rule.
     pub num_frames: u32,
     /// One plan per condition, in request order.
     pub conditions: Vec<ConditionPlan>,

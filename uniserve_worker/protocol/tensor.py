@@ -238,8 +238,8 @@ class TensorRef:
     def max_bytes(self) -> int:
         """Maximum storage in bytes: bound element count times dtype width.
 
-        `Batch.validate` requires each persistent output's buffer allocation
-        to be at least this large.
+        The Rust `Batch::validate` requires each persistent output's buffer
+        allocation to be at least this large.
         """
         return self.shape_bound.max_elements * self.dtype.element_bytes
 

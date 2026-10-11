@@ -526,9 +526,9 @@ def _build_warmup_batch(
     """Derive allocations for a warmup submission and assemble its batch.
 
     Takes the next batch id, so each call's ``CallId`` must already name
-    ``requests._batch_id + 1`` (``Batch.validate`` rejects calls of another
-    batch). Reserves buffer spans for the calls' persistent products, binds
-    request slots from the worker's rows or ``admissions``, grows the KV
+    ``requests._batch_id + 1`` (the Rust ``Batch::validate`` refuses calls of
+    another batch). Reserves buffer spans for the calls' persistent products,
+    binds request slots from the worker's rows or ``admissions``, grows the KV
     leases of KV-using calls to cover ``kv_visible_len`` plus, for token
     forwards, ``bounds.max_tokens``, leases latent pages for latent-holding
     calls at ``image_size`` (default `_warmup_image_size`), and adds the
@@ -539,8 +539,7 @@ def _build_warmup_batch(
         WorkerError: From `invalid_descriptor` when a call has no request
             slot, a KV admission has a nonzero initial position, the worker
             has no KV cache, a lease would shrink, or KV, latent, or buffer
-            capacity is exhausted, and from `_warmup_flow_tables` and
-            ``Batch.validate``.
+            capacity is exhausted, and from `_warmup_flow_tables`.
     """
     requests._batch_id += 1
     admissions_by_key = {
@@ -1278,7 +1277,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         width = bucket.width
         cfg_branches = bucket.cfg_branches
         # The engine leases every guided request a second slot for its
-        # alternative prefix (``ensure_flow_prefix``), so no guided batch it
+        # alternative prefix (``ensure_guidance_prefix``), so no guided batch it
         # forms holds more than half the slots. The scenario is bounded the
         # same way: its prefix slots, taken downward from the highest slot,
         # then stay clear of the rows' slots taken upward from slot one. A

@@ -165,7 +165,7 @@ class CacheUnitAllocation:
     """Physical KV units newly assigned to a request slot and KV group.
 
     The units are a subset of the batch's `BlockTable` for the same slot and
-    group; the Rust `Batch::validate` checks this, `Batch.validate` does not.
+    group; the Rust `Batch::validate` checks this.
     The worker resets every listed unit before a call uses it.
     """
 
