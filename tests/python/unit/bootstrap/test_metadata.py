@@ -117,7 +117,7 @@ def test_h3_worker_advertises_bounded_media_products():
     # The deployment serves 768p 16:9 and 9:16.
     config = WorkerConfig(
         device="cpu",
-        max_sequence_tokens=65,
+        max_model_len=65,
         max_video_seconds=1.0,
         max_request_pool_size=2,
         min_request_pool_size=2,
@@ -343,9 +343,9 @@ def test_text_worker_reports_exact_cache_capacity(storage):
     config = WorkerConfig(
         device="cpu",
         block_size=64,
-        kv_token_capacity=256,
+        max_total_tokens=256,
         kv_cache_dtype=storage,
-        max_sequence_tokens=128,
+        max_model_len=128,
     )
     info = build_worker_layout(model, config).info
     cache = info.kv_cache
@@ -392,7 +392,7 @@ def test_h3_media_units_follow_each_request_canvas():
         model = Model(base_config())
     config = WorkerConfig(
         device="cpu",
-        max_sequence_tokens=65,
+        max_model_len=65,
         max_video_seconds=5.0,
         deployment_components=("transformer", "video_decoder", "video_codec"),
     )
@@ -467,7 +467,7 @@ def test_h3_audio_product_holds_the_decoded_track(seconds, frames):
         model = Model(fasth3_config())
     config = WorkerConfig(
         device="cpu",
-        max_sequence_tokens=65,
+        max_model_len=65,
         max_video_seconds=seconds,
         max_request_pool_size=2,
         min_request_pool_size=2,
@@ -499,7 +499,7 @@ def test_h3_video_capacity_rounds_half_frames_to_even():
         model = Model(fasth3_config())
     config = WorkerConfig(
         device="cpu",
-        max_sequence_tokens=65,
+        max_model_len=65,
         max_video_seconds=5.1875,
         max_request_pool_size=2,
         min_request_pool_size=2,
@@ -535,7 +535,7 @@ def test_a_deployment_without_condition_capacity_serves_the_largest_set():
         text_only = Model(fasth3_config())
     config = WorkerConfig(
         device="cpu",
-        max_sequence_tokens=4096,
+        max_model_len=4096,
         max_video_seconds=5.0,
         max_batch_calls=2,
         max_request_pool_size=2,

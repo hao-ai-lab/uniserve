@@ -72,7 +72,7 @@
   },
   {
     "id": "reader",
-    "memory_fraction": 0.04,
+    "mem_fraction_static": 0.04,
     "ranks": [
       { "node": "rank-0", "device": "cuda:0" }
     ],

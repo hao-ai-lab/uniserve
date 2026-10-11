@@ -158,7 +158,7 @@ def condition_capacity(
     return max(
         denoiser.make_size(
             frames,
-            config.max_sequence_tokens,
+            config.max_model_len,
             canvas=canvas,
             conditions=conditions,
         ).condition_rows
@@ -172,7 +172,7 @@ def media_builder(model: nn.Module, config: WorkerConfig):
     The frame budget is ``max_video_seconds`` at the post-processor's output
     frame rate, rounded half to even to whole frames, and admitted frame
     counts start at ``min_video_seconds`` converted the same way; the text
-    budget is ``max_sequence_tokens``, divided into
+    budget is ``max_model_len``, divided into
     ``video_text_capacities``. The deployment prepares the canvases of
     ``video_frame_sizes``, or the denoiser's own without any.
 
@@ -197,7 +197,7 @@ def media_builder(model: nn.Module, config: WorkerConfig):
     return MediaBuilder(
         denoiser,
         max_frames=max_frames,
-        max_text_tokens=config.max_sequence_tokens,
+        max_text_tokens=config.max_model_len,
         min_frames=1
         if config.min_video_seconds is None
         else round(config.min_video_seconds * output.frame_rate),

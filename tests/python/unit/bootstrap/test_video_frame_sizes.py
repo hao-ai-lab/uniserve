@@ -24,7 +24,7 @@ def model():
 def _config(*sizes: tuple[int, int]) -> WorkerConfig:
     return WorkerConfig(
         device="cpu",
-        max_sequence_tokens=1024,
+        max_model_len=1024,
         max_video_seconds=5.0,
         video_frame_sizes=sizes,
     )

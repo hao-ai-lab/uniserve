@@ -71,7 +71,7 @@ def execution_worker(
         policy,
         device=worker_config.device,
         block_size=worker_config.block_size,
-        kv_token_capacity=worker_config.kv_token_capacity,
+        max_total_tokens=worker_config.max_total_tokens,
         attention_backend=worker_config.attention_backend,
         max_request_pool_size=worker_config.max_request_pool_size,
         encoder_cache_entries=worker_config.encoder_cache_entries,

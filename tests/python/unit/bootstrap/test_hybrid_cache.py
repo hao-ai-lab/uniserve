@@ -22,7 +22,7 @@ FULL = (5, 11)
 
 def _config(**options):
     return WorkerConfig(
-        device="cpu", block_size=16, max_sequence_tokens=256, **options
+        device="cpu", block_size=16, max_model_len=256, **options
     )
 
 
@@ -70,7 +70,7 @@ def test_hybrid_capacity_counts_units_of_every_group():
         pages=tuple(
             (group.page_tokens, group.units_per_page) for group in planes.groups
         ),
-        kv_token_capacity=256,
+        max_total_tokens=256,
         unit_bytes=planes.unit_bytes,
     )
     # 16 windowed pages of five units and 8 full pages of one unit.

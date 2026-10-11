@@ -157,7 +157,7 @@ def _worker(
         max_batch_calls=SLOTS,
         max_request_pool_size=SLOTS,
         max_batch_tokens=512,
-        max_sequence_tokens=SEQUENCE,
+        max_model_len=SEQUENCE,
         prefill_graph_token_sizes=(64, 256),
         decode_graph_batch_sizes=(1,),
         canvas_sampling=SAMPLING,

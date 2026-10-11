@@ -1,7 +1,7 @@
 [
   {
     "id": "text",
-    "memory_fraction": 0.18,
+    "mem_fraction_static": 0.18,
     "ranks": [
       { "node": "localhost", "device": "cuda:0" },
       { "node": "localhost", "device": "cuda:1" },
@@ -22,7 +22,7 @@
   },
   {
     "id": "flow-0",
-    "memory_fraction": 0.81,
+    "mem_fraction_static": 0.81,
     "ranks": [
       { "node": "localhost", "device": "cuda:0" }
     ],
@@ -48,7 +48,7 @@
   },
   {
     "id": "flow-1",
-    "memory_fraction": 0.81,
+    "mem_fraction_static": 0.81,
     "ranks": [
       { "node": "localhost", "device": "cuda:1" }
     ],
@@ -74,7 +74,7 @@
   },
   {
     "id": "flow-2",
-    "memory_fraction": 0.81,
+    "mem_fraction_static": 0.81,
     "ranks": [
       { "node": "localhost", "device": "cuda:2" }
     ],
@@ -100,7 +100,7 @@
   },
   {
     "id": "flow-3",
-    "memory_fraction": 0.81,
+    "mem_fraction_static": 0.81,
     "ranks": [
       { "node": "localhost", "device": "cuda:3" }
     ],
@@ -126,7 +126,7 @@
   },
   {
     "id": "flow-4",
-    "memory_fraction": 0.81,
+    "mem_fraction_static": 0.81,
     "ranks": [
       { "node": "localhost", "device": "cuda:4" }
     ],
@@ -152,7 +152,7 @@
   },
   {
     "id": "flow-5",
-    "memory_fraction": 0.81,
+    "mem_fraction_static": 0.81,
     "ranks": [
       { "node": "localhost", "device": "cuda:5" }
     ],
@@ -178,7 +178,7 @@
   },
   {
     "id": "flow-6",
-    "memory_fraction": 0.81,
+    "mem_fraction_static": 0.81,
     "ranks": [
       { "node": "localhost", "device": "cuda:6" }
     ],
@@ -204,7 +204,7 @@
   },
   {
     "id": "flow-7",
-    "memory_fraction": 0.81,
+    "mem_fraction_static": 0.81,
     "ranks": [
       { "node": "localhost", "device": "cuda:7" }
     ],

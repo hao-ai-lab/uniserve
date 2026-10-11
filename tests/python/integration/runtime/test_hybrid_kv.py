@@ -39,7 +39,7 @@ CONSUMER = ((1, 2, (21, 22, 23, 24, 25), 48), (1, 0, (3, 4), 64))
 
 
 def _config(device):
-    return WorkerConfig(device=device, block_size=16, max_sequence_tokens=128)
+    return WorkerConfig(device=device, block_size=16, max_model_len=128)
 
 
 def _install(pool, tables):

@@ -517,7 +517,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             ranks: args.ranks.clone(),
             components: args.components.clone(),
             queue_depth: args.queue_depth,
-            storage_fraction: None,
+            mem_fraction_static: None,
         }])?;
         args.transfer = transfer.clone();
         let mut executor = WorkerExecutor::try_new(
@@ -2188,7 +2188,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         queue_depth: QUEUE_DEPTH,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
-        kv_token_capacity: Some(4096),
+        max_total_tokens: Some(4096),
         block_size: Some(16),
         max_batch_calls: 256,
         max_batch_tokens: 256,
@@ -3075,7 +3075,7 @@ fn rank_group_args(
         queue_depth: QUEUE_DEPTH,
         req_slot_cap: request_slot_capacity,
         resp_slot_cap: response_slot_capacity,
-        kv_token_capacity: Some(4096),
+        max_total_tokens: Some(4096),
         block_size: Some(16),
         max_batch_calls: 256,
         max_batch_tokens: 256,
@@ -3129,8 +3129,8 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "model_dtype": "bfloat16",
     "quantization_config": {},
     "kv_cache_dtype": null,
-    "kv_memory_fraction": 0.7,
-    "kv_token_capacity": 4096,
+    "mem_fraction_static": 0.7,
+    "max_total_tokens": 4096,
     "attention_backend": "torch",
     "block_size": 16,
     "max_batch_calls": 8,

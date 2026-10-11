@@ -540,10 +540,10 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
         if int(value) <= 0:
             raise ValueError(f"{option} must be positive")
     if (
-        namespace.kv_token_capacity is not None
-        and int(namespace.kv_token_capacity) <= 0
+        namespace.max_total_tokens is not None
+        and int(namespace.max_total_tokens) <= 0
     ):
-        raise ValueError("--kv-token-capacity must be positive when provided")
+        raise ValueError("--max-total-tokens must be positive when provided")
 
     # The capacity resolves to frames at 24 frames per second, rounded half
     # to even as the server rounds a request's duration. The server admits

@@ -54,7 +54,7 @@ REQUIRED_FIELDS = (
     "ffmpeg",
     "model_dtype",
     "quantization_config",
-    "kv_memory_fraction",
+    "mem_fraction_static",
     "graph_policy",
     "prefill_cuda_graph",
     "flashinfer_workspace_size",

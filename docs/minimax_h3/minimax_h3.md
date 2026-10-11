@@ -158,7 +158,7 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 | `--media-directory` | Directory under which `file://` condition URIs resolve; `file://` is refused without it. |
 | `--remote-media` | Whether `http(s)://` condition URIs are fetched; on by default. |
 | `--max-request-bytes` | Largest request body and fetched media in total; 256 MiB by default. |
-| `--mem-fraction-static` | Device storage each worker process may hold; 0.70 by default. |
+| `--mem-fraction-static` | Device memory each worker process may hold for weights and KV cache; 0.70 by default. |
 | `--graph-policy` | `auto` (default) captures CUDA graphs at startup; `off` runs eagerly. |
 
 Startup prepares, and with graphs captures, every layout a request without conditions reaches: each frame count up to `--max-video-seconds` at each canvas and text capacity. Fewer canvases, capacities and seconds start faster and hold less storage. A request with conditions evaluates in a layout of its own, prepared when it arrives, so a reference denoiser, whose every request brings a reference, prepares only its largest layout at startup: its text capacities and seconds add no startup work. Until then the log reports `worker still busy during Worker startup`. On four GB200 with `fasth3-ulysses4.json` and the defaults, FastH3 is ready in about 17 minutes from warm kernel caches and holds about 105 GiB per model worker; the first startup also compiles kernels. Serving all 12 FastH3 canvases needs fewer text capacities, such as `--video-text-capacities 1024,10240,16384`. 768p 21:9 needs more request storage than the other canvases. A deployment that does not fit fails before it reports ready and logs what each component holds.
@@ -255,7 +255,7 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `--quantization-config` for a packed NVFP4 checkpoint. |
 | `nvfp4 conversion requires an SM100-class CUDA device` | Use `quality` or FP8 overrides on Hopper. |
 | `NVML reports no device storage for process` | Run the container in the host's process ID namespace (`--pid=host`). |
-| Startup refuses a static storage grant, or GPU out of memory | Raise `--mem-fraction-static`, serve fewer canvases, capacities or seconds, or shard the denoiser further. |
+| Startup refuses the static memory grant, or GPU out of memory | Raise `--mem-fraction-static`, serve fewer canvases, capacities or seconds, or shard the denoiser further. |
 | `invalid_request` naming the condition rows and `--max-condition-rows` | Serve with a larger `--max-condition-rows`. |
 | `invalid_request` naming the prompt length | Raise `--max-model-len` together with `--video-text-capacities`. |
 | A refused `file://` condition | Set `--media-directory` to a directory that holds the path. |

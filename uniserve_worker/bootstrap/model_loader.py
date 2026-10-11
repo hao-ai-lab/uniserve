@@ -572,7 +572,7 @@ def loaded_worker_config(
             )
         config = replace(
             config,
-            kv_token_capacity=None,
+            max_total_tokens=None,
             attention_backend=None,
             max_batch_calls=state_slots,
             max_batch_tokens=state_slots,

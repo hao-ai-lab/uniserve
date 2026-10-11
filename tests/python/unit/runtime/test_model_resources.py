@@ -184,7 +184,7 @@ def test_worker_info_reports_capabilities_and_cache_limits():
 def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
     worker_config = replace(
         TEST_WORKER_CONFIG,
-        kv_token_capacity=1024 + 1,
+        max_total_tokens=1024 + 1,
     )
 
     layout = build_worker_layout(
@@ -302,7 +302,7 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     # what a deployment running it would declare.
     config = WorkerConfig(
         device="cpu",
-        max_sequence_tokens=3,
+        max_model_len=3,
         max_request_pool_size=2,
         model_dtype="float32",
     )

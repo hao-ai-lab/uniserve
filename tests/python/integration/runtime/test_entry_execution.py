@@ -651,7 +651,7 @@ def test_text_entry_stages_successive_bounded_inputs(device):
     model = EncodedModel().to(device)
     runner = ModelExecutor(
         model,
-        WorkerConfig(device=device, max_sequence_tokens=16),
+        WorkerConfig(device=device, max_model_len=16),
         bindings=_encoder_bindings(
             model, (("text_encoder", ComponentConfig((0,))),), device
         ),
@@ -689,7 +689,7 @@ def test_worker_reports_text_bounds_and_executes_dense_attention_without_kv():
     with execution_worker(
         model,
         execution=WorkerConfig(
-            max_sequence_tokens=16, graph_policy="off", model_dtype="float32"
+            max_model_len=16, graph_policy="off", model_dtype="float32"
         ),
         components=components,
         bindings=_encoder_bindings(model, components),

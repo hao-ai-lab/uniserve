@@ -289,9 +289,7 @@ def prepare_prefill(
         ValueError: A bucket is prepared on a worker without a KV cache.
     """
     config = runner.worker_config
-    row_tokens = max(
-        1, min(config.max_sequence_tokens, config.max_batch_tokens)
-    )
+    row_tokens = max(1, min(config.max_model_len, config.max_batch_tokens))
     cache = runner.kv_cache
     if cache is None:
         raise ValueError("prefill capture requires the worker KV cache")

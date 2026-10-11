@@ -66,7 +66,7 @@ def _worker(root):
         stub_worker_config(PAGE, max_batch_tokens=256),
         device="cuda:0",
         model_dtype="bfloat16",
-        max_sequence_tokens=128,
+        max_model_len=128,
         graph_policy="off",
         prefill_cuda_graph=False,
     )

@@ -218,7 +218,7 @@ def condition_media_layouts(
     """Describe the media reader's products, bounded for every request.
 
     A request's condition rows are at most ``config.max_condition_rows`` and
-    its presentation at most ``config.max_sequence_tokens`` tokens, which
+    its presentation at most ``config.max_model_len`` tokens, which
     bound what it reads:
 
     - ``condition_pixels``: ``[pixels, 3]`` RGB24 of every visual condition.
@@ -252,7 +252,7 @@ def condition_media_layouts(
         "condition_samples": _rows(
             (rows // 2 * audio_encoder.latent_rate, 2), torch.float32
         ),
-        "vision_pixels": vision.pixels_layout(config.max_sequence_tokens),
+        "vision_pixels": vision.pixels_layout(config.max_model_len),
     }
 
 
@@ -297,9 +297,7 @@ def output_layouts(
         and call.entry_point.method == "encode"
     ):
         return component.output_layout(
-            config.max_sequence_tokens
-            if prompt_tokens is None
-            else prompt_tokens,
+            config.max_model_len if prompt_tokens is None else prompt_tokens,
             getattr(torch, config.model_dtype),
         )
 
@@ -315,7 +313,7 @@ def output_layouts(
         if condition_rows == 0:
             return {}
         if isinstance(component, PatchEncoder):
-            return component.features_layout(config.max_sequence_tokens)
+            return component.features_layout(config.max_model_len)
         # One row's width, from the encoder's own layout of a small input.
         if isinstance(component, VideoEncoder):
             sample = component.output_layout(
@@ -374,7 +372,7 @@ def output_layouts(
 
     size = builder.size(
         frames,
-        config.max_sequence_tokens if prompt_tokens is None else prompt_tokens,
+        config.max_model_len if prompt_tokens is None else prompt_tokens,
         canvas,
         conditions=conditions,
     )

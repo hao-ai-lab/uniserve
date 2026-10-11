@@ -212,7 +212,7 @@ impl Default for WorkerProcessArgs {
             queue_depth: 2,
             req_slot_cap: 1 << 20,
             resp_slot_cap: 8 << 20,
-            kv_token_capacity: None,
+            max_total_tokens: None,
             block_size: None,
             max_batch_calls: 128,
             max_batch_tokens: 16_384,
@@ -229,7 +229,7 @@ impl Default for WorkerProcessArgs {
             model_dtype: uniserve_core::ModelDtype::BFloat16,
             quantization_config: serde_json::json!({}),
             kv_cache_dtype: None,
-            kv_storage_fraction: 0.70,
+            mem_fraction_static: 0.70,
             mesh: None,
             distributed_backend: None,
             lanes: Vec::new(),
@@ -449,8 +449,11 @@ impl WorkerProcessArgs {
             "kv_cache_dtype".into(),
             json!(self.kv_cache_dtype.as_ref().map(|value| value.as_str())),
         );
-        fields.insert("kv_memory_fraction".into(), json!(self.kv_storage_fraction));
-        fields.insert("kv_token_capacity".into(), json!(self.kv_token_capacity));
+        fields.insert(
+            "mem_fraction_static".into(),
+            json!(self.mem_fraction_static),
+        );
+        fields.insert("max_total_tokens".into(), json!(self.max_total_tokens));
         fields.insert("attention_backend".into(), json!(self.attention_backend));
         fields.insert("block_size".into(), json!(self.block_size));
         fields.insert("max_batch_calls".into(), json!(self.max_batch_calls));

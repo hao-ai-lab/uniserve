@@ -104,7 +104,7 @@ def _runner(checkpoint: Path, modules, placed) -> ModelExecutor:
     model = models.load_model(source, device=DEVICE).model
     config = WorkerConfig(
         device=DEVICE,
-        max_sequence_tokens=8192,
+        max_model_len=8192,
         max_video_seconds=15.0,
         deployment_components=(*(name for name, _ in placed), "transformer"),
     )

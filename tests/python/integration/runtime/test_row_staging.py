@@ -185,7 +185,7 @@ def test_rows_stage_the_columns_their_host_layout_describes(
     device, write, causal
 ):
     model = hybrid_model()
-    config = WorkerConfig(device=device, block_size=16, max_sequence_tokens=128)
+    config = WorkerConfig(device=device, block_size=16, max_model_len=128)
     manager = hybrid_pool(
         model, config, num_units=UNITS, request_pool_size=SLOTS
     )

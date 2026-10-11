@@ -1135,7 +1135,7 @@ def test_non_power_of_two_context_capacity_accepts_prefill_and_decode(
         block_size=4,
         device=device,
         execution=WorkerConfig(
-            max_sequence_tokens=20,
+            max_model_len=20,
             graph_policy="off",
             prefill_cuda_graph=False,
             flow_graph_batch_sizes=(1,),

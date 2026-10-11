@@ -334,11 +334,11 @@ class WorkerConfig:
     # Tokens per KV page of the cache group with the widest token rows; None
     # until resolved.
     block_size: int | None = None
-    kv_token_capacity: int | None = None
+    max_total_tokens: int | None = None
     attention_backend: str | None = None
     max_batch_calls: int = 1024
     max_batch_tokens: int = 8192
-    max_sequence_tokens: int = 16384
+    max_model_len: int = 16384
     max_video_seconds: float = 15.0
     # Most denoiser rows a video request's conditions may take. It bounds the
     # condition products a video worker provisions; zero provisions none, as
@@ -374,7 +374,7 @@ class WorkerConfig:
     pool_storage_bytes: int | None = None
     model_dtype: str = "bfloat16"
     kv_cache_dtype: str | None = None
-    kv_storage_fraction: float = 0.70
+    mem_fraction_static: float = 0.70
     lanes: tuple[LaneConfig, ...] = ()
     graph_policy: str = "auto"
     decode_graph_batch_sizes: tuple[int, ...] = DEFAULT_DECODE_GRAPH_BATCH_SIZES
@@ -426,7 +426,7 @@ class WorkerConfig:
             (self.block_size is not None and self.block_size < 1)
             or self.max_batch_calls < 1
             or self.max_batch_tokens < 1
-            or self.max_sequence_tokens < 1
+            or self.max_model_len < 1
             or self.max_request_pool_size < 1
             or self.encoder_cache_entries < 1
         ):
@@ -455,10 +455,8 @@ class WorkerConfig:
             )
         if any(value < 1 for value in self.video_text_capacities):
             raise invalid_descriptor("video text capacities must be positive")
-        if not 0 < self.kv_storage_fraction <= 1:
-            raise invalid_descriptor(
-                "worker configuration KV storage fraction must be in (0, 1]"
-            )
+        if not 0 < self.mem_fraction_static <= 1:
+            raise invalid_descriptor("mem_fraction_static must be in (0, 1]")
         if self.model_dtype not in {"float16", "bfloat16", "float32"}:
             raise invalid_descriptor("worker model dtype is unsupported")
         if self.kv_cache_dtype is not None and self.kv_cache_dtype not in {
@@ -526,7 +524,7 @@ def worker_config_from_namespace(
         max_batch_tokens=int(namespace.max_batch_tokens),
         # The engine sizes the request pool from its running-request limit.
         max_request_pool_size=int(namespace.max_request_pool_size),
-        max_sequence_tokens=int(namespace.max_model_len),
+        max_model_len=int(namespace.max_model_len),
         max_video_seconds=float(namespace.max_video_seconds),
         max_condition_rows=None
         if namespace.max_condition_rows is None
@@ -549,13 +547,13 @@ def worker_config_from_namespace(
         canvas_sampling=_canvas_sampling(
             getattr(namespace, "canvas_sampling", None)
         ),
-        kv_token_capacity=_positive_optional_int(namespace.kv_token_capacity),
+        max_total_tokens=_positive_optional_int(namespace.max_total_tokens),
         attention_backend=str(namespace.attention_backend),
         model_dtype=str(namespace.model_dtype),
         kv_cache_dtype=_none_if_empty(namespace.kv_cache_dtype),
-        kv_storage_fraction=_storage_fraction(
-            float(namespace.kv_memory_fraction),
-            "kv-memory-fraction",
+        mem_fraction_static=_storage_fraction(
+            float(namespace.mem_fraction_static),
+            "mem_fraction_static",
         ),
         lanes=_parse_lanes(getattr(namespace, "lane", ())),
         graph_policy=getattr(namespace, "graph_policy", "auto"),
@@ -639,10 +637,10 @@ def _positive_optional_int(value: object | None) -> int | None:
 
 
 def _storage_fraction(value: float, name: str) -> float:
-    """Validate a per-process device storage fraction.
+    """Validate a per-process static memory fraction.
 
-    The fraction is a share of each device's total storage, which
-    ``device_storage_budget`` also bounds by the storage free at startup, so
+    The fraction is a share of each device's total memory, which
+    ``device_storage_budget`` also bounds by the memory free at startup, so
     any finite value in (0, 1] is meaningful; one grants the whole device.
     The engine checks the same range before it launches a rank.
 

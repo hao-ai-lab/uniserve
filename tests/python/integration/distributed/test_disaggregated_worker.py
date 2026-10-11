@@ -171,7 +171,7 @@ def _run(rank, local_rank, rendezvous, root, graphs, attention_tp, replicas):
             max_batch_calls=4,
             max_request_pool_size=8,
             max_batch_tokens=32,
-            max_sequence_tokens=64,
+            max_model_len=64,
             prefill_graph_token_sizes=(16, 32),
             decode_graph_batch_sizes=(1, 2, 4),
             graph_policy="off",

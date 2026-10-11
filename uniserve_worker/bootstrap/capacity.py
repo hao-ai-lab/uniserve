@@ -13,7 +13,7 @@ once warmup has run.
 Two kinds of worker are sized differently. A token worker (no
 ``VideoPostprocessor`` and no media request state) derives its bounds from
 the queue depth and batch bounds and, without a configured
-``kv_token_capacity``, gives paged KV what remains of the device grant. A
+``max_total_tokens``, gives paged KV what remains of the device grant. A
 request-tensor worker holds fixed per-request state and products; on CUDA,
 its request-slot count is fitted collectively so every rank of the worker
 agrees on it.
@@ -181,7 +181,7 @@ def input_buffer_config(
         max_text_tokens=text_tokens,
         table_widths=table_widths(
             plan_cache(text, config),
-            max_sequence_tokens=config.max_sequence_tokens,
+            max_sequence_tokens=config.max_model_len,
             max_query_tokens=call_tokens,
         ),
         hidden_size=text.backbone.hidden_size,
@@ -466,7 +466,7 @@ def latent_pool_plan(
     resolved.
 
     An image denoiser's pages hold ``block_size`` patchified latent tokens,
-    enough for ``kv_token_capacity`` tokens, when set, and at least one
+    enough for ``max_total_tokens`` tokens, when set, and at least one
     image. A video denoiser's pages hold ``page_units`` sample elements each,
     a fixed run of pages per request slot. Both reserve one extra sentinel
     page.
@@ -494,7 +494,7 @@ def latent_pool_plan(
             )
         page_units = page_size(worker_config)
         units = active_latent_capacity_tokens(
-            flow.max_tokens, worker_config.kv_token_capacity
+            flow.max_tokens, worker_config.max_total_tokens
         )
         return LatentPoolPlan(
             request_pool_size=slots,
@@ -819,7 +819,7 @@ def device_total_bytes(device: str | torch.device) -> int:
 def derive_runtime_kv_capacity(
     *,
     pages: Sequence[tuple[int, int]],
-    kv_token_capacity: int | None,
+    max_total_tokens: int | None,
     unit_bytes: int,
     device: Any = None,
     available_bytes: int | None = None,
@@ -834,7 +834,7 @@ def derive_runtime_kv_capacity(
     unit count, which includes the unit-zero sentinel, comes from the first
     source present:
 
-    - ``kv_token_capacity``: the units whole pages of that many tokens
+    - ``max_total_tokens``: the units whole pages of that many tokens
       occupy in every group;
     - ``available_bytes``: the whole units the grant holds, less
       ``co_resident_units`` units of other fixed allocations, divided among
@@ -848,7 +848,7 @@ def derive_runtime_kv_capacity(
     given, the resulting pools and co-resident units must fit it.
 
     Raises:
-        ValueError: A dimension is out of range, ``kv_token_capacity`` or
+        ValueError: A dimension is out of range, ``max_total_tokens`` or
             ``available_bytes`` is invalid, a grant yields fewer than the
             minimum units or is exceeded, or a CUDA device has no grant.
     """
@@ -866,10 +866,10 @@ def derive_runtime_kv_capacity(
         raise ValueError("KV storage grant must not be negative")
     minimum = max(int(floor), 1 + sum(int(per_page) for _, per_page in pages))
 
-    if kv_token_capacity is not None:
-        if kv_token_capacity <= 0:
+    if max_total_tokens is not None:
+        if max_total_tokens <= 0:
             raise ValueError("configured KV token capacity must be positive")
-        units = max(minimum, units_for_tokens(pages, kv_token_capacity))
+        units = max(minimum, units_for_tokens(pages, max_total_tokens))
     elif available_bytes is not None:
         units = (available_bytes // size - co_resident_units) // resident_copies
         if units < minimum:
@@ -946,7 +946,7 @@ def resolve_request_capacity(
     """
     if canonical_device(worker_config.device).type == "cuda":
         available, _free = device_storage_budget(
-            worker_config.device, worker_config.kv_storage_fraction
+            worker_config.device, worker_config.mem_fraction_static
         )
         worker_config = replace(worker_config, pool_storage_bytes=available)
         schema = (
@@ -1025,15 +1025,15 @@ def graph_table_widths(
     a window of history and one call's queries intersect. Every captured
     text graph uses these widths, so graph shapes vary only in rows and
     tokens. Empty without a ``CausalLM``, a KV pool, or a positive
-    ``max_sequence_tokens``.
+    ``max_model_len``.
     """
     if capability(model, CausalLM) is None or pool is None:
         return ()
-    if worker_config.max_sequence_tokens < 1:
+    if worker_config.max_model_len < 1:
         return ()
     widths = table_widths(
         pool.cache.planes,
-        max_sequence_tokens=worker_config.max_sequence_tokens,
+        max_sequence_tokens=worker_config.max_model_len,
         max_query_tokens=worker_config.max_batch_tokens,
     )
     # Unit 0 is the pool's padding sentinel, so one group's table can hold
@@ -1060,7 +1060,7 @@ def check_startup_storage(
     devices; on each CUDA device, the part not yet resident in
     ``tensor_store`` must fit both its current storage budget and, together
     with everything the process holds on the device
-    (``process_device_bytes``), the ``kv_storage_fraction`` share of the
+    (``process_device_bytes``), the ``mem_fraction_static`` share of the
     device.
 
     Raises:
@@ -1084,10 +1084,10 @@ def check_startup_storage(
         if canonical_device(device).type != "cuda":
             continue
         available, free = device_storage_budget(
-            device, worker_config.kv_storage_fraction
+            device, worker_config.mem_fraction_static
         )
         grant = int(
-            device_total_bytes(device) * worker_config.kv_storage_fraction
+            device_total_bytes(device) * worker_config.mem_fraction_static
         )
         remaining = max(0, product_bytes - tensor_store.resident_bytes(device))
         process_bytes = process_device_bytes(device)

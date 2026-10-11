@@ -76,7 +76,7 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
             WorkerConfig(
                 device="cuda:0",
                 model_dtype="bfloat16",
-                max_sequence_tokens=64,
+                max_model_len=64,
                 max_video_seconds=2,
                 max_request_pool_size=1,
             ),

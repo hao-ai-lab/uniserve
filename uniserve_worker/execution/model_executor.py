@@ -2281,9 +2281,7 @@ class ModelExecutor:
         # The token buffer holds the longest prompt at its text capacity.
         return runner.prepare_tokens(
             tokens,
-            capacity=self._text_capacity(
-                self.worker_config.max_sequence_tokens
-            ),
+            capacity=self._text_capacity(self.worker_config.max_model_len),
         )
 
     @contextmanager

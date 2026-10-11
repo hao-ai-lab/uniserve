@@ -34,7 +34,7 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
         attention_backend="torch",
         model_dtype="float32",
         block_size=16,
-        max_sequence_tokens=32,
+        max_model_len=32,
         max_batch_calls=3,
         max_request_pool_size=3,
         max_batch_tokens=64,

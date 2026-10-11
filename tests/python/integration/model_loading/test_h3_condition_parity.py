@@ -183,7 +183,7 @@ class _Worker:
         ).model
         config = WorkerConfig(
             device=str(DEVICE),
-            max_sequence_tokens=text,
+            max_model_len=text,
             max_video_seconds=seconds,
             min_video_seconds=seconds,
             video_text_capacities=(text,),

@@ -91,6 +91,6 @@ def hybrid_pool(
         import_capacity=import_capacity,
         request_pool_size=request_pool_size,
         table_width=resident_width(
-            planes, max_sequence_tokens=config.max_sequence_tokens
+            planes, max_sequence_tokens=config.max_model_len
         ),
     )

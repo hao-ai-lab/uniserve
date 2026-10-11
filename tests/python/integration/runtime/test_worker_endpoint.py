@@ -110,7 +110,7 @@ def _stub_config(
         rank=rank,
         local_rank=rank,
         world_size=world_size,
-        kv_token_capacity=4096,
+        max_total_tokens=4096,
         components={
             "model": {
                 "ranks": list(range(world_size)),
