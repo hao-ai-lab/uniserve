@@ -214,10 +214,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     def tasks(self) -> tuple[str, ...]:
         return self.config.tasks
 
-    @property
-    def fixed_canvases(self) -> tuple[image.Config, ...] | None:
-        return self.config.canvases
-
     def max_conditions(
         self, num_frames: int, canvas: image.Config
     ) -> tuple[Condition, ...]:
@@ -255,7 +251,9 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             return size.condition_rows
 
         # A reference video keeps the leading whole VAE windows of the
-        # generated frames, and its soundtrack the generated duration.
+        # generated frames, and its soundtrack the generated duration. A
+        # soundtrack resampled to 32 kHz rounds up (``processing.audio_clip``),
+        # so the ceiling bounds the samples of every source rate.
         windows = max(
             1, (num_frames - VAE_LATENTS_PER_CHUNK) // VAE_FRAMES_PER_CHUNK
         )

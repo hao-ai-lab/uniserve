@@ -31,7 +31,7 @@ from uniserve_models import qwen3_vl
 from . import audio_vae, output, video_vae
 from .checkpoint import TASK_PARTITIONS, Layout, detect
 from .encoder import TextEncoderConfig
-from .packing import CANVAS_MULTIPLE
+from .packing import CANVAS_MULTIPLE, VIDEO_TILE_SHAPES
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -254,8 +254,12 @@ class SparseAttention:
     reference_keep: float | None = None
 
     def __post_init__(self) -> None:
-        if self.tile not in (64, 128):
-            raise ValueError("H3 sparse attention tiles hold 64 or 128 rows")
+        # A tile holds a video tile shape of the segment packing.
+        if self.tile not in VIDEO_TILE_SHAPES:
+            raise ValueError(
+                "H3 sparse attention tiles hold "
+                f"{' or '.join(map(str, VIDEO_TILE_SHAPES))} rows"
+            )
         for name in ("sparsity",) + (
             () if self.reference_keep is None else ("reference_keep",)
         ):
@@ -301,9 +305,7 @@ class DenoiserConfig:
         if (
             not isinstance(self.tasks, tuple)
             or not self.tasks
-            or any(
-                task not in ("t2va", "fl2va", "ref2va") for task in self.tasks
-            )
+            or any(task not in TASK_PARTITIONS for task in self.tasks)
             or len(set(self.tasks)) != len(self.tasks)
         ):
             raise ValueError("H3 denoiser tasks must name distinct H3 tasks")

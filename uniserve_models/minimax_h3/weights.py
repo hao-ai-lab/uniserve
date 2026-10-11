@@ -254,7 +254,7 @@ def _prepare_modulation(model, config: DenoiserConfig, reader):
                 .to(device=device, dtype=torch.float32)
             )
             setattr(
-                embedding.video_projection[index],
+                embedding.projection[index],
                 field,
                 nn.Parameter(value, requires_grad=False),
             )
