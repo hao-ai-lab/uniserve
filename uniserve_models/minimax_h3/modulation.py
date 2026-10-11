@@ -19,7 +19,7 @@ class TimestepEmbedding(nn.Module):
     products feed SiLU before the BF16 modulation projections.
 
     No resident module holds this embedding: checkpoint loading builds it
-    transiently to precompute the transformer's modulation products for the
+    transiently to precompute the transformer's AdaLN cache for the
     fixed schedule, then releases it.
     """
 

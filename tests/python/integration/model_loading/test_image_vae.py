@@ -120,7 +120,7 @@ def test_posterior_and_reconstruction_match_flux_checkpoint(tmp_path):
             reconstructed,
         )
 
-        codec = PatchAutoencoder(
+        autoencoder = PatchAutoencoder(
             model.encoder,
             model.decoder,
             patch_size=2,
@@ -128,15 +128,15 @@ def test_posterior_and_reconstruction_match_flux_checkpoint(tmp_path):
             latent_dtype=torch.bfloat16,
             downsample=4,
         )
-        patches = codec.encode(
+        patches = autoencoder.encode(
             pixels, generator=torch.Generator().manual_seed(8)
         )
-        restored = codec.unpatchify(patches, image.Config(8, 12))
+        restored = autoencoder.unpatchify(patches, image.Config(8, 12))
         torch.testing.assert_close(restored, latents.bfloat16(), rtol=0, atol=0)
         expected_pixels = (
             reference.decode(restored.double() / 0.5 + 0.25).sample * 0.5 + 0.5
         ).clamp(0, 1)
         torch.testing.assert_close(
-            codec.decode(patches, image.Config(8, 12)),
+            autoencoder.decode(patches, image.Config(8, 12)),
             expected_pixels,
         )

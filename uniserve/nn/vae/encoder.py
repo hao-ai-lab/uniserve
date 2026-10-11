@@ -1,4 +1,4 @@
-"""Latent encoding through a codec's posterior and normalization."""
+"""Latent encoding through a VAE's posterior and normalization."""
 
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ class LatentEncoder(nn.Module):
 
     The inverse of ``LatentDecoder``. ``encoder`` maps its native input to
     posterior moments, or directly to latents when ``posterior`` is None; a
-    ``SpatialEncoder`` does so through overlapping tiles. The posterior turns
+    ``TiledEncoder`` does so through overlapping tiles. The posterior turns
     the moments into native latents and ``normalization`` maps them to the
-    normalized latent the codec's reference produces.
+    normalized latent the VAE's reference produces.
     """
 
     def __init__(
@@ -42,7 +42,7 @@ class LatentEncoder(nn.Module):
         """Return the normalized latent of ``inputs``.
 
         ``rows`` asks the encoder for a band of latent rows along its
-        height axis alone, which a ``SpatialEncoder`` computes from the tiles
+        height axis alone, which a ``TiledEncoder`` computes from the tiles
         the band depends on; None encodes every row. ``window`` then indexes
         the encoder output in native latent coordinates and keeps only that
         region, such as the latent frames of an input that was padded to the

@@ -9,7 +9,7 @@ from torch import nn
 
 from uniserve.distributed import Communicator
 from uniserve.media import image, video
-from uniserve.nn.vae import LatentDecoder, LatentEncoder, SpatialEncoder
+from uniserve.nn.vae import LatentDecoder, LatentEncoder, TiledEncoder
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
 
@@ -26,7 +26,7 @@ class VideoEncoder(nn.Module):
     groups, each band's rows are a contiguous run of the frame's rows, and
     the bands' rows assemble the frame's encoding exactly. Banding needs a
     latent encoder that encodes a band on its own, such as one over a
-    ``SpatialEncoder``.
+    ``TiledEncoder``.
 
     Subclasses define both temporal partitions; ``output_layout``, which
     describes a video's complete latent as frame-major rows along its leading
@@ -97,10 +97,10 @@ class VideoEncoder(nn.Module):
 
     def still_tile(
         self, device: torch.device
-    ) -> tuple[SpatialEncoder, torch.Tensor] | None:
+    ) -> tuple[TiledEncoder, torch.Tensor] | None:
         """Return the tiled encoder of still frames and one tile's input.
 
-        A latent encoder over a ``SpatialEncoder`` encodes every still frame
+        A latent encoder over a ``TiledEncoder`` encodes every still frame
         at least a tile high and wide in tiles of one shape: the native input
         of a tile-sized frame, which ``unpack_pixels`` returns with the
         frame's raster as its trailing axes. Returns that encoder and a zero
@@ -108,7 +108,7 @@ class VideoEncoder(nn.Module):
         encoder does not tile.
         """
         spatial = self.encoder.encoder
-        if not isinstance(spatial, SpatialEncoder):
+        if not isinstance(spatial, TiledEncoder):
             return None
         frame = torch.zeros(
             (1, spatial.tile_height, spatial.tile_width, 3),
@@ -295,7 +295,7 @@ class AudioEncoder(nn.Module):
     """Encode sample-major PCM tracks into latent rows.
 
     Tracks are encoded whole rather than by media unit. Subclasses define
-    ``latent_frames`` and ``latent_rate`` from their codec's compression;
+    ``latent_frames`` and ``latent_rate`` from their VAE's compression;
     ``output_layout``; ``unpack_samples``, the conversion of one track's
     ``[samples, channels]`` PCM into the native encoder input; and
     ``pack_latents``, the conversion of the track's native latents into its
@@ -499,7 +499,7 @@ class AudioDecoder(nn.Module):
     """Decode media units of a packed latent timeline into sample-major PCM.
 
     Subclasses define ``latent_frames``, ``latent_rate``, ``latent_halo`` and
-    ``unpack_latents`` from their codec's compression and channel layout. A
+    ``unpack_latents`` from their VAE's compression and channel layout. A
     media unit is a contiguous span of latent frames; because the decoder is
     convolutional, decoding a unit together with ``latent_halo`` frames of
     context on each side and discarding that context reproduces the whole-track
@@ -540,7 +540,7 @@ class AudioDecoder(nn.Module):
         raise NotImplementedError
 
     def unpack_latents(self, latent, num_samples, *, window, workspace):
-        """Return the codec's native channel and time representation.
+        """Return the VAE's native channel and time representation.
 
         ``window`` selects the contiguous latent frames to unpack, including
         the halo the caller added around the media unit.

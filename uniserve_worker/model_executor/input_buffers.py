@@ -1241,7 +1241,7 @@ class DiffusionBuffers(AttentionBuffers):
 
 
 class VisionBuffers(InputBuffers):
-    """Borrow prepared image views; codecs need no token or KV backing."""
+    """Borrow prepared image views; VAEs need no token or KV backing."""
 
     row_type = VisionRow
 

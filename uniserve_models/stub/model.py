@@ -169,7 +169,7 @@ class _Scale(nn.Module):
     """Identity pixel scaling through a unit weight, for the latent decoder.
 
     ``PatchAutoencoder`` casts its inputs to the dtype of the encoder's or
-    decoder's first parameter, so the unit weight makes the codec run in
+    decoder's first parameter, so the unit weight makes the VAE run in
     BF16.
     """
 

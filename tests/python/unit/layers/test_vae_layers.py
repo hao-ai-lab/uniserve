@@ -68,9 +68,9 @@ def test_spatial_encoder_tiles_reproduce_a_local_encoding():
     placed at their raster positions agree on every overlap and the blended
     seams reproduce the whole-raster encoding.
     """
-    from uniserve.nn.vae import SpatialEncoder
+    from uniserve.nn.vae import TiledEncoder
 
-    encoder = SpatialEncoder(
+    encoder = TiledEncoder(
         torch.nn.AvgPool2d(4),
         spatial_compression=4,
         tile_height=32,
@@ -93,10 +93,10 @@ def test_spatial_encoder_bands_are_rows_of_the_whole_encoding():
     overlaps and each band's seams must blend exactly as the whole raster's
     do, including bands that start inside a cross-fade.
     """
-    from uniserve.nn.vae import SpatialEncoder
+    from uniserve.nn.vae import TiledEncoder
 
     torch.manual_seed(0)
-    encoder = SpatialEncoder(
+    encoder = TiledEncoder(
         torch.nn.Sequential(
             torch.nn.Conv2d(3, 4, 3, padding=1), torch.nn.AvgPool2d(4)
         ),
@@ -128,11 +128,11 @@ def test_spatial_encoder_encodes_tiles_through_a_bound_operator():
     encoding equals twice the unbound one only if every tile went through
     the operator; outside the context the encoder is unbound again.
     """
-    from uniserve.nn.vae import SpatialEncoder
+    from uniserve.nn.vae import TiledEncoder
     from uniserve.runtime import ExecutionContext
 
     torch.manual_seed(0)
-    encoder = SpatialEncoder(
+    encoder = TiledEncoder(
         torch.nn.Sequential(
             torch.nn.Conv2d(3, 4, 3, padding=1), torch.nn.AvgPool2d(4)
         ),

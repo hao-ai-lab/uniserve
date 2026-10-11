@@ -306,7 +306,7 @@ class ModelExecutor:
         # method) borrow on that entry's stream; see ``prepare_module``.
         self._module_scratch: dict[tuple[str, str, str], Scratch] = {}
         # Replays of the still-frame tile encodings startup captured, by
-        # ``SpatialEncoder``; every context prepared afterwards binds them
+        # ``TiledEncoder``; every context prepared afterwards binds them
         # (see ``capture_tiles``).
         self._tile_operators: dict[
             nn.Module, Callable[[torch.Tensor], torch.Tensor]
@@ -1508,7 +1508,7 @@ class ModelExecutor:
                             else None,
                             weights=self.expert_weights,
                         )
-                        # Text staging counts canonical tokens. Spatial codecs
+                        # Text staging counts canonical tokens. VAEs
                         # and vision towers expand those into different query
                         # domains, so their layer plans use the actual numerical
                         # shapes encountered during preparation/eager execution.

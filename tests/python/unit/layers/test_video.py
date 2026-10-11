@@ -9,7 +9,7 @@ from torch import nn
 
 from uniserve.media import image, video
 from uniserve.model import VideoPostprocessor
-from uniserve.nn.vae.spatial import SpatialDecoder
+from uniserve.nn.vae.tiled import TiledDecoder
 from uniserve.tensors import OutputLayout, TensorOutput
 
 pytestmark = pytest.mark.unit
@@ -133,7 +133,7 @@ def test_video_clips_preserve_pixels_across_separate_calls():
 
 @pytest.mark.parametrize("height,width", [(3, 4), (5, 7), (9, 13)])
 def test_spatial_decoder_preserves_batches_and_raster_alignment(height, width):
-    decoder = SpatialDecoder(
+    decoder = TiledDecoder(
         nn.Upsample(scale_factor=(1, 2, 2), mode="nearest"),
         spatial_compression=2,
         tile_height=8,
