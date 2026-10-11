@@ -162,6 +162,7 @@ def test_null_dense_kv_heads_mean_one_per_query_head(tmp_path):
             "default and YaRN",
         ),
         (_DENSE | {"partial_rotary_factor": 0.5}, "full head"),
+        (_DENSE | {"hidden_act": "relu"}, "unsupported Qwen3 hidden_act"),
         (_SPARSE | {"hidden_act": "gelu"}, "experts do not implement"),
         (
             _SPARSE | {"num_experts": 4, "num_local_experts": 8},
@@ -177,6 +178,7 @@ def test_null_dense_kv_heads_mean_one_per_query_head(tmp_path):
         "sliding-layer",
         "linear-rope",
         "partial-rope",
+        "ungated-activation",
         "erf-experts",
         "expert-aliases",
     ],

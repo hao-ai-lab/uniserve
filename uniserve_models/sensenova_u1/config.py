@@ -21,6 +21,7 @@ from uniserve.diffusion import NoiseScale
 from uniserve.loading import checkpoint
 from uniserve.nn.rope import RoPEScaling
 
+from ..qwen3.config import gated_activation
 from ..rotary import alias, read_rotary
 from . import flow, vision
 
@@ -121,20 +122,6 @@ class TransformerConfig:
         ):
             raise ValueError(
                 "SenseNova pad_token_id must be inside the vocabulary"
-            )
-        if not isinstance(self.hidden_act, str) or self.hidden_act not in {
-            "silu",
-            "swish",
-            "silu_and_mul",
-            "swiglu",
-            "gelu",
-            "gelu_and_mul",
-            "geglu",
-            "gelu_pytorch_tanh",
-            "gelu_tanh",
-        }:
-            raise ValueError(
-                f"unsupported SenseNova hidden_act {self.hidden_act!r}"
             )
 
 
@@ -269,7 +256,9 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
                 text, "num_key_value_heads", "llm_config"
             ),
             head_dim=text.get("head_dim", hidden // heads),
-            hidden_act=text.get("hidden_act", "silu"),
+            hidden_act=gated_activation(
+                text.get("hidden_act", "silu"), owner="SenseNova"
+            ),
             rms_norm_eps=text.get("rms_norm_eps", 1e-6),
             attention_bias=text.get("attention_bias", False),
             max_position_embeddings=text.get("max_position_embeddings", 32768),

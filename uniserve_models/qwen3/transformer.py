@@ -32,16 +32,6 @@ from uniserve.nn.rope import MRotaryEmbedding, RotaryEmbedding
 from .config import Config, expert_activation
 
 
-def _activation(name: str) -> str:
-    """Map checkpoint activation aliases onto the library's implemented kernels."""  # noqa: E501
-    if name in {"silu", "swish", "silu_and_mul", "swiglu"}:
-        return "silu"
-    if name in {"gelu", "gelu_and_mul", "geglu"}:
-        return "gelu"
-    # Config accepts only the aliases above and the two tanh GELU spellings.
-    return "gelu_pytorch_tanh"
-
-
 class Attention(nn.Module):
     """QK-normalized rotary attention followed by the output contraction."""
 
@@ -155,7 +145,7 @@ class TransformerLayer(nn.Module):
             else GatedMLP(
                 config.hidden_size,
                 config.intermediate_size,
-                activation=_activation(config.hidden_act),
+                activation=config.hidden_act,
             )
         )
 
