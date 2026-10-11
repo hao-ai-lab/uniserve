@@ -20,7 +20,7 @@ A call no native kernel serves raises when its layer is prepared or bound,
 naming the call's path, shape, dtype and mask semantics. FlashInfer's own
 attention kernels, the FlashAttention-2 library and the portable torch
 provider remain selectable by name but never stand in for a native kernel.
-FP32 dense attention without a prefix cache or history window uses PyTorch
+FP32 dense attention without a K/V cache or history window uses PyTorch
 SDPA, preserving the precision of image and audio autoencoders. Both causal
 and non-causal calls are supported. Off CUDA the portable provider serves
 every call.
@@ -66,7 +66,7 @@ def _available(module, names):
 def _layer(*, num_heads, num_kv_heads, head_dim, dtype, cache, window):
     """Describe a layer's attention shape, dtypes and history bound."""
     if cache is None:
-        storage = "without a prefix cache"
+        storage = "without a K/V cache"
     elif isinstance(cache.key, QuantizedTensor):
         storage = (
             f"over a per-block FP8 cache of {cache.block_size}-token pages"
@@ -483,7 +483,7 @@ class Backend(_Backend):
     ):
         """Return the available providers that serve a layer's shape.
 
-        ``pages`` describes the layer's paged prefix cache, or is None for
+        ``pages`` describes the layer's paged K/V cache, or is None for
         a layer without one.
         """
         if self.device.type != "cuda" or (

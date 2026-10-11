@@ -877,7 +877,6 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
         )
     elif owner == "device":
         store = TensorStore(
-            capacity=1,
             byte_capacity=4096,
             buffer_pool=buffers,
             event_pool=events,

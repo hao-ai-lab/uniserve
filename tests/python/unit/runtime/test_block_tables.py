@@ -160,8 +160,6 @@ def test_release_bursts_do_not_wait_for_queued_device_work():
         (1, 0, 1, (2, 3), 13),
         # A unit table wider than the table capacity.
         (1, 0, 0, (2, 3, 4, 5), 8),
-        # The padding sentinel.
-        (1, 0, 0, (0, 3), 8),
     ),
 )
 def test_rejected_installation_changes_nothing(entry):

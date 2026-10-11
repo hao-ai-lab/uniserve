@@ -20,8 +20,8 @@ from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image
 from uniserve.model import TextSize
 from uniserve.nn.attention import AttentionBatch
-from uniserve.runtime import ExecutionContext, PrefixCache
-from uniserve_worker.bootstrap.cache import cache_info
+from uniserve.runtime import ExecutionContext, KVCache
+from uniserve_worker.bootstrap.cache import cache_info, plan_cache
 from uniserve_worker.bootstrap.capacity import input_buffer_config
 from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.execution.diffusion import (
@@ -165,12 +165,16 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
     size = image.Config(16, 16)
     factory = runner.image_builder
     shape = factory.denoiser.latent_shape("image", size)
-    cache = PrefixCache(
-        model.text.cache_config, num_units=8, block_size=16, device="cuda:0"
+    planes = plan_cache(model.text, config)
+    cache = KVCache(
+        model.text.cache_config,
+        planes,
+        num_units=8,
+        device="cuda:0",
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model.text, config, num_units=8),
+        info=cache_info(model.text, planes, num_units=8),
         request_pool_size=3,
         table_width=2,
     )
@@ -185,7 +189,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
     oracle = ExecutionContext(model.denoiser, cache=cache, attention="torch")
     try:
         runner.configure_inputs(
-            input_config=input_buffer_config(model, config),
+            input_config=input_buffer_config(model, config, planes=planes),
             kv_cache=manager,
             latent_pool=latents,
             decode_predicates=torch.tensor(

@@ -372,7 +372,7 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(
         )
         if storage == "encoder"
         else TensorStore(
-            capacity=1, byte_capacity=1, buffer_pool=buffers, event_pool=events
+            byte_capacity=1, buffer_pool=buffers, event_pool=events
         )
     )
     product = TensorRef(
@@ -468,7 +468,6 @@ def test_a_deferred_write_commits_when_its_host_work_publishes_it() -> None:
     """A write host work fills later packs without it and commits with it."""
     buffers = BufferPool(byte_capacity=16, devices=("cpu",))
     store = TensorStore(
-        capacity=2,
         request_capacity=0,
         relay_depth=0,
         buffer_pool=buffers,
@@ -534,7 +533,6 @@ def test_resident_bytes_cover_only_storage_the_store_allocates() -> None:
     buffers = BufferPool(byte_capacity=64, devices=("cpu",))
     request_slots, relay_depth = 1, 2
     store = TensorStore(
-        capacity=1,
         byte_capacity=32,
         request_capacity=request_slots,
         relay_depth=relay_depth,
@@ -583,7 +581,6 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
 ) -> None:
     buffers = BufferPool(byte_capacity=16, devices=("cpu",))
     store = TensorStore(
-        capacity=2,
         request_capacity=1 if relay else 0,
         relay_depth=2 if relay else 0,
         buffer_pool=buffers,
@@ -661,7 +658,7 @@ def test_tensor_publication_enforces_its_logical_region_and_representation() -> 
     buffers = BufferPool(byte_capacity=24, devices=("cpu",))
     events = EventPool()
     store = TensorStore(
-        capacity=1, byte_capacity=16, buffer_pool=buffers, event_pool=events
+        byte_capacity=16, buffer_pool=buffers, event_pool=events
     )
     reference = TensorRef(
         request_key=RequestKey(1, 1, 1),

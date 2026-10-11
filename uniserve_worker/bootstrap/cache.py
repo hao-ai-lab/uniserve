@@ -4,11 +4,12 @@ The worker reports a ``KVCacheInfo`` in its ``WorkerInfo``: the unit pool's
 size, and one group per history window and K/V page shape. Each group places
 this rank's layers by global cache-layer id and its K/V heads by interval.
 The token-worker path of ``build_worker_layout`` in
-``uniserve_worker.bootstrap.report`` sizes the pool from the unit size of
-``plan_cache``, describes it with ``cache_info`` and attaches the granted unit
-count with ``resize_cache``. When the engine assembles a worker group from
-its ranks' startup reports, it requires every logical layer to belong to one
-group and its K/V heads to be covered without a gap.
+``uniserve_worker.bootstrap.report`` plans the pool once with ``plan_cache``,
+sizes it from the plan's unit size and describes the granted pool with
+``cache_info``; the worker allocates the pool from the same plan. When the
+engine assembles a worker group from its ranks' startup reports, it requires
+every logical layer to belong to one group and its K/V heads to be covered
+without a gap.
 """
 
 from dataclasses import replace
@@ -22,7 +23,7 @@ from uniserve.model import CausalLM
 from uniserve.nn.attention import Attention
 from uniserve.quantization import Quantizer
 from uniserve.runtime.backends.attention import Backend, CachePages
-from uniserve.runtime.prefix_cache import Planes, plan_units
+from uniserve.runtime.kv_cache import Planes, plan_units
 from uniserve_worker.bootstrap.inputs import capability
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import unsupported_setup
@@ -266,15 +267,14 @@ def group_layers(
 
 
 def cache_info(
-    model: CausalLM, config: WorkerConfig, *, num_units: int
+    model: CausalLM, planes: Planes, *, num_units: int
 ) -> KVCacheInfo:
     """Map resident MHA layers to the unit pool's groups and global axes.
 
     Args:
         model: The causal LM whose ``cache_config`` lists this rank's resident
             cache layers and whose backbone orders all logical layers.
-        config: Supplies ``block_size`` and the optional ``kv_cache_dtype``
-            override of the layers' compute dtype.
+        planes: The rank's unit pool plan (``plan_cache``).
         num_units: Units to advertise, including the unit-zero sentinel.
 
     Returns:
@@ -282,13 +282,10 @@ def cache_info(
         shape; a history window becomes a sliding-window group.
 
     Raises:
-        ValueError: As ``plan_cache``; or a group's layers hold
-            non-consecutive heads.
+        ValueError: A group's layers hold non-consecutive heads.
     """
-    planes = plan_cache(model, config)
     names = model.backbone.cache_names
     layouts = model.cache_config.layers
-    dtype, fp8 = storage(config)
 
     groups = []
     for group in planes.groups:
@@ -315,22 +312,9 @@ def cache_info(
             )
         )
 
-    # The published dtype names the stored element type: FP8 for encoded
-    # storage, otherwise the configured or compute dtype.
-    stored = (
-        torch.float8_e4m3fn
-        if fp8
-        else dtype
-        if dtype is not None
-        else layouts[planes.groups[0].layers[0]].compute_dtype
-    )
+    # The published dtype names the stored element type, FP8 included.
     return KVCacheInfo(
         num_units=num_units,
-        dtype=str(stored).removeprefix("torch."),
+        dtype=str(planes.groups[0].dtype).removeprefix("torch."),
         groups=tuple(groups),
     )
-
-
-def resize_cache(info: KVCacheInfo, num_units: int) -> KVCacheInfo:
-    """Attach the granted unit count to a cache description."""
-    return replace(info, num_units=num_units)

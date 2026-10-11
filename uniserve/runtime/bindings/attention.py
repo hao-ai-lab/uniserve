@@ -44,7 +44,7 @@ class AttentionBinding:
     """Specialize one attention call site.
 
     Specialize one attention call site's operators, plans, and bound
-    metadata. ``table`` is the prefix-cache table holding this layer's
+    metadata. ``table`` is the K/V cache table holding this layer's
     state, whose entry of each ``AttentionBatch`` the layer reads; ``None``
     means the layer has no cache table and reads a single-entry batch.
     ``derive_host_lengths`` states whether a plan that needs host sequence
@@ -358,7 +358,7 @@ class AttentionBinding:
         )
 
     def update_cache(self, k, v, *, indices):
-        """Write current K/V into the bound prefix cache at physical indices."""
+        """Write current K/V into the bound K/V cache at physical indices."""
         if self.cache is None:
             raise RuntimeError("this attention layer has no bound prefix state")
 

@@ -1,7 +1,7 @@
 """SM100 block attention over a borrowed paged prefix.
 
 The provider binds ``uniserve_kernels.attention.prefix_block`` to a layer's
-prefix cache. It serves the reads whose query rows see a window of the
+K/V cache. It serves the reads whose query rows see a window of the
 sequence's paged prefix and their current block, with the visibility
 :class:`uniserve.nn.attention.Attention` defines:
 
@@ -63,16 +63,16 @@ def unsupported(
 ) -> str | None:
     """Return why the kernel cannot serve a layer, or None.
 
-    ``pages`` describes the layer's bound prefix cache: the kernel reads
+    ``pages`` describes the layer's bound K/V cache: the kernel reads
     prefixes only from paged caches storing the query dtype in 16-, 32- or
     64-token pages.
     """
     from uniserve_kernels.attention import prefix_block
 
     if pages is None:
-        return "requires a bound paged prefix cache"
+        return "requires a bound paged K/V cache"
     if pages.quantized:
-        return "does not read per-block FP8 prefix caches"
+        return "does not read per-block FP8 K/V caches"
     if pages.dtype != dtype:
         return "requires the cache to store the query dtype"
     return prefix_block.unsupported_configuration(

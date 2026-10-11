@@ -38,9 +38,10 @@ from uniserve.nn.attention import (
     SequenceLengths,
 )
 from uniserve.quantization import Quantizer
-from uniserve.runtime import PrefixCache, TensorBuffers
+from uniserve.runtime import KVCache, TensorBuffers
 from uniserve.runtime.backends.attention import resolve
 from uniserve.runtime.backends.attention.torch import Backend as TorchBackend
+from uniserve.runtime.kv_cache import plan_units
 
 pytestmark = [
     pytest.mark.integration,
@@ -82,8 +83,11 @@ def _pool(block_size, window):
             "full": mha.Config(2, 512, (0, 1), torch.bfloat16),
         }
     )
-    with PrefixCache(
-        layers, num_units=_UNITS, block_size=block_size, device="cuda"
+    with KVCache(
+        layers,
+        plan_units(layers, block_size=block_size),
+        num_units=_UNITS,
+        device="cuda",
     ) as cache:
         yield cache
 
@@ -494,13 +498,13 @@ def test_windowed_layers_without_native_storage_raise_when_prepared():
 
 def test_a_per_block_fp8_cache_has_no_native_kernel_and_raises_when_prepared():
     # Native kernels read half-precision pages only.
-    with PrefixCache(
-        Config({"attention": mha.Config(2, 128, (0,), torch.bfloat16)}),
-        num_units=4,
+    config = Config({"attention": mha.Config(2, 128, (0,), torch.bfloat16)})
+    planes = plan_units(
+        config,
         block_size=64,
-        device="cuda",
         quantization={"attention": Quantizer("fp8", axis=0)},
-    ) as cache:
+    )
+    with KVCache(config, planes, num_units=4, device="cuda") as cache:
         with pytest.raises(
             ValueError,
             match=(

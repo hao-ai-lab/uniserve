@@ -10,8 +10,9 @@ import torch.nn.functional as F
 from uniserve.cache import Config, mha
 from uniserve.model import TextSize
 from uniserve.nn.attention import BlockTable, SegmentedInput, SequenceLengths
-from uniserve.runtime import PrefixCache, TensorBuffers
+from uniserve.runtime import KVCache, TensorBuffers
 from uniserve.runtime.backends.attention import resolve
+from uniserve.runtime.kv_cache import plan_units
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -85,12 +86,17 @@ def test_segmented_replay_reads_changed_partitions_empty_prefixes_and_page_bound
 
     with ExitStack() as scope:
         cache = scope.enter_context(
-            PrefixCache(
+            KVCache(
                 Config(
                     {"attention": mha.Config(2, width, (0, 1), query.dtype)}
                 ),
+                plan_units(
+                    Config(
+                        {"attention": mha.Config(2, width, (0, 1), query.dtype)}
+                    ),
+                    block_size=page_size,
+                ),
                 num_units=6,
-                block_size=page_size,
                 device=device,
             )
         )

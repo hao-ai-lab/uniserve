@@ -28,7 +28,8 @@ def _config(**options):
 
 def test_hybrid_layers_form_one_group_per_window_and_page_shape():
     model = hybrid_model()
-    info = cache_info(model, _config(), num_units=20)
+    planes = plan_cache(model, _config())
+    info = cache_info(model, planes, num_units=20)
 
     windowed, full = info.groups
     # The windowed rows are the widest, so their pages hold ``block_size``
@@ -45,7 +46,6 @@ def test_hybrid_layers_form_one_group_per_window_and_page_shape():
     assert (full.num_kv_heads, full.head_dim) == (1, 8)
     assert (info.num_units, info.dtype) == (20, "float32")
 
-    planes = plan_cache(model, _config())
     # Two columns of key and value planes, each 16 windowed rows of 16 FP32
     # elements with one initialization flag.
     assert planes.unit_bytes == 2 * 2 * (16 * 16 * 4 + 1)

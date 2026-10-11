@@ -47,12 +47,9 @@ from uniserve.runtime.device import (
     device_storage_budget,
     process_device_bytes,
 )
+from uniserve.runtime.kv_cache import Planes
 from uniserve.tensors import BufferConfig
-from uniserve_worker.bootstrap.cache import (
-    page_size,
-    plan_cache,
-    table_widths,
-)
+from uniserve_worker.bootstrap.cache import page_size, table_widths
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import (
     capability,
@@ -74,14 +71,8 @@ from uniserve_worker.storage.kv_cache import KVCacheManager
 from uniserve_worker.storage.latent_pool import LatentPool
 from uniserve_worker.storage.tensor_store import (
     TensorStore,
-    device_product_capacity_bytes,
 )
 
-# ``ArenaCapacity.tensor_store`` allows this many generic persistent products
-# per call slot of the arena, plus ``_DEVICE_PRODUCT_RETIREMENT_BATCHES``
-# further batches of ``max_batch_calls`` calls.
-_DEVICE_PRODUCTS_PER_CALL = 6
-_DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
 # Upper bound on the reads ``ArenaCapacity.transfer_tickets`` lets a rank
 # keep in flight for its queued calls; see ``request_tensor_arena_capacity``
 # for the floor a request-tensor rank keeps above it.
@@ -90,6 +81,9 @@ _MAX_TRANSFER_ENTRIES = 256
 _HOST_LANE_INFLIGHT = 256
 # Relay-arena bytes budgeted per (request slot, relay lane) row across one
 # device's ``TensorStore`` relay arenas.
+# FIXME: A relay arena exists per (dtype, field) of the scalar outputs the
+# engine's calls declare, which the worker does not learn before its
+# capacity is reported. Derive this row size from those outputs.
 _REQUEST_RELAY_ROW_BYTES = 18
 # Relay lanes beyond the unresolved-call window. ``Worker.__init__`` builds
 # ``TensorStore`` with ``relay_depth = max_unresolved_calls + 1`` to match.
@@ -102,9 +96,13 @@ def input_buffer_config(
     model: nn.Module,
     config: WorkerConfig,
     *,
+    planes: Planes,
     processor: ImageProcessor | None = None,
 ) -> TokenBufferConfig:
     """Size text input staging for one call on this worker.
+
+    ``planes`` is the rank's unit pool plan (``plan_cache``); its groups
+    bound the block tables each call stages.
 
     Rows are bounded by the request pool and by the worker's and every lane's
     call bound; with an image denoiser, the row bound is multiplied by the
@@ -180,7 +178,7 @@ def input_buffer_config(
         max_tokens=call_tokens,
         max_text_tokens=text_tokens,
         table_widths=table_widths(
-            plan_cache(text, config),
+            planes,
             max_sequence_tokens=config.max_model_len,
             max_query_tokens=call_tokens,
         ),
@@ -522,19 +520,15 @@ def latent_pool_plan(
 
 @dataclass(frozen=True, slots=True)
 class ArenaCapacity:
-    """Budgets latent storage, device products, transfers, and CPU tasks.
+    """Budgets device products, transfers, and CPU tasks.
 
     All budgets are for one worker arena.
 
     Attributes:
-        latent_pool_bytes: Exact ``LatentPool`` allocation, or zero when this
-            rank holds no latent pool.
-        tensor_store: ``TensorStore`` capacity in resident generic persistent
-            products per device.
-        device_product_bytes: Device bytes of ``TensorStore``'s scalar
-            product backing plus its request-relay arenas, summed over the
-            worker's devices for a token worker and sized for one device for
-            a request-tensor worker; also the store's relay byte bound.
+        device_product_bytes: Device bytes of ``TensorStore``'s request-relay
+            arenas, summed over the worker's devices for a token worker and
+            sized for one device for a request-tensor worker; also the
+            store's relay byte bound.
         transfer_bytes: Byte budget of the rank's ``TransferCapacity``, which
             ``Worker.__init__`` scales further for request-tensor workers.
         transfer_tickets: Read tickets of the rank's ``TransferCapacity``.
@@ -542,8 +536,6 @@ class ArenaCapacity:
             except on a rank holding host components, which runs one task.
     """
 
-    latent_pool_bytes: int
-    tensor_store: int
     device_product_bytes: int
     transfer_bytes: int
     transfer_tickets: int
@@ -573,7 +565,6 @@ def request_tensor_arena_capacity(
     queue_depth: int,
     product_bytes_per_request: int,
     concurrent_imports: int = 0,
-    latent_pool_bytes: int = 0,
 ) -> ArenaCapacity:
     """Bound product, relay and transfer storage for fixed request tensors.
 
@@ -592,9 +583,6 @@ def request_tensor_arena_capacity(
     # resident request's concurrent artifact imports when those are more.
     slots = max(depth * max_calls, state_slots * int(concurrent_imports))
     unresolved_window = request_tensor_window(depth, state_slots)
-    tensor_store = _DEVICE_PRODUCTS_PER_CALL * (
-        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_calls
-    )
     # Relay arenas index one-based request slots directly, so they hold one
     # extra row.
     relay_bytes = (
@@ -603,12 +591,7 @@ def request_tensor_arena_capacity(
         * _REQUEST_RELAY_ROW_BYTES
     )
     return ArenaCapacity(
-        latent_pool_bytes=int(latent_pool_bytes),
-        tensor_store=tensor_store,
-        device_product_bytes=(
-            device_product_capacity_bytes(tensor_store, 1, max_value_bytes=1)
-            + relay_bytes
-        ),
+        device_product_bytes=relay_bytes,
         transfer_bytes=max(1, state_slots * product_bytes_per_request),
         # Read tickets bound the reads in flight: a ticket returns when its
         # read retires, and a batch whose imports need more than are free
@@ -654,10 +637,6 @@ def model_arena_capacity(
     *,
     queue_depth: int,
     num_units: int,
-    request_pool_size: int,
-    num_latent_pages: int,
-    latent_page_units: int,
-    latent_width: int,
     max_latent_feature_bytes: int,
     max_vision_feature_bytes: int,
     unit_bytes: int,
@@ -666,7 +645,7 @@ def model_arena_capacity(
 ) -> ArenaCapacity:
     """Derive arena bounds from worker settings.
 
-    Covers device-product, transfer, latent, and CPU arenas. A request-tensor
+    Covers device-product, transfer, and CPU arenas. A request-tensor
     worker (a ``VideoPostprocessor`` or non-empty ``state_buffers``) is sized
     by ``request_tensor_arena_capacity`` from its placement; of the keyword
     arguments, only ``queue_depth``, ``bindings`` and ``state_buffers``
@@ -675,8 +654,7 @@ def model_arena_capacity(
     state of ``bindings``.
 
     Raises:
-        ValueError: A runtime bound or latent-pool dimension is invalid, or
-            an image denoiser's ``model_dtype`` is not FP16, BF16 or FP32.
+        ValueError: A runtime bound is invalid.
     """
     depth = int(queue_depth)
     max_calls = int(worker_config.max_batch_calls)
@@ -690,17 +668,8 @@ def model_arena_capacity(
         )
 
     if capability(model, VideoPostprocessor) is not None or state_buffers:
-        # A rank that holds a standalone denoiser's request state advances
-        # its samples in the latent pool.
-        plan = latent_pool_plan(model, worker_config)
         return request_tensor_arena_capacity(
             worker_config,
-            latent_pool_bytes=plan.capacity_bytes
-            if plan is not None
-            and holds_samples(
-                state_buffers, media_builder(model, worker_config)
-            )
-            else 0,
             queue_depth=depth,
             product_bytes_per_request=local_product_storage_bytes(
                 resolve_outputs(model, worker_config),
@@ -715,48 +684,16 @@ def model_arena_capacity(
         )
 
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
-    flow = image_builder(model)
 
-    latent_pool_bytes = 0
-    latent_transfer_bytes = 0
-    if flow is not None:
-        dtype = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }.get(str(worker_config.model_dtype).removeprefix("torch.").lower())
-        if dtype is None:
-            raise ValueError(
-                f"unsupported latent dtype {worker_config.model_dtype!r}"
-            )
-        # An image denoiser's pool stages each step (``latent_pool_plan``).
-        latent_pool_bytes = LatentPoolPlan(
-            request_pool_size=int(request_pool_size),
-            num_pages=int(num_latent_pages),
-            page_units=int(latent_page_units),
-            latent_width=int(latent_width),
-            dtype=dtype,
-            staging=True,
-        ).capacity_bytes
-        latent_transfer_bytes = latent_trajectory_bytes(
-            flow.max_tokens,
-            int(latent_width),
-            dtype.itemsize,
-        )
     # Every ticket is budgeted for the largest single transfer: the whole KV
-    # pool, one image's latent trajectory, or one latent or vision feature.
+    # pool, or one latent (an image's whole trajectory) or vision feature.
     max_transfer_bytes = max(
         int(num_units) * int(unit_bytes),
-        latent_transfer_bytes,
         int(max_latent_feature_bytes),
         int(max_vision_feature_bytes),
         1,
     )
 
-    device_product_slots = (
-        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_calls
-    )
-    tensor_store = _DEVICE_PRODUCTS_PER_CALL * device_product_slots
     device_count = len(
         {
             str(worker_config.device),
@@ -765,23 +702,16 @@ def model_arena_capacity(
     )
     # Resident images and tensor products borrow scheduler-assigned storage
     # from BufferPool, whose complete grant ``build_worker_layout`` counts.
-    # TensorStore owns scalar backing and request relays separately, with
-    # relay arenas on each device.
-    device_product_bytes = device_product_capacity_bytes(
-        tensor_store,
-        device_count,
-        max_value_bytes=1,
-    )
-    device_product_bytes += (
-        (int(request_pool_size) + 1)
+    # TensorStore owns only its request relays, with relay arenas on each
+    # device.
+    device_product_bytes = (
+        (int(worker_config.max_request_pool_size) + 1)
         * (call_window(depth, max_calls) + _REQUEST_RELAY_RETIREMENT_LANES)
         * _REQUEST_RELAY_ROW_BYTES
         * device_count
     )
 
     return ArenaCapacity(
-        latent_pool_bytes=latent_pool_bytes,
-        tensor_store=tensor_store,
         device_product_bytes=device_product_bytes,
         transfer_bytes=max_transfer_bytes * transfer_tickets,
         transfer_tickets=transfer_tickets,
@@ -1037,7 +967,7 @@ def graph_table_widths(
     # Unit 0 is the pool's padding sentinel, so one group's table can hold
     # at most every remaining unit, a whole page at a time.
     limits = tuple(
-        max(1, (int(pool.info.num_units) - 1) // group.units_per_page)
+        max(1, (int(pool.num_units) - 1) // group.units_per_page)
         for group in pool.cache.groups
         for _ in range(group.units_per_page)
     )

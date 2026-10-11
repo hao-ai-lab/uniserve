@@ -137,7 +137,7 @@ class _WarmupRequests:
         occupied = self.occupied_units()
         free = (
             unit
-            for unit in range(1, int(cache.info.num_units))
+            for unit in range(1, int(cache.num_units))
             if unit not in occupied
         )
 

@@ -1322,12 +1322,12 @@ class ModelExecutor:
         # plus one image's feature span, and at most the tokens the pool's
         # units cover.
         max_rows = min(max_calls, request_slots)
-        pool_rows = (kv_cache.info.num_units - 1) // kv_cache.row_units
+        pool_rows = (kv_cache.num_units - 1) // kv_cache.row_units
         decode_sizes = decode_captures(
             config,
             max_rows=max_rows,
             row_units=kv_cache.row_units,
-            num_units=kv_cache.info.num_units,
+            num_units=kv_cache.num_units,
         )
         feature_injection = (
             self.processor is not None
@@ -1429,7 +1429,7 @@ class ModelExecutor:
                 ):
                     raise ValueError(
                         f"no configured decode graph size fits {rows} rows "
-                        f"and a KV pool of {kv_cache.info.num_units} units, "
+                        f"and a KV pool of {kv_cache.num_units} units, "
                         f"whose rows hold {kv_cache.row_units} units each"
                     )
                 # Graph pools exist only on CUDA, where every prefill call
@@ -1450,7 +1450,7 @@ class ModelExecutor:
                                 (group.page_tokens, group.units_per_page)
                                 for group in kv_cache.shapes
                             ),
-                            kv_cache.info.num_units - 1,
+                            kv_cache.num_units - 1,
                         ),
                     )
                     if ForwardMode.PREFILL in kinds and target.type == "cuda"
@@ -1749,14 +1749,11 @@ class ModelExecutor:
         )
 
     def _bind_expert_steps(self):
-        """Bind forwards reaching experts to a common transfer catalog.
+        """Bind forwards reaching experts to the exchange's transfer catalog.
 
         Every local numerical graph captures the transfer capacities that
-        hold its tokens. All ranks must share the same catalog, including
-        ranks whose next step has no local work.
-
-        Raises:
-            RuntimeError: The ranks' step plans differ.
+        hold its tokens. The deployment gives every rank the same catalog,
+        including ranks whose next step has no local work.
         """
         exchange = self.experts
         if exchange is None:
@@ -1774,29 +1771,6 @@ class ModelExecutor:
                 peer.expert_step = True
                 peer.expert_order = len(self._expert_runners)
             self._expert_runners.append(entry)
-
-        # Warmup executes collectives too. Equal transfer catalogs alone do
-        # not establish that peers capture the same local numerical calls.
-        plan = (
-            exchange.capacities,
-            self.worker_config.expert_microbatches,
-            tuple(entry.capture_plan() for entry in self._expert_runners),
-        )
-        plans = [None] * exchange.group.size
-        torch.distributed.all_gather_object(
-            plans, plan, group=exchange.group._require()
-        )
-        sources = (
-            plans[: exchange.attention_ranks]
-            if exchange.attention_ranks
-            else plans
-        )
-        if any(other != sources[0] for other in sources) or any(
-            other[:2] != sources[0][:2] for other in plans
-        ):
-            raise RuntimeError(
-                f"expert-parallel ranks have different capture plans: {plans}"
-            )
 
     def join_expert_step(self, *, leaving: bool = False) -> bool:
         """Take part in the next expert step when this rank has no forward.

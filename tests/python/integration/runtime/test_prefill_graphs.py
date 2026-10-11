@@ -30,9 +30,9 @@ from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.distributed import Communicator
 from uniserve.loading import weights
 from uniserve.math import ceil_div
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve_models import loading as models
-from uniserve_worker.bootstrap.cache import cache_info
+from uniserve_worker.bootstrap.cache import cache_info, plan_cache
 from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
@@ -117,15 +117,16 @@ def _diffusion_gemma_worker(
         decode_graph_batch_sizes=(1,),
     )
     processor = source.image_processor
-    cache = PrefixCache(
+    planes = plan_cache(model.text, config)
+    cache = KVCache(
         model.text.cache_config,
+        planes,
         num_units=units,
-        block_size=16,
         device="cuda:0",
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model.text, config, num_units=units),
+        info=cache_info(model.text, planes, num_units=units),
         request_pool_size=slots,
         table_width=64,
     )
@@ -133,7 +134,7 @@ def _diffusion_gemma_worker(
     try:
         runner.configure_inputs(
             input_config=input_buffer_config(
-                model, config, processor=processor
+                model, config, planes=planes, processor=processor
             ),
             kv_cache=manager,
             latent_pool=None,

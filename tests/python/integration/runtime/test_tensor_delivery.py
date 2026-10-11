@@ -99,9 +99,7 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
         for piece in pieces
     ]
     stores = [
-        TensorStore(
-            capacity=1, byte_capacity=16, buffer_pool=arena, event_pool=event
-        )
+        TensorStore(byte_capacity=16, buffer_pool=arena, event_pool=event)
         for arena, event in zip(arenas, events[:2], strict=True)
     ]
     locations = []
@@ -782,7 +780,6 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
     allocation = BufferAllocation(reference.buffer_id, 0, reference.max_bytes)
     arena = BufferPool(byte_capacity=reference.max_bytes, devices=(device,))
     store = TensorStore(
-        capacity=1,
         byte_capacity=16,
         max_entry_bytes=reference.max_bytes,
         devices=(device,),
@@ -879,7 +876,7 @@ def test_full_region_publishes_complete_bounded_tensor() -> None:
     )
     allocation = BufferAllocation(reference.buffer_id, 0, reference.max_bytes)
     arena = BufferPool(byte_capacity=reference.max_bytes, devices=("cpu",))
-    store = TensorStore(capacity=1, byte_capacity=16, buffer_pool=arena)
+    store = TensorStore(byte_capacity=16, buffer_pool=arena)
     try:
         (write,) = store.bind_outputs(
             ((reference, "cpu"),),

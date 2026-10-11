@@ -251,7 +251,7 @@ def plan_units(
     return Planes(columns, plane_bytes, tuple(groups), quantizer is not None)
 
 
-class PrefixCache:
+class KVCache:
     """Allocate a K/V unit pool; callers own unit assignment and retirement.
 
     No layer, attention method, or numerical input receives this owning
@@ -261,26 +261,20 @@ class PrefixCache:
     def __init__(
         self,
         config: Config,
+        planes: Planes,
         *,
         num_units: int,
-        block_size: int,
         device: torch.device | str,
-        dtype: torch.dtype | None = None,
-        quantization: Mapping[str, Quantizer | None] | None = None,
     ) -> None:
         """Allocate and reset the pool's planes and bind every layer's state.
 
-        ``block_size``, ``dtype`` and ``quantization`` are interpreted as by
-        ``plan_units``; ``num_units`` counts every unit, sentinel included.
+        ``planes`` is the ``plan_units`` result for ``config``; the pool
+        takes its groups, storage types and quantization as planned.
+        ``num_units`` counts every unit, sentinel included.
         """
         self.config = config
         self.device = torch.device(device)
-        self.planes = plan_units(
-            config,
-            block_size=block_size,
-            dtype=dtype,
-            quantization=quantization,
-        )
+        self.planes = planes
         self.num_units = num_units
         # Groups storing different element types reinterpret each other's
         # stale bytes, which need not decode as finite (`recycle_units`).
@@ -296,18 +290,20 @@ class PrefixCache:
             # restart at zero.
             tensor.fill_(int(name.endswith(".scale")))
 
+        # Planned storage already names each group's element type, FP8
+        # included, so layers bind it as their logical storage dtype unless
+        # the planes are quantized, where layers decode to their compute
+        # dtype.
+        quantizer = Quantizer("fp8", axis=0) if planes.quantized else None
         self._states: dict[str, State] = {}
         self._tables: dict[str, int] = {}
         columns = self.planes.columns
         first_table = 0
-        for group_index, group in enumerate(self.planes.groups):
+        for group in self.planes.groups:
             for index, name in enumerate(group.layers):
                 row, column = divmod(index, columns)
                 layout = config.layers[name]
                 assert isinstance(layout, mha.Config)
-                quantizer = (
-                    None if quantization is None else quantization.get(name)
-                )
                 views = {}
                 for field in _FIELDS:
                     # One plane read as [units, page tokens, heads, dim]; the
@@ -332,7 +328,7 @@ class PrefixCache:
                 self._states[name] = layout.bind(
                     views,
                     block_size=group.page_tokens,
-                    dtype=dtype,
+                    dtype=None if quantizer else group.dtype,
                     quantizer=quantizer,
                 )
                 self._tables[name] = first_table + row

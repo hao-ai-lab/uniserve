@@ -54,6 +54,7 @@ from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.ticket import TransferTicket
 
 if TYPE_CHECKING:
+    from uniserve.runtime.kv_cache import CacheGroup
     from uniserve_worker.storage.block_tables import GroupTable
     from uniserve_worker.storage.kv_cache import KVCacheManager
 
@@ -63,40 +64,33 @@ def import_workers(capacity: int) -> int:
     return min(4, int(capacity))
 
 
+def import_workspace(groups: Sequence[CacheGroup]) -> dict[str, BufferConfig]:
+    """Describe one import worker's page buffers for a pool's cache groups.
+
+    One page of the largest group suffices: elements are ``page_tokens *
+    layers * kv_heads * head_dim`` and scale entries ``page_tokens * layers *
+    kv_heads``, each the largest over the groups.
+    """
+    elements = scales = 0
+    for group in groups:
+        rows = group.page_tokens * len(group.layers) * group.num_kv_heads
+        elements = max(elements, rows * group.head_dim)
+        scales = max(scales, rows)
+    return TransferBuffer.buffers(page_elements=elements, page_scales=scales)
+
+
 def cache_transfer_workspace_bytes(
-    *,
-    page_elements: int,
-    page_scales: int,
-    capacity: int,
+    groups: Sequence[CacheGroup], *, capacity: int
 ) -> int:
     """Return the startup bytes of every import workspace.
 
     Startup memory accounting (`bootstrap.report`) reserves this amount:
-    one `TransferBuffer` per import worker, as `CacheImports.__init__`
-    allocates them. ``page_elements`` and ``page_scales`` are as
-    `import_page_sizes` returns them for the pool.
+    one workspace per import worker, as `CacheImports.__init__` allocates
+    them.
     """
-    buffers = TransferBuffer.buffers(
-        page_elements=page_elements, page_scales=page_scales
-    )
     return import_workers(capacity) * sum(
-        config.nbytes for config in buffers.values()
+        config.nbytes for config in import_workspace(groups).values()
     )
-
-
-def import_page_sizes(pool: KVCacheManager) -> tuple[int, int]:
-    """Return the largest group page's elements and scale entries.
-
-    The pair sizes `cache_transfer_workspace_bytes` for ``pool``: elements
-    are ``page_tokens * layers * kv_heads * head_dim`` and scale entries
-    ``page_tokens * layers * kv_heads``, each the largest over the groups.
-    """
-    elements = scales = 0
-    for group in pool.cache.groups:
-        rows = group.page_tokens * len(group.layers) * group.num_kv_heads
-        elements = max(elements, rows * group.head_dim)
-        scales = max(scales, rows)
-    return elements, scales
 
 
 @dataclass(slots=True)
@@ -194,10 +188,7 @@ class CacheImports:
 
         # One conversion page holds the largest group's full page, which
         # every group views as its [tokens, layers, heads, dim].
-        elements, scale_entries = import_page_sizes(pool)
-        buffers = TransferBuffer.buffers(
-            page_elements=elements, page_scales=scale_entries
-        )
+        buffers = import_workspace(pool.cache.groups)
 
         # Idle workspaces. A task leases one in `_acquire`; `_reclaim` returns
         # it only after the task's physical access has retired.

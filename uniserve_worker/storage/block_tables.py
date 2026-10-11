@@ -10,7 +10,7 @@ lookups such as attention input construction (`model_executor.attention`).
 
 A cache group's logical page occupies ``units_per_page`` units, and the units
 at one position of every page form one numerical block table (see
-`uniserve.runtime.prefix_cache`). A slot's table of one group therefore
+`uniserve.runtime.kv_cache`). A slot's table of one group therefore
 installs as ``units_per_page`` device rows, one per numerical table, each
 holding the slot's units of pages ``start_page..`` at that position.
 """
@@ -310,13 +310,13 @@ class BlockTables:
         stream; the host blocks only when a pinned staging generation is
         reused before its previous copy has completed.
 
-        This method checks table-local bounds only: slots in
-        ``[1, request_pool_size]``, groups in range, positive unique units
-        forming whole pages that fit the width, ``allocated_tokens`` within
-        the installed pages, and no repeated ``(slot, group)``. The caller
-        validates unit ids against the physical pool
-        (`KVCacheManager.validate_units`). All entries are validated before
-        any staging or device write, so a rejected update changes nothing.
+        This method checks the bounds of this table's own storage only:
+        slots in ``[1, request_pool_size]``, groups in range, units forming
+        whole pages that fit the width, ``allocated_tokens`` within the
+        installed pages, and no repeated ``(slot, group)``. Which units a
+        request holds is the scheduler's allocation and is not checked. All
+        entries are validated before any staging or device write, so a
+        rejected update changes nothing.
 
         Raises:
             WorkerError: ``invalid_descriptor`` when any entry fails
@@ -343,8 +343,6 @@ class BlockTables:
                 table.start_page < 0
                 or remainder
                 or pages > self.width
-                or any(unit < 1 for unit in table.units)
-                or len(set(table.units)) != len(table.units)
                 or not 0 <= table.allocated_tokens
                 or table.allocated_tokens > table.end_page * shape.page_tokens
                 or (slot, group) in accepted

@@ -13,7 +13,8 @@ from uniserve.nn.attention import (
     SequenceLengths,
     VarlenInput,
 )
-from uniserve.runtime import ExecutionContext, PrefixCache
+from uniserve.runtime import ExecutionContext, KVCache
+from uniserve.runtime.kv_cache import plan_units
 
 pytestmark = pytest.mark.integration
 
@@ -25,8 +26,11 @@ def test_text_prefill_decode_and_zero_query_match_qwen_equations(tmp_path):
     tokens = torch.tensor([1, 4, 8, 3])
     with torch.no_grad():
         expected = reference(tokens[None]).logits[0]
-    with PrefixCache(
-        model.text.cache_config, num_units=1, block_size=4, device="cpu"
+    with KVCache(
+        model.text.cache_config,
+        plan_units(model.text.cache_config, block_size=4),
+        num_units=1,
+        device="cpu",
     ) as cache:
         with ExecutionContext(
             model.text, cache=cache, attention="torch"

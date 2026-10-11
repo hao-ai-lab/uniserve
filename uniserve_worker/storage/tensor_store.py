@@ -100,31 +100,6 @@ def device_product_storage(dtype: DType) -> tuple[str, int]:
     return _DTYPE_STORAGE[DType(dtype)]
 
 
-def device_product_capacity_bytes(
-    slot_capacity: int,
-    device_count: int,
-    *,
-    max_value_bytes: int,
-) -> int:
-    """Return the fixed backing bound for one ``TensorStore`` owner.
-
-    The bound is ``slot_capacity * device_count * (scalars + max_value_bytes)``
-    where ``scalars`` sums the element size of every supported product dtype.
-    Request-relay arena bytes are not included;
-    ``uniserve_worker.bootstrap.capacity`` adds them separately.
-
-    Raises:
-        ValueError: If any dimension is less than one.
-    """
-    slots = int(slot_capacity)
-    devices = int(device_count)
-    value_bytes = int(max_value_bytes)
-    if min(slots, devices, value_bytes) < 1:
-        raise ValueError("device-product dimensions must be positive")
-    scalar_bytes = slots * devices * sum(dict(_DTYPE_STORAGE.values()).values())
-    return scalar_bytes + slots * devices * value_bytes
-
-
 def _invariant(message: str) -> WorkerError:
     """Construct a classified invariant error for device-product misuse."""
     return WorkerError(
@@ -364,18 +339,16 @@ class TensorStore:
     callbacks, and from `retirement_ready` and `abandon_writes`. One
     reentrant lock guards all tables; the retirement callbacks also take it.
 
-    Three bounds are independent: ``capacity`` limits resident (not yet
-    reclaimed) generic persistent products per device, ``max_entry_bytes``
-    limits one encoder feature, and ``byte_capacity`` limits relay-arena
-    bytes, the only storage this store allocates itself. Encoder features
-    have no count bound here: the scheduler's buffer-pool placements, which
-    `BufferPool.bind` validates, bound their storage.
+    Two bounds are independent: ``max_entry_bytes`` limits one encoder
+    feature, and ``byte_capacity`` limits relay-arena bytes, the only storage
+    this store allocates itself. Products have no count bound here: the
+    scheduler's buffer-pool placements, which `BufferPool.bind` validates,
+    bound their storage.
     """
 
     def __init__(
         self,
         *,
-        capacity: int = 0,
         byte_capacity: int | None = None,
         max_entry_bytes: int = 1,
         devices: tuple[torch.device | str, ...] = (),
@@ -390,7 +363,6 @@ class TensorStore:
         and field.
 
         Args:
-            capacity: Resident generic persistent products per device.
             byte_capacity: Bound on relay-arena bytes; defaults to the
                 `BufferPool` byte capacity.
             max_entry_bytes: Largest ``max_bytes`` of one encoder feature.
@@ -411,10 +383,9 @@ class TensorStore:
         """
         # Validate the independent capacities and the coupled request-relay
         # dimensions before creating any registries.
-        self.capacity = int(capacity)
         self.max_entry_bytes = int(max_entry_bytes)
         self.devices = tuple(canonical_device(device) for device in devices)
-        if self.capacity < 0 or self.max_entry_bytes < 1:
+        if self.max_entry_bytes < 1:
             raise ValueError("tensor store capacities are invalid")
 
         self.byte_capacity = int(
@@ -646,8 +617,8 @@ class TensorStore:
         """Bind outputs to the `BufferPool` ranges of their allocations.
 
         This store rejects repeated or registered identities and missing
-        allocations and enforces the generic products' per-device count bound
-        (and, for features, the dtype, byte, and device limits);
+        allocations and enforces, for features, the dtype, byte, and device
+        limits;
         `BufferPool.bind` validates and places each allocation, first-fit
         when the pool is compact. On any failure every binding made by this
         call is released and no record remains.
@@ -663,17 +634,7 @@ class TensorStore:
         with self._lock:
             self._reclaim_ready_locked()
 
-            # Generic products share the per-device slot bound; features and
-            # relay lanes are bounded independently and do not consume slots.
-            counts: dict[str, int] = {}
-            for entry in self._writes.values():
-                if not entry.feature and entry.relay_slot is None:
-                    counts[entry.device_name] = (
-                        counts.get(entry.device_name, 0) + 1
-                    )
-
-            # Validate every output and count it against its bound before
-            # binding any placement.
+            # Validate every output before binding any placement.
             for (reference, raw_device), key in zip(
                 bindings, keys, strict=True
             ):
@@ -705,14 +666,6 @@ class TensorStore:
                     if device not in self.devices:
                         raise invalid_descriptor(
                             "encoder feature names an undeclared device"
-                        )
-                else:
-                    name = str(device)
-                    counts[name] = counts.get(name, 0) + 1
-                    if counts[name] > self.capacity:
-                        raise resource_error(
-                            f"device-product arena for {name} has no "
-                            "query-ready free generation"
                         )
 
             writes: list[TensorRecord] = []
@@ -2711,6 +2664,5 @@ __all__ = [
     "ImageMetadata",
     "TensorRecord",
     "FeatureMetadata",
-    "device_product_capacity_bytes",
     "device_product_storage",
 ]

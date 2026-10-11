@@ -1,6 +1,6 @@
 """Request unit assignment, cache publications, imports, and retirement.
 
-``KVCacheManager`` wraps one ``PrefixCache`` unit pool on a worker rank and
+``KVCacheManager`` wraps one ``KVCache`` unit pool on a worker rank and
 decides when each physical unit interval may be rewritten or reused. Unit
 allocation belongs to the engine scheduler; this manager validates the unit
 ids it assigns and owns the request block tables (``BlockTables``) that model
@@ -40,7 +40,7 @@ import torch
 
 from uniserve.cache import mha
 from uniserve.math import ceil_div
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.transfer import (
@@ -122,7 +122,7 @@ class KVCacheManager:
 
     def __init__(
         self,
-        cache: PrefixCache,
+        cache: KVCache,
         *,
         info: KVCacheInfo,
         group_layers: Sequence[Sequence[int]] | None = None,
@@ -131,11 +131,12 @@ class KVCacheManager:
         table_width: int | None = None,
         staging_depth: int = 1,
     ) -> None:
-        """Validate the unit pool against ``info`` and create its owners.
+        """Create the request, publication and import owners of a unit pool.
 
         Args:
             cache: Numerical K/V unit pool; closed by ``close``.
-            info: Advertised unit count and group page shapes and placement.
+            info: The pool's advertised description, which ``cache`` was
+                allocated from: group order, layer placement and stored dtype.
             group_layers: Global cache-layer ids of every layer of each group
                 across all pipeline stages, in ascending order; defaults to
                 this rank's layers, the complete group without pipelining.
@@ -147,29 +148,13 @@ class KVCacheManager:
             staging_depth: Depth of the block tables' host staging rings.
 
         Raises:
-            ValueError: When the pool does not match ``info``, a group's
-                layers are not one consecutive run of its transfer layers, or
-                ``staging_depth`` is below 1.
+            ValueError: When a group's layers are not one consecutive run of
+                its transfer layers, or ``staging_depth`` is below 1.
             WorkerError: ``invalid_descriptor`` when a block-table dimension
                 is below 1.
         """
         self.cache, self.info = cache, info
         groups = cache.groups
-        if cache.num_units != info.num_units or len(groups) != len(info.groups):
-            raise ValueError(
-                "cache backing must match the advertised unit pool"
-            )
-        for group, advertised in zip(groups, info.groups, strict=True):
-            if (
-                group.page_tokens != advertised.page_tokens
-                or group.units_per_page != advertised.units_per_page
-                or group.num_kv_heads != advertised.num_kv_heads
-                or group.head_dim != advertised.head_dim
-                or len(group.layers) != len(advertised.layer_ids)
-            ):
-                raise ValueError(
-                    "cache backing must match the advertised group shapes"
-                )
 
         # Every group's layers read one transfer layer axis; this rank's run
         # must be consecutive and in order within it.
@@ -194,7 +179,7 @@ class KVCacheManager:
                 )
             self.axes += (GroupAxis(offset, len(axis)),)
 
-        # A ``PrefixCache`` holds only MHA layers (``plan_units`` rejects any
+        # A ``KVCache`` holds only MHA layers (``plan_units`` rejects any
         # other layout).
         self.compute_dtypes = tuple(
             cast(mha.Config, cache.config.layers[group.layers[0]]).compute_dtype
@@ -206,11 +191,6 @@ class KVCacheManager:
         )
         # The most tokens a unit holds in any group bounds a whole-unit span.
         self._unit_tokens = max(group.page_tokens for group in groups)
-        # Reuse normalized unit tuples after their bounds have been
-        # established by the validation path.
-        self._validated_units: dict[
-            tuple[tuple[int, ...], bool], tuple[int, ...]
-        ] = {}
 
         # Transport locations of committed exports, updated by the batch
         # commit; publication intervals retained under their buffers.
@@ -228,7 +208,7 @@ class KVCacheManager:
         self.block_tables = BlockTables(
             groups=self.shapes,
             request_pool_size=request_pool_size,
-            width=max(1, self.info.num_units - 1)
+            width=max(1, self.num_units - 1)
             if table_width is None
             else table_width,
             device=cache.device,
@@ -251,6 +231,11 @@ class KVCacheManager:
         self.imports = CacheImports(self, capacity=import_capacity)
 
     @property
+    def num_units(self) -> int:
+        """Return the pool's units, the unit-zero sentinel included."""
+        return self.cache.num_units
+
+    @property
     def row_units(self) -> int:
         """Return the units one page of every cache group occupies."""
         return sum(shape.units_per_page for shape in self.shapes)
@@ -269,7 +254,7 @@ class KVCacheManager:
             largest // shape.page_tokens * shape.units_per_page
             for shape in self.shapes
         )
-        return (self.info.num_units - 1) // span_units * largest
+        return (self.num_units - 1) // span_units * largest
 
     def page_units(self, tokens: int) -> int:
         """Return the units of whole pages covering ``tokens`` in every group.
@@ -298,7 +283,7 @@ class KVCacheManager:
         """
         if self.has_pending_accesses:
             raise RuntimeError("startup scratch requires an idle KV pool")
-        if not 0 <= count < self.info.num_units:
+        if not 0 <= count < self.num_units:
             raise ValueError("startup scratch exceeds KV capacity")
         units = tuple(range(1, count + 1))
         self.zero_units(units)
@@ -336,13 +321,12 @@ class KVCacheManager:
         cancellation.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when the table's units are
-                invalid or ``length`` exceeds its pages.
+            WorkerError: ``invalid_descriptor`` when ``length`` exceeds the
+                table's pages.
         """
         start = table.start_page * table.shape.page_tokens
         if length <= start:
             return
-        self.validate_units(table.units)
         ranges = table.spans(start, length - start)
 
         with self._execution_lock:
@@ -662,69 +646,14 @@ class KVCacheManager:
         self._installed_bases.clear()
         self.cache.close()
 
-    def validate_group(self, group: int) -> int:
-        """Return ``group`` as an integer after checking its range.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when ``group`` is outside the
-                advertised groups.
-        """
-        value = int(group)
-        if value < 0 or value >= len(self.shapes):
-            raise invalid_descriptor(
-                f"KV group {value} outside pool group count {len(self.shapes)}"
-            )
-        return value
-
-    def validate_units(
-        self, unit_ids: Iterable[int], *, allow_sentinel: bool = False
-    ) -> tuple[int, ...]:
-        """Validate physical unit ids and return them as a tuple of ints.
-
-        Real (non-zero) units must be unique and in ``[1, num_units)``. The
-        sentinel unit ``0`` is accepted, possibly repeated, only with
-        ``allow_sentinel``. Accepted tuples are memoized; the checks depend
-        only on the pool size fixed at construction.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when any check fails.
-        """
-        # Resident scheduler tables already use immutable integer tuples.
-        # Check their validated identity before normalizing every element.
-        units = tuple(unit_ids)
-        key = (units, bool(allow_sentinel))
-        cached = self._validated_units.get(key)
-        if cached is not None:
-            return cached
-        units = tuple(int(unit) for unit in units)
-        key = (units, bool(allow_sentinel))
-
-        # Unit 0 is the padding sentinel; uniqueness applies only to real
-        # units.
-        real_units = tuple(unit for unit in units if unit != 0)
-        if len(set(real_units)) != len(real_units):
-            raise invalid_descriptor("KV allocation repeats a physical unit")
-        lower = 0 if allow_sentinel else 1
-        if units and (min(units) < lower or max(units) >= self.info.num_units):
-            raise invalid_descriptor(
-                "KV allocation exceeds the fixed physical pool"
-            )
-
-        # Bound the memo by clearing it wholesale.
-        if len(self._validated_units) >= 16_384:
-            self._validated_units.clear()
-        self._validated_units[key] = units
-        return units
-
     def zero_units(self, unit_ids: Iterable[int]) -> None:
         """Reset every column and field of the selected physical units.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when the units are invalid;
-                a resource error from ``require_reusable`` when any selected
-                unit is still retained.
+            WorkerError: A resource error from ``require_reusable`` when any
+                selected unit is still retained.
         """
-        units = self.validate_units(unit_ids)
+        units = tuple(unit_ids)
         if not units:
             return
         self.require_reusable(self.unit_spans(units))
@@ -734,14 +663,13 @@ class KVCacheManager:
         """Prepare newly allocated units for their new owner.
 
         Resets only the unit state a new writer reads
-        (`PrefixCache.recycle_units`); stale values stay unread.
+        (`KVCache.recycle_units`); stale values stay unread.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when the units are invalid;
-                a resource error from ``require_reusable`` when any selected
-                unit is still retained.
+            WorkerError: A resource error from ``require_reusable`` when any
+                selected unit is still retained.
         """
-        units = self.validate_units(unit_ids)
+        units = tuple(unit_ids)
         if not units:
             return
         self.require_reusable(self.unit_spans(units))
@@ -1142,10 +1070,7 @@ class KVCacheManager:
             raise invalid_descriptor(
                 "KV import requires a destination table per group"
             )
-        initialized = self.validate_units(initialized_units)
-        held: set[int] = set()
         for table in tables:
-            held.update(self.validate_units(table.units))
             if (
                 table.allocated_tokens < publication.published_extent
                 or table.start_page * table.shape.page_tokens
@@ -1154,10 +1079,6 @@ class KVCacheManager:
                 raise invalid_descriptor(
                     "KV import exceeds its scheduler block table"
                 )
-        if not set(initialized).issubset(held):
-            raise invalid_descriptor(
-                "KV import resets units outside its block tables"
-            )
 
         if publication.base_extent:
             # Units of the pages that hold the installed base must stay
@@ -1185,7 +1106,7 @@ class KVCacheManager:
                         )
                         * per_page
                     ]
-                    if new != old or set(new).intersection(initialized):
+                    if new != old or set(new).intersection(initialized_units):
                         raise invalid_descriptor(
                             "KV import would replace its installed base units"
                         )
@@ -1194,7 +1115,7 @@ class KVCacheManager:
             publication,
             request_pool_idx=request_pool_idx,
             tables=tuple(tables),
-            initialized_units=initialized,
+            initialized_units=initialized_units,
             transports=transports,
         )
 

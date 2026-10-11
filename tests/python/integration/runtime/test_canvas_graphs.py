@@ -45,13 +45,13 @@ from uniserve.distributed import Communicator
 from uniserve.loading import weights
 from uniserve.math import ceil_div
 from uniserve.nn.moe import FusedMoE
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve.runtime.process_groups import (
     Rendezvous,
     initialize_process_groups,
 )
 from uniserve_models import loading as models
-from uniserve_worker.bootstrap.cache import cache_info
+from uniserve_worker.bootstrap.cache import cache_info, plan_cache
 from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
@@ -188,15 +188,16 @@ def _worker(
         else:
             runner.close()
         return
-    cache = PrefixCache(
+    planes = plan_cache(model.text, config)
+    cache = KVCache(
         model.text.cache_config,
+        planes,
         num_units=units,
-        block_size=16,
         device=device,
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model.text, config, num_units=units),
+        info=cache_info(model.text, planes, num_units=units),
         request_pool_size=SLOTS,
         table_width=64,
     )
@@ -204,7 +205,7 @@ def _worker(
     try:
         runner.configure_inputs(
             input_config=input_buffer_config(
-                model, config, processor=processor
+                model, config, planes=planes, processor=processor
             ),
             kv_cache=manager,
             latent_pool=None,
@@ -701,7 +702,7 @@ def test_a_small_pool_replays_calls_of_every_canvas_it_holds(tmp_path):
     """
     _checkpoint(tmp_path)
     with _worker(tmp_path, units=SMALL_UNITS) as (runner, manager, slots):
-        rows = (manager.info.num_units - 1) // manager.row_units
+        rows = (manager.num_units - 1) // manager.row_units
         # The pool, not the call or request slot bound, bounds the rows.
         assert rows < SLOTS
         _install(manager, rows, tokens=PAGE)
