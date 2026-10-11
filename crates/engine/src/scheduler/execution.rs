@@ -98,12 +98,16 @@ impl Scheduler {
 
     /// Advances scheduler and executor work, blocking only for an outstanding result.
     ///
+    /// Serving drives `run`; `step` lets tests and examples advance the
+    /// scheduler deterministically from the calling thread.
+    ///
     /// Drains `commands` first; a shutdown command or a disconnected channel
     /// aborts every request, closes the executor and returns `false`. When the
     /// nonblocking tick makes no progress while batches are in flight, this
     /// waits a bounded time for one result.
     ///
     /// Returns whether the loop made progress or handled an executor outcome.
+    #[cfg(feature = "testing")]
     pub fn step(&mut self, commands: &Receiver<Command>) -> bool {
         if self.drain_commands(commands) {
             self.abort_all_requests();

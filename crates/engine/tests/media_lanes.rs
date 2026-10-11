@@ -9,6 +9,8 @@
 //! flight until the scheduler blocks for a completion, and the record of
 //! submissions and resolutions is a function of scheduling decisions alone.
 
+mod support;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::thread;
@@ -21,8 +23,7 @@ use uniserve_core::{
 };
 use uniserve_engine::{
     BatchEvent, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch,
-    RequestPlacement, Scheduler, SimEngine, SimExecutor, SpecialTokenIds, VideoDenoiserInfo,
-    WorkerId,
+    RequestPlacement, SchedulerConfig, SimEngine, SimExecutor, VideoDenoiserInfo, WorkerId,
 };
 use uniserve_worker_ipc::{
     Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes, ShapeBound,
@@ -380,7 +381,8 @@ impl Served {
 fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     let mut executor = SimExecutor::new(video_worker(1, 1));
     let boundary = executor.observe();
-    let scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32).unwrap();
+    let scheduler =
+        support::scheduler(Box::new(executor), SimEngine::special_tokens(), 32).unwrap();
     let (tx, commands) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let mut stream = handle
@@ -480,10 +482,16 @@ fn serve(sim: SimEngine, requests: Vec<Request>) -> Served {
 fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option<usize>) -> Served {
     let mut executor = SimExecutor::new(sim);
     let boundary = executor.observe();
-    let mut scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32).unwrap();
-    if let Some(bound) = max_num_waiting {
-        scheduler.set_max_num_waiting(bound);
-    }
+    let scheduler = support::scheduler_with(
+        Box::new(executor),
+        SimEngine::special_tokens(),
+        SchedulerConfig {
+            max_batch: 32,
+            max_num_waiting,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
 

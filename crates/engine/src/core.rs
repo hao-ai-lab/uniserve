@@ -410,7 +410,7 @@ impl EngineConfig {
             ..WorkerProcessArgs::default()
         };
         Self {
-            generation_limits: crate::scheduler::unbounded_umm_generation_limits(),
+            generation_limits: crate::sim::SimEngine::generation_limits(),
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
@@ -788,7 +788,7 @@ impl EngineCore {
                     .map(|units| (call, units))
             })
             .collect();
-        let mut sched = Scheduler::with_model_limits(
+        let mut sched = Scheduler::new(
             executor,
             ctrl,
             SchedulerConfig {

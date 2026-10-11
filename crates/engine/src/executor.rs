@@ -61,27 +61,19 @@ pub struct ExecutorInfo {
     /// the map is placed with no components and a queue depth of one.
     ///
     /// `WorkerExecutor::try_new` and `SimExecutor` fill this from their
-    /// launch; `single` and `from_workers` leave it empty.
+    /// launch; `from_workers` leaves it empty.
     pub placements: BTreeMap<WorkerId, PoolPlacement>,
     /// For each worker that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
     ///
-    /// `WorkerExecutor::try_new` fills this from the placement; `single` and
-    /// `from_workers` leave it empty. Scheduler admission restricts a video
+    /// `WorkerExecutor::try_new` fills this from the placement;
+    /// `from_workers` leaves it empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the worker chosen to decode.
     pub video_codecs: BTreeMap<WorkerId, BTreeSet<WorkerId>>,
 }
 
 impl ExecutorInfo {
-    /// Constructs capability information for one physical pool.
-    pub fn single(id: WorkerId, info: WorkerInfo) -> Self {
-        Self {
-            workers: vec![(id, info)],
-            ..Self::default()
-        }
-    }
-
     /// Constructs capability information for multiple pools.
     ///
     /// Fails when `pools` is empty, repeats a pool id, or holds replicas of

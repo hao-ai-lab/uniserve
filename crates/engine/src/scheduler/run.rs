@@ -84,111 +84,12 @@ pub(crate) fn flow_prefix_rows(info: &WorkerInfo) -> usize {
 }
 
 impl Scheduler {
-    /// Constructs an engine loop with the default scheduler configuration.
-    ///
-    /// Fails when the executor exposes an invalid aggregate capacity view.
-    pub fn new(
-        executor: Box<dyn Executor>,
-        ctrl: SpecialTokenIds,
-        max_batch: usize,
-    ) -> anyhow::Result<Self> {
-        Self::with_config(
-            executor,
-            ctrl,
-            SchedulerConfig {
-                max_batch,
-                ..Default::default()
-            },
-        )
-    }
-
-    /// Constructs an engine loop with an explicit scheduling policy.
-    ///
-    /// Fails when the executor exposes an invalid aggregate capacity view.
-    pub fn with_policy(
-        executor: Box<dyn Executor>,
-        ctrl: SpecialTokenIds,
-        max_batch: usize,
-        policy: SchedulingPolicy,
-    ) -> anyhow::Result<Self> {
-        Self::with_config(
-            executor,
-            ctrl,
-            SchedulerConfig {
-                max_batch,
-                policy,
-                ..Default::default()
-            },
-        )
-    }
-
-    /// Constructs an engine loop whose generation limits follow from the
-    /// workers' capabilities rather than from a model description.
-    ///
-    /// Fails when the executor exposes an invalid aggregate capacity view.
-    pub fn with_config(
-        executor: Box<dyn Executor>,
-        ctrl: SpecialTokenIds,
-        config: SchedulerConfig,
-    ) -> anyhow::Result<Self> {
-        let info = executor.info().runtime_info()?;
-
-        // Without text decode, token-canvas denoising serves canvas readouts
-        // over prompts that may carry encoded images, and latent preparation
-        // serves video diffusion, which needs no generation feature. Otherwise
-        // any denoising, vision-encoding, or latent-encoding capability serves
-        // interleaved text and images from unbounded limits, and everything
-        // else serves text. `with_model_limits` clamps the result to the
-        // worker-reported capacities.
-        let calls = &info.supported_calls;
-        let decodes = calls.contains(&CallKind::Forward(ForwardMode::Decode));
-        let generation_limits =
-            if calls.contains(&CallKind::Forward(ForwardMode::TokenDenoising)) && !decodes {
-                uniserve_core::GenerationLimits {
-                    features: uniserve_core::GenerationFeatures::TOKEN_DENOISING
-                        | uniserve_core::GenerationFeatures::VISION_ENCODE,
-                    latent_downsample: 1,
-                    max_vit_grid_tokens: u32::MAX,
-                    max_vision_feature_bytes: 256 << 20,
-                    max_cfg_branches: 1,
-                    encoder_cache_entries: 256,
-                    ..Default::default()
-                }
-            } else if calls.contains(&CallKind::Media(MediaCall::LatentPreparation)) && !decodes {
-                uniserve_core::GenerationLimits {
-                    latent_downsample: 1,
-                    max_cfg_branches: 1,
-                    ..Default::default()
-                }
-            } else if calls.contains(&CallKind::Media(MediaCall::Denoising))
-                || calls.contains(&CallKind::Media(MediaCall::VisionEncoding))
-                || calls.contains(&CallKind::Media(MediaCall::LatentEncoding))
-            {
-                unbounded_umm_generation_limits()
-            } else {
-                uniserve_core::GenerationLimits {
-                    features: uniserve_core::GenerationFeatures::UNDERSTANDING,
-                    latent_downsample: 1,
-                    max_cfg_branches: 1,
-                    ..Default::default()
-                }
-            };
-
-        Self::with_model_limits(
-            executor,
-            ctrl,
-            config,
-            uniserve_core::ModelDtype::BFloat16,
-            generation_limits,
-        )
-    }
-
     /// Constructs an engine loop from explicit scheduler and model capabilities.
     ///
     /// Worker limits clamp scheduler concurrency and resource capacities.
     ///
     /// Fails when the executor exposes an invalid aggregate capacity view.
-    pub fn with_model_limits(
+    pub fn new(
         executor: Box<dyn Executor>,
         ctrl: SpecialTokenIds,
         mut config: SchedulerConfig,
@@ -328,21 +229,6 @@ impl Scheduler {
         if let Some(cache) = self.storage.cache.as_mut() {
             cache.set_prefix_cache(on);
         }
-    }
-
-    /// Configures the per-step token budget.
-    pub fn set_token_budget(&mut self, tokens: usize) {
-        self.config.max_num_batched_tokens = tokens.max(1);
-    }
-
-    /// Sets the token threshold above which prefill is chunked.
-    pub fn set_long_prefill_threshold(&mut self, n: usize) {
-        self.config.long_prefill_threshold = n.max(1);
-    }
-
-    /// Caps waiting and terminal-output-retained request state.
-    pub fn set_max_num_waiting(&mut self, n: usize) {
-        self.config.max_num_waiting = Some(n.max(1));
     }
 
     /// Returns the executor's aggregate worker capabilities.
