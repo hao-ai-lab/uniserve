@@ -105,16 +105,16 @@ async def run_load(
     its arrival time and waits for all of them. When every row has a
     ``session_id``, sessions run concurrently and each awaits its previous
     response before submitting its next row. Session traces require an
-    infinite request rate and, if specified, a concurrency equal to their
-    session count. A trace measures each session's initial cold request, so
-    it has no repeated-row warmup.
+    infinite request rate; their sessions are their concurrency, one request
+    in flight per session. A trace measures each session's initial cold
+    request, so it has no repeated-row warmup.
 
     Args:
         rows: Examples in submission order.
         request_rate: Mean arrivals per second; ``inf`` submits all rows at
             once, or starts all declared closed-loop sessions.
-        max_concurrency: Maximum in-flight submissions, or ``None`` (or
-            ``0``) for no limit.
+        max_concurrency: Maximum in-flight warmup and arrival-driven
+            submissions, or ``None`` (or ``0``) for no limit.
         submit: Coroutine that sends one example; see ``Submit``.
         warmup_requests: Number of first-row warmup submissions; ``0`` skips
             them, and so does a session trace.
@@ -153,14 +153,11 @@ async def run_load(
                     "closed-loop sessions require every session_id"
                 )
             sessions.setdefault(row.session_id, []).append((index, row))
-        if max_concurrency and len(sessions) != max_concurrency:
-            raise ValueError(
-                "closed-loop session count must equal max_concurrency"
-            )
 
-    # Warmup and measurement share the declared in-flight limit. The arrival
-    # timestamp is taken before the semaphore, so time queued here appears
-    # as the gap between ``scheduled`` and the moment ``submit`` starts.
+    # Warmup and arrival-driven measurement share the declared in-flight
+    # limit. The arrival timestamp is taken before the semaphore, so time
+    # queued here appears as the gap between ``scheduled`` and the moment
+    # ``submit`` starts.
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
     async def limited(row: Example, scheduled: float | None) -> T:
