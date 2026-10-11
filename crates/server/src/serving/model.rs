@@ -15,7 +15,6 @@
 //! [`InputProcessor::preprocess_video_request`] produces a `DiffusionRequest` for MiniMax H3
 //! through the deployment's `VideoService`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::EngineSettings;
@@ -81,15 +80,6 @@ pub enum ModelResolutionError {
     /// The model chat renderer cannot be initialized.
     #[error(transparent)]
     Chat(#[from] crate::serving::chat::Error),
-    /// A resolved asset path cannot be prepared for worker access.
-    #[error("model asset path `{path}` could not be prepared")]
-    Io {
-        /// Asset path that could not be prepared.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: std::io::Error,
-    },
     /// The running worker lacks a feature required by the selected profile.
     #[error("configured model description `{description}` requires worker feature `{feature}`")]
     MissingFeature {

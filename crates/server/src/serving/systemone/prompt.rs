@@ -48,10 +48,6 @@ use serde_json::Value;
 use crate::serving::systemone::python::json_dumps;
 use crate::serving::systemone::request::{Criteria, Question};
 
-/// Prompt format version: the text, template, and canvas rules of this
-/// module and of the canvas scaffold. Any change to them is a new version.
-pub const PROMPT_FORMAT: u32 = 1;
-
 /// The fixed instruction that opens every readout prompt.
 pub(super) const PREAMBLE: &str = "You are a decision model. Read the state, then answer every \
      question below. Judge each question independently, using only the state and that \

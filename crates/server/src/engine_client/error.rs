@@ -1,7 +1,5 @@
 //! Errors returned by the server-facing engine client.
 
-use std::sync::Arc;
-
 use thiserror::Error;
 use thiserror_ext::Macro;
 
@@ -11,9 +9,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Public error type for the engine client.
 #[derive(Debug, Error, Macro)]
 pub enum Error {
-    /// An operating-system or transport call failed.
-    #[error("io error")]
-    Io(#[from] std::io::Error),
     /// A live request already owns the supplied identifier
     /// (`EngineClient::register_request`), or the registered request was
     /// already submitted to the engine (`EngineClient::submit_generation`,
@@ -43,11 +38,4 @@ pub enum Error {
         /// Human-readable closure context.
         message: String,
     },
-    /// Status cannot be read after client closure.
-    #[error("engine status is unavailable because the engine client is closed")]
-    StatusUnavailable,
-
-    /// Shared ownership of an error returned to multiple observers.
-    #[error(transparent)]
-    Shared(Arc<Self>),
 }

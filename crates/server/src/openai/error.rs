@@ -172,7 +172,7 @@ impl IntoResponse for ApiError {
 
 /// Maps one canonical serving error into the OpenAI error vocabulary.
 ///
-/// Unsupported output counts or features, context limits, duplicate request
+/// Unsupported features or sampling controls, context limits, duplicate request
 /// IDs, input images that cannot be fetched or decoded, and tokenization
 /// failures become invalid requests; model-resolution, engine, and
 /// output-processing failures become server errors. An input-image or
@@ -182,10 +182,6 @@ impl IntoResponse for ApiError {
 /// own `Display`.
 pub fn serve_error_to_api(error: ServeError) -> ApiError {
     match error {
-        ServeError::UnsupportedOutputCount { requested, .. } => ApiError::invalid_request(
-            format!("Only one output is supported, got {requested}."),
-            Some("n"),
-        ),
         ServeError::UnsupportedSamplingControl {
             control, reason, ..
         } => ApiError::invalid_request(
@@ -194,7 +190,6 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
         ),
         error @ (ServeError::UnsupportedFeature { .. }
         | ServeError::ContextLengthExceeded { .. }
-        | ServeError::ContextCapacityExceeded { .. }
         | ServeError::DuplicateRequestId { .. }) => {
             ApiError::invalid_request(error.to_string(), None)
         }

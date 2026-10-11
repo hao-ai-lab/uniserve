@@ -766,22 +766,13 @@ impl EngineCore {
     /// Builds the engine core from an executor supplied by a higher composition layer.
     ///
     /// The command waker is a no-op, so a command does not interrupt the
-    /// scheduler's idle park; `with_executor_and_waker` supplies a real one.
-    /// Neither constructor uses `config.workers` or `config.transfer`.
+    /// scheduler's idle park. The constructor uses neither `config.workers`
+    /// nor `config.transfer`.
     pub fn with_executor(
         config: EngineConfig,
         executor: Box<dyn Executor>,
     ) -> anyhow::Result<Self> {
         Self::assemble(config, executor, CommandWaker::noop())
-    }
-
-    /// Builds the engine core from an executor with an event-driven command waker.
-    pub fn with_executor_and_waker(
-        config: EngineConfig,
-        executor: Box<dyn Executor>,
-        command_waker: CommandWaker,
-    ) -> anyhow::Result<Self> {
-        Self::assemble(config, executor, command_waker)
     }
 
     /// Assembles scheduler state and transport channels around an initialized executor.

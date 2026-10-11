@@ -227,14 +227,6 @@ pub enum OutputProcessingError {
 /// Runtime-local serving errors.
 #[derive(Debug, Error)]
 pub enum ServeError {
-    /// A request asks for more output candidates than the runtime supports.
-    #[error("request `{request_id}` asks for {requested} outputs; only one output is supported")]
-    UnsupportedOutputCount {
-        /// Identifier of the rejected request.
-        request_id: ServeRequestId,
-        /// Requested number of candidates.
-        requested: u32,
-    },
     /// A request requires a feature unavailable on the selected model path.
     #[error("request `{request_id}` requires unsupported feature `{feature}`")]
     UnsupportedFeature {
@@ -264,18 +256,6 @@ pub enum ServeError {
         /// Tokenized prompt length.
         prompt_tokens: usize,
         /// Maximum token count declared by the profile.
-        max_tokens: u32,
-    },
-    /// The request's full KV requirement exceeds runtime capacity.
-    #[error(
-        "request `{request_id}` requires {required_tokens} KV tokens, exceeding the {max_tokens}-token runtime limit"
-    )]
-    ContextCapacityExceeded {
-        /// Identifier of the rejected request.
-        request_id: ServeRequestId,
-        /// Total KV tokens required by the request.
-        required_tokens: u64,
-        /// Maximum KV tokens available to one request.
         max_tokens: u32,
     },
     /// Another live request already owns the same identifier.
