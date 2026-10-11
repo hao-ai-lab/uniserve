@@ -249,11 +249,11 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
     )
 
 
-# The image-plus-audio request (W4) takes 7,808 condition rows on OmniRef when
+# The image-plus-audio request (W4) packs 7,808 condition rows on OmniRef when
 # references are enlarged to the released pipeline's encoding size: its 16:9
-# reference image, enlarged to a 2048-pixel short edge, fills 57 whole
-# 128-row tiles and the five-second voice four. This deployment states a
-# 4,096-row condition capacity, below that request's.
+# reference image, enlarged to a 2048-pixel short edge, fills 57 whole 128-row
+# tiles (7,296 rows of video latents) and the five-second voice four. This
+# deployment states a 4,096-row condition capacity, below that request's.
 SMALL_CAPACITY_OPTIONS = [
     "--mm-processor-kwargs",
     '{"enlarge_references": true}',
@@ -269,8 +269,9 @@ SMALL_CAPACITY_OPTIONS = [
 
 
 def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
-    # The worker that packs the conditions refuses them, naming their rows,
-    # the deployment's capacity and the option that raises it.
+    # The latent encoder's declared bound is the condition capacity, so the
+    # engine refuses the request at admission, naming the product, the bound
+    # and the rows the request needs of it.
     inputs = _inputs()
     export = _omniref()
     port = find_free_port()
@@ -291,5 +292,5 @@ def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
         error = refused.json()["error"]
         assert error["type"] == "invalid_request_error", error
         message = error["message"]
-        assert "7808" in message and "4096" in message, message
-        assert "--max-condition-rows" in message, message
+        assert "condition_video_latents" in message, message
+        assert "4096" in message and "7296" in message, message
