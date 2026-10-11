@@ -61,13 +61,16 @@ class TransformerLayer(nn.Module):
             self.post_attention_norms[route] = RMSNorm(
                 hidden, config.rms_norm_eps
             )
-            # The reference's eager MLP and vLLM-Omni's BAGEL (vLLM's gating
-            # kernel) both round the activated gate to the activation dtype
-            # before the product.
+            # The reference's eager MLP rounds the activated gate to the
+            # activation dtype before the product, but the rest of this layer
+            # evaluates fused single-rounding kernels. Measured on the real
+            # checkpoint, the logits of the whole network land closer to the
+            # Transformers forward, in float32 and in BF16, with
+            # single-rounding gating than with per-operation gating.
             self.mlps[route] = GatedMLP(
                 hidden,
                 config.intermediate_size,
-                rounding=Rounding.STEPWISE,
+                rounding=Rounding.ONCE,
             )
         # The denoiser shares this layer with the text LM, so both address the
         # K/V cache entry named here.

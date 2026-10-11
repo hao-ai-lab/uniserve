@@ -142,8 +142,6 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
         },
         "video_decoder": {
             "ranks": ranks,
-            "distribution": "temporal_units",
-            "units_per_rank": 1,
         },
         "audio_decoder": {"ranks": [0]},
     }
@@ -212,8 +210,6 @@ def test_component_bindings_release_cancelled_requests(
         "text_encoder": {"ranks": [0]},
         "video_decoder": {
             "ranks": [2, 0],
-            "distribution": "temporal_units",
-            "units_per_rank": 1,
         },
         "audio_decoder": {"ranks": [1]},
     }
@@ -237,8 +233,6 @@ def test_component_bindings_release_cancelled_requests(
             },
             "video_decoder": {
                 "ranks": ranks,
-                "distribution": "temporal_units",
-                "units_per_rank": 1,
             },
             "audio_decoder": {"ranks": [0]},
         }
@@ -350,8 +344,6 @@ def test_component_bindings_release_cancelled_requests(
             "components": {
                 "video_codec": {
                     "ranks": list(range(decoder_units)),
-                    "distribution": "temporal_units",
-                    "units_per_rank": 1,
                 },
                 "muxer": {"ranks": [decoder_units]},
             },

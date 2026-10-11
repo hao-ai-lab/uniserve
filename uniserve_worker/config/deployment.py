@@ -223,7 +223,10 @@ class ComponentConfig:
     ``units_per_rank`` units in the order of ``ranks``, and the parallel world
     size must be one. Which components accept a distribution is checked
     against the model's declared calls by ``validate_components`` in
-    ``uniserve_worker.bootstrap.components``.
+    ``uniserve_worker.bootstrap.components``. The video decoder and the video
+    codec are always ``temporal_units`` with one unit per rank; the engine
+    completes that placement from a deployment that omits it, so a launch
+    descriptor always carries it.
     """
 
     ranks: tuple[int, ...]

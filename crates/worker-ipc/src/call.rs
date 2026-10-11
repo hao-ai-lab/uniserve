@@ -340,6 +340,17 @@ impl Readout {
 /// Component used when a deployment does not partition a model by capability.
 pub const DEFAULT_COMPONENT: &str = "model";
 
+/// Component that decodes video latents into frames. Each member rank decodes
+/// the native units dealt to it, one per round, so the component is always
+/// distributed by temporal units and a deployment names no distribution for
+/// it.
+pub const VIDEO_DECODER_COMPONENT: &str = "video_decoder";
+
+/// Host component that encodes decoded frames, one codec slot per member
+/// rank. It is always distributed by temporal units, one unit per rank, and a
+/// deployment names no distribution for it.
+pub const VIDEO_CODEC_COMPONENT: &str = "video_codec";
+
 /// One image block of a context prefill.
 ///
 /// The block writes the vision-encoder product `feature` into KV as one

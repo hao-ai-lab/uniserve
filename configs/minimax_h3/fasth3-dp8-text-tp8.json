@@ -33,8 +33,7 @@
       },
       "video_decoder": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       },
       "audio_decoder": {
         "ranks": [0],
@@ -57,8 +56,7 @@
       },
       "video_decoder": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       },
       "audio_decoder": {
         "ranks": [0],
@@ -81,8 +79,7 @@
       },
       "video_decoder": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       },
       "audio_decoder": {
         "ranks": [0],
@@ -105,8 +102,7 @@
       },
       "video_decoder": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       },
       "audio_decoder": {
         "ranks": [0],
@@ -129,8 +125,7 @@
       },
       "video_decoder": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       },
       "audio_decoder": {
         "ranks": [0],
@@ -153,8 +148,7 @@
       },
       "video_decoder": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       },
       "audio_decoder": {
         "ranks": [0],
@@ -177,8 +171,7 @@
       },
       "video_decoder": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       },
       "audio_decoder": {
         "ranks": [0],
@@ -201,8 +194,7 @@
       },
       "video_decoder": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       },
       "audio_decoder": {
         "ranks": [0],
@@ -220,8 +212,7 @@
     "components": {
       "video_codec": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       }
     },
     "queue_depth": 6
@@ -234,8 +225,7 @@
     "components": {
       "video_codec": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       }
     },
     "queue_depth": 6
@@ -248,8 +238,7 @@
     "components": {
       "video_codec": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       }
     },
     "queue_depth": 6
@@ -262,8 +251,7 @@
     "components": {
       "video_codec": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       }
     },
     "queue_depth": 6
@@ -276,8 +264,7 @@
     "components": {
       "video_codec": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       }
     },
     "queue_depth": 6
@@ -290,8 +277,7 @@
     "components": {
       "video_codec": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       }
     },
     "queue_depth": 6
@@ -304,8 +290,7 @@
     "components": {
       "video_codec": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       }
     },
     "queue_depth": 6
@@ -318,8 +303,7 @@
     "components": {
       "video_codec": {
         "ranks": [0],
-        "parallel_config": {},
-        "distribution": "temporal_units"
+        "parallel_config": {}
       }
     },
     "queue_depth": 6
