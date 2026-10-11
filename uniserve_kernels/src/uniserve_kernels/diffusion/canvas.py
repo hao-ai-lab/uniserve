@@ -55,6 +55,8 @@ __all__ = [
     "start",
     "supported",
     "unsupported",
+    "unsupported_advance",
+    "unsupported_device",
 ]
 
 # Tokens of one position each sweep CTA owns at most; a position splits over
@@ -131,6 +133,33 @@ def cluster_size(vocab_size: int) -> int:
     return 0
 
 
+def unsupported_device(device: torch.device) -> str | None:
+    """Return why the kernels cannot run on ``device``, or ``None``."""
+    if device.type != "cuda":
+        return f"the canvas kernels need a CUDA device, not {device}"
+    if not supported(device):
+        return "the canvas kernels require an SM100 (compute capability 10.0)"
+    return None
+
+
+def unsupported_advance(
+    device: torch.device, *, canvas_length: int, eos_ids: tuple[int, ...]
+) -> str | None:
+    """Return why :func:`advance` cannot decide a canvas, or ``None``.
+
+    ``canvas_length`` is the positions of one canvas row and ``eos_ids`` the
+    end-of-sequence ids the block ends at.
+    """
+    reason = unsupported_device(device)
+    if reason is not None:
+        return reason
+    if canvas_length % 32 or not 0 < canvas_length <= 1024:
+        return "the canvas length must be a multiple of 32 up to 1024"
+    if len(eos_ids) > _MAX_EOS:
+        return f"at most {_MAX_EOS} end-of-sequence ids"
+    return None
+
+
 def unsupported(
     logits: torch.Tensor,
     *,
@@ -142,10 +171,11 @@ def unsupported(
 
     ``logits`` are the step's FP32 ``[rows, canvas, vocab]`` logits.
     """
-    if not logits.is_cuda:
-        return f"logits reside on {logits.device}, not a CUDA device"
-    if not supported(logits.device):
-        return "the canvas kernels require an SM100 (compute capability 10.0)"
+    reason = unsupported_advance(
+        logits.device, canvas_length=canvas_length, eos_ids=eos_ids
+    )
+    if reason is not None:
+        return reason
     if logits.dtype != torch.float32 or logits.ndim != 3:
         return "logits must be FP32 [rows, canvas, vocab]"
     if not logits.is_contiguous() or logits.data_ptr() % 16:
@@ -155,12 +185,8 @@ def unsupported(
             f"the vocabulary must split into whole {_CHUNK_TOKENS}-token "
             f"chunks, at most {SLICE_TOKENS} tokens on each of at most 16 CTAs"
         )
-    if canvas_length % 32 or not 0 < canvas_length <= 1024:
-        return "the canvas length must be a multiple of 32 up to 1024"
     if hidden_size % 8:
         return "the hidden size must be a multiple of 8"
-    if len(eos_ids) > _MAX_EOS:
-        return f"at most {_MAX_EOS} end-of-sequence ids"
     return None
 
 
