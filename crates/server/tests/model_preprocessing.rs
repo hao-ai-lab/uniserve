@@ -930,8 +930,7 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
                 "size": format!("{width}x{height}"),
                 "steps": 4,
                 "seed": 17,
-                "guidance_scale": 7.5,
-                "n": 1
+                "guidance_scale": 7.5
             }))
             .unwrap();
         let (generation, _) = processor

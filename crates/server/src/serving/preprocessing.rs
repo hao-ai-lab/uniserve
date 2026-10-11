@@ -408,12 +408,6 @@ impl crate::serving::InputProcessor {
                 Some("prompt"),
             ));
         }
-        if request.n != 1 {
-            return Err(ApiError::invalid_request(
-                "n must be 1 for the configured image-generation route".to_string(),
-                Some("n"),
-            ));
-        }
         if let Some(model) = request.model.as_deref() {
             crate::openai::utils::check_model_served(model, self.served_model_name())?;
         }
