@@ -560,7 +560,6 @@ fn resolve_image_params(
         .map(|interval| (interval[0], interval[1]))
         .unwrap_or(defaults.cfg_interval);
     let max_images = image.max_images.unwrap_or(defaults.max_images);
-    validate_max_images(max_images, defaults.max_images_limit)?;
     // `GenerationRequest::validate` checks the resolved steps, guidance,
     // interval, and shift (`ImageParams::validate`) once the request is built.
     Ok(ImageParams {
@@ -726,14 +725,6 @@ fn validate_prompt(prompt_ids: &[u32]) -> OmniResult<()> {
     } else {
         Ok(())
     }
-}
-
-/// Refuses an `image.max_images` above the profile's own image limit.
-fn validate_max_images(value: u16, limit: u16) -> OmniResult<()> {
-    if value > limit {
-        return Err(format!("image.max_images exceeds model limit {limit}").into());
-    }
-    Ok(())
 }
 
 /// Builds a cache key isolated by request namespace and salt.

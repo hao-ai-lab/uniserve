@@ -69,8 +69,6 @@ pub struct ImageGenerationDefaults {
     pub seed: Option<u64>,
     /// Default maximum number of images generated for one request.
     pub max_images: u16,
-    /// Hard profile limit on generated images per request.
-    pub max_images_limit: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

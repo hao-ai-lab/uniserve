@@ -145,7 +145,6 @@ impl SenseNovaProfile {
                 timestep_shift: 3.0,
                 seed: Some(42),
                 max_images: 4,
-                max_images_limit: 10,
             },
             resolution_policy,
             output_filter: OutputFilterPolicy {

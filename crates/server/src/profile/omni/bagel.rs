@@ -186,7 +186,6 @@ impl BagelProfile {
                 timestep_shift: 1.0,
                 seed: None,
                 max_images: 1,
-                max_images_limit: 16,
             },
             // The denoiser reads a latent patch's position embedding from
             // table row `row * max_latent_size + col`, so a canvas wider than
