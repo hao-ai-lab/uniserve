@@ -15,7 +15,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from uniserve.loading import checkpoint, weights
-from uniserve.model import TransformerDecoder
+from uniserve.model import TransformerDecoder, mot
 
 if TYPE_CHECKING:
     from .model import Model
@@ -31,56 +31,11 @@ def _backbone_names(backbone: TransformerDecoder):
     ``_mot_gen`` suffix. QK norms split into temporal and spatial (``_hw``)
     checkpoint tensors. Only layers resident on this pipeline rank appear.
     """
-    names = {
-        "embedding.weight": "embed_tokens.weight",
-        "norm.text.weight": "norm.weight",
-        "norm.flow.weight": "norm_mot_gen.weight",
-    }
-
-    for path, _ in backbone.named_parameters():
-        if not path.startswith("layers."):
-            continue
-        _, index, kind, route, *parts = path.split(".")
-        suffix = "" if route == "text" else "_mot_gen"
-        tail = ".".join(parts)
-
-        if kind in ("input_norms", "post_attention_norms"):
-            target = (
-                (
-                    "input_layernorm"
-                    if kind == "input_norms"
-                    else "post_attention_layernorm"
-                )
-                + suffix
-                + "."
-                + tail
-            )
-        elif kind == "outputs":
-            target = f"self_attn.o_proj{suffix}.{tail}"
-        elif kind == "projections":
-            if parts[0] == "projection":
-                target = f"self_attn.{parts[2]}_proj{suffix}.{parts[3]}"
-            else:
-                spatial = "_hw" if parts[1] == "1" else ""
-                target = (
-                    f"self_attn.{'q' if parts[0] == 'query_norm' else 'k'}"
-                    f"_norm{spatial}{suffix}.{parts[2]}"
-                )
-        elif kind == "mlps":
-            tail = (
-                tail.replace("gate_up.projections.gate", "gate_proj")
-                .replace("gate_up.projections.up", "up_proj")
-                .replace("down.", "down_proj.")
-            )
-            target = f"mlp{suffix}.{tail}"
-        else:
-            raise ValueError(f"unmapped SenseNova backbone parameter {path}")
-
-        names[path] = f"layers.{index}.{target}"
-
     return {
         target: "language_model.model." + source
-        for target, source in names.items()
+        for target, source in mot.backbone_names(
+            backbone, flow_suffix="_mot_gen"
+        ).items()
     }
 
 
@@ -118,19 +73,12 @@ def checkpoint_mappings(model: Model):
     names = _backbone_names(backbone)
 
     # PP omits only the source layers and terminal modules assigned elsewhere.
-    # Every layer has the same tensors, so the first resident layer's
-    # checkpoint names, minus the layer prefix, enumerate each absent layer.
-    template = tuple(
-        source.split(".", 4)[-1]
-        for target, source in names.items()
-        if target.startswith(f"layers.{next(iter(backbone.layers))}.")
+    nonresident = mot.absent_layers(
+        backbone,
+        names,
+        depth=model.config.text.num_hidden_layers,
+        prefix="language_model.model.",
     )
-    nonresident = {
-        f"language_model.model.layers.{index}.{tail}"
-        for index in range(model.config.text.num_hidden_layers)
-        if str(index) not in backbone.layers
-        for tail in template
-    }
     # With tied embeddings the embedding tensor is never declared unused:
     # on the last stage the tied head reads it as ``head_name``.
     if backbone.embedding is None and not model.config.text.tie_word_embeddings:
