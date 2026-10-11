@@ -197,7 +197,15 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     // A video checkpoint serves what its placed denoiser declares in the
     // worker handshake, planned against the conditioner's vision processor.
     let renderer = match renderer {
-        LoadedRenderer::Chat(renderer) => RequestRenderer::Chat(*renderer),
+        LoadedRenderer::Chat(renderer) => {
+            // No other served model's processor takes options.
+            anyhow::ensure!(
+                config.mm_processor_kwargs.is_empty(),
+                "invalid --mm-processor-kwargs: the processor of `{}` takes no options",
+                config.model
+            );
+            RequestRenderer::Chat(*renderer)
+        }
         LoadedRenderer::Video(vision) => {
             let denoiser = engine
                 .video_denoiser()
@@ -208,6 +216,11 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             let latent_encoding_lane = engine
                 .media_lane_units(uniserve_engine::MediaCall::LatentEncoding)
                 .unwrap_or(1);
+            // The video processor's options are its reference sizing.
+            let references = crate::serving::video::plan::ReferenceConfig::from_kwargs(
+                &config.mm_processor_kwargs,
+            )
+            .map_err(|message| anyhow::anyhow!("invalid --mm-processor-kwargs: {message}"))?;
             RequestRenderer::Video(
                 crate::serving::video::VideoService::new(
                     denoiser,
@@ -215,6 +228,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                     config.engine.max_video_seconds,
                     latent_encoding_lane,
                     &config.video_media,
+                    references,
                     Arc::clone(&tokenizer),
                 )
                 .context("failed to bind the video denoiser")?,

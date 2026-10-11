@@ -4,18 +4,21 @@ A MiniMax-H3 request is sized before any pixel is decoded. The target canvas
 and frame count, the size every condition is prepared at, the Qwen3-VL vision
 grids, the denoiser's condition rows and the tokenized presentation all
 follow from the request and a few probed facts per condition: the displayed
-size of an image, the displayed aspect, frame rate and frame count of a
-video, and the sample rate and sample count of a soundtrack.
+size of an image, the displayed aspect, size, frame rate and frame count of
+a video, and the sample rate and sample count of a soundtrack.
 
 ``plan_request`` resolves those rules into a ``RequestPlan`` and ``present``
 tokenizes the presentation the conditioner reads. The serving path applies
 the same rules in Rust (``crates/server/src/serving/video``); both are checked
 against ``tests/python/fixtures/minimax_h3_plan.json``, which is generated
-from the diffusers reference pipeline.
+from the diffusers reference pipeline and holds under
+``ReferenceConfig(enlarge=True)``, that pipeline's reference sizing.
 
 Rules that the reference pipeline does not define are fixed here and in the
 Rust planner alike:
 
+* A reference smaller than the size the reference pipeline encodes it at
+  keeps its own size instead of being enlarged to it (``ReferenceConfig``).
 * ``start_time_seconds`` drops the first ``floor(s * 24 + 0.5)`` frames of
   a reference video's 24 fps timeline and the first ``floor(s * rate + 0.5)``
   samples of its soundtrack.
@@ -110,8 +113,8 @@ MAX_SECONDS = 15.0
 # named ratios; their ``auto`` is 16:9.
 DEFAULT_ASPECT_RATIO = (16, 9)
 
-# An image reference is encoded at its own 2048-pixel short edge, upscaling
-# included and without an area cap.
+# The released checkpoint encodes an image reference at a 2048-pixel short
+# edge, without an area cap.
 REFERENCE_IMAGE_SHORT_EDGE = 2048
 
 # A reference video holds at least one complete VAE window.
@@ -183,6 +186,44 @@ class PlanError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class ReferenceConfig:
+    """How a deployment sizes the references of a ``ref2va`` request.
+
+    A reference is only ever reduced by default: an image whose short edge
+    exceeds ``image_short_edge`` scales down to it, and a video with more
+    pixels than the canvas of its aspect scales down to that canvas, while
+    smaller references keep their own size. The released pipeline also
+    enlarges smaller ones to those sizes, which ``enlarge`` selects.
+
+    Attributes:
+        image_short_edge: Short edge, in pixels, an image reference is
+            encoded at, at most: a multiple of 32 up to the 2048 pixels the
+            released checkpoint encodes references at.
+        enlarge: Whether a reference smaller than its encoding size is
+            enlarged to it: an image to ``image_short_edge`` and a video to
+            the canvas of its aspect.
+    """
+
+    image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE
+    enlarge: bool = False
+
+    def __post_init__(self) -> None:
+        edge = self.image_short_edge
+        if (
+            type(edge) is not int
+            or edge % CANVAS_MULTIPLE
+            or not CANVAS_MULTIPLE <= edge <= REFERENCE_IMAGE_SHORT_EDGE
+        ):
+            raise ValueError(
+                f"a reference image short edge must be a multiple of "
+                f"{CANVAS_MULTIPLE} from {CANVAS_MULTIPLE} to "
+                f"{REFERENCE_IMAGE_SHORT_EDGE} pixels, got {edge!r}"
+            )
+        if type(self.enlarge) is not bool:
+            raise ValueError("a reference config's enlarge must be a bool")
+
+
+@dataclass(frozen=True, slots=True)
 class ImageFacts:
     """An image as displayed, after its EXIF orientation."""
 
@@ -200,13 +241,17 @@ class AudioFacts:
 
 @dataclass(frozen=True, slots=True)
 class VideoFacts:
-    """A video's display aspect, frame rate, frame count and soundtrack.
+    """A video's display aspect and size, frame rate, frames and soundtrack.
 
     Attributes:
         display_width: Width of the displayed aspect. Only the ratio to
             ``display_height`` matters; a probe passes the coded size scaled
             by the sample aspect ratio and turned by the display rotation.
         display_height: Height of the displayed aspect.
+        width: Displayed width in pixels: the coded width scaled by the
+            sample aspect ratio, rounded half to even, and turned with
+            ``height`` by the display rotation.
+        height: Displayed height in pixels.
         frame_rate: The container's average frame rate.
         frames: Decoded frames of the whole video.
         soundtrack: The first audio stream, when the video has one.
@@ -214,6 +259,8 @@ class VideoFacts:
 
     display_width: int
     display_height: int
+    width: int
+    height: int
     frame_rate: Fraction
     frames: int
     soundtrack: AudioFacts | None = None
@@ -574,12 +621,15 @@ def frame_count(seconds: float, max_seconds: float = MAX_SECONDS) -> int:
     return align_num_frames(round(seconds * FPS))
 
 
-def reference_image_size(width: int, height: int) -> image.Config:
+def reference_image_size(
+    width: int, height: int, config: ReferenceConfig = ReferenceConfig()
+) -> image.Config:
     """Return the size an image reference is encoded at.
 
-    The short edge scales to 2048 pixels, upscaling included, and each side
-    rounds to the nearest multiple of 32. This is not the canvas rule: there
-    is no area cap.
+    An image whose short edge exceeds ``config.image_short_edge`` scales
+    down to it; a smaller one keeps its size, or scales up to that edge
+    under ``config.enlarge``. Each side then rounds to the nearest multiple
+    of 32. This is not the canvas rule: there is no area cap.
 
     Raises:
         ValueError: The image lies outside 1:4 to 4:1.
@@ -589,7 +639,9 @@ def reference_image_size(width: int, height: int) -> image.Config:
             f"a reference image must lie within 1:4 and 4:1, got "
             f"{width}x{height}"
         )
-    scale = REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    scale = config.image_short_edge / min(width, height)
+    if not config.enlarge:
+        scale = min(scale, 1.0)
     return image.Config(
         height=_nearest_multiple(height * scale),
         width=_nearest_multiple(width * scale),
@@ -655,19 +707,24 @@ def video_reference(
     start_seconds: float,
     num_frames: int,
     vision: VisionConfig,
+    config: ReferenceConfig = ReferenceConfig(),
 ) -> tuple[VideoClip, VideoVision]:
     """Size a reference video and the conditioner's view of it.
 
     The video is resampled to 24 fps, its first ``floor(s * 24 + 0.5)``
     frames are skipped and the rest is truncated to the generated frame
-    count, on the canvas of its own aspect. Its soundtrack is offset by the
-    same start and sized like an audio reference.
+    count, on the canvas of its own aspect. A video with fewer pixels than
+    that canvas keeps its own size, each side rounded to the nearest
+    multiple of 32, unless ``config.enlarge`` scales it up to the canvas.
+    Its soundtrack is offset by the same start and sized like an audio
+    reference.
 
     Args:
         media: The probed video.
         start_seconds: The request's start offset into the video.
         num_frames: The generated frame count.
         vision: The conditioner's processor geometry.
+        config: The deployment's reference sizing.
 
     Raises:
         ValueError: The video's aspect lies outside 1:4 to 4:1, fewer than
@@ -678,6 +735,13 @@ def video_reference(
         size = canvas(media.display_width, media.display_height)
     except ValueError as error:
         raise ValueError(f"the video's {error}") from None
+    if not config.enlarge and media.width * media.height < (
+        size.width * size.height
+    ):
+        size = image.Config(
+            height=_nearest_multiple(media.height),
+            width=_nearest_multiple(media.width),
+        )
     frame_rate = float(media.frame_rate)
     if frame_rate == FPS:
         timeline = media.frames
@@ -774,6 +838,7 @@ def plan_request(
     tasks: Sequence[Task] = tuple(Task),
     max_seconds: float = MAX_SECONDS,
     canvases: Sequence[image.Config] | None = None,
+    references: ReferenceConfig = ReferenceConfig(),
 ) -> RequestPlan:
     """Validate a request and resolve every size it implies.
 
@@ -785,6 +850,7 @@ def plan_request(
         tasks: The tasks of the denoiser that serves the request.
         max_seconds: The longest duration served.
         canvases: The only canvases the checkpoint serves, when restricted.
+        references: The deployment's reference sizing.
 
     Raises:
         PlanError: The request breaks a rule; ``field`` names the culprit.
@@ -817,7 +883,11 @@ def plan_request(
             )
             keyframes += 1
         else:
-            plans.append(_plan_reference(index, condition, num_frames, vision))
+            plans.append(
+                _plan_reference(
+                    index, condition, num_frames, vision, references
+                )
+            )
     return RequestPlan(
         task=task,
         canvas=size,
@@ -1239,14 +1309,18 @@ def _plan_keyframe(
 
 
 def _plan_reference(
-    index: int, condition: Condition, num_frames: int, vision: VisionConfig
+    index: int,
+    condition: Condition,
+    num_frames: int,
+    vision: VisionConfig,
+    config: ReferenceConfig,
 ) -> ConditionPlan:
     """Size an image, video or audio reference."""
     field = f"conditions[{index}]"
     media = condition.media
     if isinstance(media, ImageFacts):
         try:
-            resize = reference_image_size(media.width, media.height)
+            resize = reference_image_size(media.width, media.height, config)
         except ValueError as error:
             raise PlanError(field, str(error)) from None
         grid = vision.image_grid(resize.height, resize.width)
@@ -1271,7 +1345,7 @@ def _plan_reference(
                 audio_rows=clip.rows,
             )
         video, seen = video_reference(
-            media, condition.start_seconds or 0.0, num_frames, vision
+            media, condition.start_seconds or 0.0, num_frames, vision, config
         )
     except ValueError as error:
         raise PlanError(field, str(error)) from None

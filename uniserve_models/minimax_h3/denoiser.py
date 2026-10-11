@@ -90,7 +90,7 @@ from .packing import (
 from .processing import (
     MAX_IMAGE_REFERENCES,
     MAX_VIDEO_REFERENCES,
-    reference_image_size,
+    REFERENCE_IMAGE_SHORT_EDGE,
 )
 from .transformer import Transformer, TransformerLayer
 
@@ -219,12 +219,13 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         """The largest condition set the checkpoint documents for a request.
 
         A ``ref2va`` request carries up to nine image and three video
-        references, twelve references in all: nine images of the widest
-        reference raster and three videos of the generated length with
-        their soundtracks, on the canvas of the canvas rule where a video
-        packs the most rows. A network that packs keyframes also holds the
-        two keyframes of ``canvas``, which are all an ``fl2va`` request
-        carries. Single-segment sparse attention takes no conditions.
+        references, twelve references in all: nine images of the largest
+        reference raster, the checkpoint's 2048-pixel short edge at 4:1,
+        and three videos of the generated length with their soundtracks, on
+        the canvas of the canvas rule where a video packs the most rows. A
+        network that packs keyframes also holds the two keyframes of
+        ``canvas``, which are all an ``fl2va`` request carries.
+        Single-segment sparse attention takes no conditions.
         """
         tasks = set(self.config.tasks)
         if not (self.dense or self.segmented) or not tasks & {
@@ -269,13 +270,16 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             ),
             key=rows,
         )
+        # The largest image a deployment encodes has the checkpoint's short
+        # edge and the widest or tallest aspect, 4:1 or 1:4.
+        edge = REFERENCE_IMAGE_SHORT_EDGE
         still = max(
             (
-                Condition(
-                    ConditionRole.REFERENCE,
-                    video.Config(1, reference_image_size(*aspect)),
+                Condition(ConditionRole.REFERENCE, video.Config(1, raster))
+                for raster in (
+                    image.Config(edge, 4 * edge),
+                    image.Config(4 * edge, edge),
                 )
-                for aspect in ((4, 1), (1, 4))
             ),
             key=rows,
         )

@@ -18,7 +18,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1289,6 +1289,11 @@ pub struct WorkerFailure {
     pub endpoints: Vec<uniserve_worker_ipc::WorkerEndpoint>,
     /// Request epochs affected by the failed work or invalidated allocations.
     pub requests: Vec<RequestKey>,
+    /// The requests among `requests` that a worker refused as invalid
+    /// (`ErrorCode::InvalidRequest`), each with the reason the worker stated.
+    /// The scheduler rejects these with their reason and fails the others
+    /// with `message`.
+    pub refusals: HashMap<RequestKey, String>,
     /// Accepted logical calls that will no longer produce a device completion.
     pub retired: Vec<(u64, RequestKey, CallId)>,
     /// Buffers whose published locations no longer cover their complete logical value.

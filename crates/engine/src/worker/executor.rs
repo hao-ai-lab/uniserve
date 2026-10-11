@@ -1116,6 +1116,7 @@ impl WorkerExecutor {
             worker_id: self.workers[worker_index].0.clone(),
             endpoints: Vec::new(),
             requests: requests.into_iter().collect(),
+            refusals: HashMap::new(),
             retired: Vec::new(),
             buffers: Vec::new(),
             execution: None,
@@ -1201,7 +1202,9 @@ impl WorkerExecutor {
     /// When some calls failed, the report, failed completions included, is
     /// still published and the method then returns a `WorkerFailure` naming
     /// the failed calls' requests and the buffers those calls would have
-    /// produced.
+    /// produced. A request the worker refused (`ErrorCode::InvalidRequest`)
+    /// is named with the reason its call states, so the scheduler rejects it
+    /// instead of failing it.
     fn route_result(&mut self, worker_index: usize, report: WorkerResult) -> anyhow::Result<()> {
         let mut report = report;
         let failed_calls = report
@@ -1210,10 +1213,27 @@ impl WorkerExecutor {
             .filter(|completion| completion.output.status == uniserve_worker_ipc::CallStatus::Error)
             .map(|completion| (completion.output.request_key, completion.output.call_id))
             .collect::<HashSet<_>>();
+        // A refusal is the worker's verdict on the request itself, and its
+        // reason is the caller's to read. The failure carries it because the
+        // scheduler reconciles the failure before it applies the completion.
+        let refusals = report
+            .results
+            .iter()
+            .filter(|completion| {
+                completion.output.status == uniserve_worker_ipc::CallStatus::Error
+                    && completion.output.error_code
+                        == Some(uniserve_worker_ipc::ErrorCode::InvalidRequest)
+            })
+            .filter_map(|completion| {
+                let reason = completion.output.error_message.clone()?;
+                Some((completion.output.request_key, reason))
+            })
+            .collect::<HashMap<_, _>>();
         if !failed_calls.is_empty() {
-            // The worker names the code; the request's caller sees only that
-            // its dependent work could not complete, so the code is recorded
-            // here, where the failing call and worker are known.
+            // The worker names the code; the caller of a request it did not
+            // refuse sees only that its dependent work could not complete, so
+            // the code is recorded here, where the failing call and worker
+            // are known.
             let failed = report
                 .results
                 .iter()
@@ -1371,6 +1391,7 @@ impl WorkerExecutor {
                 worker_id: self.workers[worker_index].0.clone(),
                 endpoints: Vec::new(),
                 requests: failed_calls.iter().map(|(request, _)| *request).collect(),
+                refusals,
                 retired: Vec::new(),
                 buffers: failed_buffers,
                 execution: None,

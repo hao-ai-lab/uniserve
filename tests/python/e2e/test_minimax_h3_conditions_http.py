@@ -249,11 +249,14 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
     )
 
 
-# The image-plus-audio request (W4) takes 7,808 condition rows on OmniRef:
-# its 16:9 reference image, resized to a 2048-pixel short edge, fills 57 whole
+# The image-plus-audio request (W4) takes 7,808 condition rows on OmniRef when
+# references are enlarged to the released pipeline's encoding size: its 16:9
+# reference image, enlarged to a 2048-pixel short edge, fills 57 whole
 # 128-row tiles and the five-second voice four. This deployment states a
 # 4,096-row condition capacity, below that request's.
 SMALL_CAPACITY_OPTIONS = [
+    "--mm-processor-kwargs",
+    '{"enlarge_references": true}',
     "--max-video-seconds",
     "5",
     "--max-model-len",

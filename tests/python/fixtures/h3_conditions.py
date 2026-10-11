@@ -127,6 +127,8 @@ def _video_facts(path: Path, ffmpeg: str) -> processing.VideoFacts:
     return processing.VideoFacts(
         display_width=width,
         display_height=height,
+        width=width,
+        height=height,
         frame_rate=Fraction(stream["avg_frame_rate"]),
         frames=int(stream["nb_read_frames"]),
         soundtrack=_audio_facts(path),
@@ -160,8 +162,14 @@ def plan(request: dict, root: Path, ffmpeg: str):
             )
         )
     target = processing.Target(**request["target"])
+    # The recorded runs come from the reference pipeline, which enlarges
+    # small references.
     return processing.plan_request(
-        processing.Task(request["task"]), target, conditions, _VISION
+        processing.Task(request["task"]),
+        target,
+        conditions,
+        _VISION,
+        references=processing.ReferenceConfig(enlarge=True),
     )
 
 

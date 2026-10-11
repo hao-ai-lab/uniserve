@@ -72,33 +72,36 @@ export UNISERVE_MINIMAX_H3_FFMPEG=/workspace/tools/ffmpeg-8.1.2/bin
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-w3
 ```
 
-The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF`, and the Hugging Face cache supplies the base revision it pins. The two-host SGLang suites, `sglang-gb200-8` and `sglang-gb200-8-reference`, need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`, the address of `rank-0`, and the reference suite also `UNISERVE_MINIMAX_H3_SHARED_SCRATCH`, a directory both hosts mount.
+The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF`, and the Hugging Face cache supplies the base revision it pins. The `gb200-4-reference` and `gb200-4-omniref` servers enlarge references to their encoding size (`--mm-processor-kwargs '{"enlarge_references":true}'`), the sizing of the released pipeline and of the SGLang and FastVideo baselines W4 and W5 are compared with. The two-host SGLang suites, `sglang-gb200-8` and `sglang-gb200-8-reference`, need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`, the address of `rank-0`, and the reference suite also `UNISERVE_MINIMAX_H3_SHARED_SCRATCH`, a directory both hosts mount.
 
 ## OmniRef reference compositions
 
 The reference matrix measures FastH3 OmniRef (`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`) on nine reference compositions of MiniMax-H3's ref2va interface, each at 5, 10 and 15 seconds, every target 16:9 (1344×768). A workload is `ref-<composition>-<seconds>s`:
 
-| Composition | References | Prompt tokens with vision | Condition rows |
-| --- | --- | --- | --- |
-| `image` | One 16:9 subject image | about 7,600 | 7,296 |
-| `image-voice` | One 16:9 subject image and a reference voice | about 7,650 | 7,808 to 8,064 |
-| `images3` | Three 16:9 images: a subject, a product sheet and a scene | about 22,400 | 22,016 |
-| `images9` | Nine square images | 37,701 | 36,864 |
-| `clip` | One 2-second reference clip with its soundtrack | about 3,500 | 14,080 |
-| `video` | One reference video (6 s, with its soundtrack) | 6,458 to 7,630 | 46,592 to 51,200 |
-| `clips3` | Three 2-second reference clips, each with its soundtrack | 9,718 | 42,240 |
-| `mixed` | One 16:9 image, one reference video with its soundtrack and a reference voice | 13,911 to 15,118 | 54,400 to 59,264 |
-| `full` | Nine square images and three 2-second clips with their soundtracks | 47,160 | 79,104 |
+| Composition | References | Prompt tokens with vision | Condition rows | Enlarged: prompt tokens | Enlarged: condition rows |
+| --- | --- | --- | --- | --- | --- |
+| `image` | One 16:9 subject image | about 3,900 | 3,712 | about 7,600 | 7,296 |
+| `image-voice` | One 16:9 subject image and a reference voice | about 3,950 | 4,224 to 4,480 | about 7,650 | 7,808 to 8,064 |
+| `images3` | Three 16:9 images: a subject, a product sheet and a scene | about 8,900 | 8,576 | about 22,400 | 22,016 |
+| `images9` | Nine square images | 14,415 | 13,952 | 37,701 | 36,864 |
+| `clip` | One 2-second reference clip with its soundtrack | about 3,500 | 14,080 | about 3,500 | 14,080 |
+| `video` | One reference video (6 s, with its soundtrack) | 6,458 to 7,630 | 46,592 to 51,200 | 6,458 to 7,630 | 46,592 to 51,200 |
+| `clips3` | Three 2-second reference clips, each with its soundtrack | 9,718 | 42,240 | 9,718 | 42,240 |
+| `mixed` | One 16:9 image, one reference video with its soundtrack and a reference voice | 10,215 to 11,422 | 50,816 to 55,680 | 13,911 to 15,118 | 54,400 to 59,264 |
+| `full` | Nine square images and three 2-second clips with their soundtracks | 23,874 | 56,192 | 47,160 | 79,104 |
 
-A request's packed sequence is its prompt, which carries every visual reference's vision tokens, its condition rows and its generated rows: 37,710 at 5 s, 73,386 at 10 s and 109,062 at 15 s. A reference image, resized to a 2048-pixel short edge, is 7,296 prompt tokens and 7,296 condition rows at 16:9 and 4,096 of each when square. A reference video or voice longer than the target contributes the target's duration, so its rows grow with the target up to its own length. The largest cell, `ref-full-15s`, packs 236,294 rows. The square images are centred crops and the clips the leading two seconds of their sources, cut without re-encoding; each row's `metadata.condition_media` names the source and the derivation.
+A request's packed sequence is its prompt, which carries every visual reference's vision tokens, its condition rows and its generated rows: 37,710 at 5 s, 73,386 at 10 s and 109,062 at 15 s. A reference video or voice longer than the target contributes the target's duration, so its rows grow with the target up to its own length. The square images are centred crops and the clips the leading two seconds of their sources, cut without re-encoding; each row's `metadata.condition_media` names the source and the derivation.
 
-A point sends one warmup at seed 42 and three measured requests one at a time, seeds 0 to 2. One deployment across two four-GB200 hosts (`ulysses8-reference-two-node.json`) serves every cell: `--max-video-seconds 15 --max-model-len 48128 --video-text-capacities 4096,7168,8192,10240,14336,15360,22528,37888,48128 --max-condition-rows 79104`, a text capacity for each cell's prompt and the condition rows of `full`.
+The matrix is measured under both reference sizings (`enlarge_references` of `--mm-processor-kwargs`). The `gb200-8-omniref-refs` suite serves the default: a reference keeps its own size unless it exceeds its encoding size. Every image of the matrix has a short edge below 2048 pixels, so each is as many prompt tokens and condition rows as its own 32-pixel patches, 3,600 for the 2560×1440 subject and 576 to 2,025 for a square, and every reference video is larger than its canvas and scales down to it; the largest cell, `ref-full-15s`, packs 189,830 rows. The `gb200-8-omniref-refs-enlarged` suite enlarges each image to its 2048-pixel short edge, 7,296 prompt tokens and condition rows at 16:9 and 4,096 when square, as the released pipeline and SGLang do; its largest cell packs 236,294 rows.
+
+A point sends one warmup at seed 42 and three measured requests one at a time, seeds 0 to 2. One deployment across two four-GB200 hosts (`ulysses8-reference-two-node.json`) serves every cell of a suite, with a text capacity for each cell's prompt and the condition rows of `full`: `--max-video-seconds 15 --max-model-len 24576 --video-text-capacities 4096,7168,8192,9216,10240,12288,15360,24576 --max-condition-rows 56192` by default, and `--max-model-len 48128 --video-text-capacities 4096,7168,8192,10240,14336,15360,22528,37888,48128 --max-condition-rows 79104 --mm-processor-kwargs '{"enlarge_references":true}'` for the enlarged suite.
 
 ```bash
 export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastVideo-FastH3-Omni-8-Step-V1
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-8-omniref-refs --reuse-deployment
+.venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-8-omniref-refs-enlarged --reuse-deployment
 ```
 
-Start `uniserve-host` on `rank-1` for the two-host server, as in [Two hosts](minimax_h3.md#two-hosts). The `sglang-gb200-8-reference` suite measures SGLang's base Ref2VA on the same cells and hosts with the base schedule (50 sigma points), one measured request per cell after its warmup; start SGLang's node rank 1 on `rank-1` beside the head, as for `sglang-gb200-8`.
+Start `uniserve-host` on `rank-1` for the two-host server, as in [Two hosts](minimax_h3.md#two-hosts). The `sglang-gb200-8-reference` suite measures SGLang's base Ref2VA on the same cells and hosts with the base schedule (50 sigma points), one measured request per cell after its warmup; start SGLang's node rank 1 on `rank-1` beside the head, as for `sglang-gb200-8`. SGLang enlarges every reference image, so its results compare with the enlarged suite.
 
 Cross-engine results are not equal-work ratios: the engines differ in reference-image resizing, noise generators, media codecs and distributed attention. vLLM-Omni's W4 image processing keeps a smaller condition layout than the others, and its diffusion worker does not implement the two-host placement.

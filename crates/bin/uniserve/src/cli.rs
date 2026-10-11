@@ -213,6 +213,21 @@ pub(crate) struct SharedRuntimeArgs {
     /// `ffprobe` executable that probes video and audio condition media.
     #[arg(long, default_value = "ffprobe", value_name = "PATH")]
     pub ffprobe: std::path::PathBuf,
+    /// Options of the served model's multimodal processor, as a JSON object.
+    /// The processor refuses an option it does not take. MiniMax H3's video
+    /// processor sizes `ref2va` references by two: an image whose short
+    /// edge exceeds `reference_image_short_edge` (a multiple of 32 up to
+    /// 2048, the default) scales down to it and a video larger than the
+    /// canvas of its aspect scales down to that canvas, while smaller
+    /// references keep their own size unless `enlarge_references` (false by
+    /// default) enlarges them to those sizes, as the released pipeline does.
+    #[arg(
+        long = "mm-processor-kwargs",
+        value_parser = parse_json::<serde_json::Map<String, Value>>,
+        value_name = "JSON",
+        default_value = "{}"
+    )]
+    pub mm_processor_kwargs: serde_json::Map<String, Value>,
     /// Optional explicit KV token capacity override for the worker.
     #[arg(long = "max-total-tokens")]
     pub kv_token_capacity: Option<u64>,
@@ -552,6 +567,7 @@ impl SharedRuntimeArgs {
                 candidates: self.readout_candidates,
             },
             diffusion_generation: self.diffusion_generation_config.unwrap_or_default(),
+            mm_processor_kwargs: self.mm_processor_kwargs,
         }
     }
 }
@@ -1031,6 +1047,32 @@ mod tests {
         );
         assert!(serve(&["--image-fetch-timeout", "0"]).is_err());
         assert!(serve(&["--image-fetch-max-bytes", "0"]).is_err());
+    }
+
+    /// The processor options are one JSON object, empty by default, that
+    /// reaches the server as stated for the served model's processor to
+    /// read; anything but an object is refused.
+    #[test]
+    fn serve_passes_the_processor_options_through() {
+        let serve = |flags: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(
+                ["uniserve", "serve", "model"]
+                    .into_iter()
+                    .chain(flags.iter().copied()),
+            )
+        };
+        let options = |flags: &[&str]| {
+            let Command::Serve(args) = serve(flags).expect("serve invocation").command;
+            Value::Object(args.to_uniserve_config().mm_processor_kwargs)
+        };
+
+        assert_eq!(options(&[]), serde_json::json!({}));
+        assert_eq!(
+            options(&["--mm-processor-kwargs", r#"{"enlarge_references": true}"#]),
+            serde_json::json!({"enlarge_references": true})
+        );
+        assert!(serve(&["--mm-processor-kwargs", "[1]"]).is_err());
+        assert!(serve(&["--mm-processor-kwargs", "true"]).is_err());
     }
 
     #[test]

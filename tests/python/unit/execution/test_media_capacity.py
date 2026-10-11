@@ -17,7 +17,10 @@ from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
 from uniserve_models.minimax_h3 import Model
 from uniserve_models.minimax_h3 import config as h3_config
-from uniserve_models.minimax_h3.processing import reference_image_size
+from uniserve_models.minimax_h3.processing import (
+    ReferenceConfig,
+    reference_image_size,
+)
 from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
 pytestmark = pytest.mark.unit
@@ -394,11 +397,13 @@ def test_the_largest_condition_set_follows_the_served_tasks():
             return size.condition_rows
 
         # No reference a request may bring packs more rows than the
-        # declared one of its kind, at any aspect from 1:4 to 4:1.
+        # declared one of its kind, at any aspect from 1:4 to 4:1, however
+        # the deployment sizes it: enlarged references are the largest.
+        enlarged = ReferenceConfig(enlarge=True)
         for width in range(250, 4001, 7):
             still = Condition(
                 ConditionRole.REFERENCE,
-                video.Config(1, reference_image_size(width, 1000)),
+                video.Config(1, reference_image_size(width, 1000, enlarged)),
             )
             clip = Condition(
                 ConditionRole.REFERENCE,
