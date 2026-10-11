@@ -6,7 +6,7 @@ Columns supplied by device producers are preserved too.
 import pytest
 import torch
 
-from uniserve.nn.attention import AttentionBatch, PagedInput
+from tests.python.fixtures.cache import mha_pool
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import (
     TokenBufferConfig,
@@ -17,6 +17,27 @@ from uniserve_worker.sampling.metadata import TokenSelection
 from uniserve_worker.storage.decode_state import DecodeState
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+
+def _pool(slots):
+    """A one-group cache whose slots 1..``slots`` each hold one page."""
+    pool = mha_pool(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=8,
+        dtype=torch.float32,
+        total_layers=1,
+        total_kv_heads=1,
+        num_pages=slots + 1,
+        page_size=4,
+        device="cuda:0",
+        request_pool_size=slots,
+        table_width=1,
+    )
+    pool.block_tables.install(
+        tuple((slot, 0, 0, (slot,), 4) for slot in range(1, slots + 1))
+    )
+    return pool
 
 
 @pytest.mark.parametrize("devices", (("cpu", "cuda:0"), ("cuda:0", "cpu")))
@@ -36,21 +57,13 @@ def test_token_positions_preserve_row_order_across_source_devices(
             ),
             selection=TokenSelection.LAST_LOGITS,
             request_pool_idx=index + 1,
+            write_kv=True,
         )
         for index, (device, token, position) in enumerate(
             zip(devices, (5, 9), (17, 23), strict=True)
         )
     )
-    attention = AttentionBatch.single(
-        PagedInput.from_blocks(
-            blocks=((0,), (1,)),
-            query_lengths=(1, 1),
-            prefix_lengths=(0, 0),
-            block_size=4,
-            causal=True,
-            device="cpu",
-        )
-    )
+    pool = _pool(2)
     buffers = TokenBuffers(
         config=TokenBufferConfig(
             max_rows=2,
@@ -63,7 +76,10 @@ def test_token_positions_preserve_row_order_across_source_devices(
     )
     try:
         batch = buffers.prepare_inputs(
-            rows, forward_mode=ForwardMode.PREFILL, attention=attention
+            rows,
+            forward_mode=ForwardMode.PREFILL,
+            cache=pool,
+            tables=pool.block_tables,
         )
         assert (
             batch.inputs.input_ids is not None
@@ -97,27 +113,19 @@ def test_mixed_forward_reads_current_continuation_in_row_order(
         positions=torch.tensor([17, 18]),
         selection=TokenSelection.LAST_LOGITS,
         request_pool_idx=1,
+        write_kv=True,
     )
     continuation = TokenRow(
         forward_mode=ForwardMode.DECODE,
         selection=TokenSelection.LAST_LOGITS,
         request_pool_idx=2,
+        write_kv=True,
         request_indexed_decode=True,
     )
     rows = (
         (continuation, prefix) if continuation_first else (prefix, continuation)
     )
-    query_lens = (1, 2) if continuation_first else (2, 1)
-    attention = AttentionBatch.single(
-        PagedInput.from_blocks(
-            blocks=((0,), (1,)),
-            query_lengths=query_lens,
-            prefix_lengths=(0, 0),
-            block_size=4,
-            causal=True,
-            device="cpu",
-        )
-    )
+    pool = _pool(2)
     buffers = TokenBuffers(
         config=TokenBufferConfig(
             max_rows=2,
@@ -146,7 +154,8 @@ def test_mixed_forward_reads_current_continuation_in_row_order(
             batch = buffers.prepare_inputs(
                 rows,
                 forward_mode=ForwardMode.PREFILL,
-                attention=attention,
+                cache=pool,
+                tables=pool.block_tables,
                 states=states,
             )
             expected_tokens = (

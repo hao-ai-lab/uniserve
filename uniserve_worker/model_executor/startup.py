@@ -5,9 +5,12 @@ before ``ModelExecutor.complete_startup`` seals graph capture. They stage
 startup rows (token ID zero for text; for image denoising, guidance-branch
 prefixes resolved through the model's ``FlowPrompt``) through the same
 ``TokenBuffers``, ``CanvasBuffers`` and ``DiffusionBuffers`` serving uses, on
-scratch KV units and latent values leased from the idle pools, and capture
-each configured bucket; when graphs are disabled, representative calls run
-eagerly as warmup instead.
+scratch KV units and latent values leased from the idle pools. Each row's
+scratch units are installed as a request slot of a store of resident block
+tables (``resident_tables``), so its attention columns are gathered on the
+device by ``stage_rows`` as serving's are. Each configured bucket is
+captured; when graphs are disabled, representative calls run eagerly as
+warmup instead.
 Image encoders and decoders, which run eagerly, evaluate one synthetic image
 each (``prepare_images``), so every staged call kind has prepared its call
 sites and chosen its kernels before serving.
@@ -15,7 +18,8 @@ sites and chosen its kernels before serving.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, TypedDict
 
@@ -24,7 +28,6 @@ import torch
 from uniserve.diffusion import Renorm
 from uniserve.math import ceil_div
 from uniserve.media import image as media_image
-from uniserve_worker.model_executor.attention import from_tables, table_pages
 from uniserve_worker.model_executor.diffusion_inputs import (
     DiffusionRow,
     resolve_prefix,
@@ -49,7 +52,7 @@ from uniserve_worker.model_executor.model_runner import ModelRunner
 from uniserve_worker.model_executor.output import ExecutionOutput
 from uniserve_worker.protocol.call import ForwardMode, ImageParams, MediaCall
 from uniserve_worker.sampling.metadata import TokenSelection
-from uniserve_worker.storage.block_tables import GroupTable
+from uniserve_worker.storage.block_tables import BlockTables, GroupTable
 from uniserve_worker.storage.kv_cache import KVCacheManager
 
 if TYPE_CHECKING:
@@ -86,10 +89,52 @@ def scratch_tables(
     return tuple(result)
 
 
+@contextmanager
+def resident_tables(
+    cache: KVCacheManager, tables: Sequence[Sequence[GroupTable]]
+) -> Iterator[BlockTables]:
+    """Install scratch tables as the request slots of a store of startup rows.
+
+    Row ``i`` of ``tables`` becomes request slot ``i + 1``, installed as the
+    scheduler installs a request's tables. The store holds only startup
+    rows, so it neither occupies the worker's request slots nor bounds the
+    rows a bucket stages by them.
+    """
+    width = max(
+        len(table.units) // table.shape.units_per_page
+        for row in tables
+        for table in row
+    )
+    store = BlockTables(
+        groups=cache.shapes,
+        request_pool_size=len(tables),
+        width=width,
+        device=cache.block_tables.unit_tables.device,
+    )
+    try:
+        store.install(
+            tuple(
+                (
+                    slot,
+                    group,
+                    table.start_page,
+                    table.units,
+                    table.allocated_tokens,
+                )
+                for slot, row in enumerate(tables, start=1)
+                for group, table in enumerate(row)
+            )
+        )
+        yield store
+    finally:
+        store.close()
+
+
 def stage_text(
     buffers: TokenBuffers,
     tokens: tuple[tuple[int, ...], ...],
-    tables: Sequence[Sequence[GroupTable]],
+    cache: KVCacheManager,
+    tables: BlockTables,
     *,
     prefixes: tuple[int, ...] | None = None,
     decode: bool = False,
@@ -100,9 +145,11 @@ def stage_text(
 ) -> InputBatch:
     """Stage synthetic token rows through serving's staging path.
 
-    ``tokens`` holds each row's token IDs and ``tables`` its scratch tables
-    of every cache group. Rows default to empty prefixes and to request
-    slots ``1..rows``; slot 0 is the inactive sentinel. Every row writes KV.
+    ``tokens`` holds each row's token IDs, and ``tables`` the resident block
+    tables (``resident_tables``) holding each row's scratch tables of every
+    cache group at its request slot. Rows default to empty prefixes and to
+    request slots ``1..rows``; slot 0 is the inactive sentinel. Every row
+    writes KV.
     With ``embeddings``, every token replaces its embedding with zeros, as an
     image feature row replaces its placeholders. A decode batch also carries
     the staging's cleared force-finish column. ``causal=None`` stages device
@@ -119,14 +166,6 @@ def stage_text(
     positions = tuple(
         torch.arange(prefix, prefix + length, dtype=torch.int64)
         for prefix, length in zip(prefixes, lengths, strict=True)
-    )
-
-    attention = from_tables(
-        table_pages(tables, prefix_lengths=prefixes, query_lengths=lengths),
-        query_lengths=lengths,
-        prefix_lengths=prefixes,
-        causal=flags,
-        write=(True,) * rows,
     )
 
     slots = slots or tuple(range(1, rows + 1))
@@ -156,7 +195,8 @@ def stage_text(
             )
         ),
         forward_mode=mode,
-        attention=attention,
+        cache=cache,
+        tables=tables,
     )
     if causal is None:
         # Even a one-row warmup must compile the device-flag specialization;
@@ -307,11 +347,17 @@ def prepare_prefill(
     ):
         lengths = capture_lengths(shape, row_tokens, pages, units)
         count = sum(map(cache.page_units, lengths))
-        with cache.startup_units(count) as scratch:
+        with (
+            cache.startup_units(count) as scratch,
+            resident_tables(
+                cache, scratch_tables(cache, scratch, lengths)
+            ) as resident,
+        ):
             batch = stage_text(
                 buffers,
                 tuple((0,) * length for length in lengths),
-                scratch_tables(cache, scratch, lengths),
+                cache,
+                resident,
                 selection=TokenSelection.LAST_LOGITS
                 if shape.outputs
                 else TokenSelection.CACHE,
@@ -342,17 +388,21 @@ def prepare_decode(
         if cache is None:
             raise ValueError("decode capture requires the worker KV cache")
         # Each row holds its one-token prompt and one decoded token.
-        with cache.startup_units(rows * cache.page_units(2)) as scratch:
-            tables = scratch_tables(cache, scratch, (2,) * rows)
-
+        with (
+            cache.startup_units(rows * cache.page_units(2)) as scratch,
+            resident_tables(
+                cache, scratch_tables(cache, scratch, (2,) * rows)
+            ) as tables,
+        ):
             # Prefill the one-token prompt eagerly so the decode capture below
             # attends over K/V the model wrote rather than zeroed scratch.
-            prompt = stage_text(buffers, ((0,),) * rows, tables)
+            prompt = stage_text(buffers, ((0,),) * rows, cache, tables)
             entry.eager_batch(prompt, forward)
 
             batch = stage_text(
                 buffers,
                 ((0,),) * rows,
+                cache,
                 tables,
                 prefixes=(1,) * rows,
                 decode=True,
@@ -383,7 +433,9 @@ class _RowFields(TypedDict):
 
 def stage_canvas(
     buffers: CanvasBuffers,
-    tables: Sequence[Sequence[GroupTable]],
+    cache: KVCacheManager,
+    tables: BlockTables,
+    rows: int,
     *,
     length: int,
     generating: bool = False,
@@ -392,24 +444,12 @@ def stage_canvas(
     """Stage synthetic canvas rows through serving's staging path.
 
     Row ``i`` is a canvas of ``length`` tokens in request slot ``i + 1``
-    over a one-token prefix on its scratch ``tables``, read-only and
+    over a one-token prefix on its scratch units in ``tables``, read-only and
     non-causal as every canvas is. Unless ``generating``, the rows are
     readout canvases of token zero reading one slot; otherwise they are step
     ``step`` of block zero of the slots' resident canvases.
     """
-    rows = len(tables)
     prefix = 1
-    attention = from_tables(
-        table_pages(
-            tables,
-            prefix_lengths=(prefix,) * rows,
-            query_lengths=(length,) * rows,
-        ),
-        query_lengths=(length,) * rows,
-        prefix_lengths=(prefix,) * rows,
-        causal=(False,) * rows,
-        write=(False,) * rows,
-    )
     positions = torch.arange(prefix, prefix + length, dtype=torch.int64)
     common: _RowFields = {
         "forward_mode": ForwardMode.TOKEN_DENOISING,
@@ -438,7 +478,10 @@ def stage_canvas(
         for slot in range(1, rows + 1)
     )
     return buffers.prepare_inputs(
-        staged, forward_mode=ForwardMode.TOKEN_DENOISING, attention=attention
+        staged,
+        forward_mode=ForwardMode.TOKEN_DENOISING,
+        cache=cache,
+        tables=tables,
     )
 
 
@@ -477,10 +520,17 @@ def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
     )
     for rows in reversed(entry.canvas_rows if entry.pools else (1,)):
         for generating, step, length in kinds:
-            with cache.startup_units(rows * cache.page_units(1)) as scratch:
+            with (
+                cache.startup_units(rows * cache.page_units(1)) as scratch,
+                resident_tables(
+                    cache, scratch_tables(cache, scratch, (1,) * rows)
+                ) as tables,
+            ):
                 batch = stage_canvas(
                     entry.input_buffers,
-                    scratch_tables(cache, scratch, (1,) * rows),
+                    cache,
+                    tables,
+                    rows,
                     length=length,
                     generating=generating,
                     step=step,
@@ -517,8 +567,9 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     prompt prefix eagerly into scratch KV units, then the denoising entry
     stages rows that read those prefixes and captures them, or runs them
     eagerly when graph capture or flow graphs are disabled. Rows are
-    ordered by request with guidance branches varying fastest, and the
-    branches of one request share its slot and latent.
+    ordered by request with guidance branches varying fastest; the
+    branches of one request share its latent, and each row holds its own
+    prefix in its own request slot of the startup block tables.
     """
     import math
 
@@ -620,14 +671,15 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                 cache.startup_units(
                     sum(map(cache.page_units, lengths))
                 ) as scratch,
+                resident_tables(
+                    cache, scratch_tables(cache, scratch, lengths)
+                ) as tables,
                 latent_pool.startup_values(
                     shape.rows, builder.denoiser.latent_shape("image", size)[0]
                 ) as latents,
             ):
                 for value in latents:
                     value.zero_()
-
-                tables = scratch_tables(cache, scratch, lengths)
 
                 # Only nonempty prefixes are prefilled, with hidden-state
                 # selection whose output is discarded; the denoising rows
@@ -639,12 +691,10 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                     batch = stage_text(
                         prefix_entry.input_buffers,
                         tuple(prefixes[index] for index in selected),
-                        tuple(tables[index] for index in selected),
+                        cache,
+                        tables,
                         selection=TokenSelection.HIDDEN,
-                        slots=tuple(
-                            1 + index // shape.cfg_branches
-                            for index in selected
-                        ),
+                        slots=tuple(1 + index for index in selected),
                     )
                     prefix_stream = prefix_entry.context.stream
                     if prefix_stream is not None:
@@ -661,16 +711,6 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                             prefix_stream.stream
                         )
 
-                queries = (builder.sequence_length(size),) * len(prefixes)
-                attention = from_tables(
-                    table_pages(
-                        tables, prefix_lengths=lengths, query_lengths=queries
-                    ),
-                    query_lengths=queries,
-                    prefix_lengths=lengths,
-                    causal=(False,) * len(prefixes),
-                    write=(False,) * len(prefixes),
-                )
                 rows = tuple(
                     DiffusionRow(
                         forward_mode=MediaCall.DENOISING,
@@ -684,7 +724,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                         image_tokens=builder.sequence_length(size),
                         image_height=size.height,
                         image_width=size.width,
-                        request_pool_idx=1 + index // shape.cfg_branches,
+                        request_pool_idx=1 + index,
                         seq_len=len(prefix),
                         causal=False,
                     )
@@ -694,7 +734,8 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                 batch = entry.input_buffers.prepare_inputs(
                     rows,
                     forward_mode=MediaCall.DENOISING,
-                    attention=attention,
+                    cache=cache,
+                    tables=tables,
                 )
                 if capture:
                     entry.capture_batch(batch, forward)
@@ -812,23 +853,15 @@ def _write_latent_feature(runner, entry, latents, size):
     units = builder.denoiser.latent_shape("image", size)[0]
     with (
         cache.startup_units(cache.page_units(query)) as scratch,
+        resident_tables(
+            cache, scratch_tables(cache, scratch, (query,))
+        ) as tables,
         latents.startup_values(1, units) as (latent,),
     ):
         latent.zero_()
         positions = builder.positions(size, 1, device=entry.device)
         positions[0, 0] = 0
         positions[0, -1] = builder.rope_advance
-        attention = from_tables(
-            table_pages(
-                scratch_tables(cache, scratch, (query,)),
-                prefix_lengths=(0,),
-                query_lengths=(query,),
-            ),
-            query_lengths=(query,),
-            prefix_lengths=(0,),
-            causal=(False,),
-            write=(True,),
-        )
         row = DiffusionRow(
             forward_mode=MediaCall.DENOISING,
             positions=positions,
@@ -844,6 +877,9 @@ def _write_latent_feature(runner, entry, latents, size):
         )
         with entry.context.activate():
             batch = entry.prepare_inputs(
-                (row,), forward_mode=MediaCall.DENOISING, attention=attention
+                (row,),
+                forward_mode=MediaCall.DENOISING,
+                cache=cache,
+                tables=tables,
             )
         entry.eager_batch(batch, entry.batch_forward)
