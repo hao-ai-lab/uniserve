@@ -78,9 +78,6 @@ class KvGroup:
         window: With `KvGroupKind.SLIDING_WINDOW`, the history tokens any
             reader of the group needs. Encoded only for a sliding window and
             decoded as zero when absent.
-        sink: With `KvGroupKind.SLIDING_WINDOW`, prefix tokens retained
-            outside the window; the unit pool supports only zero. Encoded
-            only for a sliding window and decoded as zero when absent.
         page_tokens: Tokens per logical page; a power of two.
         units_per_page: Units one logical page occupies.
         layer_ids: Global cache-layer ids of this rank's layers in the
@@ -93,7 +90,6 @@ class KvGroup:
 
     kind: KvGroupKind
     window: int
-    sink: int
     page_tokens: int
     units_per_page: int
     layer_ids: tuple[int, ...]
@@ -115,17 +111,13 @@ class KvGroup:
             or self.kv_head_offset + self.num_kv_heads > self.total_kv_heads
         ):
             raise invalid_descriptor("worker KV group is invalid")
-        if self.kind is KvGroupKind.SLIDING_WINDOW and self.sink:
-            raise invalid_descriptor(
-                "worker KV group retains sliding-window sink tokens"
-            )
 
     @classmethod
     def from_mapping(cls, value: object, where: str) -> KvGroup:
         """Decode and validate one KV group from its scheduler wire mapping.
 
         The policy is a nested mapping tagged by its own ``kind`` key, with
-        ``window`` and ``sink`` beside the tag for a sliding window.
+        ``window`` beside the tag for a sliding window.
         """
         data = _map(value, where)
         kind_data = _map(data.get("kind"), f"{where}.kind")
@@ -134,7 +126,6 @@ class KvGroup:
                 KvGroupKind, kind_data.get("kind"), f"{where}.kind.kind"
             ),
             window=_uint(kind_data.get("window", 0), f"{where}.kind.window"),
-            sink=_uint(kind_data.get("sink", 0), f"{where}.kind.sink"),
             page_tokens=_uint(data.get("page_tokens"), f"{where}.page_tokens"),
             units_per_page=_uint(
                 data.get("units_per_page"), f"{where}.units_per_page"
@@ -161,7 +152,7 @@ class KvGroup:
         """Encode the group's policy, page shape and placement."""
         kind: dict[str, object] = {"kind": self.kind.value}
         if self.kind is KvGroupKind.SLIDING_WINDOW:
-            kind.update(window=self.window, sink=self.sink)
+            kind.update(window=self.window)
         return {
             "kind": kind,
             "page_tokens": self.page_tokens,
@@ -178,28 +169,21 @@ class KvGroup:
 class KVCacheInfo:
     """Publish the KV unit pool to the scheduler.
 
-    The pool is `num_units` units of `unit_bytes` bytes each on this rank,
-    unit zero being the padding sentinel; every group's pages draw from it.
+    The pool is `num_units` units on this rank, unit zero being the padding
+    sentinel; every group's pages draw from it.
     """
 
     num_units: int
-    unit_bytes: int
     dtype: str
     groups: tuple[KvGroup, ...]
 
     def __post_init__(self) -> None:
         """Validate the pool size and the groups' combined page shapes.
 
-        Requires an allocatable unit beyond the sentinel, a positive unit
-        size, a dtype, and groups whose page sizes divide the largest one and
-        whose layers are distinct.
+        Requires an allocatable unit beyond the sentinel, a dtype, and groups
+        whose page sizes divide the largest one and whose layers are distinct.
         """
-        if (
-            self.num_units < 2
-            or self.unit_bytes < 1
-            or not self.groups
-            or not self.dtype
-        ):
+        if self.num_units < 2 or not self.groups or not self.dtype:
             raise invalid_descriptor(
                 "worker info declares an incomplete KV unit pool"
             )
@@ -218,7 +202,6 @@ class KVCacheInfo:
         data = _map(value, where)
         return cls(
             num_units=_uint(data.get("num_units"), f"{where}.num_units"),
-            unit_bytes=_uint(data.get("unit_bytes"), f"{where}.unit_bytes"),
             dtype=_str(data.get("dtype"), f"{where}.dtype"),
             groups=tuple(
                 KvGroup.from_mapping(item, f"{where}.groups[{index}]")
@@ -232,7 +215,6 @@ class KVCacheInfo:
         """Encode the unit pool and its groups for scheduler discovery."""
         return {
             "num_units": self.num_units,
-            "unit_bytes": self.unit_bytes,
             "dtype": self.dtype,
             "groups": [group.to_mapping() for group in self.groups],
         }

@@ -1173,10 +1173,7 @@ fn hybrid_groups_share_one_unit_pool() {
             ..base.clone()
         },
         KvCacheGroup {
-            kind: KvGroupKind::SlidingWindow {
-                window: 96,
-                sink: 0,
-            },
+            kind: KvGroupKind::SlidingWindow { window: 96 },
             page_tokens: 32,
             units_per_page: 3,
             layer_ids: (4..16).collect(),

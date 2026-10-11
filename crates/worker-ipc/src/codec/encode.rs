@@ -1258,13 +1258,11 @@ fn batch_output<'a>(
 }
 
 fn kv_group<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheGroup) -> WIPOffset<fbs::KvGroup<'a>> {
-    // `window` and `sink` are meaningful only for sliding-window groups; a
-    // full-attention group writes zeros, which `kv_group_from_table` ignores.
-    let (kind, window, sink) = match v.kind {
-        KvGroupKind::Full => (fbs::KvGroupKind::Full, 0, 0),
-        KvGroupKind::SlidingWindow { window, sink } => {
-            (fbs::KvGroupKind::SlidingWindow, window, sink)
-        }
+    // `window` is meaningful only for a sliding-window group; a
+    // full-attention group writes zero, which `kv_group_from_table` ignores.
+    let (kind, window) = match v.kind {
+        KvGroupKind::Full => (fbs::KvGroupKind::Full, 0),
+        KvGroupKind::SlidingWindow { window } => (fbs::KvGroupKind::SlidingWindow, window),
     };
     let layer_ids = Some(b.create_vector(&v.layer_ids));
     fbs::KvGroup::create(
@@ -1272,7 +1270,6 @@ fn kv_group<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheGroup) -> WIPOffset<fb
         &fbs::KvGroupArgs {
             kind,
             window,
-            sink,
             page_tokens: v.page_tokens,
             units_per_page: v.units_per_page,
             layer_ids,
@@ -1298,7 +1295,6 @@ fn kv_cache<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheInfo) -> WIPOffset<fbs
         b,
         &fbs::KVCacheInfoArgs {
             num_units: v.num_units,
-            unit_bytes: v.unit_bytes,
             dtype,
             groups,
         },

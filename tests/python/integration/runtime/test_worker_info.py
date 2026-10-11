@@ -58,7 +58,6 @@ def test_worker_info_reports_schedulable_work_and_bounds(
         "kv_install",
     }
     assert info["kv_cache"]["num_units"] > 1
-    assert info["kv_cache"]["unit_bytes"] > 0
     assert all(
         group["layer_ids"]
         and group["num_kv_heads"] > 0

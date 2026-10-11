@@ -206,8 +206,8 @@ impl ExecutorInfo {
     /// media routing are unions, queue depth is a sum, and most batch, slot,
     /// and storage limits take the smallest nonzero value any pool reports.
     /// The exceptions are the KV cache, whose layout the KV pools must share
-    /// and whose block count is their smallest and per-token footprint their
-    /// largest; request slots of a deployment that muxes video,
+    /// and whose unit count is their smallest; request slots of a deployment
+    /// that muxes video,
     /// the narrowest per-component sum of replica slots; and the diffusion
     /// step count and latent page geometry, taken from the first denoising
     /// pool and zero without one.
@@ -291,8 +291,7 @@ impl ExecutorInfo {
         );
         // Every KV stage must agree on its groups' retention policies and page
         // shapes. Capacity is the narrowest pool because a request may
-        // traverse all routed KV stages with one set of unit ids, and the
-        // per-unit footprint is the largest any of them reports
+        // traverse all routed KV stages with one set of unit ids
         // (`KvCacheInfo::merge`).
         if let Some(first_index) = kv_indices.first().copied() {
             let mut kv_cache = self.workers[first_index]

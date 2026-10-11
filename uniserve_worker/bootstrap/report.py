@@ -301,10 +301,10 @@ def _token_worker_layout(
         else 0
     )
 
-    # A minimal cache description supplies the unit geometry;
-    # ``resize_cache`` attaches the granted unit count at the end. The
-    # minimal pool holds the unit-zero sentinel and one page of the group
-    # whose page spans the most units.
+    # The planned pool supplies the unit size and a minimal cache
+    # description the group geometry; ``resize_cache`` attaches the granted
+    # unit count at the end. The minimal pool holds the unit-zero sentinel
+    # and one page of the group whose page spans the most units.
     text = capability(model, CausalLM)
     owns_kv = text is not None
     planes: Planes | None = None
@@ -316,7 +316,7 @@ def _token_worker_layout(
             worker_config,
             num_units=1 + max(group.units_per_page for group in planes.groups),
         )
-    unit_bytes = 0 if cache is None else cache.unit_bytes
+    unit_bytes = 0 if planes is None else planes.unit_bytes
 
     flow = image_builder(model)
     plan = latent_pool_plan(model, worker_config) if flow is not None else None

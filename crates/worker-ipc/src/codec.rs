@@ -1413,15 +1413,13 @@ fn map_from_table(
 }
 
 /// Decodes one KV cache group: its retention kind, page shape, and this
-/// rank's layers and heads. `window` and `sink` are read only for sliding
-/// windows.
+/// rank's layers and heads. `window` is read only for sliding windows.
 fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
     let kind = if group.kind() == fbs::KvGroupKind::Full {
         KvGroupKind::Full
     } else if group.kind() == fbs::KvGroupKind::SlidingWindow {
         KvGroupKind::SlidingWindow {
             window: group.window(),
-            sink: group.sink(),
         }
     } else {
         codec_bail!("unknown KV group kind {}", group.kind().0)
@@ -1527,7 +1525,6 @@ fn token_logprob_from_fb(entry: &fbs::TokenLogprob) -> TokenLogprob {
 fn kv_cache_from_table(config: fbs::KVCacheInfo<'_>) -> CodecResult<KvCacheInfo> {
     Ok(KvCacheInfo {
         num_units: config.num_units(),
-        unit_bytes: config.unit_bytes(),
         groups: config
             .groups()
             .map(|items| {

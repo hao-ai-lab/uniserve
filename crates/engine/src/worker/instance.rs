@@ -244,7 +244,7 @@ pub struct WorkerGroup {
     /// remains of a retired batch.
     buffers: Vec<VecDeque<WorkerResult>>,
     /// The group's agreed capabilities: rank 0's report with the group-wide
-    /// product storage and KV byte accounting `from_ranks` derives.
+    /// product storage and KV layers `from_ranks` derives.
     info: WorkerInfo,
     /// Physical runs admitted concurrently, from the ranks' queue depth.
     depth: usize,
@@ -570,15 +570,13 @@ impl WorkerGroup {
             );
             // Rank-specific fields take the reference's values before the
             // comparison: the endpoint, device, transfer backends, product
-            // storage, the unit size, and each KV group's layers and head
-            // offset.
+            // storage, and each KV group's layers and head offset.
             normalized.endpoint = canonical.endpoint.clone();
             normalized.device = canonical.device.clone();
             normalized.transfer_backends = canonical.transfer_backends.clone();
             normalized.buffer_pool_bytes = canonical.buffer_pool_bytes;
             if let (Some(local), Some(reference)) = (&mut normalized.kv_cache, &canonical.kv_cache)
             {
-                local.unit_bytes = reference.unit_bytes;
                 if local.groups.len() == reference.groups.len() {
                     for (group, canonical) in local.groups.iter_mut().zip(&reference.groups) {
                         group.layer_ids.clone_from(&canonical.layer_ids);
@@ -604,8 +602,7 @@ impl WorkerGroup {
         // every layer must have its KV heads covered from head 0 to
         // `total_kv_heads` by the ranks storing it. Overlapping regions are
         // allowed; a gap is not. The group reports the union of its ranks'
-        // layers, which bounds publications, and the largest unit, because
-        // the scheduler reserves units shared by every stage.
+        // layers, which bounds publications.
         if let Some(cache) = &mut info.kv_cache {
             let regions: Vec<_> = workers
                 .iter()
@@ -652,11 +649,6 @@ impl WorkerGroup {
                 owners.keys().copied().eq(0..owners.len() as u32),
                 "worker KV regions do not cover every logical cache layer"
             );
-            cache.unit_bytes = regions
-                .iter()
-                .map(|region| region.unit_bytes)
-                .max()
-                .unwrap_or(cache.unit_bytes);
         }
 
         // Keep startup cancellation attached until every deployment group

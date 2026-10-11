@@ -1,11 +1,11 @@
 """Describe a rank's paged K/V unit pool to the engine scheduler.
 
 The worker reports a ``KVCacheInfo`` in its ``WorkerInfo``: the unit pool's
-size and unit bytes, and one group per history window and K/V page shape.
-Each group places this rank's layers by global cache-layer id and its K/V
-heads by interval. The token-worker path of ``build_worker_layout`` in
-``uniserve_worker.bootstrap.report`` calls ``cache_info`` with a minimal
-pool to learn the unit size, sizes the pool, and attaches the granted unit
+size, and one group per history window and K/V page shape. Each group places
+this rank's layers by global cache-layer id and its K/V heads by interval.
+The token-worker path of ``build_worker_layout`` in
+``uniserve_worker.bootstrap.report`` sizes the pool from the unit size of
+``plan_cache``, describes it with ``cache_info`` and attaches the granted unit
 count with ``resize_cache``. When the engine assembles a worker group from
 its ranks' startup reports, it requires every logical layer to belong to one
 group and its K/V heads to be covered without a gap.
@@ -305,7 +305,6 @@ def cache_info(
                 if group.window is None
                 else KvGroupKind.SLIDING_WINDOW,
                 window=0 if group.window is None else group.window,
-                sink=0,
                 page_tokens=group.page_tokens,
                 units_per_page=group.units_per_page,
                 layer_ids=tuple(names.index(name) for name in group.layers),
@@ -327,7 +326,6 @@ def cache_info(
     )
     return KVCacheInfo(
         num_units=num_units,
-        unit_bytes=planes.unit_bytes,
         dtype=str(stored).removeprefix("torch."),
         groups=tuple(groups),
     )

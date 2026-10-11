@@ -923,10 +923,6 @@ pub enum KvGroupKind {
     SlidingWindow {
         /// History tokens any reader of the group needs.
         window: u32,
-        /// Prefix tokens retained outside the window. The unit pool keeps one
-        /// contiguous run of pages per table, so validation rejects a
-        /// nonzero sink.
-        sink: u32,
     },
 }
 

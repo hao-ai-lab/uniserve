@@ -21,8 +21,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 pub use uniserve_core::{CallId, ForwardStats};
 use uniserve_core::{
-    ImageParams, KvCacheDtype, KvCacheGroup, KvGroupKind, RequestId, SamplingParams, TokenLogprob,
-    UnitId,
+    ImageParams, KvCacheDtype, KvCacheGroup, RequestId, SamplingParams, TokenLogprob, UnitId,
 };
 
 /// Result type for semantic worker-message validation.
