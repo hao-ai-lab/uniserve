@@ -758,7 +758,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             **{
                 name: BufferConfig((tiles,), torch.int32)
                 for name in (
-                    "valid_sizes",
+                    "variable_block_sizes",
                     "tile_segments",
                     "segment_starts",
                     "segment_keep",
@@ -824,7 +824,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             "sin": sine.flatten(1),
             # Row ``3 * group + tag`` of each step's modulation products.
             "modulation_indices": groups * 3 + tags,
-            "valid_sizes": tables.valid_sizes,
+            "variable_block_sizes": tables.variable_block_sizes,
             "tile_segments": tables.tile_segments,
             "segment_starts": tables.segment_starts,
             "segment_keep": tables.segment_keep,
@@ -1082,7 +1082,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 vsa.Segments(
                     packing.tile,
                     tokens,
-                    state["valid_sizes"],
+                    state["variable_block_sizes"],
                     state["tile_segments"],
                     state["segment_starts"],
                     state["segment_keep"],

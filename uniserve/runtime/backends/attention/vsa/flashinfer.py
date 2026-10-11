@@ -35,15 +35,15 @@ class _Operator(BaseOperator):
                 bsa_attn_sm120_blk64_fwd,
             )
 
-            index_width = batch.block_indices.shape[-1]
+            index_width = batch.q2k_index.shape[-1]
             bsa_attn_sm120_blk64_fwd(
                 q.unsqueeze(0),
                 k.unsqueeze(0),
                 v.unsqueeze(0),
-                batch.block_indices.unsqueeze(0),
+                batch.q2k_index.unsqueeze(0),
                 index_width,
-                block_sizes=batch.valid_sizes,
-                q2k_block_nums=batch.block_counts.unsqueeze(0),
+                block_sizes=batch.variable_block_sizes,
+                q2k_block_nums=batch.q2k_num.unsqueeze(0),
                 softmax_scale=scale,
                 out=out.unsqueeze(0),
             )
@@ -69,7 +69,7 @@ class _Operator(BaseOperator):
                     query[:, :prefix_rows],
                     key[:, :key_rows],
                     value[:, :key_rows],
-                    batch.valid_sizes,
+                    batch.variable_block_sizes,
                     scale=scale,
                 )
             )
@@ -82,7 +82,7 @@ class _Operator(BaseOperator):
             q,
             k,
             pattern=self.pattern,
-            index_width=batch.block_indices.shape[-1],
+            index_width=batch.q2k_index.shape[-1],
             scale=scale,
             row_start=prefix_rows,
             row_count=sparse_rows,
@@ -92,9 +92,9 @@ class _Operator(BaseOperator):
             query[:, prefix_rows:].contiguous().view(-1, 1, self.head_dim),
             key.reshape(-1, 1, self.head_dim),
             value.reshape(-1, 1, self.head_dim),
-            block_indices=batch.block_indices,
-            block_counts=batch.block_counts,
-            valid_sizes=batch.valid_sizes,
+            q2k_index=batch.q2k_index,
+            q2k_num=batch.q2k_num,
+            variable_block_sizes=batch.variable_block_sizes,
         )
         out[prefix_rows:].copy_(
             result.view(self.num_heads, sparse_rows, self.head_dim).transpose(

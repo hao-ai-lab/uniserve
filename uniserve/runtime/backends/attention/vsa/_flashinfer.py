@@ -152,7 +152,7 @@ if triton is not None:
     def _count_sparse_tokens_kernel(
         source_indices,
         source_counts,
-        valid_sizes,
+        variable_block_sizes,
         counts,
         index_stride_head: tl.constexpr,
         index_stride_tile: tl.constexpr,
@@ -176,14 +176,14 @@ if triton is not None:
             mask=active,
             other=0,
         )
-        sizes = tl.load(valid_sizes + keys, mask=active, other=0)
+        sizes = tl.load(variable_block_sizes + keys, mask=active, other=0)
         tl.store(counts + row, tl.sum(sizes, 0))
 
     @triton.jit
     def _fill_sparse_tokens_kernel(
         source_indices,
         source_counts,
-        valid_sizes,
+        variable_block_sizes,
         indptr,
         indices,
         index_stride_head: tl.constexpr,
@@ -214,7 +214,7 @@ if triton is not None:
                 mask=active,
                 other=0,
             )
-            sizes = tl.load(valid_sizes + keys, mask=active, other=0)
+            sizes = tl.load(variable_block_sizes + keys, mask=active, other=0)
             offsets = tl.cumsum(sizes, 0) - sizes
             tl.store(
                 indices + destination + offsets[:, None] + tokens[None, :],
@@ -227,7 +227,7 @@ if triton is not None:
     def _fill_flattened_bsr_kernel(
         source_indices,
         source_counts,
-        valid_sizes,
+        variable_block_sizes,
         indptr,
         destination_indices,
         packed_mask,
@@ -280,7 +280,7 @@ if triton is not None:
             )
 
         # Pack each key tile's valid rows as bits, 8 rows per byte, so the
-        # FlashInfer BSR mask marks exactly valid_sizes[tile] keys
+        # FlashInfer BSR mask marks exactly variable_block_sizes[tile] keys
         # per tile.
         bytes_per_tile_row = tile_rows // 8
         mask_bytes = selected_count * tile_rows * bytes_per_tile_row
@@ -298,7 +298,7 @@ if triton is not None:
                 other=0,
             )
             valid_rows = tl.load(
-                valid_sizes + selected_blocks, mask=live, other=0
+                variable_block_sizes + selected_blocks, mask=live, other=0
             )
             bits = tl.minimum(
                 tl.maximum(
@@ -632,7 +632,7 @@ def _fill_flattened_bsr(
     plan: _SparsePlan | _TokenPlan,
     source_indices: torch.Tensor,
     source_counts: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
 ) -> None:
     """Populate a cached plan's indices.
 
@@ -652,7 +652,7 @@ def _fill_flattened_bsr(
         _count_sparse_tokens_kernel[(heads * plan.query_tiles,)](
             source_indices,
             source_counts,
-            valid_sizes,
+            variable_block_sizes,
             plan.counts,
             *arguments,
             *mapping,
@@ -666,7 +666,7 @@ def _fill_flattened_bsr(
         _fill_sparse_tokens_kernel[(heads * plan.query_tiles,)](
             source_indices,
             source_counts,
-            valid_sizes,
+            variable_block_sizes,
             plan.indptr,
             plan.indices,
             *arguments,
@@ -693,7 +693,7 @@ def _fill_flattened_bsr(
     _fill_flattened_bsr_kernel[(heads * plan.query_tiles,)](
         source_indices,
         source_counts,
-        valid_sizes,
+        variable_block_sizes,
         wrapper_indptr,
         plan.indices,
         plan.packed_mask,
@@ -717,9 +717,9 @@ def run_sparse(
     key: torch.Tensor,
     value: torch.Tensor,
     *,
-    block_indices: torch.Tensor,
-    block_counts: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    q2k_index: torch.Tensor,
+    q2k_num: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Evaluate a prepared sparse plan with its live device key domain."""
@@ -739,16 +739,16 @@ def run_sparse(
                 packed.view(-1, 1, width),
                 key,
                 value,
-                block_indices=block_indices,
-                block_counts=block_counts,
-                valid_sizes=valid_sizes,
+                q2k_index=q2k_index,
+                q2k_num=q2k_num,
+                variable_block_sizes=variable_block_sizes,
             )
             outputs[:, begin : begin + count].copy_(
                 result.view(plan.heads, count, width)
             )
         return output
 
-    _fill_flattened_bsr(plan, block_indices, block_counts, valid_sizes)
+    _fill_flattened_bsr(plan, q2k_index, q2k_num, variable_block_sizes)
     if isinstance(plan, _TokenPlan):
         return plan.wrapper.run(
             query,
@@ -765,7 +765,7 @@ def dense_prefix(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
     *,
     scale: float,
 ) -> torch.Tensor:
@@ -782,8 +782,8 @@ def dense_prefix(
 
     # Preserve the vector's inner stride and alignment when CuTe converts
     # the auxiliary tensor. This changes metadata, not the borrowed counts.
-    valid_sizes.__leading_dim__ = 0  # type: ignore[attr-defined]
-    valid_sizes.__assumed_align__ = 4  # type: ignore[attr-defined]
+    variable_block_sizes.__leading_dim__ = 0  # type: ignore[attr-defined]
+    variable_block_sizes.__assumed_align__ = 4  # type: ignore[attr-defined]
     return _flash_attn_forward()(
         query.transpose(0, 1).unsqueeze(0),
         key.transpose(0, 1).unsqueeze(0),
@@ -791,5 +791,5 @@ def dense_prefix(
         softmax_scale=scale,
         causal=False,
         mask_mod=block_validity,
-        aux_tensors=[valid_sizes],
+        aux_tensors=[variable_block_sizes],
     )[0][0]

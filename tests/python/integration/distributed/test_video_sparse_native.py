@@ -19,7 +19,7 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
         rows, heads, 4, width, device="cuda", dtype=torch.bfloat16
     )
     query, key, value, _ = projected.unbind(2)
-    valid_sizes = torch.tensor(
+    variable_block_sizes = torch.tensor(
         [64, 17, 64, 0], device="cuda", dtype=torch.int32
     )
     indices = torch.zeros((heads, 4, 4), device="cuda", dtype=torch.int32)
@@ -34,7 +34,7 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
         vsa.Pattern(((2, 2, 2, 2),), 0, 0, 64),
         indices,
         counts,
-        valid_sizes,
+        variable_block_sizes,
         0,
     )
     with ExecutionContext(module) as context:
@@ -55,7 +55,7 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
     ).to(torch.bfloat16)
     valid_queries = torch.arange(
         rows, device="cuda"
-    ) % tile < valid_sizes.repeat_interleave(tile)
+    ) % tile < variable_block_sizes.repeat_interleave(tile)
     # The established BF16 attention tolerance covers softmax/MMA rounding;
     # padded query outputs are not part of the model's valid-token contract.
     torch.testing.assert_close(

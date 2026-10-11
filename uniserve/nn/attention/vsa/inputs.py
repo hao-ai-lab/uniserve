@@ -90,28 +90,27 @@ class BlockInput:
     """  # noqa: D205
 
     pattern: Pattern
-    block_indices: torch.Tensor
-    block_counts: torch.Tensor
-    valid_sizes: torch.Tensor
+    q2k_index: torch.Tensor
+    q2k_num: torch.Tensor
+    variable_block_sizes: torch.Tensor
     query_tile_offset: int
 
     def __post_init__(self):
         if (
-            self.block_indices.ndim != 3
-            or self.block_counts.shape != self.block_indices.shape[:2]
-            or self.valid_sizes.ndim != 1
+            self.q2k_index.ndim != 3
+            or self.q2k_num.shape != self.q2k_index.shape[:2]
+            or self.variable_block_sizes.ndim != 1
             or self.query_tile_offset < 0
             or any(
                 value.dtype != torch.int32
                 for value in (
-                    self.block_indices,
-                    self.block_counts,
-                    self.valid_sizes,
+                    self.q2k_index,
+                    self.q2k_num,
+                    self.variable_block_sizes,
                 )
             )
-            or len(self.pattern.row_counts[0]) != self.block_counts.shape[1]
-            or len(self.pattern.row_counts)
-            not in (1, self.block_counts.shape[0])
+            or len(self.pattern.row_counts[0]) != self.q2k_num.shape[1]
+            or len(self.pattern.row_counts) not in (1, self.q2k_num.shape[0])
         ):
             raise ValueError(
                 "VSA block input requires matching tile counts and int32 "
@@ -143,7 +142,7 @@ class Segments:
     Attributes:
         tile: Rows of one tile.
         padded_tokens: Packed rows, whole tiles.
-        valid_sizes: Valid rows of each tile; they lead the tile's
+        variable_block_sizes: Valid rows of each tile; they lead the tile's
             rows.
         tile_segments: ``DENSE_TILE`` for a dense or empty tile, else the
             tile's segment index.
@@ -166,7 +165,7 @@ class Segments:
 
     tile: int
     padded_tokens: int
-    valid_sizes: torch.Tensor
+    variable_block_sizes: torch.Tensor
     tile_segments: torch.Tensor
     segment_starts: torch.Tensor
     segment_keep: torch.Tensor
@@ -198,7 +197,7 @@ class Segments:
         if any(
             value.shape != (tiles,) or value.dtype != torch.int32
             for value in (
-                self.valid_sizes,
+                self.variable_block_sizes,
                 self.tile_segments,
                 self.segment_starts,
                 self.segment_keep,

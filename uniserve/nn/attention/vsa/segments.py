@@ -30,27 +30,27 @@ if TYPE_CHECKING:
 
 
 def zero_padding(
-    rows: torch.Tensor, valid_sizes: torch.Tensor, tile: int
+    rows: torch.Tensor, variable_block_sizes: torch.Tensor, tile: int
 ) -> None:
     """Store zeros to the rows past each tile's valid size, in place.
 
     ``rows`` is ``[tiles * tile, heads, width]`` with any row and head
-    strides and ``valid_sizes`` holds the valid rows of each of its
+    strides and ``variable_block_sizes`` holds the valid rows of each of its
     tiles; rows within a tile's valid size are not touched.
     """
     if rows.is_cuda:
         from uniserve_kernels.attention import vsa_segments
 
-        vsa_segments.zero_tile_padding(rows, valid_sizes, tile)
+        vsa_segments.zero_tile_padding(rows, variable_block_sizes, tile)
         return
-    live = torch.arange(tile) < valid_sizes[:, None]
-    rows.view(valid_sizes.numel(), tile, *rows.shape[1:]).masked_fill_(
+    live = torch.arange(tile) < variable_block_sizes[:, None]
+    rows.view(variable_block_sizes.numel(), tile, *rows.shape[1:]).masked_fill_(
         ~live[:, :, None, None], 0
     )
 
 
 def pool(
-    rows: torch.Tensor, valid_sizes: torch.Tensor, tile: int
+    rows: torch.Tensor, variable_block_sizes: torch.Tensor, tile: int
 ) -> torch.Tensor:
     """Average each tile's valid rows of every head in FP32.
 
@@ -59,9 +59,9 @@ def pool(
     width]`` FP32, zero for an empty tile. The zeros add nothing, so the sum
     is the valid rows' sum in the order of a masked copy's.
     """
-    values = rows.view(valid_sizes.numel(), tile, *rows.shape[1:])
+    values = rows.view(variable_block_sizes.numel(), tile, *rows.shape[1:])
     total = values.sum(1, dtype=torch.float32)
-    return total / valid_sizes.clamp_min(1).view(-1, 1, 1)
+    return total / variable_block_sizes.clamp_min(1).view(-1, 1, 1)
 
 
 def select(
@@ -87,7 +87,7 @@ def select(
         return vsa_segments.select_tiles(
             scores.contiguous(),
             segments.tile_segments,
-            segments.valid_sizes,
+            segments.variable_block_sizes,
             segments.segment_starts,
             segments.segment_keep,
             query_tile_offset=query_tile_offset,
@@ -96,7 +96,7 @@ def select(
     queries = slice(query_tile_offset, query_tile_offset + scores.shape[1])
     device = scores.device
     tile_segments = segments.tile_segments.long()
-    live = segments.valid_sizes > 0
+    live = segments.variable_block_sizes > 0
     dense = live & (tile_segments < 0)
     video = live & (tile_segments >= 0)
 
@@ -229,12 +229,12 @@ class SegmentAttention(nn.Module):
         # head width. Attention never reads padding rows (keys past a tile's
         # valid size are masked and padded query rows are unspecified), so
         # zeroing them leaves every valid result as it was.
-        zero_padding(q, segments.valid_sizes[queries], tile)
+        zero_padding(q, segments.variable_block_sizes[queries], tile)
         for value in (k, v):
-            zero_padding(value, segments.valid_sizes, tile)
-        pooled_query = pool(q, segments.valid_sizes[queries], tile)
+            zero_padding(value, segments.variable_block_sizes, tile)
+        pooled_query = pool(q, segments.variable_block_sizes[queries], tile)
         pooled_key, pooled_value = (
-            pool(value, segments.valid_sizes, tile) for value in (k, v)
+            pool(value, segments.variable_block_sizes, tile) for value in (k, v)
         )
         scores = torch.matmul(
             pooled_query.permute(1, 0, 2), pooled_key.permute(1, 2, 0)
@@ -263,7 +263,7 @@ class SegmentAttention(nn.Module):
                 pattern,
                 indices,
                 counts,
-                segments.valid_sizes,
+                segments.variable_block_sizes,
                 queries.start,
             ),
         )
@@ -271,7 +271,7 @@ class SegmentAttention(nn.Module):
         # Compression: each query tile's softmax over the live key tiles
         # weights their mean values. The BF16 tile result then scales the
         # gate and adds to the fine rows, each operation rounding to BF16.
-        live = segments.valid_sizes > 0
+        live = segments.variable_block_sizes > 0
         weights = scores.masked_fill(~live, -torch.inf).softmax(-1)
         compressed = torch.matmul(weights, pooled_value.permute(1, 0, 2)).to(
             q.dtype

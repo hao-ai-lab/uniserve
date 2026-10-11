@@ -20,13 +20,15 @@ def available(device):
 
 
 class _Operator(BaseOperator):
-    def kernel(self, q, k, v, out, indices, counts, valid_sizes, *, scale):
+    def kernel(
+        self, q, k, v, out, indices, counts, variable_block_sizes, *, scale
+    ):
         tile = self.pattern.tile
         if tile == 64 and vsa_cute.should_use(
             rows=k.shape[0], prefix_tiles=self.pattern.dense_prefix_tiles
         ):
             vsa_cute.block_sparse_attention(
-                q, k, v, out, indices, counts, valid_sizes, scale=scale
+                q, k, v, out, indices, counts, variable_block_sizes, scale=scale
             )
             return
         vsa_native.block_sparse_attention(
@@ -36,7 +38,7 @@ class _Operator(BaseOperator):
             out,
             indices,
             counts,
-            valid_sizes,
+            variable_block_sizes,
             scale=scale,
             block=tile,
         )

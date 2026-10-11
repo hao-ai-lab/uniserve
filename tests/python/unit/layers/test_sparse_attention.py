@@ -9,7 +9,7 @@ from uniserve.nn.attention.vsa.segments import select
 pytestmark = pytest.mark.unit
 
 
-def _segments(tile_segments, valid_sizes, keep, **fields):
+def _segments(tile_segments, variable_block_sizes, keep, **fields):
     """Segment tables over ``tile_segments`` (-1 dense or empty) on the host."""
     segments = torch.tensor(tile_segments, dtype=torch.int32)
     starts = torch.zeros_like(segments)
@@ -20,7 +20,7 @@ def _segments(tile_segments, valid_sizes, keep, **fields):
     return vsa.Segments(
         128,
         segments.numel() * 128,
-        torch.tensor(valid_sizes, dtype=torch.int32),
+        torch.tensor(variable_block_sizes, dtype=torch.int32),
         segments,
         starts,
         keeps,

@@ -222,7 +222,10 @@ def test_reference_segment_state_follows_its_layout():
     # The prompt, the clip's soundtrack and patches, and the generated 2 x
     # 207 audio rows and 37 x 24 x 42 video patches fill the tiles.
     prefix = 300 + 120 + 4032
-    assert int(out["valid_sizes"].sum()) == prefix + 2 * 207 + 37 * 24 * 42
+    assert (
+        int(out["variable_block_sizes"].sum())
+        == prefix + 2 * 207 + 37 * 24 * 42
+    )
     # The clip's video forms segment 0 and the generated video segment 1.
     assert set(out["tile_segments"].tolist()) == {-1, 0, 1}
     # Only the request's prefix rows gather the prefix source; every other

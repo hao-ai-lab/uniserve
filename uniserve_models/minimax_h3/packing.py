@@ -718,7 +718,7 @@ class SegmentPacking:
             row, ascending.
         video_raster_indices: [video rows] int64 raster row of each entry of
             ``video_indices``.
-        video_valid_sizes: [video tiles] int32 rows of each video tile.
+        video_variable_block_sizes: [video tiles] int32 rows of each video tile.
         padded_tokens: All rows, a multiple of the layout's alignment.
     """
 
@@ -728,7 +728,7 @@ class SegmentPacking:
     audio_rows: int
     video_indices: torch.Tensor
     video_raster_indices: torch.Tensor
-    video_valid_sizes: torch.Tensor
+    video_variable_block_sizes: torch.Tensor
     padded_tokens: int
 
     @property
@@ -778,7 +778,7 @@ class SegmentPacking:
         """
         tiles = self.padded_tokens // self.tile
         start = self.video_start // self.tile
-        video = int(self.video_valid_sizes.numel())
+        video = int(self.video_variable_block_sizes.numel())
         keep = min(tiles, start + kept_tiles(sparsity, video))
         return (
             (tiles,) * start + (keep,) * video + (1,) * (tiles - start - video)
@@ -840,7 +840,7 @@ def segment_packing(
         audio_rows=audio_rows,
         video_indices=torch.from_numpy(video_indices),
         video_raster_indices=torch.from_numpy(raster),
-        video_valid_sizes=torch.from_numpy(sizes),
+        video_variable_block_sizes=torch.from_numpy(sizes),
         padded_tokens=math.ceil(end / token_multiple) * token_multiple,
     )
 
@@ -859,7 +859,7 @@ class SegmentTables:
             packed row takes: the text rows, then the conditions' rows in
             packed order, and the source's zero row for every generated row
             and every row outside the request.
-        valid_sizes: [tiles] int32 rows of each tile; zero for a
+        variable_block_sizes: [tiles] int32 rows of each tile; zero for a
             tile the request leaves empty.
         tile_segments: [tiles] int32 video segment of each tile, ``-1`` for a
             dense or empty tile (``uniserve.nn.attention.vsa.Segments``).
@@ -872,7 +872,7 @@ class SegmentTables:
     token_tags: torch.Tensor
     groups: torch.Tensor
     prefix_index: torch.Tensor
-    valid_sizes: torch.Tensor
+    variable_block_sizes: torch.Tensor
     tile_segments: torch.Tensor
     segment_starts: torch.Tensor
     segment_keep: torch.Tensor
@@ -940,7 +940,7 @@ def segment_tables(
     tags = torch.full((rows,), VIDEO_TAG, dtype=torch.int64)
     groups = torch.full((rows,), VIDEO_GROUP, dtype=torch.int64)
     prefix_index = torch.full((rows,), packing.zero_row, dtype=torch.int64)
-    valid_sizes = torch.zeros(tiles, dtype=torch.int32)
+    variable_block_sizes = torch.zeros(tiles, dtype=torch.int32)
     tile_segments = torch.full((tiles,), -1, dtype=torch.int32)
     segment_tile_counts: list[int] = []
 
@@ -950,7 +950,7 @@ def segment_tables(
         used = math.ceil(count / tile)
         sizes = torch.full((used,), tile, dtype=torch.int32)
         sizes[-1] = count - (used - 1) * tile
-        valid_sizes[first_tile : first_tile + used] = sizes
+        variable_block_sizes[first_tile : first_tile + used] = sizes
         return torch.arange(first_tile * tile, first_tile * tile + count)
 
     def video_segment(first_tile: int, grid: tuple[int, int, int]):
@@ -960,8 +960,8 @@ def segment_tables(
         offsets = np.arange(tile, dtype=np.int64)[None, :]
         starts = (first_tile + np.arange(sizes.size, dtype=np.int64)) * tile
         packed = (starts[:, None] + offsets)[offsets < sizes[:, None]]
-        valid_sizes[first_tile : first_tile + sizes.size] = torch.from_numpy(
-            sizes
+        variable_block_sizes[first_tile : first_tile + sizes.size] = (
+            torch.from_numpy(sizes)
         )
         tile_segments[first_tile : first_tile + sizes.size] = len(
             segment_tile_counts
@@ -1055,9 +1055,9 @@ def segment_tables(
     )
     tags[audio], groups[audio] = AUDIO_TAG, AUDIO_GROUP
     video_tile = packing.video_start // tile
-    video_tiles = packing.video_valid_sizes.numel()
-    valid_sizes[video_tile : video_tile + video_tiles] = (
-        packing.video_valid_sizes
+    video_tiles = packing.video_variable_block_sizes.numel()
+    variable_block_sizes[video_tile : video_tile + video_tiles] = (
+        packing.video_variable_block_sizes
     )
     tile_segments[video_tile : video_tile + video_tiles] = len(
         segment_tile_counts
@@ -1092,7 +1092,7 @@ def segment_tables(
         token_tags=tags,
         groups=groups,
         prefix_index=prefix_index,
-        valid_sizes=valid_sizes,
+        variable_block_sizes=variable_block_sizes,
         tile_segments=tile_segments,
         segment_starts=segment_starts,
         segment_keep=segment_keep,

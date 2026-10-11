@@ -67,7 +67,7 @@ def test_gated_tiles_round_as_the_eager_product_and_sum(scale):
     assert torch.equal(output, expected)
 
 
-def _segments(tile_segments, valid_sizes, keep):
+def _segments(tile_segments, variable_block_sizes, keep):
     """Segment tables over ``tile_segments`` (-1 dense or empty) on the host."""
     segments = torch.tensor(tile_segments, dtype=torch.int32)
     starts = torch.zeros_like(segments)
@@ -75,7 +75,7 @@ def _segments(tile_segments, valid_sizes, keep):
     for segment, count in enumerate(keep):
         starts[segment] = int((segments < segment).sum())
         keeps[segment] = count
-    valid = torch.tensor(valid_sizes, dtype=torch.int32)
+    valid = torch.tensor(variable_block_sizes, dtype=torch.int32)
     return Segments(
         TILE, segments.numel() * TILE, valid, segments, starts, keeps
     )
@@ -88,7 +88,7 @@ def _on_device(segments):
         *(
             table.cuda()
             for table in (
-                segments.valid_sizes,
+                segments.variable_block_sizes,
                 segments.tile_segments,
                 segments.segment_starts,
                 segments.segment_keep,

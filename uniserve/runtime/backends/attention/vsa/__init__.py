@@ -15,7 +15,7 @@ class Operator:
 
     Serialized call sites may share an operator; block IDs remain live inputs.
     A concrete operator supplies ``kernel``, the numerical call
-    ``kernel(q, k, v, out, block_indices, block_counts, valid_sizes,
+    ``kernel(q, k, v, out, q2k_index, q2k_num, variable_block_sizes,
     scale=...)`` that evaluates complete calls over the pattern's tiles
     (``Pattern.tile`` rows). K and V rows past a tile's valid size must be
     finite.
@@ -80,7 +80,7 @@ class Operator:
             or k.shape != v.shape
             or k.ndim != 3
             or k.shape[1:] != q.shape[1:]
-            or k.shape[0] != batch.valid_sizes.numel() * tile
+            or k.shape[0] != batch.variable_block_sizes.numel() * tile
             or out.shape != q.shape
             or out.dtype != q.dtype
             or any(value.dtype != self.dtype for value in (q, k, v))
@@ -90,13 +90,12 @@ class Operator:
                     k,
                     v,
                     out,
-                    batch.block_indices,
-                    batch.block_counts,
-                    batch.valid_sizes,
+                    batch.q2k_index,
+                    batch.q2k_num,
+                    batch.variable_block_sizes,
                 )
             )
-            or batch.block_indices.shape[:2]
-            != (self.num_heads, q.shape[0] // tile)
+            or batch.q2k_index.shape[:2] != (self.num_heads, q.shape[0] // tile)
         ):
             raise ValueError(
                 "VSA tensors disagree with the prepared numerical dimensions"
@@ -110,9 +109,9 @@ class Operator:
             k,
             v,
             out,
-            batch.block_indices,
-            batch.block_counts,
-            batch.valid_sizes,
+            batch.q2k_index,
+            batch.q2k_num,
+            batch.variable_block_sizes,
             scale=scale,
         )
         return out
