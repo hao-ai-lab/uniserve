@@ -549,12 +549,11 @@ impl WorkerGroup {
             normalized.endpoint = canonical.endpoint.clone();
             normalized.buffer_pool_bytes = canonical.buffer_pool_bytes;
             if let (Some(local), Some(reference)) = (&mut normalized.kv_cache, &canonical.kv_cache)
+                && local.groups.len() == reference.groups.len()
             {
-                if local.groups.len() == reference.groups.len() {
-                    for (group, canonical) in local.groups.iter_mut().zip(&reference.groups) {
-                        group.layer_ids.clone_from(&canonical.layer_ids);
-                        group.kv_head_offset = canonical.kv_head_offset;
-                    }
+                for (group, canonical) in local.groups.iter_mut().zip(&reference.groups) {
+                    group.layer_ids.clone_from(&canonical.layer_ids);
+                    group.kv_head_offset = canonical.kv_head_offset;
                 }
             }
             anyhow::ensure!(

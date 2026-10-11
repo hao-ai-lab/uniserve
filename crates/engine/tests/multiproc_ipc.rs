@@ -1427,55 +1427,52 @@ fn replacement_rejects_changed_capacity() -> anyhow::Result<()> {
     // relaunch every rank, and `validate_replacement_info`, called from the
     // group's recovery, refuses a replacement whose info differs in anything
     // but its endpoint; a failed replacement closes the group.
-    for change in [serde_json::json!({"max_batch_tokens": 128})] {
-        let directory = tempfile::tempdir()?;
-        let wrapper = directory.path().join("python");
-        let python = serde_json::to_string(&worker_python())?;
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let fixture =
-            serde_json::to_string(&root.join("tests/python/fixtures/replacement_worker.py"))?;
-        // The fixture is run by path, so its own directory leads the import
-        // path; the repository root named here resolves the worker packages
-        // from this checkout.
-        let import_root = serde_json::to_string(&root.canonicalize()?)?;
-        let state = serde_json::to_string(&directory.path())?;
-        // `WorkerGroup` runs `<python> -m uniserve_worker.main <args>`, so the
-        // wrapper drops its first two arguments and runs the fixture with the
-        // rest. The fixture serves a `Worker` whose `info` reads
-        // `replacement.json` from `directory`, where each rank also writes
-        // its pid.
-        std::fs::write(
-            &wrapper,
-            format!(
-                "#!/usr/bin/env python3\nimport os, sys\nenv = dict(os.environ, PYTHONPATH={import_root}, UNISERVE_TEST_REPLACEMENT_DIR={state})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
-            ),
-        )?;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-        let mut args = rank_group_args(1 << 20, 8 << 20);
-        args.python = wrapper;
-        let mut worker = WorkerGroup::spawn(args)?;
+    let change = serde_json::json!({"max_batch_tokens": 128});
+    let directory = tempfile::tempdir()?;
+    let wrapper = directory.path().join("python");
+    let python = serde_json::to_string(&worker_python())?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = serde_json::to_string(&root.join("tests/python/fixtures/replacement_worker.py"))?;
+    // The fixture is run by path, so its own directory leads the import
+    // path; the repository root named here resolves the worker packages
+    // from this checkout.
+    let import_root = serde_json::to_string(&root.canonicalize()?)?;
+    let state = serde_json::to_string(&directory.path())?;
+    // `WorkerGroup` runs `<python> -m uniserve_worker.main <args>`, so the
+    // wrapper drops its first two arguments and runs the fixture with the
+    // rest. The fixture serves a `Worker` whose `info` reads
+    // `replacement.json` from `directory`, where each rank also writes
+    // its pid.
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env python3\nimport os, sys\nenv = dict(os.environ, PYTHONPATH={import_root}, UNISERVE_TEST_REPLACEMENT_DIR={state})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    let mut args = rank_group_args(1 << 20, 8 << 20);
+    args.python = wrapper;
+    let mut worker = WorkerGroup::spawn(args)?;
 
-        std::fs::write(
-            directory.path().join("replacement.json"),
-            serde_json::to_vec(&change)?,
-        )?;
-        let pid =
-            std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
-        anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
+    std::fs::write(
+        directory.path().join("replacement.json"),
+        serde_json::to_vec(&change)?,
+    )?;
+    let pid = std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
+    anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
 
-        let failure = worker
-            .poll_batch(Duration::from_secs(30))
-            .expect_err("rank loss must report replacement rejection");
-        assert!(
-            format!("{failure:#}").contains("worker info changed"),
-            "unexpected failure for {change}: {failure:#}",
-        );
-        assert!(
-            !worker.is_ready(),
-            "incompatible replacement accepted: {change}"
-        );
-        worker.close()?;
-    }
+    let failure = worker
+        .poll_batch(Duration::from_secs(30))
+        .expect_err("rank loss must report replacement rejection");
+    assert!(
+        format!("{failure:#}").contains("worker info changed"),
+        "unexpected failure for {change}: {failure:#}",
+    );
+    assert!(
+        !worker.is_ready(),
+        "incompatible replacement accepted: {change}"
+    );
+    worker.close()?;
     Ok(())
 }
 
