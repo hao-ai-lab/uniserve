@@ -267,7 +267,7 @@ def execute(
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
     transports: Mapping[str, Transport],
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> PendingOutput:
     """Schedule one host media call on the rank's lane.
 
@@ -300,12 +300,12 @@ def execute(
     tasks: tuple[HostTask, ...] = ()
     finish: Callable[[tuple[object, ...]], None] | None = None
     if call.kind is MediaCall.VIDEO_ENCODING:
-        binding = model_runner.bindings[call.component]
+        binding = model_executor.bindings[call.component]
         positions = encoded_unit_positions(
             call,
             state=state,
             component=binding.config,
-            rank=model_runner.worker_config.rank,
+            rank=model_executor.worker_config.rank,
         )
         if len(positions) != len(reservations):
             raise invalid_descriptor(
@@ -315,7 +315,7 @@ def execute(
         from uniserve_worker.execution.media import decode_range
 
         cursor = int(decode_range(call, state=state).cursor)
-        config = mux_config(model_runner, media)
+        config = mux_config(model_executor, media)
         publication = _input_publication(call, state)
         # Batch preparation borrows the round only when it is published over
         # shared storage on this node; otherwise the tensor store holds it.
@@ -326,7 +326,7 @@ def execute(
             imported_read = tensor_store.consume(
                 call.inputs[0],
                 consumer_call_id=call.call_id,
-                device=model_runner.call_devices(call)[0],
+                device=model_executor.call_devices(call)[0],
             )
             request.device_reads.append(imported_read)
             if imported_read.region is not None or imported_read.tensor is None:
@@ -334,7 +334,7 @@ def execute(
                     "video encoding requires the complete decoded unit round"
                 )
             imported_units = imported_read.tensor
-        encoder = MediaEncoder(rank=model_runner.worker_config.rank)
+        encoder = MediaEncoder(rank=model_executor.worker_config.rank)
         scheduled: list[HostTask] = []
         borrows: list[HostBorrow] = []
         try:
@@ -438,7 +438,7 @@ def execute(
     elif call.kind is MediaCall.AUDIO_ENCODING:
         if media_mux is None:
             raise unsupported_setup("audio encoding has no muxer resources")
-        config = mux_config(model_runner, media)
+        config = mux_config(model_executor, media)
         media_mux.open(call.request_key, config=config)
         if len(call.inputs) != 1:
             raise invalid_descriptor("audio encoding requires one PCM input")
@@ -448,7 +448,7 @@ def execute(
         read = tensor_store.consume(
             call.inputs[0],
             consumer_call_id=call.call_id,
-            device=model_runner.call_devices(call)[0],
+            device=model_executor.call_devices(call)[0],
         )
         request.device_reads.append(read)
         if read.region is not None or read.tensor is None:
@@ -465,7 +465,9 @@ def execute(
     elif call.kind is MediaCall.MUXING:
         if media_mux is None:
             raise unsupported_setup("artifact assembly has no muxer resources")
-        media_mux.open(call.request_key, config=mux_config(model_runner, media))
+        media_mux.open(
+            call.request_key, config=mux_config(model_executor, media)
+        )
         # A muxing call carries the encode rounds completed since the last
         # one, one product per round in media unit order, and the muxer
         # appends them to the request's container. The final call carries
@@ -489,7 +491,7 @@ def execute(
             read = tensor_store.consume(
                 product,
                 consumer_call_id=call.call_id,
-                device=model_runner.call_devices(call)[0],
+                device=model_executor.call_devices(call)[0],
             )
             request.device_reads.append(read)
             if read.region is not None or read.tensor is None:

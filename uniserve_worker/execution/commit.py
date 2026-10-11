@@ -61,7 +61,7 @@ def commit_batch(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     latent_pool: LatentPool | None,
     request_pool: RequestPool,
     decode_state: DecodeState | None,
@@ -121,7 +121,7 @@ def commit_batch(
                         "KV publication differs from its declared output"
                     )
 
-            reports_output = config.rank == model_runner.output_rank(
+            reports_output = config.rank == model_executor.output_rank(
                 call.component
             )
             report_products.extend(outcome.products)

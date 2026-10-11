@@ -133,7 +133,7 @@ def prepare_latent(
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     config: WorkerConfig,
 ) -> PendingOutput:
     """Seed a diffusion request's trajectory and stage its first latent.
@@ -154,7 +154,7 @@ def prepare_latent(
             coordinates, output generation or staged latent do not match the
             call, or the request's trajectory has already started.
     """
-    require_inputs(model_runner)
+    require_inputs(model_executor)
     request_id = call.request_key.request_id
 
     # Media preparation joins one visible conditioning publication to one new
@@ -213,7 +213,7 @@ def prepare_latent(
     staging.value.zero_()
     initial = staging.value[: int(params.latent_units)]
     trajectory = image_state(
-        require_inputs(model_runner),
+        require_inputs(model_executor),
         media_image.Config(int(params.height), int(params.width)),
         image,
     )
@@ -225,7 +225,7 @@ def prepare_latent(
         int(params.width),
         initial,
         seed=image.seed or 0,
-        model_runner=model_runner,
+        model_executor=model_executor,
     )
     pool.initialize(
         row.request.request_pool_idx,
@@ -246,7 +246,7 @@ def prepare_latent(
         output,
         row,
         step_index=0,
-        model_runner=model_runner,
+        model_executor=model_executor,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
         config=config,
@@ -267,7 +267,7 @@ def initialize(
     kv_cache: KVCacheManager | None,
     latent_pool: LatentPool,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> DiffusionState:
     """Open a denoising call's trajectory from its exact input generation.
 
@@ -278,7 +278,7 @@ def initialize(
     from this call's descriptors and ``entries`` is cleared for
     ``prepare_step`` to fill again.
     """
-    require_inputs(model_runner)
+    require_inputs(model_executor)
     request_id = call.request_key.request_id
     conditioning = call.kv_input
     latent_input = call.latent_input
@@ -340,7 +340,7 @@ def initialize(
     size = media_image.Config(int(params.height), int(params.width))
     trajectory = row.request.diffusion
     if not isinstance(trajectory, DiffusionState) or trajectory.size != size:
-        trajectory = image_state(require_inputs(model_runner), size, image)
+        trajectory = image_state(require_inputs(model_executor), size, image)
         row.request.diffusion = trajectory
 
     # Prefix initialization follows this submission's descriptors, including
@@ -358,7 +358,7 @@ def prepare_step(
     *,
     state: BatchState,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     latent_pool: LatentPool,
     tokenizer: PreTrainedTokenizerBase | None,
 ) -> tuple[
@@ -390,7 +390,7 @@ def prepare_step(
     if image is None:
         raise invalid_descriptor("flow step requires admitted image parameters")
 
-    builder = require_inputs(model_runner)
+    builder = require_inputs(model_executor)
     row = state.pending_output(call.request_key.request_id)
     params = row.latent.input_params
     staging = row.latent.staging
@@ -429,7 +429,7 @@ def prepare_step(
         source = builder.branch_source(branch)
         if source not in kv.prefixes:
             kv.prefixes[source] = resolve_prefix(
-                model_runner.flow_prompt,
+                model_executor.flow_prompt,
                 source,
                 negative_prompt=image.negative_prompt,
                 negative_token_ids=request.request.negative_token_ids,
@@ -511,7 +511,7 @@ def finish(
     trajectory: DiffusionState,
     *,
     state: BatchState,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
@@ -567,7 +567,7 @@ def finish(
         latent_output,
         row,
         step_index=final_step,
-        model_runner=model_runner,
+        model_executor=model_executor,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
         config=config,
@@ -605,7 +605,7 @@ def publish_latent_transfer(
     *,
     state: BatchState,
     step_index: int,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
     config: WorkerConfig,
@@ -623,7 +623,7 @@ def publish_latent_transfer(
 
     transports = publication_transports
     if not any(name != "local" for name in transports) or (
-        config.rank != model_runner.output_rank(call.component)
+        config.rank != model_executor.output_rank(call.component)
     ):
         return ()
 
@@ -656,7 +656,7 @@ def initial_latent(
     target: torch.Tensor,
     *,
     seed: int,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Draw a request's seeded initial latent into ``target``.
 
@@ -664,7 +664,7 @@ def initial_latent(
     ``prepare_latent`` checks that the call names its image index.
     """
     assert call.image_index is not None
-    require_inputs(model_runner).initialize(
+    require_inputs(model_executor).initialize(
         media_image.Config(height, width),
         seed=flow_noise_seed(seed, int(call.image_index)),
         out=target,

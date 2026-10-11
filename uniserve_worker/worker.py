@@ -1,7 +1,7 @@
 """Resource scope and public entry point for one model-backed worker.
 
 `Worker` owns the execution resources of one worker rank, including the
-model runner (`ModelExecutor`), the paged KV cache and block tables of a
+model executor (`ModelExecutor`), the paged KV cache and block tables of a
 worker with a ``CausalLM``, the latent pool of a denoising worker, the
 request slots (`RequestPool`), the product, buffer and output stores, the
 transports, the host lane, the muxer rank's `MediaMux`, and the process

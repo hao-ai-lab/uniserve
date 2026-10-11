@@ -95,7 +95,7 @@ def prepare_forward(
     state: BatchState,
     tensor_store: TensorStore,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     decode_state: DecodeState | None,
 ) -> TokenRow | DiffusionRow:
     """Pack one prefill, decode or verify call into a model-forward row.
@@ -127,7 +127,7 @@ def prepare_forward(
             request,
             tensor_store=tensor_store,
             request_tables=request_tables,
-            model_runner=model_runner,
+            model_executor=model_executor,
             state=state,
         )
 
@@ -483,7 +483,7 @@ def _prepare_visual(
     state: BatchState,
     tensor_store: TensorStore,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> TokenRow | DiffusionRow:
     """Build a visual-state row from a prefill's image features.
 
@@ -507,7 +507,7 @@ def _prepare_visual(
     read = tensor_store.consume(
         reference,
         consumer_call_id=call.call_id,
-        device=model_runner.call_devices(call)[0],
+        device=model_executor.call_devices(call)[0],
     )
     request.feature_reads.append(read)
     metadata = read.metadata
@@ -530,7 +530,7 @@ def _prepare_visual(
             close_image=True,
             logits=sample_token,
             request_tables=request_tables,
-            model_runner=model_runner,
+            model_executor=model_executor,
             state=state,
         )
     else:
@@ -541,7 +541,7 @@ def _prepare_visual(
             metadata.width,
             position,
             request_tables=request_tables,
-            model_runner=model_runner,
+            model_executor=model_executor,
             state=state,
         )
 
@@ -653,7 +653,7 @@ def prepare_context(
     state: BatchState,
     tensor_store: TensorStore,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> tuple[TokenRow, ...]:
     """Pack a context prefill into one row per segment, in context order.
 
@@ -708,7 +708,7 @@ def prepare_context(
         request, tables=request_tables
     )
     position = int(calls.require_progress(request).logical_position)
-    device = model_runner.call_devices(call)[0]
+    device = model_executor.call_devices(call)[0]
     rows: list[TokenRow] = []
     for index, segment in enumerate(segments):
         last = index == len(segments) - 1
@@ -733,7 +733,7 @@ def prepare_context(
                 logits=scores_prompt
                 or (last and call.token_output is not None),
                 request_tables=request_tables,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
         else:

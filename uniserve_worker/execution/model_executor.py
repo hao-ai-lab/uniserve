@@ -442,7 +442,7 @@ class ModelExecutor:
         executor is closed and ``InputError`` unless exactly one call matches.
         """
         if self._closed:
-            raise RuntimeError("model runner is closed")
+            raise RuntimeError("model executor is closed")
         entries = [
             (binding, call)
             for (entry, entry_path, entry_method), (
@@ -2454,10 +2454,10 @@ class ModelExecutor:
         ``_execution_failure`` classifies when execution or validation fails.
         """
         if self._closed:
-            raise RuntimeError("model runner is closed")
+            raise RuntimeError("model executor is closed")
         tasks = rows
         if not tasks:
-            raise ValueError("model runner received an empty call")
+            raise ValueError("model executor received an empty call")
 
         # Only token forward modes and denoising are eligible for CUDA graphs;
         # other staged kinds run eagerly.
@@ -2486,7 +2486,7 @@ class ModelExecutor:
         entry = self._forward_calls.get((calls[0].component, forward_mode))
         if entry is None:
             raise InputError(
-                f"model runner has no {calls[0].kind.value!r} binding "
+                f"model executor has no {calls[0].kind.value!r} binding "
                 f"for {calls[0].component!r}",
                 phase="input_staging",
                 route=forward_mode.value,

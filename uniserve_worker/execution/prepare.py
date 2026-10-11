@@ -300,7 +300,7 @@ def prepare_inputs(
     output_pool: OutputPool,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> None:
@@ -380,7 +380,7 @@ def prepare_inputs(
             # One transferred product must land on exactly one consumer device:
             # the compute device (`call_devices(...)[0]`) of its consumers.
             devices = {
-                model_runner.call_devices(call)[0]
+                model_executor.call_devices(call)[0]
                 for call in batch.calls
                 if entry.product in call.tensor_inputs()
                 or entry.product == call.predicate
@@ -723,7 +723,7 @@ def prepare_inputs(
             state,
             tensor_store=tensor_store,
             output_pool=output_pool,
-            model_runner=model_runner,
+            model_executor=model_executor,
         )
     except BaseException as error:
         if resumable and isinstance(error, ReadBackpressureError):
@@ -746,7 +746,7 @@ def _prepare_predicates(
     *,
     tensor_store: TensorStore,
     output_pool: OutputPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Capture completion-valued (U8) predicates into one completion buffer.
 
@@ -774,7 +774,9 @@ def _prepare_predicates(
     buffer = output_pool.acquire(
         len(scheduled),
         token_capacity=len(scheduled),
-        devices=tuple(model_runner.call_devices(call)[0] for call in scheduled),
+        devices=tuple(
+            model_executor.call_devices(call)[0] for call in scheduled
+        ),
     )
     captures: list[tuple[CallIdentity, tuple[int, int], int]] = []
     pending: list[tuple[CallIdentity, BufferId, int]] = []
@@ -789,7 +791,7 @@ def _prepare_predicates(
         for call in scheduled:
             source = cast(TensorRef, call.predicate).buffer_id
             if source not in state.tensor_reads:
-                grouped[model_runner.call_devices(call)[0]].append(call)
+                grouped[model_executor.call_devices(call)[0]].append(call)
             else:
                 pending.append(
                     (
@@ -882,7 +884,7 @@ def reserve_outputs(
     output_pool: OutputPool,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> None:
@@ -923,7 +925,7 @@ def reserve_outputs(
     )
 
     if active_calls:
-        stream = model_runner.call_stream(active_calls[0])
+        stream = model_executor.call_stream(active_calls[0])
         if stream is not None:
             # A standalone capability's batch runs on the stream
             # `ModelExecutor.call_stream` selects for its first active call.
@@ -969,7 +971,7 @@ def reserve_outputs(
                     dict.fromkeys(
                         device
                         for call in scheduled
-                        for device in model_runner.call_devices(call)
+                        for device in model_executor.call_devices(call)
                     )
                 ),
             )
@@ -991,7 +993,7 @@ def reserve_outputs(
             _reserve_host_tasks(
                 active_calls,
                 host_tasks=host_tasks,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 config=config,
                 state=state,
             )
@@ -1019,13 +1021,13 @@ def reserve_outputs(
                 _bind_latent_inputs(
                     active_calls,
                     latent_pool=latent_pool,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             _reserve_outputs(
                 scheduled,
                 tensor_store=tensor_store,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
 
@@ -1051,13 +1053,13 @@ def reserve_outputs(
                 kv_cache=kv_cache,
                 tensor_store=tensor_store,
                 latent_pool=latent_pool,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
             _consume_predicates(
                 active_calls,
                 tensor_store=tensor_store,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
             _publish_predicated_outputs(
@@ -1100,7 +1102,7 @@ def _reserve_host_tasks(
     *,
     state: BatchState,
     host_tasks: HostLane,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     config: WorkerConfig,
 ) -> None:
     """Reserve bounded host-lane slots for the calls that run host work.
@@ -1125,14 +1127,14 @@ def _reserve_host_tasks(
         }:
             continue
 
-        binding = model_runner.bindings.get(call.component)
+        binding = model_executor.bindings.get(call.component)
         distributed = (
             binding is not None and binding.config.distribution is not None
         )
         if (
             call.kind is not MediaCall.IMAGE_DECODING
             and not distributed
-            and config.rank != model_runner.output_rank(call.component)
+            and config.rank != model_executor.output_rank(call.component)
         ):
             continue
 
@@ -1166,7 +1168,7 @@ def _reserve_host_tasks(
 def validate_batch(
     batch: Batch,
     *,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     config: WorkerConfig,
     predecessors: Mapping[CallId, CallId | None],
 ) -> None:
@@ -1182,9 +1184,9 @@ def validate_batch(
     `BlockTables.install` and `Worker.supports_call`).
     Violations raise `invalid_descriptor` errors.
     """
-    if model_runner.bindings:
+    if model_executor.bindings:
         for call in batch.calls:
-            binding = model_runner.bindings.get(call.component)
+            binding = model_executor.bindings.get(call.component)
             if binding is None or config.rank not in binding.config.ranks:
                 raise invalid_descriptor(
                     f"call targets component {call.component!r} outside "
@@ -1207,7 +1209,7 @@ def validate_batch(
     # Latent preparation opens a request's trajectory, so it must be the first
     # state-advancing call of its request: the call it follows is the
     # admission root, not an earlier step.
-    if model_runner.video_postprocessor is not None:
+    if model_executor.video_postprocessor is not None:
         for call in batch.calls:
             if call.kind is MediaCall.LATENT_PREPARATION and predecessors.get(
                 call.call_id
@@ -1222,7 +1224,7 @@ def _reserve_outputs(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Bind each declared device value to its concrete bounded owner.
 
@@ -1249,7 +1251,7 @@ def _reserve_outputs(
 
     for call in scheduled:
         # Outputs are bound on the call's output device.
-        device = model_runner.call_devices(call)[2]
+        device = model_executor.call_devices(call)[2]
         request = state.pending_output(call.request_key.request_id)
         predicated = request.status is CallStatus.PREDICATED
 
@@ -1271,7 +1273,7 @@ def _reserve_outputs(
                     # mathematics.
                     persistent_bindings.append((output, device))
                     continue
-                layout = model_runner.output_layout(
+                layout = model_executor.output_layout(
                     call.component,
                     output.output_index,
                     request.request.admission.diffusion,
@@ -1381,7 +1383,7 @@ def _consume_predicates(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Hand each active call its predicate tensor and register the reader.
 
@@ -1403,7 +1405,7 @@ def _consume_predicates(
         predicate = call.predicate
         if predicate is None:
             continue
-        device = model_runner.call_devices(call)[0]
+        device = model_executor.call_devices(call)[0]
         grouped.setdefault(device, []).append(
             (
                 call,
@@ -1454,7 +1456,7 @@ def _bind_latent_inputs(
     *,
     state: BatchState,
     latent_pool: LatentPool | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Validate trajectory parameters and bind rank-local latent staging.
 
@@ -1482,12 +1484,12 @@ def _bind_latent_inputs(
 
     if pool is None:
         raise invalid_descriptor("latent params require a resident latent pool")
-    if model_runner.image_builder is None:
+    if model_executor.image_builder is None:
         raise invalid_descriptor("latent params have no image denoiser")
 
     # Image trajectories bind validated image dimensions and page ownership
     # and borrow the pool's step staging.
-    flow = model_runner.image_builder
+    flow = model_executor.image_builder
     rows: list[tuple[CallIdentity, LatentParams, int]] = []
     for params in parameters:
         identity = (params.request_key, params.call_id)
@@ -1674,7 +1676,7 @@ def _stage_input_products(
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Publish query-ready transferred values into their owning stores.
 
@@ -1781,7 +1783,7 @@ def _stage_input_products(
                 "transferred product has no batch consumer"
             )
 
-        devices = {model_runner.call_devices(call)[0] for call in consumers}
+        devices = {model_executor.call_devices(call)[0] for call in consumers}
         if len(devices) != 1:
             raise invalid_descriptor(
                 "transferred product spans multiple consumer devices"

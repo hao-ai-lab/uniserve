@@ -424,17 +424,17 @@ def test_conditioned_request_computes_the_model_first_step(workers, root, case):
         TensorBuffers.allocate(requirements, device="cpu") as host,
         TensorBuffers.allocate(requirements, device=DEVICE) as backing,
     ):
-        model_runner = DenoisingRunner(denoiser, context=context)
-        model_runner.warmup(model_layout)
+        model_executor = DenoisingRunner(denoiser, context=context)
+        model_executor.warmup(model_layout)
         request, staged = backing.view(requirements), host.view(requirements)
-        model_runner.prepare_latents(
+        model_executor.prepare_latents(
             (model_layout,),
             noise=noise,
             state={
                 name: staged[name].unsqueeze(0) for name in denoiser.modalities
             },
         )
-        model_runner.prepare_state(
+        model_executor.prepare_state(
             (model_size,),
             layouts=(model_layout,),
             out={
@@ -464,7 +464,7 @@ def test_conditioned_request_computes_the_model_first_step(workers, root, case):
             model_schedules["video"].step(0),
             (conditioning,),
         )
-        model_runner.step(inputs, model_schedules, state=request)
+        model_executor.step(inputs, model_schedules, state=request)
         for name in denoiser.modalities:
             assert _equal(successor[name], request[name]), name
 

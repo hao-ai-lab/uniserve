@@ -678,7 +678,7 @@ def sample_update(
 
 
 def trajectory_params(
-    call: Call, request: PendingOutput, *, model_runner: ModelExecutor
+    call: Call, request: PendingOutput, *, model_executor: ModelExecutor
 ) -> LatentParams:
     """Return the pool parameters of a video request's trajectory.
 
@@ -686,7 +686,7 @@ def trajectory_params(
     consecutive pages, which its sample layout sizes, so the worker names the
     pages of the request's slot itself; the raster is the admitted canvas.
     """
-    builder = model_runner.media_builder
+    builder = model_executor.media_builder
     media = request.request.admission.diffusion
     if builder is None or media is None:
         raise invalid_descriptor("video call has no admitted media dimensions")
@@ -805,7 +805,7 @@ def execute(
     tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> PendingOutput:
     """Land one ready video call without constructing a model input row.
 
@@ -823,33 +823,33 @@ def execute(
     the call's storage or capability or a module returns no statistics;
     errors of the executor, tensor store and latent pool calls propagate.
     """
-    if model_runner.video_postprocessor is None:
+    if model_executor.video_postprocessor is None:
         raise invalid_descriptor("video execution requires a video model")
     request = state.pending_output(call.request_key.request_id)
     media = request.request.admission.diffusion
     if media is None:
         raise invalid_descriptor("video call has no admitted media dimensions")
-    numerical_shape = video_shape(model_runner, request.request.admission)
+    numerical_shape = video_shape(model_executor, request.request.admission)
 
-    trajectory = video_state(model_runner, request.request)
+    trajectory = video_state(model_executor, request.request)
 
     slot, context = prepare_call(
-        model_runner,
+        model_executor,
         trajectory,
         call,
         request_pool.storage.tensors(request.request.request_pool_idx)
-        if model_runner.state_buffers
+        if model_executor.state_buffers
         else None,
     )
 
     from uniserve_worker.execution import transfer
 
-    builder = model_runner.media_builder
-    pool = model_runner.latent_pool
+    builder = model_executor.media_builder
+    pool = model_executor.latent_pool
     slot_index = request.request.request_pool_idx
     products: tuple[TensorPublication, ...] = ()
     if call.kind is MediaCall.LATENT_PREPARATION:
-        params = trajectory_params(call, request, model_runner=model_runner)
+        params = trajectory_params(call, request, model_executor=model_executor)
         assert pool is not None
         # The text features, then a conditioned request's condition latents:
         # every visual round's rows, then every audio track's
@@ -859,7 +859,7 @@ def execute(
             read = tensor_store.consume(
                 product,
                 consumer_call_id=call.call_id,
-                device=model_runner.call_devices(call)[0],
+                device=model_executor.call_devices(call)[0],
             )
             request.device_reads.append(read)
             if read.region is not None:
@@ -899,13 +899,13 @@ def execute(
             constants=context.constants,
             workspace=context.workspace,
         )
-        with model_runner.preparing_inputs(initial):
-            if "conditioning" in model_runner.encoder_kinds:
+        with model_executor.preparing_inputs(initial):
+            if "conditioning" in model_executor.encoder_kinds:
                 if encoded is None:
                     raise invalid_descriptor(
                         "conditioning module has no input Tensor"
                     )
-                result = model_runner.encode_conditioning(encoded)
+                result = model_executor.encode_conditioning(encoded)
                 if result.stats is None:
                     raise RuntimeError(
                         "module output has no execution statistics"
@@ -942,7 +942,7 @@ def execute(
         )
 
     elif call.kind is MediaCall.DENOISING:
-        params = trajectory_params(call, request, model_runner=model_runner)
+        params = trajectory_params(call, request, model_executor=model_executor)
 
         # Each call advances the slot's committed trajectory by one step.
         # ``step_banks`` checks the trajectory's generation and the call's
@@ -965,7 +965,7 @@ def execute(
         # replayed by every later step.
         slot_state = bound_slot(trajectory)
         layout = builder.layout(numerical_shape)
-        diffusion = model_runner.diffusion
+        diffusion = model_executor.diffusion
         if slot_state.steps is None or not diffusion.binds(slot_state.steps):
             samples = builder.sample_views(numerical_shape, diffusion.samples)
             slot_state.steps = diffusion.bind(
@@ -985,7 +985,7 @@ def execute(
                 slot=slot_index,
                 pages=params.page_table,
             )
-        result = model_runner.run_denoising(
+        result = model_executor.run_denoising(
             slot_state.steps, start_step, source
         )
         if result.stats is None:
@@ -1023,7 +1023,7 @@ def execute(
         read = tensor_store.consume(
             inputs[0],
             consumer_call_id=call.call_id,
-            device=model_runner.call_devices(call)[0],
+            device=model_executor.call_devices(call)[0],
         )
         request.device_reads.append(read)
         if read.region is not None or read.tensor is None:
@@ -1041,16 +1041,16 @@ def execute(
         # contiguous run of the declared range's media units, on either
         # track (``ComponentBinding.media_units``).
         if track is MediaTrack.VIDEO:
-            clips = model_runner.video_decoder.clips(media.num_frames)
+            clips = model_executor.video_decoder.clips(media.num_frames)
             # A video decoder places one native clip per rank
             # (``validate_components``), so its run is a single unit.
             unit = assigned_units(
-                model_runner, call.component, cursor, count, len(clips)
+                model_executor, call.component, cursor, count, len(clips)
             ).start
             clip = clips[unit]
             output = video.Config(media.num_frames, media.canvas)
             decoded = decode_video_clip(
-                model_runner, call.component, read.tensor, clip, output
+                model_executor, call.component, read.tensor, clip, output
             )
             if decoded.stats is None:
                 raise RuntimeError("module output has no execution statistics")
@@ -1063,9 +1063,9 @@ def execute(
             # The decoded clip becomes an RGB media unit on this rank,
             # cross-faded with the neighbouring unit's tail, and that unit
             # is the product a host rank encodes.
-            decoder = model_runner.video_decoder
+            decoder = model_executor.video_decoder
             unit_outputs = (decoder.place(decoded.values[0], clip, output),)
-            processed = model_runner.run_module(
+            processed = model_executor.run_module(
                 call.component,
                 unit_outputs,
                 method="forward",
@@ -1094,10 +1094,10 @@ def execute(
             values: tuple[torch.Tensor, ...] = (value,)
         else:
             result = decode_audio(
-                model_runner,
+                model_executor,
                 call.component,
                 read.tensor,
-                audio_samples(model_runner, media.num_frames),
+                audio_samples(model_executor, media.num_frames),
                 cursor=cursor,
                 count=count,
             )

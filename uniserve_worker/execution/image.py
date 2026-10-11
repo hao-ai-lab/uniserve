@@ -87,7 +87,7 @@ def text(
     state: BatchState,
     tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> PendingOutput:
     """Encode admitted conditioning tokens and publish their declared tensors.
 
@@ -109,13 +109,13 @@ def text(
             "text encoder outputs must declare conditioning tensors"
         )
 
-    result = model_runner.encode_text(
+    result = model_executor.encode_text(
         admission.prompt_token_ids,
         **vision_inputs(
             call,
             state=state,
             tensor_store=tensor_store,
-            model_runner=model_runner,
+            model_executor=model_executor,
         ),
     )
     if len(result.values) != len(call.outputs):
@@ -151,7 +151,7 @@ def reserve_images(
     *,
     host_tasks: HostLane,
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Start preparing the batch's inline input images on the rank's host lane.
 
@@ -183,10 +183,10 @@ def reserve_images(
     if not calls:
         return
 
-    processor = model_runner.image_processor()
+    processor = model_executor.image_processor()
     for call, encoded in calls:
         admission = request_pool.get(call.request_key.request_id).admission
-        device = model_runner.call_devices(call)[1]
+        device = model_executor.call_devices(call)[1]
         task = host_tasks.reserve()
         state.image_tasks[call.call_id] = task
         task.configure(
@@ -208,7 +208,7 @@ def prepare_features(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> PreparedImage:
     """Stage the source image of one vision or latent encoder call.
 
@@ -222,7 +222,7 @@ def prepare_features(
         WorkerError: The preparation's own error, such as an undecodable
             payload, which fails the batch.
     """
-    image_processor = model_runner.image_processor()
+    image_processor = model_executor.image_processor()
     mode = call.kind
     if not isinstance(mode, MediaCall) or mode not in {
         MediaCall.VISION_ENCODING,
@@ -242,10 +242,10 @@ def prepare_features(
     source = encode_source(
         call,
         tensor_store=tensor_store,
-        model_runner=model_runner,
+        model_executor=model_executor,
         state=state,
     )
-    target_device = model_runner.call_devices(call)[1]
+    target_device = model_executor.call_devices(call)[1]
     if isinstance(source, tuple):
         # A resident image records its numerical range: a (-1, 1) image is
         # mapped to [0, 1] before the processor's transforms, and any other
@@ -285,7 +285,7 @@ def publish_features(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     publication_transports: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> PendingOutput:
@@ -310,7 +310,7 @@ def publish_features(
     products: tuple[TensorPublication, ...] = ()
     if any(
         name != "local" for name in publication_transports
-    ) and config.rank == model_runner.output_rank(call.component):
+    ) and config.rank == model_executor.output_rank(call.component):
         locations = publish_tensor(
             publication_transports,
             resident,
@@ -343,7 +343,7 @@ def materialization_latent(
     *,
     state: BatchState,
     latent_pool: LatentPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> torch.Tensor:
     """Gather a completed latent trajectory for the image decoder.
 
@@ -512,7 +512,7 @@ def encode_source(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> str | tuple[torch.Tensor, ImageMetadata]:
     """Resolve the source image of an encoder call.
 
@@ -533,7 +533,7 @@ def encode_source(
         read = tensor_store.consume(
             reference,
             consumer_call_id=call.call_id,
-            device=model_runner.call_devices(call)[0],
+            device=model_executor.call_devices(call)[0],
         )
         request = state.pending_output(call.request_key.request_id)
         request.device_reads.append(read)
@@ -577,7 +577,7 @@ def vision_state_row(
     close_image: bool,
     logits: bool,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> TokenRow:
     """Build the prefill row that writes one image's vision features into KV.
 
@@ -601,7 +601,7 @@ def vision_state_row(
         raise invalid_descriptor(
             "vision row prefix lies outside the request's KV extent"
         )
-    injection = model_runner.image_processor().feature_injection
+    injection = model_executor.image_processor().feature_injection
     if injection is None:
         raise invalid_descriptor(
             "vision state stage requires declared feature injection"
@@ -651,7 +651,7 @@ def vision_state_row(
         input_images=None
         if close_image
         else _input_images(request.request.admission.input_images),
-        model_runner=model_runner,
+        model_executor=model_executor,
     )
     return TokenRow(
         forward_mode=ForwardMode.PREFILL,
@@ -692,7 +692,7 @@ def _vision_positions(
     trailing: bool,
     close_image: bool,
     input_images: int | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> torch.Tensor:
     """Build position ids for a vision row's marker and feature slots.
 
@@ -714,7 +714,7 @@ def _vision_positions(
         start = int(conditioning_position)
         return torch.arange(start, start + query, dtype=torch.long)
 
-    transform = model_runner.image_processor().vit
+    transform = model_executor.image_processor().vit
     if not isinstance(transform, PatchTransform):
         raise invalid_descriptor(
             "temporal-spatial feature injection requires a patch image "
@@ -766,7 +766,7 @@ def latent_state_row(
     *,
     state: BatchState,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> DiffusionRow:
     """Build the denoiser row that writes an image latent into KV.
 
@@ -775,7 +775,7 @@ def latent_state_row(
     requires an image builder with two framing tokens and a latent whose
     token count matches the declared image size.
     """
-    builder = model_runner.image_builder
+    builder = model_executor.image_builder
     if builder is None or builder.framing != 2:
         raise invalid_descriptor(
             "latent feature publication requires framed image conditioning"
@@ -821,7 +821,7 @@ def diffusion_finalize_frames(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> PendingOutput:
     """Schedule PNG encoding of a finalized resident image product.
 
@@ -831,7 +831,7 @@ def diffusion_finalize_frames(
     image, metadata = transfer.fetch_product(
         call,
         tensor_store=tensor_store,
-        model_runner=model_runner,
+        model_executor=model_executor,
         state=state,
     )
     if (
