@@ -153,8 +153,9 @@ impl ModelConfig {
         // root index rather than a root `config.json`, so the index selects the
         // profile and locates the tokenizer component before any other asset
         // is resolved. A component folder the checkpoint omits is read from
-        // the base revision it pins, as its workers read it.
-        let mut indexed_description = None;
+        // the base revision it pins, as its workers read it. A family that a
+        // root `config.json` describes is selected by that file alone, even
+        // when the checkpoint publishes an index beside it.
         if let Some(pipeline) = PipelineCheckpoint::resolve(&config.model).await? {
             let description = ModelDescription::from_pipeline_class(pipeline.class_name())
                 .ok_or_else(|| crate::profile::assets::Error::UnsupportedPipeline {
@@ -178,9 +179,6 @@ impl ModelConfig {
                     renderer: LoadedRenderer::Video(vision),
                 });
             }
-            // Root-configured families can publish an index too. Both
-            // descriptors must identify the same numerical architecture.
-            indexed_description = Some(description);
         }
 
         let files = ResolvedModelFiles::new(&config.model).await?;
@@ -193,16 +191,6 @@ impl ModelConfig {
             tokenizer.as_ref(),
         )
         .await?;
-        if let Some(indexed) = indexed_description
-            && indexed != model.description()
-        {
-            return Err(crate::profile::assets::Error::invalid(format!(
-                "the checkpoint index names `{}` but config.json describes `{}`",
-                indexed.id(),
-                model.description().id()
-            ))
-            .into());
-        }
         // DiffusionGemma's template renders each image part itself, as one
         // image token that preprocessing expands; the omni models replace
         // image parts before rendering.
@@ -882,11 +870,11 @@ mod tests {
     use crate::serving::{InputProcessor, RequestRenderer, ServeRequestId, WorkerCapabilities};
 
     /// Writes a checkpoint laid out as DiffusionGemma publishes it: a root
-    /// transformers `config.json` whose `model_type` is `root_model_type`,
-    /// beside a `DiffusionGemmaPipeline` diffusers index. The tokenizer maps
+    /// transformers `config.json` beside a `DiffusionGemmaPipeline` diffusers
+    /// index. The tokenizer maps
     /// each ASCII character to one token and adds the Gemma control tokens,
     /// including the thought-channel delimiters its reasoning parser reads.
-    fn indexed_checkpoint(root_model_type: &str) -> TempDir {
+    fn indexed_checkpoint() -> TempDir {
         let directory = tempfile::tempdir().unwrap();
         let mut vocab = Vocab::from_iter([("<unk>".to_owned(), 0_u32)]);
         for code in 1_u32..=127 {
@@ -930,7 +918,7 @@ mod tests {
             "config.json",
             json!({
                 "architectures": ["DiffusionGemmaForBlockDiffusion"],
-                "model_type": root_model_type,
+                "model_type": "diffusion_gemma",
                 "canvas_length": 256,
                 "image_token_id": id("<|image|>"),
                 "boi_token_id": id("<|image>"),
@@ -977,7 +965,7 @@ mod tests {
     /// text limit from `text_config`, and its block-diffusion settings.
     #[tokio::test]
     async fn an_indexed_diffusion_gemma_checkpoint_resolves_from_its_root_config() {
-        let directory = indexed_checkpoint("diffusion_gemma");
+        let directory = indexed_checkpoint();
 
         let LoadedModel {
             config: model,
@@ -1004,19 +992,6 @@ mod tests {
         );
         assert_eq!(profile.denoising.max_denoising_steps, 48);
         assert!(!profile.quantized);
-    }
-
-    #[tokio::test]
-    async fn a_checkpoint_index_must_name_the_family_of_its_root_config() {
-        let directory = indexed_checkpoint("qwen3");
-
-        let error = ModelConfig::load(&config(&directory)).await.err().unwrap();
-
-        let message = error.to_string();
-        assert!(
-            message.contains("`diffusion_gemma`") && message.contains("`qwen3`"),
-            "{message}"
-        );
     }
 
     /// Binds a DiffusionGemma checkpoint whose context holds `max_model_len`
@@ -1077,7 +1052,7 @@ mod tests {
     /// by a fresh random one, and truncated at `max_completion_tokens`.
     #[tokio::test]
     async fn a_diffusion_gemma_chat_reply_is_generated_in_canvases() {
-        let directory = indexed_checkpoint("diffusion_gemma");
+        let directory = indexed_checkpoint();
         let processor = diffusion_gemma_processor(&directory, 65_536).await;
 
         let (generation, _) = processor
@@ -1134,7 +1109,7 @@ mod tests {
     /// A reply fills only whole canvases of the context the prompt leaves.
     #[tokio::test]
     async fn a_diffusion_gemma_reply_fits_whole_canvases_of_the_context() {
-        let directory = indexed_checkpoint("diffusion_gemma");
+        let directory = indexed_checkpoint();
         // `<bos>Hello` is six tokens, which leave 594 positions: two canvases.
         let processor = diffusion_gemma_processor(&directory, 600).await;
         let (generation, _) = processor
@@ -1164,7 +1139,7 @@ mod tests {
     /// soft-token run, where the engine writes the image's vision features.
     #[tokio::test]
     async fn a_diffusion_gemma_chat_image_enters_at_its_part() {
-        let directory = indexed_checkpoint("diffusion_gemma");
+        let directory = indexed_checkpoint();
         let processor = diffusion_gemma_processor(&directory, 65_536).await;
         let mut png = Vec::new();
         image::RgbImage::new(64, 48)
@@ -1232,7 +1207,7 @@ mod tests {
             );
         }
 
-        let directory = indexed_checkpoint("diffusion_gemma");
+        let directory = indexed_checkpoint();
         let processor = diffusion_gemma_processor(&directory, 65_536).await;
         for (control, value) in [
             ("temperature", json!(0.7)),
