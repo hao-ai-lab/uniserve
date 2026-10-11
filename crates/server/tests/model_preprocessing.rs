@@ -24,7 +24,7 @@ use uniserve_server::serving::media::{
     ImageFetchError, ImageFetchPolicy, ImageFetcher, ImageInput, ImageListError,
 };
 use uniserve_server::serving::video::VideoService;
-use uniserve_server::serving::video::plan::VisionConfig;
+use uniserve_server::serving::video::plan::{NAMED_ASPECT_RATIOS, ProcessorConfig, canvas};
 use uniserve_server::serving::{
     InputProcessor, RequestRenderer, ResponseOptions, ServeRequestId, chat_image_urls,
 };
@@ -52,14 +52,17 @@ const SPECIAL_TOKENS: &[&str] = &[
 ];
 
 /// What a released base denoiser reports in its handshake: text-to-video
-/// over every canvas of the canvas rule, on the 50-point schedule.
+/// over the canvases of the named aspect ratios, on the 50-point schedule.
 fn base_denoiser() -> VideoDenoiserInfo {
     VideoDenoiserInfo {
         tasks: vec!["t2va".to_owned()],
         schedule_points: 50,
         video_shift: 12.0,
         audio_shift: 3.0,
-        canvases: Vec::new(),
+        canvases: NAMED_ASPECT_RATIOS
+            .iter()
+            .map(|&(width, height)| canvas(f64::from(width), f64::from(height)).unwrap())
+            .collect(),
     }
 }
 
@@ -73,7 +76,7 @@ fn video_service(
 ) -> VideoService {
     VideoService::new(
         denoiser,
-        VisionConfig {
+        ProcessorConfig {
             patch_size: 16,
             temporal_patch_size: 2,
             merge_size: 2,

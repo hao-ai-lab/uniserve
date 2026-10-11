@@ -27,10 +27,8 @@ first step's prediction deviation from the reference beside the deviations
 of the reference's alternative attention kernels on the same inputs
 (``acceptance/<workload>/seed42/kernel_steps.json``) for information only.
 
-The cases need the released checkpoint (``UNISERVE_H3_MODEL``), the
-reference artifacts (``UNISERVE_MINIMAX_H3_REFERENCE``) and the FFmpeg build
-the reference decoded with (``UNISERVE_FFMPEG``), which probes the media the
-request is planned from.
+The cases need the released checkpoint (``UNISERVE_H3_MODEL``) and the
+reference artifacts (``UNISERVE_MINIMAX_H3_REFERENCE``).
 """
 
 import gc
@@ -49,11 +47,12 @@ from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.diffusion import normal_noise
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.execution import DenoisingRunner
-from uniserve.media import image, video
-from uniserve.model import Condition, ConditionRole, LatentInput
+from uniserve.media import video
+from uniserve.model import Condition, LatentInput
 from uniserve.runtime import ExecutionContext, TensorBuffers
 from uniserve_models import loading as models
-from uniserve_models.minimax_h3 import DenoiserInput, processing, weight_config
+from uniserve_models.minimax_h3 import DenoiserInput, weight_config
+from uniserve_models.minimax_h3.packing import VIDEO_TAG
 from uniserve_worker.config.deployment import ComponentConfig, ParallelConfig
 from uniserve_worker.execution import media
 from uniserve_worker.execution.conditions import condition_latents
@@ -61,7 +60,7 @@ from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.protocol.batch import DiffusionParams, NewRequest
 from uniserve_worker.protocol.identity import RequestKey
-from uniserve_worker.protocol.video import VideoAdmission, VideoTask
+from uniserve_worker.protocol.video import VideoAdmission
 from uniserve_worker.storage.latent_pool import LatentPool
 from uniserve_worker.storage.request_slots import RequestSlots
 
@@ -106,11 +105,6 @@ def root() -> Path:
     )
 
 
-@pytest.fixture(scope="module")
-def ffmpeg() -> str:
-    return str(_path("UNISERVE_FFMPEG", "the reference's FFmpeg build"))
-
-
 def _rel(value: torch.Tensor, reference: torch.Tensor) -> float:
     value, reference = value.double().cpu(), reference.double().cpu()
     return float((value - reference).norm() / reference.norm())
@@ -122,8 +116,8 @@ def _equal(value: torch.Tensor, expected: torch.Tensor) -> bool:
     )
 
 
-def _conditions(plan: processing.RequestPlan) -> tuple[Condition, ...]:
-    """Each planned condition as the denoiser sizes it, in request order.
+def _conditions(conditions) -> tuple[Condition, ...]:
+    """Each admitted condition as the denoiser sizes it, in request order.
 
     A keyframe is one frame on the generated canvas, an image reference
     one frame at the size it is resized to, a video reference the frames
@@ -131,32 +125,25 @@ def _conditions(plan: processing.RequestPlan) -> tuple[Condition, ...]:
     an audio reference its resampled samples.
     """
     result = []
-    for condition in plan.conditions:
-        prepared = condition.prepared
-        if isinstance(prepared, processing.KeyframeFit):
-            role = (
-                ConditionRole.FIRST_FRAME
-                if prepared.position is processing.FramePosition.FIRST
-                else ConditionRole.LAST_FRAME
-            )
-            result.append(Condition(role, video.Config(1, plan.canvas)))
-        elif isinstance(prepared, image.Config):
+    for condition in conditions:
+        samples = 0 if condition.audio is None else condition.audio.samples
+        if condition.image is not None:
+            # A keyframe's kept window is the canvas; a reference image's
+            # is its whole resized image.
             result.append(
-                Condition(ConditionRole.REFERENCE, video.Config(1, prepared))
+                Condition(condition.role, video.Config(1, condition.image.size))
             )
-        elif isinstance(prepared, processing.VideoClip):
-            sound = prepared.soundtrack
+        elif condition.video is not None:
+            clip = condition.video
             result.append(
                 Condition(
-                    ConditionRole.REFERENCE,
-                    video.Config(prepared.vae_frames, prepared.canvas),
-                    0 if sound is None else sound.samples,
+                    condition.role,
+                    video.Config(clip.vae_frames, clip.canvas),
+                    samples,
                 )
             )
         else:
-            result.append(
-                Condition(ConditionRole.REFERENCE, None, prepared.samples)
-            )
+            result.append(Condition(condition.role, None, samples))
     return tuple(result)
 
 
@@ -165,7 +152,7 @@ def _vision_spans(tags: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
     spans, start = [], 0
     for tag, run in itertools.groupby(tags):
         stop = start + sum(1 for _ in run)
-        if tag == processing.VIDEO_TAG:
+        if tag == VIDEO_TAG:
             spans.append((start, stop))
         start = stop
     return tuple(spans)
@@ -271,9 +258,7 @@ def workers(checkpoint):
 
 @pytest.mark.parametrize("case", tuple(WORKLOADS))
 @torch.inference_mode()
-def test_conditioned_request_computes_the_model_first_step(
-    workers, root, ffmpeg, case
-):
+def test_conditioned_request_computes_the_model_first_step(workers, root, case):
     from diffusers.modular_pipelines.minimax_h3.before_denoise import (
         patchify_video_latents,
     )
@@ -285,21 +270,21 @@ def test_conditioned_request_computes_the_model_first_step(
     run = root / "reference" / "diffusers" / case / "seed42"
     presentation = json.loads((run / "presentation.json").read_text())
     with published() as publish:
-        _, plan, _, conditions = recorded_request(root, case, ffmpeg, publish)
+        _, request, _, conditions = recorded_request(root, case, publish)
     tokens = tuple(presentation["token_ids"])
     tags = tuple(presentation["tags"])
     video_admission = VideoAdmission(
-        VideoTask(plan.task.value), text_tags=tags, conditions=conditions
+        request.task, text_tags=tags, conditions=conditions
     )
     admission = NewRequest(
         RequestKey(1, 0, 0),
         request_pool_idx=1,
         diffusion=DiffusionParams(
-            plan.num_frames,
-            len(runner.video_decoder.frame_slices(plan.num_frames)),
+            request.num_frames,
+            len(runner.video_decoder.frame_slices(request.num_frames)),
             SEED,
-            width=plan.canvas.width,
-            height=plan.canvas.height,
+            width=request.canvas.width,
+            height=request.canvas.height,
         ),
         video=video_admission,
         prompt_token_ids=tokens,
@@ -380,19 +365,19 @@ def test_conditioned_request_computes_the_model_first_step(
 
     # The model path on the same denoiser, in the layout of the worker's
     # text capacity.
-    model_conditions = _conditions(plan)
+    model_conditions = _conditions(conditions)
     model_size = denoiser.make_size(
-        plan.num_frames,
+        request.num_frames,
         len(tokens),
-        canvas=plan.canvas,
+        canvas=request.canvas,
         conditions=model_conditions,
         vision_spans=_vision_spans(tags),
     )
     model_layout = denoiser.layout_size(
         denoiser.make_size(
-            plan.num_frames,
+            request.num_frames,
             text,
-            canvas=plan.canvas,
+            canvas=request.canvas,
             conditions=model_conditions,
         )
     )

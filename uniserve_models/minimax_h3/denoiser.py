@@ -251,9 +251,11 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             return size.condition_rows
 
         # A reference video keeps the leading whole VAE windows of the
-        # generated frames, and its soundtrack the generated duration. A
-        # soundtrack resampled to 32 kHz rounds up (``processing.audio_clip``),
-        # so the ceiling bounds the samples of every source rate.
+        # generated frames, and its soundtrack the generated duration. The
+        # server truncates a soundtrack to that duration at its native rate
+        # and torchaudio's resampler returns ``ceil(new * length / orig)``
+        # samples at 32 kHz, so the ceiling of the generated duration at
+        # 32 kHz bounds the samples of every source rate.
         windows = max(
             1, (num_frames - VAE_LATENTS_PER_CHUNK) // VAE_FRAMES_PER_CHUNK
         )

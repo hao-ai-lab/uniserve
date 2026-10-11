@@ -783,7 +783,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["video"]["tasks"], serde_json::json!(["t2va"]));
         assert_eq!(body["video"]["schedule"]["num_inference_steps"], 5);
-        assert_eq!(body["video"]["canvas"]["canvases"], serde_json::Value::Null);
+        assert_eq!(
+            body["video"]["canvas"]["canvases"],
+            serde_json::json!([
+                {"width": 1536, "height": 672},
+                {"width": 1344, "height": 768},
+                {"width": 1024, "height": 768},
+                {"width": 768, "height": 768},
+                {"width": 768, "height": 1024},
+                {"width": 768, "height": 1344},
+            ])
+        );
         assert_eq!(
             body["video"]["canvas"]["aspect_ratios"],
             serde_json::json!(["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"])

@@ -2,9 +2,10 @@
 //! and the conditioner presentation.
 //!
 //! A MiniMax-H3 request must be sized before admission: the engine reserves
-//! the conditioner's token count and the denoiser's condition rows, so both
-//! are known exactly before any pixel is decoded. One request flows through
-//! four stages, which [`VideoProcessor::process`] runs in order:
+//! the conditioner's token count and the worker encodes each condition in
+//! the units the plan states, so both are known exactly before any pixel is
+//! decoded. One request flows through four stages, which
+//! [`VideoProcessor::process`] runs in order:
 //!
 //! 1. [`plan::check_request`] applies every rule that needs no media
 //!    (task, roles, counts, target), so a malformed request is rejected
@@ -17,12 +18,11 @@
 //!    aspect, frame rate, decoded frame count and soundtrack, and an audio
 //!    file's sample rate and decoded sample count, through `ffprobe`.
 //! 4. [`plan::plan_request`] resolves the canvas, the frame counts, how each
-//!    condition is prepared, the Qwen3-VL vision grids and the condition rows;
+//!    condition is prepared and the Qwen3-VL vision grids;
 //!    [`presentation::present`] tokenizes the conditioner's presentation and
 //!    tags every token for the denoiser's AdaLN modulation.
 //!
-//! The rules are those of `uniserve_models/minimax_h3/processing.py`; both
-//! implementations are tested against
+//! The rules are tested against
 //! `tests/python/fixtures/minimax_h3_plan.json`, generated from the diffusers
 //! reference pipeline.
 //!
@@ -44,7 +44,7 @@ use std::fmt;
 use crate::openai::ApiError;
 use crate::profile::tokenizer::DynTokenizer;
 
-use plan::{ConditionSpec, PlanLimits, RequestPlan, Target, VisionConfig};
+use plan::{ConditionSpec, PlanLimits, ProcessorConfig, RequestPlan, Target};
 use presentation::Presentation;
 use probe::MediaProber;
 use sources::{FetchedMedia, MediaFetcher};
@@ -180,7 +180,7 @@ pub struct VideoInputs<'a> {
 /// bytes of its conditions.
 #[derive(Debug, Clone)]
 pub struct ProcessedVideoRequest {
-    /// Canvas, frame counts, condition preparation and rows.
+    /// Canvas, frame counts and condition preparation.
     pub plan: RequestPlan,
     /// The conditioner's token ids and their AdaLN tags.
     pub presentation: Presentation,
@@ -195,7 +195,7 @@ pub struct ProcessedVideoRequest {
 pub struct VideoProcessor {
     fetcher: MediaFetcher,
     prober: MediaProber,
-    vision: VisionConfig,
+    vision: ProcessorConfig,
     limits: PlanLimits,
     tokenizer: DynTokenizer,
 }
@@ -206,7 +206,7 @@ impl VideoProcessor {
     pub fn new(
         fetcher: MediaFetcher,
         prober: MediaProber,
-        vision: VisionConfig,
+        vision: ProcessorConfig,
         limits: PlanLimits,
         tokenizer: DynTokenizer,
     ) -> Self {

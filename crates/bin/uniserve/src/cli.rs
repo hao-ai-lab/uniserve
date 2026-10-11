@@ -25,6 +25,7 @@ use uniserve_engine::{
 use uniserve_server::profile::diffusion_gemma::DenoisingOverrides;
 use uniserve_server::profile::omni::resolution::ResolutionName;
 use uniserve_server::profile::video::VideoResolution;
+use uniserve_server::serving::MAX_VIDEO_SECONDS;
 use uniserve_server::serving::systemone::{
     CandidateTokens, CanvasMode, ReadoutLayout, ReadoutOptions,
 };
@@ -164,7 +165,7 @@ pub(crate) struct SharedRuntimeArgs {
     /// Longest video duration, in seconds, a media deployment provisions and
     /// admits: a capacity within the video API's [4, 15] second range,
     /// advertised as `max_seconds`.
-    #[arg(long = "max-video-seconds", default_value_t = WorkerProcessArgs::DEFAULT_MAX_VIDEO_SECONDS)]
+    #[arg(long = "max-video-seconds", default_value_t = MAX_VIDEO_SECONDS)]
     pub max_video_seconds: f64,
     /// Comma-separated video resolution classes (`768p`, `480p`) a video
     /// deployment prepares, each at every `--video-aspect-ratios` entry. A

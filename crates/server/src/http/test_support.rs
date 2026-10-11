@@ -24,7 +24,7 @@ use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
-use crate::serving::video::plan::VisionConfig;
+use crate::serving::video::plan::ProcessorConfig;
 use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime, WorkerCapabilities};
 
 /// Served model name the simulated state answers to.
@@ -89,9 +89,9 @@ pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
     ServingRuntime::new(processor, client, images, false)
 }
 
-/// The video service of a four-step text-to-video denoiser that generates
-/// every canvas of the canvas rule, with the released checkpoint's vision
-/// processor geometry and the default media policy.
+/// The video service of a four-step text-to-video denoiser that prepared the
+/// named aspect ratios' canvases of the canvas rule, with the released
+/// checkpoint's vision processor geometry and the default media policy.
 pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
     VideoService::new(
         uniserve_engine::VideoDenoiserInfo {
@@ -99,9 +99,15 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             schedule_points: 5,
             video_shift: 12.0,
             audio_shift: 3.0,
-            canvases: Vec::new(),
+            canvases: crate::serving::video::plan::NAMED_ASPECT_RATIOS
+                .iter()
+                .map(|&(width, height)| {
+                    crate::serving::video::plan::canvas(f64::from(width), f64::from(height))
+                        .unwrap()
+                })
+                .collect(),
         },
-        VisionConfig {
+        ProcessorConfig {
             patch_size: 16,
             temporal_patch_size: 2,
             merge_size: 2,
