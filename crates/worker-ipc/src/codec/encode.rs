@@ -1363,6 +1363,15 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             })
             .collect::<Vec<_>>();
         let canvases = Some(b.create_vector(&canvases));
+        let references = Some(fbs::ReferenceLimits::create(
+            b,
+            &fbs::ReferenceLimitsArgs {
+                images: value.references.images,
+                videos: value.references.videos,
+                audios: value.references.audios,
+                total: value.references.total,
+            },
+        ));
         fbs::VideoDenoiserInfo::create(
             b,
             &fbs::VideoDenoiserInfoArgs {
@@ -1371,6 +1380,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 video_shift: value.video_shift,
                 audio_shift: value.audio_shift,
                 canvases,
+                references,
             },
         )
     });

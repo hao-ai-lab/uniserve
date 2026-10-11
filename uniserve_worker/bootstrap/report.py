@@ -686,7 +686,8 @@ def video_denoiser_info(
     include the clean endpoint the network never evaluates. The canvases are
     ``canvases``, those the deployment prepares and admits, or without any
     every canvas the denoiser offers (``VideoDenoiser.canvases``), each with
-    the short edge and aspect ratio that select it.
+    the short edge and aspect ratio that select it. The references are the
+    most one request may carry (``VideoDenoiser.max_references``).
     """
     # The denoiser names each of its canvases once.
     names = {size: name for name, size in denoiser.canvases.items()}
@@ -701,6 +702,7 @@ def video_denoiser_info(
             ServedCanvas(*names[canvas], canvas.width, canvas.height)
             for canvas in served
         ),
+        references=denoiser.max_references,
     )
 
 

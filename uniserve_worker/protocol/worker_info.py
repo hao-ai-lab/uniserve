@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from uniserve.model import ReferenceLimits
 from uniserve_worker.protocol.call import CallKind, MediaCall
 from uniserve_worker.protocol.tensor import OutputInfo
 from uniserve_worker.protocol.transfer import WorkerEndpoint
@@ -168,7 +169,8 @@ class VideoDenoiserInfo:
 
     Mirrors the Rust ``VideoDenoiserInfo``. ``schedule_points`` counts the
     fixed schedule's sigma points, the clean endpoint included; ``canvases``
-    lists the only canvases the deployment serves, those it prepares.
+    lists the only canvases the deployment serves, those it prepares;
+    ``references`` states the references one request may carry.
     """
 
     tasks: tuple[str, ...]
@@ -176,6 +178,7 @@ class VideoDenoiserInfo:
     video_shift: float
     audio_shift: float
     canvases: tuple[ServedCanvas, ...] = ()
+    references: ReferenceLimits = ReferenceLimits()
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -184,6 +187,12 @@ class VideoDenoiserInfo:
             "video_shift": self.video_shift,
             "audio_shift": self.audio_shift,
             "canvases": [canvas.to_mapping() for canvas in self.canvases],
+            "references": {
+                "images": self.references.images,
+                "videos": self.references.videos,
+                "audios": self.references.audios,
+                "total": self.references.total,
+            },
         }
 
 

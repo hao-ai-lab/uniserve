@@ -42,6 +42,7 @@ from uniserve.model import (
     Condition,
     ConditionRole,
     LatentInput,
+    ReferenceLimits,
     VideoDenoiser,
 )
 from uniserve.nn import ColumnParallelLinear, RotaryEmbedding
@@ -82,7 +83,9 @@ from .packing import (
     video_latent_frames,
 )
 from .processing import (
+    MAX_AUDIO_REFERENCES,
     MAX_IMAGE_REFERENCES,
+    MAX_REFERENCES,
     MAX_VIDEO_REFERENCES,
     REFERENCE_IMAGE_SHORT_EDGE,
 )
@@ -216,19 +219,30 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         # Only ``t2va`` generates from the prompt alone.
         return "t2va" in self.config.tasks
 
+    @property
+    def max_references(self) -> ReferenceLimits:
+        """The reference counts the checkpoint documents for ``ref2va``."""
+        if "ref2va" not in self.config.tasks:
+            return ReferenceLimits()
+        return ReferenceLimits(
+            images=MAX_IMAGE_REFERENCES,
+            videos=MAX_VIDEO_REFERENCES,
+            audios=MAX_AUDIO_REFERENCES,
+            total=MAX_REFERENCES,
+        )
+
     def max_conditions(
         self, num_frames: int, canvas: image.Config
     ) -> tuple[Condition, ...]:
         """The largest condition set the checkpoint documents for a request.
 
-        A ``ref2va`` request carries up to nine image and three video
-        references, twelve references in all: nine images of the largest
-        reference raster, the checkpoint's 2048-pixel short edge at 4:1,
-        and three videos of the generated length with their soundtracks, on
-        the canvas of the canvas rule where a video packs the most rows. A
-        network that packs keyframes also holds the two keyframes of
-        ``canvas``, which are all an ``fl2va`` request carries. A
-        text-to-video network takes no conditions.
+        A ``ref2va`` request carries up to ``max_references``: nine images of
+        the largest reference raster, the checkpoint's 2048-pixel short edge
+        at 4:1, and three videos of the generated length with their
+        soundtracks, on the canvas of the canvas rule where a video packs
+        the most rows. A network that packs keyframes also holds the two
+        keyframes of ``canvas``, which are all an ``fl2va`` request carries.
+        A text-to-video network takes no conditions.
         """
         tasks = set(self.config.tasks)
         if not tasks & {"fl2va", "ref2va"}:
@@ -285,10 +299,11 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             ),
             key=rows,
         )
+        limits = self.max_references
         return (
             *keyframes,
-            *(still,) * MAX_IMAGE_REFERENCES,
-            *(clip,) * MAX_VIDEO_REFERENCES,
+            *(still,) * limits.images,
+            *(clip,) * limits.videos,
         )
 
     @property

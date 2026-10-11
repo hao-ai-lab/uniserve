@@ -35,8 +35,7 @@ use serde::{Deserialize, Serialize};
 use uniserve_core::{
     Canvas, ConditionMedia, ConditionVision, ImageFit, MediaLocator, VideoCondition, VideoTask,
 };
-
-use uniserve_engine::ServedCanvas;
+use uniserve_engine::{ReferenceLimits, ServedCanvas};
 
 use super::probe::{AudioFacts, ImageFacts, MediaFacts, VideoFacts};
 use super::{RequestField, VideoInputError};
@@ -74,16 +73,6 @@ const AUDIO_CHANNELS: u32 = 2;
 
 /// The rate the conditioner samples a reference video at.
 const VIDEO_SAMPLE_FPS: f64 = 2.0;
-
-/// Image references one `ref2va` request may carry, as documented for the
-/// released checkpoint.
-pub const MAX_IMAGE_REFERENCES: usize = 9;
-/// Video references, with or without soundtrack, one request may carry.
-pub const MAX_VIDEO_REFERENCES: usize = 3;
-/// Audio references one request may carry, not counting video soundtracks.
-pub const MAX_AUDIO_REFERENCES: usize = 3;
-/// References of all types one request may carry; keyframes not counted.
-pub const MAX_REFERENCES: usize = 12;
 
 /// The media type of a condition, by its request name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -288,6 +277,9 @@ pub struct PlanLimits {
     /// in their handshake: each with the `target.short_edge` and
     /// `target.aspect_ratio` that select it.
     pub canvases: Vec<ServedCanvas>,
+    /// The references one `ref2va` request may carry, as the denoiser
+    /// declares them in its handshake.
+    pub reference_limits: ReferenceLimits,
     /// How the deployment sizes references.
     pub references: ReferenceConfig,
 }
@@ -1185,7 +1177,7 @@ pub fn check_request(
         check_served(size, limits)?;
     }
 
-    check_conditions(task, conditions)?;
+    check_conditions(task, conditions, limits)?;
 
     match target.duration_seconds {
         Some(seconds) => {
@@ -1210,7 +1202,11 @@ pub fn check_request(
 
 /// Checks each condition's fields, then the task's counts and keyframe
 /// order.
-fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(), VideoInputError> {
+fn check_conditions(
+    task: VideoTask,
+    conditions: &[ConditionSpec],
+    limits: &PlanLimits,
+) -> Result<(), VideoInputError> {
     if task == VideoTask::T2va {
         if !conditions.is_empty() {
             return Err(VideoInputError::invalid(
@@ -1286,13 +1282,14 @@ fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(),
         let images = count(|kind| kind == ConditionType::Image);
         let audios = count(|kind| kind == ConditionType::Audio);
         let videos = count(|kind| matches!(kind, ConditionType::Video | ConditionType::VideoAudio));
+        let declared = &limits.reference_limits;
         for (kind, found, limit) in [
-            ("image", images, MAX_IMAGE_REFERENCES),
-            ("video", videos, MAX_VIDEO_REFERENCES),
-            ("audio", audios, MAX_AUDIO_REFERENCES),
-            ("reference", references().count(), MAX_REFERENCES),
+            ("image", images, declared.images),
+            ("video", videos, declared.videos),
+            ("audio", audios, declared.audios),
+            ("reference", references().count(), declared.total),
         ] {
-            if found > limit {
+            if found > limit as usize {
                 return Err(VideoInputError::invalid(
                     RequestField::Conditions,
                     format!("at most {limit} {kind} references, got {found}"),
@@ -1590,8 +1587,9 @@ pub(super) mod tests {
     use super::{
         AudioClip, Canvas, ConditionPlan, ConditionRole, ConditionSpec, ConditionType,
         FramePosition, KeyframeFit, PlanLimits, Prepared, ProcessorConfig, ReferenceConfig,
-        RequestPlan, Target, VideoTask, Vision, audio_clip, canvas, check_request, cover_crop,
-        latent_frames, plan_request, reference_image_size, rows_per_frame, video_reference,
+        ReferenceLimits, RequestPlan, Target, VideoTask, Vision, audio_clip, canvas, check_request,
+        cover_crop, latent_frames, plan_request, reference_image_size, rows_per_frame,
+        video_reference,
     };
 
     /// The shared planning vectors, generated from the diffusers reference.
@@ -1646,6 +1644,13 @@ pub(super) mod tests {
             tasks: vec![VideoTask::T2va, VideoTask::Fl2va, VideoTask::Ref2va],
             max_video_seconds: 15.0,
             canvases: served_canvases(),
+            // The checkpoint's documented limits.
+            reference_limits: ReferenceLimits {
+                images: 9,
+                videos: 3,
+                audios: 3,
+                total: 12,
+            },
             // The fixture's cases follow the released pipeline.
             references: ReferenceConfig::RELEASED,
         }
@@ -2284,6 +2289,54 @@ pub(super) mod tests {
         };
         let error = super::check_request(VideoTask::T2va, &ten_seconds, &[], &limits).unwrap_err();
         assert_eq!(error.field(), Some(RequestField::TargetDuration));
+    }
+
+    /// A `ref2va` request carries at most the references its denoiser
+    /// declares, of each kind and in all.
+    #[test]
+    fn reference_counts_are_bounded_by_the_declared_limits() {
+        let limits = PlanLimits {
+            reference_limits: ReferenceLimits {
+                images: 2,
+                videos: 1,
+                audios: 1,
+                total: 3,
+            },
+            ..limits()
+        };
+        let reference = |condition_type| ConditionSpec {
+            condition_type,
+            role: ConditionRole::Reference,
+            frame_index: None,
+            start_seconds: None,
+        };
+        let image = reference(ConditionType::Image);
+        let video = reference(ConditionType::Video);
+        let audio = reference(ConditionType::Audio);
+        let check = |conditions: &[ConditionSpec]| {
+            super::check_request(VideoTask::Ref2va, &FIVE_SECONDS, conditions, &limits)
+        };
+
+        assert!(check(&[image.clone(), image.clone(), video.clone()]).is_ok());
+        for (conditions, bound) in [
+            (vec![image.clone(); 3], "at most 2 image"),
+            (
+                vec![image.clone(), video.clone(), video.clone()],
+                "at most 1 video",
+            ),
+            (
+                vec![image.clone(), audio.clone(), audio.clone()],
+                "at most 1 audio",
+            ),
+            (
+                vec![image.clone(), image.clone(), video.clone(), audio.clone()],
+                "at most 3 reference",
+            ),
+        ] {
+            let error = check(&conditions).unwrap_err();
+            assert_eq!(error.field(), Some(RequestField::Conditions));
+            assert!(error.to_string().contains(bound), "{bound}: {error}");
+        }
     }
 
     /// A task outside the placed denoiser's set is rejected first.

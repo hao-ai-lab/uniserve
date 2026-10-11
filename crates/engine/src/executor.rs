@@ -1381,6 +1381,7 @@ mod tests {
                 video_shift: 12.0,
                 audio_shift: 3.0,
                 canvases: Vec::new(),
+                references: Default::default(),
             }),
             ..WorkerInfo::default()
         }
@@ -1606,6 +1607,7 @@ mod tests {
                 video_shift: 12.0,
                 audio_shift: 3.0,
                 canvases: Vec::new(),
+                references: Default::default(),
             });
             ExecutorInfo {
                 workers: vec![(WorkerId("model".to_owned()), info)],

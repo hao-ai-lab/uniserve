@@ -116,6 +116,8 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
                 },
             )
             .collect(),
+            // A text-to-video denoiser takes no references.
+            references: Default::default(),
         },
         ProcessorConfig {
             patch_size: 16,

@@ -9,6 +9,7 @@ from tests.python.fixtures.h3 import (
 )
 from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.media import image
+from uniserve.model import ReferenceLimits
 from uniserve_models.minimax_h3 import Model
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import media_builder, video_denoiser
@@ -76,9 +77,19 @@ def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
         (768, "9:16", 768, 1344),
     )
 
-    # The reference DiT serves ref2va alone.
-    reference = video_denoiser(base, _config("transformer_ref"))
-    assert video_denoiser_info(reference).tasks == ("ref2va",)
+    # It takes no references.
+    assert info.references == ReferenceLimits()
+
+    # The reference DiT serves ref2va alone, with the references the
+    # checkpoint documents: nine images, three videos and three audio tracks,
+    # twelve in all.
+    reference = video_denoiser_info(
+        video_denoiser(base, _config("transformer_ref"))
+    )
+    assert reference.tasks == ("ref2va",)
+    assert reference.references == ReferenceLimits(
+        images=9, videos=3, audios=3, total=12
+    )
 
 
 @pytest.mark.parametrize("placed", [(), ("transformer", "transformer_ref")])

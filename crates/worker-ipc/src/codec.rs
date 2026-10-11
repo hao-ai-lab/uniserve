@@ -610,6 +610,15 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
                     .collect()
             })
             .unwrap_or_default(),
+        references: table
+            .references()
+            .map(|limits| crate::ReferenceLimits {
+                images: limits.images(),
+                videos: limits.videos(),
+                audios: limits.audios(),
+                total: limits.total(),
+            })
+            .unwrap_or_default(),
     }
 }
 

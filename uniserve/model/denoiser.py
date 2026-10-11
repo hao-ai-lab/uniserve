@@ -74,6 +74,29 @@ class Condition:
             raise ValueError("a keyframe is one encoded frame without audio")
 
 
+@dataclass(frozen=True, slots=True)
+class ReferenceLimits:
+    """Most references of each kind one request may carry.
+
+    A network that takes no references states none. ``total`` bounds the
+    references of every kind together, keyframes not counted; a video's
+    soundtrack counts with the video, and ``audios`` bounds the audio
+    references that are not a video's soundtrack.
+    """
+
+    images: int = 0
+    videos: int = 0
+    audios: int = 0
+    total: int = 0
+
+    def __post_init__(self) -> None:
+        if any(
+            type(limit) is not int or limit < 0
+            for limit in (self.images, self.videos, self.audios, self.total)
+        ):
+            raise ValueError("reference limits must be nonnegative integers")
+
+
 class VideoSize(Protocol):
     """A video request's output timeline, raster and conditioning lengths.
 
@@ -348,6 +371,15 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
             name: cast(FixedGrid, grid).shift
             for name, grid in self.grids.items()
         }
+
+    @property
+    def max_references(self) -> ReferenceLimits:
+        """Most references of each kind one request may carry.
+
+        The serving owner refuses a request above them, and
+        ``max_conditions`` provisions for them.
+        """
+        return ReferenceLimits()
 
     def max_conditions(
         self, num_frames: int, canvas: image.Config

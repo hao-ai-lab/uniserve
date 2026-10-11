@@ -193,16 +193,28 @@ table ServedCanvas {
   height:uint;
 }
 
+/// Most references of each kind one request may carry. `total` bounds all
+/// kinds together, keyframes not counted; a video's soundtrack counts with
+/// the video and `audios` bounds the audio references that are not one. A
+/// denoiser that takes no references declares zeros.
+table ReferenceLimits {
+  images:uint;
+  videos:uint;
+  audios:uint;
+  total:uint;
+}
+
 /// What a deployment's video denoiser serves: its tasks, its fixed schedule
-/// (sigma points including the clean endpoint, and the per-modality shifts)
-/// and the canvases it prepares and accepts, in the order the deployment
-/// selected them.
+/// (sigma points including the clean endpoint, and the per-modality shifts),
+/// the canvases it prepares and accepts, in the order the deployment
+/// selected them, and the references a request may carry.
 table VideoDenoiserInfo {
   tasks:[string];
   schedule_points:uint;
   video_shift:double;
   audio_shift:double;
   canvases:[ServedCanvas];
+  references:ReferenceLimits;
 }
 
 /// Binds a media call to the component that runs it; the decoder rejects a

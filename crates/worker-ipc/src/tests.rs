@@ -1632,6 +1632,12 @@ fn kv_free_worker_info_round_trips() {
                     },
                 },
             ],
+            references: ReferenceLimits {
+                images: 9,
+                videos: 3,
+                audios: 3,
+                total: 12,
+            },
         }),
         supported_calls: video_components()
             .into_keys()

@@ -79,6 +79,7 @@ fn base_denoiser() -> VideoDenoiserInfo {
         .into_iter()
         .map(|(aspect_ratio, width, height)| served(768, aspect_ratio, width, height))
         .collect(),
+        references: Default::default(),
     }
 }
 
@@ -739,6 +740,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
             served(480, "21:9", 992, 416),
             served(480, "16:9", 832, 480),
         ],
+        references: Default::default(),
     };
     let model = InputProcessor::new(
         loaded.config().clone(),

@@ -20,8 +20,8 @@ use uniserve_core::{
 use uniserve_engine::VideoDenoiserInfo;
 
 use super::plan::{
-    CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES,
-    MAX_REFERENCES, MAX_VIDEO_REFERENCES, PlanLimits, ProcessorConfig, ReferenceConfig, Target,
+    CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, PlanLimits, ProcessorConfig,
+    ReferenceConfig, Target,
 };
 use super::probe::{MediaProber, ProbeConfig};
 use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
@@ -109,6 +109,7 @@ impl VideoService {
             tasks: tasks.clone(),
             max_video_seconds,
             canvases: denoiser.canvases.clone(),
+            reference_limits: denoiser.references,
             references,
         };
         Ok(Self {
@@ -168,10 +169,10 @@ impl VideoService {
                         "aspect_ratio": "auto or W:H",
                     }),
                     VideoTask::Ref2va => json!({
-                        "max_images": MAX_IMAGE_REFERENCES,
-                        "max_videos": MAX_VIDEO_REFERENCES,
-                        "max_audios": MAX_AUDIO_REFERENCES,
-                        "max_references": MAX_REFERENCES,
+                        "max_images": self.denoiser.references.images,
+                        "max_videos": self.denoiser.references.videos,
+                        "max_audios": self.denoiser.references.audios,
+                        "max_references": self.denoiser.references.total,
                         "keyframe_frame_indices": [[], [0], [-1], [0, -1]],
                         "reference_image_short_edge": references.image_short_edge,
                         "enlarge_references": references.enlarge,
@@ -322,7 +323,7 @@ mod tests {
     use uniserve_core::{
         Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VideoTask, VisionGrid,
     };
-    use uniserve_engine::VideoDenoiserInfo;
+    use uniserve_engine::{ReferenceLimits, VideoDenoiserInfo};
 
     use super::super::plan::ReferenceConfig;
     use super::super::plan::tests::{fixture, vision};
@@ -343,6 +344,12 @@ mod tests {
                 video_shift: 12.0,
                 audio_shift: 3.0,
                 canvases: super::super::plan::tests::served_canvases(),
+                references: ReferenceLimits {
+                    images: 9,
+                    videos: 3,
+                    audios: 3,
+                    total: 12,
+                },
             },
             vision(&fixture()),
             15.0,

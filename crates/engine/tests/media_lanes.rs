@@ -220,6 +220,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         video_shift: 12.0,
         audio_shift: 3.0,
         canvases: Vec::new(),
+        references: Default::default(),
     });
     // The denoiser's latent pool holds the reserved sentinel page plus two
     // pages of samples per request slot.

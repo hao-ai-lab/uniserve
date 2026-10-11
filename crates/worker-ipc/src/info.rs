@@ -279,10 +279,27 @@ pub struct ServedCanvas {
     pub canvas: uniserve_core::Canvas,
 }
 
+/// Most references of each kind one request may carry.
+///
+/// `total` bounds all kinds together, keyframes not counted; a video's
+/// soundtrack counts with the video, and `audios` bounds the audio references
+/// that are not one. A denoiser that takes no references declares zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceLimits {
+    /// Image references.
+    pub images: u32,
+    /// Video references, with or without soundtrack.
+    pub videos: u32,
+    /// Audio references that are not a video's soundtrack.
+    pub audios: u32,
+    /// References of every kind.
+    pub total: u32,
+}
+
 /// What the video denoiser a deployment places serves.
 ///
-/// The denoiser fixes its schedule; the tasks and canvases bound what
-/// admission accepts.
+/// The denoiser fixes its schedule; the tasks, canvases and reference limits
+/// bound what a request may ask for.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoDenoiserInfo {
     /// Task names the denoiser serves, in canonical order.
@@ -298,6 +315,9 @@ pub struct VideoDenoiserInfo {
     /// order its operator selected them.
     #[serde(default)]
     pub canvases: Vec<ServedCanvas>,
+    /// References one request may carry.
+    #[serde(default)]
+    pub references: ReferenceLimits,
 }
 
 impl VideoDenoiserInfo {
