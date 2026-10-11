@@ -112,6 +112,7 @@ impl VideoService {
             tasks: tasks.clone(),
             max_video_seconds,
             frame_rate: denoiser.frame_rate,
+            frames: denoiser.frames,
             canvases: denoiser.canvases.clone(),
             reference_limits: denoiser.references,
             references,
@@ -291,9 +292,7 @@ impl VideoService {
                 priority: 0,
                 sampling: DiffusionSamplingParams {
                     num_frames: plan.num_frames,
-                    // Each H3 video media unit decodes one 17-frame temporal
-                    // latent window past the first 5 frames.
-                    video_units: (plan.num_frames - 5) / 17,
+                    video_units: self.denoiser.frames.units(plan.num_frames),
                     seed: request.seed,
                     width: plan.canvas.width,
                     height: plan.canvas.height,
@@ -349,6 +348,12 @@ mod tests {
                 video_shift: 12.0,
                 audio_shift: 3.0,
                 frame_rate: 24,
+                frames: uniserve_engine::FrameChunks {
+                    min_frames: 22,
+                    chunk_frames: 17,
+                    chunk_latent_frames: 5,
+                    tail_latent_frames: 2,
+                },
                 canvases: super::super::plan::tests::served_canvases(),
                 references: ReferenceLimits {
                     images: 9,

@@ -202,6 +202,14 @@ table ReferenceLimits {
   total:uint;
 }
 
+/// How the video VAE divides a video's frames into chunks (`FrameChunks`).
+table FrameChunks {
+  min_frames:uint;
+  chunk_frames:uint;
+  chunk_latent_frames:uint;
+  tail_latent_frames:uint;
+}
+
 /// What a deployment's video denoiser serves: its tasks, its fixed schedule
 /// (sigma points including the clean endpoint, and the per-modality shifts),
 /// the frame rate of every video it generates, in frames per second, how the
@@ -214,6 +222,7 @@ table VideoDenoiserInfo {
   video_shift:double;
   audio_shift:double;
   frame_rate:uint;
+  frames:FrameChunks (required);
   canvases:[ServedCanvas];
   references:ReferenceLimits;
 }

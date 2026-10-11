@@ -164,15 +164,40 @@ class ServedCanvas:
 
 
 @dataclass(frozen=True, slots=True)
+class FrameChunks:
+    """How the video VAE divides a video's frames into chunks.
+
+    Mirrors the Rust ``FrameChunks``. A video has ``min_frames + n *
+    chunk_frames`` frames, one decode unit per chunk, so ``n + 1`` units. The
+    VAE encodes each chunk to ``chunk_latent_frames`` latent frames and the
+    final window past the whole chunks to ``tail_latent_frames``.
+    """
+
+    min_frames: int
+    chunk_frames: int
+    chunk_latent_frames: int
+    tail_latent_frames: int
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "min_frames": self.min_frames,
+            "chunk_frames": self.chunk_frames,
+            "chunk_latent_frames": self.chunk_latent_frames,
+            "tail_latent_frames": self.tail_latent_frames,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class VideoDenoiserInfo:
     """What the video denoiser a deployment places serves.
 
     Mirrors the Rust ``VideoDenoiserInfo``. ``schedule_points`` counts the
     fixed schedule's sigma points, the clean endpoint included;
     ``frame_rate`` is the frame rate of every video, the clock durations and
-    reference videos are counted on; ``canvases`` lists the only canvases the
-    deployment serves, those it prepares; ``references`` states the
-    references one request may carry.
+    reference videos are counted on; ``frames`` states how the VAE chunks a
+    video's frames; ``canvases`` lists the only canvases the deployment
+    serves, those it prepares; ``references`` states the references one
+    request may carry.
     """
 
     tasks: tuple[str, ...]
@@ -180,6 +205,7 @@ class VideoDenoiserInfo:
     video_shift: float
     audio_shift: float
     frame_rate: int
+    frames: FrameChunks
     canvases: tuple[ServedCanvas, ...] = ()
     references: ReferenceLimits = ReferenceLimits()
 
@@ -190,6 +216,7 @@ class VideoDenoiserInfo:
             "video_shift": self.video_shift,
             "audio_shift": self.audio_shift,
             "frame_rate": self.frame_rate,
+            "frames": self.frames.to_mapping(),
             "canvases": [canvas.to_mapping() for canvas in self.canvases],
             "references": {
                 "images": self.references.images,

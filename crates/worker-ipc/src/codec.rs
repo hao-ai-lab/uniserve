@@ -595,6 +595,12 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
         video_shift: table.video_shift(),
         audio_shift: table.audio_shift(),
         frame_rate: table.frame_rate(),
+        frames: crate::FrameChunks {
+            min_frames: table.frames().min_frames(),
+            chunk_frames: table.frames().chunk_frames(),
+            chunk_latent_frames: table.frames().chunk_latent_frames(),
+            tail_latent_frames: table.frames().tail_latent_frames(),
+        },
         canvases: table
             .canvases()
             .map(|canvases| {

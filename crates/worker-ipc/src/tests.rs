@@ -1628,6 +1628,12 @@ fn kv_free_worker_info_round_trips() {
             video_shift: 12.0,
             audio_shift: 3.0,
             frame_rate: 24,
+            frames: crate::FrameChunks {
+                min_frames: 22,
+                chunk_frames: 17,
+                chunk_latent_frames: 5,
+                tail_latent_frames: 2,
+            },
             canvases: vec![
                 ServedCanvas {
                     short_edge: 768,
@@ -2169,4 +2175,45 @@ fn ipc_decode_rejects_malformed_frames() {
     let mut response = encode_response(&WorkerResponse::ok()).unwrap();
     response.truncate(response.len() / 2);
     assert!(decode_response(&response).is_err());
+}
+
+#[test]
+fn frame_chunks_count_decode_units_and_align_requested_frames() {
+    // 17-frame chunks past a final 5-frame window: `17n + 5` frames in `n`
+    // units, five latent frames per chunk and two in the final window.
+    let frames = FrameChunks {
+        min_frames: 22,
+        chunk_frames: 17,
+        chunk_latent_frames: 5,
+        tail_latent_frames: 2,
+    };
+    frames.validate().unwrap();
+
+    assert_eq!([22, 39, 124].map(|count| frames.units(count)), [1, 2, 7]);
+    assert_eq!(
+        [22, 39, 124].map(|count| frames.latent_frames(count)),
+        [7, 12, 37]
+    );
+
+    // A request rounds up to the next legal count and never below the fewest.
+    assert_eq!(
+        [1, 22, 23, 96, 360].map(|count| frames.align_up(count)),
+        [22, 22, 39, 107, 362]
+    );
+
+    // Available frames round down to a whole number of chunks.
+    assert_eq!(frames.align_down(21), None);
+    assert_eq!(
+        [22, 38, 39, 130].map(|count| frames.align_down(count)),
+        [Some(22), Some(22), Some(39), Some(124)]
+    );
+
+    assert!(
+        FrameChunks {
+            chunk_frames: 0,
+            ..frames
+        }
+        .validate()
+        .is_err()
+    );
 }

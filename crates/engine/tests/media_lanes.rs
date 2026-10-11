@@ -221,6 +221,12 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         video_shift: 12.0,
         audio_shift: 3.0,
         frame_rate: 24,
+        frames: uniserve_worker_ipc::FrameChunks {
+            min_frames: 22,
+            chunk_frames: 17,
+            chunk_latent_frames: 5,
+            tail_latent_frames: 2,
+        },
         canvases: Vec::new(),
         references: Default::default(),
     });

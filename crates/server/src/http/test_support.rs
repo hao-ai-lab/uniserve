@@ -100,6 +100,12 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             video_shift: 12.0,
             audio_shift: 3.0,
             frame_rate: 24,
+            frames: uniserve_engine::FrameChunks {
+                min_frames: 22,
+                chunk_frames: 17,
+                chunk_latent_frames: 5,
+                tail_latent_frames: 2,
+            },
             canvases: [
                 ("21:9", 1536, 672),
                 ("16:9", 1344, 768),

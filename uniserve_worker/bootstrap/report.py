@@ -30,6 +30,7 @@ from uniserve.model import (
     CausalLM,
     PatchEncoder,
     VideoDenoiser,
+    VideoEncoder,
     VideoPostprocessor,
 )
 from uniserve.processing import ImageProcessor
@@ -88,6 +89,7 @@ from uniserve_worker.protocol.call import CALL_KINDS
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import (
     ComponentInfo,
+    FrameChunks,
     ServedCanvas,
     VideoDenoiserInfo,
     WorkerInfo,
@@ -620,10 +622,36 @@ def _token_worker_layout(
     )
 
 
+def frame_chunks(
+    denoiser: VideoDenoiser, encoder: VideoEncoder | None
+) -> FrameChunks:
+    """State how the video VAE chunks the frames a denoiser generates.
+
+    The denoiser's legal frame counts form the progression ``min_frames + n *
+    chunk_frames``. The encoder's latent windows of the fewest frames are one
+    whole chunk followed by the final window.
+
+    Raises:
+        ValueError: The model has no video encoder to state its latent frames.
+    """
+    if encoder is None:
+        raise ValueError("a video model must declare its video encoder")
+    minimum = denoiser.legal_frame_count(1)
+    chunk = denoiser.legal_frame_count(minimum + 1) - minimum
+    whole, *_, final = encoder.latent_slices(minimum)
+    return FrameChunks(
+        min_frames=minimum,
+        chunk_frames=chunk,
+        chunk_latent_frames=whole.stop - whole.start,
+        tail_latent_frames=final.stop - final.start,
+    )
+
+
 def video_denoiser_info(
     denoiser: VideoDenoiser,
     *,
     frame_rate: int,
+    frames: FrameChunks,
     canvases: tuple[image.Config, ...] = (),
 ) -> VideoDenoiserInfo:
     """Describe what the deployment's video denoiser serves.
@@ -635,7 +663,8 @@ def video_denoiser_info(
     the short edge and aspect ratio that select it. The references are the
     most one request may carry (``VideoDenoiser.max_references``), and
     ``frame_rate`` is the model's output frame rate
-    (``VideoPostprocessor.frame_rate``).
+    (``VideoPostprocessor.frame_rate``) and ``frames`` how its VAE chunks a
+    video's frames (``frame_chunks``).
     """
     # The denoiser names each of its canvases once.
     names = {size: name for name, size in denoiser.canvases.items()}
@@ -647,6 +676,7 @@ def video_denoiser_info(
         video_shift=float(shifts["video"]),
         audio_shift=float(shifts["audio"]),
         frame_rate=frame_rate,
+        frames=frames,
         canvases=tuple(
             ServedCanvas(*names[canvas], canvas.width, canvas.height)
             for canvas in served
@@ -718,6 +748,9 @@ def _request_tensor_worker_layout(
         video_denoiser=video_denoiser_info(
             builder.denoiser,
             frame_rate=output.frame_rate,
+            frames=frame_chunks(
+                builder.denoiser, capability(model, VideoEncoder)
+            ),
             canvases=builder.canvases,
         ),
         host_lane_capacity=1 if host else int(arena.host_lane_inflight),

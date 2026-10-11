@@ -14,6 +14,7 @@ from uniserve_models.minimax_h3.config import DMD_CANVASES, NAMED_CANVASES
 from uniserve_worker.bootstrap.inputs import media_builder
 from uniserve_worker.bootstrap.report import (
     build_worker_layout,
+    frame_chunks,
     video_denoiser_info,
 )
 from uniserve_worker.config.execution import WorkerConfig
@@ -85,6 +86,7 @@ def test_the_handshake_declares_each_canvas_with_its_names(model):
     info = video_denoiser_info(
         builder.denoiser,
         frame_rate=model.video_postprocessor.frame_rate,
+        frames=frame_chunks(builder.denoiser, model.video_encoder),
         canvases=builder.canvases,
     )
     names = [(768, "16:9"), (480, "16:9")]

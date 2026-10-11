@@ -74,9 +74,8 @@ def video_shape(runner: ModelExecutor, admission: NewRequest):
     its presented vision spans; it is not rounded up to the layout it
     occupies. Raises ``invalid_descriptor`` when the admission is not a
     video request's, when the rank lacks a media builder or video decoder,
-    when the builder or decoder rejects the frame count, prompt length or
-    conditions (a size beyond the worker's capacity included), or when the
-    admission's media unit count or step count disagrees with the model.
+    or when the builder rejects the frame count, prompt length or
+    conditions (a size beyond the worker's capacity included).
     """
     from uniserve_worker.execution.conditions import library_conditions
 
@@ -98,12 +97,8 @@ def video_shape(runner: ModelExecutor, admission: NewRequest):
             conditions=library_conditions(video),
             vision_spans=video.vision_spans(),
         )
-        windows = decoder.frame_slices(size.num_frames)
     except ValueError as error:
         raise invalid_descriptor(str(error)) from error
-
-    if media.video_units != len(windows):
-        raise invalid_descriptor("video request has invalid call bounds")
     return size
 
 

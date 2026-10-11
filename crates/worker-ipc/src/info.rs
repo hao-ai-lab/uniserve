@@ -296,6 +296,64 @@ pub struct ReferenceLimits {
     pub total: u32,
 }
 
+/// How the video VAE divides a video's frames into chunks.
+///
+/// A video has `min_frames + n * chunk_frames` frames: one decode unit per
+/// chunk, so `n + 1` units. The VAE encodes each such chunk of a video to
+/// `chunk_latent_frames` latent frames and the final window past the whole
+/// chunks to `tail_latent_frames`. The model states the rule; every count a
+/// request derives from it, the generated frames, the decode units and a
+/// reference video's encoded frames, follows from these four values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameChunks {
+    /// Fewest frames of a video: one chunk and the final window.
+    pub min_frames: u32,
+    /// Frames each further chunk adds.
+    pub chunk_frames: u32,
+    /// Latent frames one chunk encodes to.
+    pub chunk_latent_frames: u32,
+    /// Latent frames of the final window past the chunks.
+    pub tail_latent_frames: u32,
+}
+
+impl FrameChunks {
+    /// Returns the decode units of a video of `frames` legal frames.
+    pub fn units(&self, frames: u32) -> u32 {
+        frames.saturating_sub(self.min_frames) / self.chunk_frames + 1
+    }
+
+    /// Returns the fewest legal frame count that is at least `requested`.
+    pub fn align_up(&self, requested: u32) -> u32 {
+        let beyond = requested.saturating_sub(self.min_frames);
+        self.min_frames + beyond.div_ceil(self.chunk_frames) * self.chunk_frames
+    }
+
+    /// Returns the most legal frames of at most `available`, or `None` below
+    /// the fewest.
+    pub fn align_down(&self, available: u32) -> Option<u32> {
+        let beyond = available.checked_sub(self.min_frames)?;
+        Some(self.min_frames + beyond / self.chunk_frames * self.chunk_frames)
+    }
+
+    /// Returns the latent frames the VAE encodes `frames` legal frames to.
+    pub fn latent_frames(&self, frames: u32) -> u32 {
+        self.units(frames) * self.chunk_latent_frames + self.tail_latent_frames
+    }
+
+    /// Checks that the rule is positive and leaves a final window past the
+    /// first chunk.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.chunk_frames > 0
+                && self.min_frames > self.chunk_frames
+                && self.chunk_latent_frames > 0
+                && self.tail_latent_frames > 0,
+            "a video denoiser declares an empty frame rule"
+        );
+        Ok(())
+    }
+}
+
 /// What the video denoiser a deployment places serves.
 ///
 /// The denoiser fixes its schedule; the tasks, canvases and reference limits
@@ -315,6 +373,9 @@ pub struct VideoDenoiserInfo {
     /// generates: the output clock durations and reference videos are
     /// counted on.
     pub frame_rate: u32,
+    /// How the VAE chunks a video's frames, which counts frames and decode
+    /// units.
+    pub frames: FrameChunks,
     /// The only canvases the deployment serves: those it prepares, in the
     /// order its operator selected them.
     #[serde(default)]
@@ -352,6 +413,7 @@ impl VideoDenoiserInfo {
             self.frame_rate > 0,
             "a video denoiser declares no frame rate"
         );
+        self.frames.validate()?;
         ensure_valid!(
             self.canvases.iter().all(|served| {
                 served.short_edge > 0
