@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from uniserve.loading import checkpoint, weights
-from uniserve.model import TransformerDecoder
+from uniserve.model import TransformerDecoder, mot
 from uniserve_models import siglip
 
 from . import vae
@@ -82,63 +82,12 @@ def _backbone_names(backbone: TransformerDecoder) -> dict[str, str]:
         A mapping from backbone parameter paths to full checkpoint tensor names
         under ``language_model.model.``. The embedding and final norm entries
         are always present, even on a rank that does not hold those modules.
-
-    Raises:
-        ValueError: A layer parameter has no known checkpoint name.
     """
-    names = {
-        "embedding.weight": "embed_tokens.weight",
-        "norm.text.weight": "norm.weight",
-        "norm.flow.weight": "norm_moe_gen.weight",
-    }
-
-    for path, _ in backbone.named_parameters():
-        if not path.startswith("layers."):
-            continue
-        # Layer paths read ``layers.<index>.<kind>.<route>.<parts...>``, where
-        # route is ``text`` or ``flow``.
-        _, index, kind, route, *parts = path.split(".")
-        suffix = "" if route == "text" else "_moe_gen"
-        tail = ".".join(parts)
-        if kind in ("input_norms", "post_attention_norms"):
-            target = (
-                (
-                    "input_layernorm"
-                    if kind == "input_norms"
-                    else "post_attention_layernorm"
-                )
-                + suffix
-                + "."
-                + tail
-            )
-        elif kind == "outputs":
-            target = f"self_attn.o_proj{suffix}.{tail}"
-        elif kind == "projections":
-            # parts is ``projection.projections.<q|k|v>.<weight|bias>`` for
-            # the fused QKV linear, or ``<query|key>_norm.weight`` for the
-            # QK norms.
-            if parts[0] == "projection":
-                target = f"self_attn.{parts[2]}_proj{suffix}.{parts[3]}"
-            else:
-                target = (
-                    f"self_attn.{'q' if parts[0] == 'query_norm' else 'k'}"
-                    f"_norm{suffix}.{parts[1]}"
-                )
-        elif kind == "mlps":
-            tail = (
-                tail.replace("gate_up.projections.gate", "gate_proj")
-                .replace("gate_up.projections.up", "up_proj")
-                .replace("down.", "down_proj.")
-            )
-            target = f"mlp{suffix}.{tail}"
-        else:
-            raise ValueError(f"unmapped BAGEL backbone parameter {path}")
-
-        names[path] = f"layers.{index}.{target}"
-
     return {
         target: "language_model.model." + source
-        for target, source in names.items()
+        for target, source in mot.backbone_names(
+            backbone, flow_suffix="_moe_gen"
+        ).items()
     }
 
 
@@ -176,22 +125,15 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
     source_names = _backbone_names(backbone)
 
     # PP omits only the source layers and terminal modules assigned elsewhere.
-    # Every layer has the same tensor set, so the first resident layer's
-    # tails name the tensors of each nonresident layer. Declaring them
-    # nonresident keeps the loader from rejecting them as unexpected. Every
-    # pipeline stage holds at least one layer (``parallelize_`` enforces it),
-    # so ``next`` has a value.
-    template = tuple(
-        source.split(".", 4)[-1]
-        for target, source in source_names.items()
-        if target.startswith(f"layers.{next(iter(backbone.layers))}.")
+    # Declaring the omitted layers' tensors nonresident keeps the loader from
+    # rejecting them as unexpected. Every pipeline stage holds at least one
+    # layer (``parallelize_`` enforces it).
+    nonresident = mot.absent_layers(
+        backbone,
+        source_names,
+        depth=model.config.text.num_hidden_layers,
+        prefix="language_model.model.",
     )
-    nonresident = {
-        f"language_model.model.layers.{index}.{tail}"
-        for index in range(model.config.text.num_hidden_layers)
-        if str(index) not in backbone.layers
-        for tail in template
-    }
     if backbone.embedding is None:
         nonresident.add("language_model.model.embed_tokens.weight")
     if backbone.norm is None:

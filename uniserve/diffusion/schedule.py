@@ -230,26 +230,28 @@ class UniformGrid(FixedGrid):
 class RungGrid(FixedGrid):
     """A distilled student's trained rungs (a DMD ladder).
 
-    Each rung is an unshifted noise level on a ``clock``-step training
-    clock, strictly decreasing; divided by ``clock`` it gives ``u`` in
-    (0, 1], which ``shift`` warps once in double precision. The clean
-    endpoint follows the last rung, and sigma is then materialized in FP32;
-    network times are ``1 - sigma`` formed in FP32, while the analytical
-    coordinates keep the unrounded ``1 - sigma``.
+    Each rung is an unshifted noise level on a ``num_train_timesteps``-step
+    training schedule, strictly decreasing; divided by
+    ``num_train_timesteps`` it gives ``u`` in (0, 1], which ``shift`` warps
+    once in double precision. The clean endpoint follows the last rung, and
+    sigma is then materialized in FP32; network times are ``1 - sigma``
+    formed in FP32, while the analytical coordinates keep the unrounded
+    ``1 - sigma``.
     """
 
     rungs: tuple[int, ...]
     shift: float
-    clock: float
+    num_train_timesteps: float
 
     def __post_init__(self):
-        if not _is_positive(self.clock):
-            raise ValueError("a training clock must be finite and positive")
+        if not _is_positive(self.num_train_timesteps):
+            raise ValueError("num_train_timesteps must be finite and positive")
         if (
             not isinstance(self.rungs, tuple)
             or not self.rungs
             or any(
-                type(rung) is not int or not 0 < rung <= self.clock
+                type(rung) is not int
+                or not 0 < rung <= self.num_train_timesteps
                 for rung in self.rungs
             )
             or any(
@@ -257,8 +259,8 @@ class RungGrid(FixedGrid):
             )
         ):
             raise ValueError(
-                "rungs must be strictly decreasing integers within the "
-                "training clock"
+                "rungs must be strictly decreasing integers within "
+                "num_train_timesteps"
             )
         _require_shift(self.shift)
 
@@ -268,7 +270,8 @@ class RungGrid(FixedGrid):
 
     def schedule(self, device) -> Schedule:
         sigmas = tuple(
-            _shifted(rung / self.clock, self.shift) for rung in (*self.rungs, 0)
+            _shifted(rung / self.num_train_timesteps, self.shift)
+            for rung in (*self.rungs, 0)
         )
         sigma = torch.tensor(sigmas, dtype=torch.float32, device=device)
         return Schedule(
@@ -278,7 +281,7 @@ class RungGrid(FixedGrid):
 
 @dataclass(frozen=True, slots=True)
 class BlockGrid(FixedGrid):
-    """A fine base-clock grid partitioned into evaluation blocks.
+    """A fine grid over ``[0, max_t]`` partitioned into evaluation blocks.
 
     A parallel-decoding (PDD) student predicts one head per fine interval of
     ``linspace(max_t, 0, intervals + 1)``, an FP64 grid clamped to

@@ -29,14 +29,19 @@ class ImageBuilder:
     the worker inserts a generated image into a continuing conversation.
     """
 
-    # Language positions a generated image spans in the conversation:
-    # ``uniserve_worker.execution.image`` places the closing framing token
-    # this far past the opening one, and ``uniserve_worker.execution.token``
-    # advances the request's logical position by it after the image.
-    rope_advance = 2
-
     def __init__(self, denoiser: ImageDenoiser):
         self.denoiser = denoiser
+
+    @property
+    def rope_advance(self) -> int:
+        """Language positions a generated image spans in the conversation.
+
+        ``uniserve_worker.execution.image`` places the closing marker token
+        this far past the position before the image, and
+        ``uniserve_worker.execution.token`` advances the request's logical
+        position by it after the image.
+        """
+        return self.denoiser.rope_advance
 
     @property
     def framing(self) -> int:

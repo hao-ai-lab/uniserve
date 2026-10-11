@@ -195,7 +195,7 @@ class MoE(nn.Module):
             size,
             config.moe_intermediate_size,
             top_k=config.top_k_experts,
-            activation="gelu_tanh",
+            activation="gelu_pytorch_tanh",
         )
         self.output_norm = RMSNorm(size, eps)
 

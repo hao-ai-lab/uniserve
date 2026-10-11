@@ -27,6 +27,7 @@ def neo_metadata():
             "downsample_ratio": [0.5],
         },
         "pad_token_id": 3,
+        "max_image_seq_len": 4096,
     }
 
 

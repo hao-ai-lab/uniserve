@@ -16,7 +16,6 @@ from pathlib import Path
 
 from uniserve import loading
 from uniserve.loading import checkpoint
-from uniserve.nn.moe import Activation
 from uniserve.nn.rope import RoPEScaling, YaRNScaling
 
 from ..rotary import read_rotary
@@ -158,7 +157,10 @@ class Config:
                 "half the head dimension"
             )
 
-        if self.num_experts and self.hidden_act not in _EXPERT_ACTIVATIONS:
+        if self.num_experts and self.hidden_act not in {
+            "silu",
+            "gelu_pytorch_tanh",
+        }:
             raise ValueError(
                 f"Qwen3-MoE experts do not implement {self.hidden_act!r}; "
                 "expert kernels gate with SiLU or tanh-approximated GELU"
@@ -182,13 +184,6 @@ _GATED_ACTIVATIONS: Mapping[str, str] = {
     "gelu_pytorch_tanh": "gelu_pytorch_tanh",
 }
 
-# ``FusedMoE``'s name for each ``GatedMLP`` activation the expert kernels
-# implement; they have no exact GELU.
-_EXPERT_ACTIVATIONS: Mapping[str, Activation] = {
-    "silu": "silu",
-    "gelu_pytorch_tanh": "gelu_tanh",
-}
-
 
 def gated_activation(hidden_act: object, *, owner: str) -> str:
     """Resolve a checkpoint's ``hidden_act`` to a ``GatedMLP`` activation.
@@ -199,11 +194,6 @@ def gated_activation(hidden_act: object, *, owner: str) -> str:
     if not isinstance(hidden_act, str) or hidden_act not in _GATED_ACTIVATIONS:
         raise ValueError(f"unsupported {owner} hidden_act {hidden_act!r}")
     return _GATED_ACTIVATIONS[hidden_act]
-
-
-def expert_activation(hidden_act: str) -> Activation:
-    """Name the ``FusedMoE`` gating of ``Config.hidden_act``."""
-    return _EXPERT_ACTIVATIONS[hidden_act]
 
 
 def _required_int(config: Mapping[str, object], name: str) -> int:
@@ -265,10 +255,10 @@ def read_config(
 ) -> Config:
     """Normalize checkpoint metadata into immutable decoder configuration.
 
-    ``architectures`` selects the family: ``Qwen3ForCausalLM`` (dense,
-    ``model_type`` qwen3) or ``Qwen3MoeForCausalLM`` (``model_type``
-    qwen3_moe). Each family's absent fields take Transformers' defaults for
-    that family, so a field means the same here as in the reference.
+    ``architectures`` selects the family: ``Qwen3ForCausalLM`` (dense) or
+    ``Qwen3MoeForCausalLM`` (mixture of experts). Each family's absent
+    fields take Transformers' defaults for that family, so a field means the
+    same here as in the reference.
 
     Args:
         root: Local checkpoint directory containing ``config.json``.
@@ -281,12 +271,11 @@ def read_config(
         The validated ``Config``.
 
     Raises:
-        ValueError: For invalid metadata, including an unknown or
-            inconsistent architecture and ``model_type``, a missing required
-            field, a field of the wrong type or value, conflicting aliases,
-            sliding-window attention, a rotary recipe other than default or
-            YaRN, a partial rotary width, and expert fields in a dense
-            checkpoint.
+        ValueError: For invalid metadata, including an unknown architecture,
+            a missing required field, a field of the wrong type or value,
+            conflicting aliases, sliding-window attention, a rotary recipe
+            other than default or YaRN, a partial rotary width, and expert
+            fields in a dense checkpoint.
     """
     config = json.loads((root / "config.json").read_text())
 
@@ -304,11 +293,6 @@ def read_config(
             f"{sorted(_FAMILIES)}"
         )
     family = _FAMILIES[architectures[0]]
-    if config.get("model_type", family.model_type) != family.model_type:
-        raise ValueError(
-            f"{architectures[0]} checkpoint has model_type "
-            f"{config['model_type']!r}, not {family.model_type!r}"
-        )
 
     hidden_size = _required_int(config, "hidden_size")
     num_attention_heads = _required_int(config, "num_attention_heads")
@@ -461,15 +445,14 @@ class _Family:
     attention width; ``experts`` is None for dense checkpoints.
     """
 
-    model_type: str
     default_head_dim: int | None
     experts: _Experts | None
 
 
 # Defaults follow Transformers' Qwen3Config and Qwen3MoeConfig.
 _FAMILIES = {
-    "Qwen3ForCausalLM": _Family("qwen3", 128, None),
-    "Qwen3MoeForCausalLM": _Family("qwen3_moe", None, _Experts(128, 8, 768)),
+    "Qwen3ForCausalLM": _Family(128, None),
+    "Qwen3MoeForCausalLM": _Family(None, _Experts(128, 8, 768)),
 }
 
 _EXPERT_FIELDS = frozenset(

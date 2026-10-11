@@ -57,6 +57,9 @@ _TEXT = {
 # (temporal, height, width) axes.
 _SECTIONS = (4, 2, 2)
 
+# The checkpoint processor's normalization (``image_mean``, ``image_std``).
+_PIXELS = qwen3_vl.PixelConfig((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+
 # The encoder runs the first three of the four checkpoint layers, so the
 # DeepStack features (after layers 0 and 1) enter before its output.
 _RETAINED = (0, 1, 2)
@@ -65,7 +68,7 @@ _RETAINED = (0, 1, 2)
 @pytest.mark.parametrize("num_frames", (1, 3))
 def test_pixel_packing_matches_the_checkpoint_processor(num_frames):
     config = qwen3_vl.read_vision_config(_VISION)
-    pixels = qwen3_vl.PixelConfig()
+    pixels = _PIXELS
     with torch.device("meta"):
         encoder = qwen3_vl.VisionEncoder(config, pixels, dtype=torch.float32)
     frames = torch.randint(
@@ -112,7 +115,7 @@ def _encoder(config):
         network,
         _RETAINED,
         vision,
-        pixels=qwen3_vl.PixelConfig(),
+        pixels=_PIXELS,
         image_token_id=IMAGE,
         video_token_id=VIDEO,
         dtype=torch.float32,

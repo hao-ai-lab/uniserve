@@ -19,7 +19,12 @@ from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image
 from uniserve.model import TextSize
-from uniserve.nn.attention import AttentionBatch
+from uniserve.nn.attention import (
+    AttentionBatch,
+    BlockTable,
+    SegmentedInput,
+    SequenceLengths,
+)
 from uniserve.runtime import ExecutionContext, KVCache
 from uniserve_worker.bootstrap.cache import cache_info, plan_cache
 from uniserve_worker.bootstrap.capacity import input_buffer_config
@@ -30,7 +35,6 @@ from uniserve_worker.execution.diffusion import (
     prefix_row,
 )
 from uniserve_worker.execution.model_executor import ModelExecutor
-from uniserve_worker.model_executor.attention import TablePages, from_tables
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.protocol.call import (
     Bounds,
@@ -277,29 +281,33 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 for _ in branches
             )
             # The model's one cache group has one-unit pages, so its single
-            # table holds each branch's prefix pages.
-            attention = from_tables(
-                (
-                    TablePages(
-                        16,
-                        False,
-                        (0,) * len(branches),
-                        tuple(
-                            (slot * 2 + 1, slot * 2 + 2)
-                            for slot in range(len(branches))
-                        ),
-                    ),
-                ),
-                query_lengths=(factory.sequence_length(size),) * len(branches),
-                prefix_lengths=(prefix_length,) * len(branches),
-                causal=(False,) * len(branches),
-                write=(False,) * len(branches),
+            # table holds each branch's prefix pages. Each branch's queries
+            # see its prefix and the whole image sequence, and write nothing.
+            queries = SequenceLengths.from_lengths(
+                (factory.sequence_length(size),) * len(branches),
+                device="cuda:0",
             )
-            from uniserve_worker.model_executor.cuda_graph import map_tensors
-
+            prefixes = SequenceLengths.from_lengths(
+                (prefix_length,) * len(branches), device="cuda:0"
+            )
             attention = AttentionBatch.single(
-                map_tensors(
-                    attention.entries[0], lambda value: value.to("cuda:0")
+                SegmentedInput(
+                    queries,
+                    prefixes,
+                    BlockTable(
+                        torch.tensor(
+                            [
+                                (slot * 2 + 1, slot * 2 + 2)
+                                for slot in range(len(branches))
+                            ],
+                            dtype=torch.int32,
+                            device="cuda:0",
+                        ),
+                        16,
+                    ),
+                    None,
+                    queries.values[:, None].expand(-1, queries.maximum),
+                    True,
                 )
             )
             inputs = factory.bind(

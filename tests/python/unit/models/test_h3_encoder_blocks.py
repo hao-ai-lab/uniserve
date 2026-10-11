@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
+from tests.python.fixtures.h3 import video_vae_config
 from uniserve_models.minimax_h3 import video_vae
 
 pytestmark = [
@@ -25,7 +26,7 @@ pytestmark = [
 @pytest.mark.parametrize("in_channels", [128, 64])
 def test_causal_block_equals_its_eager_composition(in_channels):
     torch.manual_seed(5)
-    block = video_vae.CausalBlock(in_channels, 128, video_vae.Config()).cuda()
+    block = video_vae.CausalBlock(in_channels, 128, video_vae_config()).cuda()
     with torch.no_grad():
         for parameter in block.parameters():
             parameter.normal_(0.0, 0.05)

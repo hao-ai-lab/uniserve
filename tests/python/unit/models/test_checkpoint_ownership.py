@@ -11,12 +11,12 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 from safetensors.torch import save_file
 
 from tests.python.fixtures.checkpoints import bagel_checkpoint
-from tests.python.fixtures.h3 import dmd_denoiser
+from tests.python.fixtures.h3 import dmd_denoiser, transformer_config
 from uniserve import loading
 from uniserve.distributed import DeviceMesh
 from uniserve.loading import checkpoint, weights
 from uniserve_models import bagel
-from uniserve_models.minimax_h3 import Transformer, TransformerConfig
+from uniserve_models.minimax_h3 import Transformer
 from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
 from uniserve_models.minimax_h3.weights import transformer_component
 
@@ -101,7 +101,7 @@ def test_bagel_loading_rejects_unknown_records_on_each_pipeline_stage(
 def test_h3_loading_rejects_unknown_records_on_each_pipeline_stage(
     tmp_path, rank
 ):
-    config = TransformerConfig(
+    config = transformer_config(
         hidden_size=32,
         num_attention_heads=2,
         num_hidden_layers=2,
@@ -159,11 +159,12 @@ def test_h3_loading_rejects_unknown_records_on_each_pipeline_stage(
     loaded = load()
     skipped = {name for report in loaded.reports for name in report.skipped}
     assert f"transformer_blocks.{1 - rank}.attn.to_q.weight" in skipped
+    # Records of a module this stage reads that the model does not know, a
+    # layer beyond the checkpoint's depth, and a module no stage declares.
     unknown = (
-        "time_embedder.unknown.weight",
+        f"transformer_blocks.{rank}.attn.unknown.weight",
         "transformer_blocks.50.attn.to_q.weight",
-        "transformer_blocks.0.adaln_proj.unknown.weight",
-        "token_refiner.unknown.weight",
+        "unknown.weight",
     )
     source.update(dict.fromkeys(unknown, torch.zeros(1)))
     # safetensors requires independently owned values for distinct records.

@@ -270,6 +270,11 @@ def test_sensenova_reader_resolves_aliases(tmp_path):
         ),
         ("num_key_value_heads", 3, "divisible by KV heads"),
         ("num_experts", 8, "sparse MoE is not supported"),
+        (
+            "rope_scaling",
+            {"rope_type": "yarn", "factor": 2.0},
+            "default rotary recipe",
+        ),
     ],
 )
 def test_sensenova_reader_rejects_inconsistent_checkpoint_math(
@@ -281,6 +286,16 @@ def test_sensenova_reader_rejects_inconsistent_checkpoint_math(
     raw["llm_config"][field] = value
     (tmp_path / "config.json").write_text(json.dumps(raw))
     with pytest.raises(ValueError, match=error):
+        read_config(tmp_path, IOConfig(), sources={})
+
+
+def test_sensenova_reader_requires_the_image_sequence_limit(tmp_path):
+    from uniserve_models.sensenova_u1 import read_config
+
+    raw = neo_metadata()
+    del raw["max_image_seq_len"]
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="max_image_seq_len"):
         read_config(tmp_path, IOConfig(), sources={})
 
 

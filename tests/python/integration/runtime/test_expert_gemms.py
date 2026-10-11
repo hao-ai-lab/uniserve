@@ -38,7 +38,7 @@ def _positive(generator, *shape, fan_in=1):
     return values.to(DEVICE, torch.bfloat16)
 
 
-@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("activation", ["silu", "gelu_pytorch_tanh"])
 @pytest.mark.parametrize("pair", PAIRS, ids=str)
 @torch.inference_mode()
 def test_route_rows_hold_each_routes_expert_output(pair, activation):

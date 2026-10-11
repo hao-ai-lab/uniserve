@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from uniserve.diffusion import (
+    Branch,
     FixedGrid,
     Grid,
     LinearGrid,
@@ -526,12 +527,21 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
 
     ``framing_tokens`` and ``image_unconditional`` describe how this network
     frames a generated image and which prefix its image-unconditional guidance
-    branch reads. Execution owns the buffers and the stepping; the network
-    states these layout facts and assembles its own typed input.
+    branch reads; ``guidance_branches`` is the most branches one denoising
+    step's guidance evaluates (the conditioned prediction and each
+    unconditional one, ``uniserve.diffusion.Branch``), so execution prepares
+    one call shape for every count from one to it. ``rope_advance`` is the
+    language positions a generated image spans once it is part of a
+    continuing conversation: the request's logical position after the image
+    is its position before the image plus this. Execution owns the buffers
+    and the stepping; the network states these layout facts and assembles its
+    own typed input.
     """
 
     framing_tokens: int = 0
     image_unconditional: BranchSource = BranchSource.START
+    guidance_branches: int = len(Branch)
+    rope_advance: int
 
     @property
     def max_sequence_tokens(self) -> int:

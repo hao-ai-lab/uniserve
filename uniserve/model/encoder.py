@@ -124,13 +124,16 @@ class PatchEncoder(Encoder[VisionInput]):
     axis: each output feature merges patches of one time step, so the sample
     yields ``time * height * width / downsample**2`` features.
 
-    With ``max_patches``, the most patch rows one image can have, the
-    encoder also encodes images packed into fixed slots of that many rows
+    With ``max_patches``, the most patch rows one image can have, and
+    ``max_slots``, the most slots one packed call holds, the encoder also
+    encodes images packed into fixed slots of ``max_patches`` rows
     (``encode_packed``). The network must then read image grids only as
     device values, accept ``grid_shapes=None``, and keep every image's
     output independent of the other segments its grids describe, as
     attention restricted to each segment and pooling within it do. One
     prepared or captured call then serves every packing of a slot count.
+    ``max_slots`` bounds the activations a packed graph retains; a larger
+    batch runs in groups of that many.
     """
 
     def __init__(
@@ -143,6 +146,7 @@ class PatchEncoder(Encoder[VisionInput]):
         output_size: int,
         output_dtype: torch.dtype,
         max_patches: int | None = None,
+        max_slots: int | None = None,
     ):
         super().__init__(network)
         if any(
@@ -167,8 +171,17 @@ class PatchEncoder(Encoder[VisionInput]):
             patch_size,
             downsample,
         )
+        if (max_slots is None) != (max_patches is None) or (
+            max_slots is not None
+            and (type(max_slots) is not int or max_slots < 1)
+        ):
+            raise ValueError(
+                "packed image slots require both a patch capacity and a "
+                "positive slot count per call"
+            )
         self._output_size, self._output_dtype = output_size, output_dtype
         self.max_patches = max_patches
+        self.max_slots = max_slots
 
     def packed_grids(
         self, shapes: Sequence[tuple[int, int]], slots: int

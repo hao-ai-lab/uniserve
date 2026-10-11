@@ -4,16 +4,13 @@ An H3 checkpoint is a diffusers pipeline directory; ``checkpoint_sources``
 names its weight subdirectories, one per DiT partition. ``checkpoint_mappings``
 returns a ``weights.ModuleMapping`` for each component module. The loader
 fails on a checkpoint tensor that no assignment, derived constant, or
-``nonresident`` entry accounts for, so each mapping enumerates the tensors it
-intentionally leaves unloaded from a meta-device instance of the native
-diffusers or transformers model (``_transformer_names`` and its siblings).
+nonresident declaration accounts for, so each mapping states by name prefix
+the tensors of its source it intentionally leaves unloaded.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict
-from functools import cache
 
 import torch
 from torch import nn
@@ -27,13 +24,7 @@ from uniserve_models import qwen3_vl
 from . import audio_vae, video_vae
 from .checkpoint import TASK_PARTITIONS
 from .conditioning import assignments as conditioning_assignments
-from .config import (
-    TEXT_FIELDS,
-    TRANSFORMER_FIELDS,
-    DenoiserConfig,
-    DenseAttention,
-    TransformerConfig,
-)
+from .config import DenoiserConfig
 from .denoiser import modulation_timesteps
 from .modulation import TimestepEmbedding
 from .transformer import StepProjection
@@ -56,85 +47,24 @@ checkpoint_sources = (
     ),
 )
 
-# The checkpoint tensors each VAE encoder loads; every other tensor of its
-# VAE belongs to the decoder or to heads the encoders never evaluate.
+# Each VAE checkpoint holds an encoder half and a decoder half; a component
+# loads one and leaves the other to its sibling. The audio VAE's ``logs_proj``
+# is the encoder's log-scale head, which no encoder evaluates.
 _VIDEO_ENCODER_TENSORS = ("encoder.", "quant_conv.")
+_VIDEO_DECODER_TENSORS = ("decoder.", "post_quant_conv.")
 _AUDIO_ENCODER_TENSORS = ("encoder.", "pre_block.", "mean_proj.")
+_AUDIO_DECODER_TENSORS = ("decoder.", "dec_in_proj.")
+_AUDIO_UNEVALUATED_TENSORS = ("logs_proj.",)
 
-
-@cache
-def _transformer_names(
-    config: TransformerConfig, *, sparse: bool
-) -> frozenset[str]:
-    # The native diffusers model has no ``to_gate_compress`` projection, but
-    # a sparse-attention checkpoint stores one per block for the attention
-    # projection's ``gate`` branch. Listing it lets the nonresident sets of
-    # other pipeline stages and of the conditioner mapping account for it.
-    from diffusers.models.transformers.transformer_minimax_h3 import (
-        MiniMaxH3Transformer3DModel,
-    )
-
-    with torch.device("meta"):
-        native = MiniMaxH3Transformer3DModel(
-            **{
-                source: getattr(config, target)
-                for source, target in TRANSFORMER_FIELDS.items()
-            },
-            patch_size=(1, 2, 2),
-            final_norm_eps=config.norm_eps,
-        )
-    names = frozenset(native.state_dict())
-    if not sparse:
-        return names
-    return names | {
-        f"transformer_blocks.{index}.attn.to_gate_compress.weight"
-        for index in range(config.num_hidden_layers)
-    }
-
-
-@cache
-def _text_names(config) -> frozenset[str]:
-    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
-
-    # Only tensor names matter here; the language depth and the vision
-    # tower's depth and DeepStack blocks determine them.
-    native_config = Qwen3VLConfig(
-        text_config={
-            source: getattr(config, target)
-            for source, target in TEXT_FIELDS.items()
-        },
-        vision_config={
-            "depth": config.vision.depth,
-            "deepstack_visual_indexes": list(
-                config.vision.deepstack_visual_indexes
-            ),
-        },
-    )
-    with torch.device("meta"):
-        native = Qwen3VLForConditionalGeneration(native_config)
-    return frozenset(native.state_dict())
-
-
-@cache
-def _video_names(config) -> frozenset[str]:
-    from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import (
-        AutoencoderKLMiniMaxH3,
-    )
-
-    with torch.device("meta"):
-        native = AutoencoderKLMiniMaxH3(**asdict(config))
-    return frozenset(native.state_dict())
-
-
-@cache
-def _audio_names(config) -> frozenset[str]:
-    from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (
-        AutoencoderKLMiniMaxH3Audio,
-    )
-
-    with torch.device("meta"):
-        native = AutoencoderKLMiniMaxH3Audio(**asdict(config))
-    return frozenset(native.state_dict())
+# A DiT checkpoint's top-level modules (the diffusers
+# ``MiniMaxH3Transformer3DModel``) by serialized prefix. The conditioner
+# owns the text projection and refiner; the transformer owns the blocks
+# and the latent input and output heads.
+_CONDITIONER_TENSORS = ("context_embedder.", "token_refiner.")
+_BLOCK_TENSORS = "transformer_blocks."
+_TIME_TENSORS = ("time_embedder.",)
+_INPUT_TENSORS = ("proj_in.", "audio_proj_in.")
+_OUTPUT_TENSORS = ("proj_out.", "audio_proj_out.")
 
 
 def _resident_layers(model):
@@ -354,38 +284,24 @@ def transformer_component(model, config: DenoiserConfig, source: str):
     checkpoint source of this DiT partition.
     """
     _resident_layers(model)
-    sparse = not isinstance(config.attention, DenseAttention)
     fused = isinstance(model.video_output, StepProjection)
-    all_names = _transformer_names(model.config, sparse=sparse)
-    nonresident = set()
-    for name in all_names:
-        parts = name.split(".")
-        if name.startswith(
-            (
-                "context_embedder.",
-                "token_refiner.",
-                "time_embedder.",
-                "norm_out.linear.",
-            )
-        ):
-            nonresident.add(name)
-        elif parts[0] == "transformer_blocks" and (
-            parts[1] not in model.layers or parts[2] == "adaln_proj"
-        ):
-            nonresident.add(name)
-        elif model.video_input is None and parts[0] in {
-            "proj_in",
-            "audio_proj_in",
-        }:
-            nonresident.add(name)
-        elif model.output_norm is None and parts[0] in {
-            "norm_out",
-            "proj_out",
-            "audio_proj_out",
-        }:
-            nonresident.add(name)
-        elif fused and parts[0] in {"proj_out", "audio_proj_out"}:
-            nonresident.add(name)
+
+    # The conditioner and time embedder weights, and every layer's
+    # modulation projection, are read only by the post-load hook (or by the
+    # conditioner); a layer of another pipeline stage is left whole.
+    prefixes = [*_CONDITIONER_TENSORS, *_TIME_TENSORS, "norm_out.linear."]
+    for index in range(model.config.num_hidden_layers):
+        block = f"{_BLOCK_TENSORS}{index}."
+        if str(index) in model.layers:
+            prefixes.append(block + "adaln_proj.")
+        else:
+            prefixes.append(block)
+    if model.video_input is None:
+        prefixes.extend(_INPUT_TENSORS)
+    if model.output_norm is None:
+        prefixes.extend(("norm_out.", *_OUTPUT_TENSORS))
+    elif fused:
+        prefixes.extend(_OUTPUT_TENSORS)
 
     def post_load(reader):
         _prepare_modulation(model, config, reader)
@@ -397,7 +313,7 @@ def transformer_component(model, config: DenoiserConfig, source: str):
         source,
         lambda reader: tuple(transformer_assignments(model, reader)),
         frozenset(name for name, _ in model.named_parameters()),
-        nonresident=frozenset(nonresident),
+        nonresident_prefixes=tuple(prefixes),
         post_load=post_load,
     )
 
@@ -405,14 +321,24 @@ def transformer_component(model, config: DenoiserConfig, source: str):
 def _text_component(model, config):
     # The text encoder checkpoint is a whole Qwen3-VL model: the resident
     # language-model layers and the vision tower load from it, and every
-    # other native tensor (the language head, layers past the retained
-    # depth) is nonresident.
+    # other tensor (the language head, the final norm H3's conditioning
+    # skips, layers past the retained depth) is nonresident.
+    language = qwen3_vl.weights.LANGUAGE_PREFIX
     return weights.ModuleMapping(
         model,
         "text_encoder",
         lambda reader: qwen3_vl.weights.assignments(model, reader),
         frozenset(name for name, _ in model.named_parameters()),
-        nonresident=_text_names(config) - qwen3_vl.weights.sources(model),
+        nonresident_prefixes=(
+            "lm_head.",
+            f"{language}norm.",
+            *(
+                f"{language}layers.{index}."
+                for index in range(
+                    config.num_retained_layers, config.num_checkpoint_layers
+                )
+            ),
+        ),
     )
 
 
@@ -428,7 +354,6 @@ def _denoiser_components(name, denoiser):
     components = [transformer]
     if pipeline.rank == 0:
         conditioner = denoiser.conditioner
-        sparse = not isinstance(config.attention, DenseAttention)
         components.append(
             weights.ModuleMapping(
                 conditioner,
@@ -437,14 +362,12 @@ def _denoiser_components(name, denoiser):
                     conditioning_assignments(conditioner, reader)
                 ),
                 frozenset(name for name, _ in conditioner.named_parameters()),
-                nonresident=frozenset(
-                    name
-                    for name in _transformer_names(
-                        config.transformer, sparse=sparse
-                    )
-                    if not name.startswith(
-                        ("context_embedder.", "token_refiner.")
-                    )
+                nonresident_prefixes=(
+                    _BLOCK_TENSORS,
+                    *_TIME_TENSORS,
+                    "norm_out.",
+                    *_INPUT_TENSORS,
+                    *_OUTPUT_TENSORS,
                 ),
             )
         )
@@ -481,21 +404,16 @@ def checkpoint_mappings(model) -> tuple[weights.ModuleMapping, ...]:
                 "video_decoder",
                 lambda reader: video_vae.assignments(video, reader),
                 frozenset(name for name, _ in video.named_parameters()),
-                nonresident=frozenset(
-                    name
-                    for name in _video_names(model.config.video_vae)
-                    if name.startswith(("encoder.", "quant_conv."))
-                ),
+                nonresident_prefixes=_VIDEO_ENCODER_TENSORS,
             ),
             weights.ModuleMapping(
                 audio,
                 "audio_decoder",
                 lambda reader: audio_vae.assignments(audio, reader),
                 frozenset(name for name, _ in audio.named_parameters()),
-                nonresident=frozenset(
-                    name
-                    for name in _audio_names(audio.config)
-                    if not name.startswith(("decoder.", "dec_in_proj."))
+                nonresident_prefixes=(
+                    *_AUDIO_ENCODER_TENSORS,
+                    *_AUDIO_UNEVALUATED_TENSORS,
                 ),
             ),
             weights.ModuleMapping(
@@ -505,11 +423,7 @@ def checkpoint_mappings(model) -> tuple[weights.ModuleMapping, ...]:
                     video_encoder.encoder, reader
                 ),
                 frozenset(name for name, _ in video_encoder.named_parameters()),
-                nonresident=frozenset(
-                    name
-                    for name in _video_names(model.config.video_vae)
-                    if not name.startswith(_VIDEO_ENCODER_TENSORS)
-                ),
+                nonresident_prefixes=_VIDEO_DECODER_TENSORS,
             ),
             weights.ModuleMapping(
                 audio_encoder,
@@ -518,10 +432,9 @@ def checkpoint_mappings(model) -> tuple[weights.ModuleMapping, ...]:
                     audio_encoder.encoder, reader
                 ),
                 frozenset(name for name, _ in audio_encoder.named_parameters()),
-                nonresident=frozenset(
-                    name
-                    for name in _audio_names(model.config.audio_vae)
-                    if not name.startswith(_AUDIO_ENCODER_TENSORS)
+                nonresident_prefixes=(
+                    *_AUDIO_DECODER_TENSORS,
+                    *_AUDIO_UNEVALUATED_TENSORS,
                 ),
             ),
         )

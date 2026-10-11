@@ -19,7 +19,6 @@ from typing import Any
 from uniserve import loading
 from uniserve.diffusion import NoiseScale
 from uniserve.loading import checkpoint
-from uniserve.nn.rope import RoPEScaling
 
 from ..qwen3.config import gated_activation
 from ..rotary import alias, read_rotary
@@ -50,8 +49,8 @@ class TransformerConfig:
     temporal rotary half and height and width quarters: the temporal axis
     uses ``rope_theta`` and ``max_position_embeddings``, the spatial axes
     ``rope_theta_hw`` and ``max_position_embeddings_hw``, and all three share
-    ``rope_scaling`` and ``partial_rotary_factor``. Every layer attends over
-    the whole visible sequence.
+    ``partial_rotary_factor``. Every layer attends over the whole visible
+    sequence.
 
     Raises:
         ValueError: From ``__post_init__`` when a field has the wrong type or
@@ -72,7 +71,6 @@ class TransformerConfig:
     max_position_embeddings_hw: int = 10000
     rope_theta: float = 10000.0
     rope_theta_hw: float = 10000.0
-    rope_scaling: RoPEScaling | None = None
     partial_rotary_factor: float = 1.0
     pad_token_id: int | None = None
     tie_word_embeddings: bool = False
@@ -137,7 +135,7 @@ class Config:
     text: TransformerConfig
     vision: vision.Config
     flow: flow.Config
-    max_image_seq_len: int = 4096
+    max_image_seq_len: int
 
     def __post_init__(self) -> None:
         _positive(self.max_image_seq_len, "max_image_seq_len", integer=True)
@@ -198,6 +196,10 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
         default_theta=10000.0,
         default_original=text.get("max_position_embeddings", 32768),
     )
+    if rotary.kind != "default":
+        raise ValueError(
+            f"SenseNova supports the default rotary recipe, not {rotary.kind!r}"
+        )
 
     layers = _required(text, "num_hidden_layers", "llm_config")
     heads = _required(text, "num_attention_heads", "llm_config")
@@ -267,7 +269,6 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
             ),
             rope_theta=rotary.theta,
             rope_theta_hw=text.get("rope_theta_hw", 10000.0),
-            rope_scaling=rotary.scaling,
             partial_rotary_factor=rotary.partial_rotary_factor,
             # The text map's pad_token_id takes precedence over the root's.
             pad_token_id=text.get("pad_token_id")
@@ -312,7 +313,7 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
                 raw.get("noise_scale_max_value", 1.0),
             ),
         ),
-        max_image_seq_len=raw.get("max_image_seq_len", 4096),
+        max_image_seq_len=_required(raw, "max_image_seq_len", "config"),
     )
 
 

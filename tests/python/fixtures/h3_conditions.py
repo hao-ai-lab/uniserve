@@ -22,10 +22,10 @@ from pathlib import Path
 
 import torch
 
+from tests.python.fixtures.h3 import text_encoder_config
 from uniserve.media import image
 from uniserve.model import ConditionRole
 from uniserve_models import qwen3_vl
-from uniserve_models.minimax_h3.encoder import TextEncoderConfig
 from uniserve_models.minimax_h3.packing import AUDIO_SAMPLE_RATE, FPS
 from uniserve_worker.execution.media_reader import read_conditions
 from uniserve_worker.media.reader import SHARED_MEMORY
@@ -136,7 +136,7 @@ def _audio_reference(source: MediaLocator) -> VideoCondition:
 
 def vision_encoder() -> qwen3_vl.VisionEncoder:
     """The conditioner's vision encoder; packing reads no parameter."""
-    config = TextEncoderConfig()
+    config = text_encoder_config()
     with torch.device("meta"):
         return qwen3_vl.VisionEncoder(
             config.vision, config.pixels, dtype=torch.bfloat16
