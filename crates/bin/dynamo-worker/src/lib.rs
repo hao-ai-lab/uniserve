@@ -45,10 +45,7 @@ use uniserve_server::{
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
     profile::omni::resolution::ResolutionName,
     profile::video::{VideoRasters, VideoResolution},
-    serving::{
-        FinishStatus, MAX_VIDEO_SECONDS, RequestOutput, ServeRequestId, VIDEO_FPS,
-        video_frame_count,
-    },
+    serving::{FinishStatus, MAX_VIDEO_SECONDS, RequestOutput, ServeRequestId, VIDEO_FPS},
 };
 
 // The served canvases come from `--video-resolutions` and
@@ -500,10 +497,10 @@ enum ResponseFormat {
 }
 
 /// Dynamo's `nvext` video extensions. `prepare_request` accepts only the
-/// fields FastH3 can honor: `seed` at any non-negative value, and `fps` and
-/// `num_frames` only at the values FastH3 runs with. The checkpoint fixes the
-/// denoising schedule, so `num_inference_steps` is refused like the other
-/// controls FastH3 does not take.
+/// fields FastH3 can honor, `seed` at any non-negative value. The checkpoint
+/// fixes the denoising schedule and the frame rate, and the duration states
+/// the frame count, so `num_inference_steps`, `fps` and `num_frames` are
+/// refused like the other controls FastH3 does not take.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VideoNvExt {
@@ -541,9 +538,8 @@ struct PreparedRequest {
 /// both when they name the same raster; omitted, it is the deployment's
 /// default. Its resolution class names the target's short edge.
 /// Omitted fields default to seed 0, a `url` response, and 5 seconds, capped
-/// at `max_video_seconds`. `nvext.num_frames` is only checked against the
-/// aligned frame count of `seconds`; UniServe derives the frame count from
-/// the target duration again when it prepares the request.
+/// at `max_video_seconds`; the video service bounds it and derives the frame
+/// count when it plans the target.
 /// Every refusal is an invalid-argument error.
 fn prepare_request(
     value: Value,
@@ -602,12 +598,11 @@ fn prepare_request(
         .select(resolution, aspect_ratio)
         .map_err(invalid_argument)?;
 
-    // `seconds` is an integer in Dynamo's API; the server's duration contract
-    // bounds it and derives the frame count `nvext.num_frames` must match.
+    // `seconds` is an integer in Dynamo's API; the video service refuses one
+    // outside the deployment's duration range when it plans the target.
     let seconds = request
         .seconds
         .map_or_else(|| DEFAULT_SECONDS.min(max_video_seconds), f64::from);
-    let frames = video_frame_count(seconds, max_video_seconds).map_err(invalid_argument)?;
     let nvext = request.nvext.unwrap_or_default();
     reject_present("nvext.annotations", nvext.annotations.as_ref())?;
     reject_present("nvext.negative_prompt", nvext.negative_prompt.as_ref())?;
@@ -618,14 +613,8 @@ fn prepare_request(
     reject_present("nvext.guidance_scale", nvext.guidance_scale.as_ref())?;
     reject_present("nvext.boundary_ratio", nvext.boundary_ratio.as_ref())?;
     reject_present("nvext.guidance_scale_2", nvext.guidance_scale_2.as_ref())?;
-    if nvext.fps.is_some_and(|fps| fps != VIDEO_FPS as i32) {
-        return Err(invalid_argument(format!("nvext.fps must be {VIDEO_FPS}")));
-    }
-    if nvext.num_frames.is_some_and(|value| value != frames as i32) {
-        return Err(invalid_argument(format!(
-            "nvext.num_frames must be {frames} for {seconds} seconds"
-        )));
-    }
+    reject_present("nvext.fps", nvext.fps.as_ref())?;
+    reject_present("nvext.num_frames", nvext.num_frames.as_ref())?;
     // Dynamo's seed is signed and UniServe's unsigned.
     let seed = match nvext.seed {
         Some(seed) if seed < 0 => return Err(invalid_argument("nvext.seed must not be negative")),
@@ -832,7 +821,7 @@ mod tests {
             "prompt": "A stream in a forest",
             "seconds": 5,
             "response_format": "b64_json",
-            "nvext": {"fps": 24, "num_frames": 124, "seed": 1000}
+            "nvext": {"seed": 1000}
         })
     }
 
@@ -954,8 +943,7 @@ mod tests {
         }
     }
 
-    // Each request carries one field or value FastH3 does not support. With
-    // the default 5 seconds, `num_frames` must be 124, so 120 is refused.
+    // Each request carries one field or value FastH3 does not support.
     #[test]
     fn unsupported_control_is_rejected() {
         for request in [
@@ -963,10 +951,9 @@ mod tests {
             json!({"model":"FastH3", "prompt":"x", "stream":true}),
             json!({"model":"FastH3", "prompt":"x", "size":"832x480"}),
             json!({"model":"FastH3", "prompt":"x", "nvext":{"seed":-1}}),
-            json!({"model":"FastH3", "prompt":"x", "nvext":{"num_frames":120}}),
+            json!({"model":"FastH3", "prompt":"x", "nvext":{"fps":24}}),
+            json!({"model":"FastH3", "prompt":"x", "nvext":{"num_frames":124}}),
             json!({"model":"FastH3", "prompt":"x", "nvext":{"num_inference_steps":4}}),
-            json!({"model":"FastH3", "prompt":"x", "seconds":3}),
-            json!({"model":"FastH3", "prompt":"x", "seconds":16}),
             json!({"model":"FastH3", "prompt":"x", "extra_args":{"media_passthrough":{"foo":1}}}),
         ] {
             assert!(prepare_request(request, "FastH3", 15.0, &VideoRasters::default()).is_err());
