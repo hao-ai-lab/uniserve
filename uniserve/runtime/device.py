@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Sequence
-from typing import Any
 
 import pynvml
 import torch
@@ -17,16 +16,6 @@ __all__ = [
     "fill_cpu_ints",
     "process_device_bytes",
 ]
-
-_np: Any | None
-try:
-    import numpy as _numpy_module
-except Exception:
-    _np = None
-else:
-    _np = _numpy_module
-
-_NUMPY_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
 
 
 def process_device_bytes(device: torch.device | str) -> int:
@@ -144,15 +133,9 @@ def fill_cpu_ints(cpu: torch.Tensor, values: Sequence[int]) -> None:
     if len(values) == 0:
         return
 
-    if _np is not None and cpu.dtype in _NUMPY_DTYPES:
-        cpu[: len(values)].copy_(
-            torch.from_numpy(
-                _np.asarray(values, dtype=_NUMPY_DTYPES[cpu.dtype])
-            )
-        )
-        return
-
-    cpu[: len(values)].copy_(torch.as_tensor(values, dtype=cpu.dtype))
+    # The NumPy view shares the tensor's storage, so NumPy converts the
+    # sequence straight into the destination in one bulk pass.
+    cpu[: len(values)].numpy()[:] = values
 
 
 def fill_cpu_bools(cpu: torch.Tensor, values: Sequence[bool]) -> None:
@@ -163,10 +146,4 @@ def fill_cpu_bools(cpu: torch.Tensor, values: Sequence[bool]) -> None:
     if len(values) == 0:
         return
 
-    if _np is not None:
-        cpu[: len(values)].copy_(
-            torch.from_numpy(_np.asarray(values, dtype="bool"))
-        )
-        return
-
-    cpu[: len(values)].copy_(torch.as_tensor(values, dtype=torch.bool))
+    cpu[: len(values)].numpy()[:] = values
