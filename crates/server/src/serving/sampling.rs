@@ -23,9 +23,8 @@ use uniserve_core::SamplingParams;
 ///
 /// # Errors
 ///
-/// Fails when a logprob count is below `-1`, a bad word cannot be tokenized,
-/// or the result fails `SamplingParams::validate`. `sampling` may be partially
-/// updated on error.
+/// Fails when a bad word cannot be tokenized or the result fails
+/// `SamplingParams::validate`. `sampling` may be partially updated on error.
 pub(super) fn apply_sampling(
     tokenizer: &HuggingFaceTokenizer,
     controls: &SamplingConfig,
@@ -57,9 +56,9 @@ pub(super) fn apply_sampling(
     }
     sampling.logit_bias = biases.into_iter().collect();
     sampling.return_logprobs = stop.logprobs.is_some() || stop.logprob_token_ids.is_some();
-    sampling.n_logprobs = logprob_count("logprobs", stop.logprobs)?;
+    sampling.n_logprobs = logprob_count(stop.logprobs);
     sampling.return_prompt_logprobs = stop.prompt_logprobs.is_some();
-    sampling.n_prompt_logprobs = logprob_count("prompt_logprobs", stop.prompt_logprobs)?;
+    sampling.n_prompt_logprobs = logprob_count(stop.prompt_logprobs);
     sampling.logprob_token_ids = stop.logprob_token_ids.clone().unwrap_or_default();
     sampling.allowed_token_ids = stop.allowed_token_ids.clone();
     sampling.bad_words_ids = tokenize_bad_words(&stop.bad_words, tokenizer)?.unwrap_or_default();
@@ -69,15 +68,10 @@ pub(super) fn apply_sampling(
 
 /// Converts a wire logprob count into the engine count.
 ///
-/// `-1` requests all candidates and maps to `u32::MAX`; an absent count is
-/// zero. Values below `-1` are rejected.
-fn logprob_count(field: &'static str, value: Option<i32>) -> Result<u32, TokenizeError> {
-    match value {
-        Some(-1) => Ok(u32::MAX),
-        Some(value) if value < -1 => Err(TokenizeError::InvalidLogprobCount { field, value }),
-        Some(value) => Ok(value as u32),
-        None => Ok(0),
-    }
+/// The chat request validation admits a non-negative count or `-1`, which
+/// requests every candidate and maps to `u32::MAX`; an absent count is zero.
+fn logprob_count(value: Option<i32>) -> u32 {
+    value.map_or(0, |value| u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 /// Converts bad-word strings into sorted, deduplicated token-ID sequences.

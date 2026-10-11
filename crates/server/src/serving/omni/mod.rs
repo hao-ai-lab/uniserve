@@ -627,7 +627,7 @@ pub(super) fn prepare_generation_resources(
     Ok(())
 }
 
-/// Merges profile defaults with request image controls and validates generation geometry.
+/// Merges profile defaults with request image controls and resolves generation geometry.
 ///
 /// Request fields override profile defaults field by field. The sampling seed
 /// (already resolved from the image and text seeds) overrides the profile
@@ -648,39 +648,22 @@ fn resolve_image_params(
         image.height,
     )
     .map_err(|error| error.to_string())?;
-    let steps = image.steps.unwrap_or(defaults.steps);
-    if steps == 0 {
-        return Err(OmniError::Invalid(
-            "image.steps must be positive".to_string(),
-        ));
-    }
     let cfg_interval = image
         .cfg_interval
         .map(|interval| (interval[0], interval[1]))
         .unwrap_or(defaults.cfg_interval);
-    validate_cfg_interval(cfg_interval)?;
     let max_images = image.max_images.unwrap_or(defaults.max_images);
     validate_max_images(max_images, defaults.max_images_limit)?;
+    // `GenerationRequest::validate` checks the resolved steps, guidance,
+    // interval, and shift (`ImageParams::validate`) once the request is built.
     Ok(ImageParams {
-        steps,
-        cfg_text_scale: finite(
-            image.cfg_text_scale.unwrap_or(defaults.cfg_text_scale),
-            "image.cfg_text_scale",
-        )?,
-        cfg_img_scale: finite(
-            image.cfg_img_scale.unwrap_or(defaults.cfg_img_scale),
-            "image.cfg_img_scale",
-        )?,
+        steps: image.steps.unwrap_or(defaults.steps),
+        cfg_text_scale: image.cfg_text_scale.unwrap_or(defaults.cfg_text_scale),
+        cfg_img_scale: image.cfg_img_scale.unwrap_or(defaults.cfg_img_scale),
         cfg_renorm_type: image.cfg_renorm_type.unwrap_or(defaults.cfg_renorm_type),
-        cfg_renorm_min: finite(
-            image.cfg_renorm_min.unwrap_or(defaults.cfg_renorm_min),
-            "image.cfg_renorm_min",
-        )?,
+        cfg_renorm_min: image.cfg_renorm_min.unwrap_or(defaults.cfg_renorm_min),
         cfg_interval,
-        timestep_shift: finite(
-            image.timestep_shift.unwrap_or(defaults.timestep_shift),
-            "image.timestep_shift",
-        )?,
+        timestep_shift: image.timestep_shift.unwrap_or(defaults.timestep_shift),
         height: resolution.height,
         width: resolution.width,
         seed: sampling_seed.or(defaults.seed),
@@ -706,11 +689,6 @@ fn bagel_context_image_params(
     sampling_seed: Option<u64>,
 ) -> OmniResult<ImageParams> {
     let steps = image.steps.unwrap_or(DEFAULT_STEPS);
-    if steps == 0 {
-        return Err(OmniError::Invalid(
-            "image.steps must be positive".to_string(),
-        ));
-    }
     let max_images = image.max_images.unwrap_or(2);
     validate_max_images(max_images, profile.image_defaults.max_images_limit)?;
     // The fixed canvas still passes the profile's per-axis latent bound.
@@ -913,37 +891,12 @@ fn validate_prompt(prompt_ids: &[u32]) -> OmniResult<()> {
     }
 }
 
-/// Requires `1 <= value <= limit` for `image.max_images`.
+/// Refuses an `image.max_images` above the profile's own image limit.
 fn validate_max_images(value: u16, limit: u16) -> OmniResult<()> {
-    if value == 0 {
-        return Err(OmniError::Invalid(
-            "image.max_images must be positive".to_string(),
-        ));
-    }
     if value > limit {
         return Err(format!("image.max_images exceeds model limit {limit}").into());
     }
     Ok(())
-}
-
-/// Requires a finite `(lo, hi)` guidance interval with `lo <= hi`.
-fn validate_cfg_interval(value: (f32, f32)) -> OmniResult<()> {
-    let (lo, hi) = value;
-    if !lo.is_finite() || !hi.is_finite() || lo > hi {
-        return Err(OmniError::Invalid(
-            "image.cfg_interval must be a finite ordered pair".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Returns the value when it is finite.
-fn finite(value: f32, name: &str) -> OmniResult<f32> {
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err(format!("{name} must be finite").into())
-    }
 }
 
 /// Builds a cache key isolated by request namespace and salt.

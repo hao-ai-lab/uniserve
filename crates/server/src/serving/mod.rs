@@ -180,14 +180,6 @@ pub enum TokenizeError {
     /// Multimodal request controls or geometry are invalid.
     #[error(transparent)]
     Omni(#[from] crate::serving::omni::OmniError),
-    /// A requested log-probability count falls outside the accepted range.
-    #[error("{field} must be non-negative or -1, got {value}")]
-    InvalidLogprobCount {
-        /// Invalid request field.
-        field: &'static str,
-        /// Rejected field value.
-        value: i32,
-    },
     /// The minimum generation length exceeds the maximum generation length.
     #[error("min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})")]
     MinTokensExceedsMaximum {

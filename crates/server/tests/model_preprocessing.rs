@@ -1213,7 +1213,7 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
 
 /// Negative seeds are accepted and reinterpreted as their two's-complement
 /// `u64` value, and a logprob count of `-1` requests every candidate
-/// (`u32::MAX`) while values below `-1` are rejected, for every token model.
+/// (`u32::MAX`), for every token model.
 #[test]
 fn sampling_controls_have_the_same_meaning_across_token_models() {
     for (description, model_type) in [
@@ -1226,11 +1226,9 @@ fn sampling_controls_have_the_same_meaning_across_token_models() {
             let mut input = uniserve_server::serving::TextPromptRequest::new("sampling", "hello");
             input.sampling.seed = Some(seed);
             input.stop.logprobs = Some(-1);
-            let (request, _) = model.preprocess_text_request(input.clone()).unwrap();
+            let (request, _) = model.preprocess_text_request(input).unwrap();
             assert_eq!(request.sampling.seed, Some(seed as u64));
             assert_eq!(request.sampling.n_logprobs, u32::MAX);
-            input.stop.logprobs = Some(-2);
-            assert!(model.preprocess_text_request(input).is_err());
         }
     }
 }

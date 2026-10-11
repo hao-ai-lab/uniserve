@@ -9,9 +9,9 @@ use super::common::Normalizable;
 /// `/v1/images/generations`.
 ///
 /// Serde enforces the field set and types. The value checks (non-blank
-/// prompt, `n == 1`, served model name, positive `steps`, well-formed `size`)
-/// run in `InputProcessor::preprocess_image_request` when the request is
-/// lowered.
+/// prompt, `n == 1`, served model name, well-formed `size`) run in
+/// `InputProcessor::preprocess_image_request` when the request is lowered,
+/// and the resolved image controls are checked by `ImageParams::validate`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct ImageGenerationRequest {
