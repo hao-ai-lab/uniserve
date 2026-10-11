@@ -234,7 +234,7 @@ impl SamplingState {
 ///
 /// A rank would otherwise derive these by chaining from the calls that
 /// preceded it. The engine holds the request state they come from, so it states
-/// them and the rank asserts its own ledger agrees.
+/// them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallCoordinates {
     /// Position of this call's first token in the request's logical sequence.

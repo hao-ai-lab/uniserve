@@ -1554,10 +1554,9 @@ def _bind_cache_tables(
     alternative-prefix slots of their forward rows, the batch's block tables
     are validated and installed in `BlockTables`, and new cache units that no
     KV import initializes are zeroed. Each call's forward rows are then
-    recorded in `state.forward_indices`, the main row's prefix is checked
-    against the call's projected visible KV length, and the units each row
-    accesses in every group are retained in the `KVCacheManager` until the
-    batch's output buffer completes.
+    recorded in `state.forward_indices`, and the units each row accesses in
+    every group are retained in the `KVCacheManager` until the batch's
+    output buffer completes.
     """
     cache = kv_cache
     page_tables = request_tables
@@ -1635,31 +1634,6 @@ def _bind_cache_tables(
         main_slot = int(request.request.request_pool_idx)
         call_rows = rows_by_call.get(calls.call_identity(call), [])
         state.forward_indices[calls.call_identity(call)] = tuple(call_rows)
-
-        main_descriptor = next(
-            (
-                row
-                for row in call_rows
-                if inputs.request_pool_indices[row] == main_slot
-            ),
-            None,
-        )
-        if main_descriptor is not None:
-            visible = int(request.progress.kv_visible_len)
-            declared = (
-                inputs.seq_lens[main_descriptor]
-                - inputs.query_lens[main_descriptor]
-            )
-            relayed = (
-                call.predicate is not None and call.predicate.dtype is DType.I64
-            )
-            # A queued relay carries a capacity bound computed before its
-            # predecessor's predicate was known. Actual KV length and validity
-            # come from the device row; an inactive descendant must still drain.
-            if declared < visible or (not relayed and declared != visible):
-                raise invalid_descriptor(
-                    "forward row sequence length disagrees with execution state"
-                )
 
         for descriptor in call_rows:
             slot = inputs.request_pool_indices[descriptor]

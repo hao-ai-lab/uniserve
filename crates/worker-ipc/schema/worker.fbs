@@ -327,7 +327,7 @@ table Readout {
 
 /// The coordinates a call carries so a rank does not derive them from the
 /// calls that preceded it. The engine holds the request state they come
-/// from; the rank asserts its own ledger agrees.
+/// from.
 table CallCoordinates {
   logical_position:uint;
   kv_visible_len:uint;
