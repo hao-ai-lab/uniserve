@@ -2,7 +2,6 @@
 
 from .inputs import (
     DENSE_TILE,
-    TILE_SIZES,
     BlockInput,
     Input,
     NormRope,
@@ -13,7 +12,6 @@ from .inputs import (
 
 __all__ = [
     "DENSE_TILE",
-    "TILE_SIZES",
     "BlockInput",
     "Input",
     "NormRope",

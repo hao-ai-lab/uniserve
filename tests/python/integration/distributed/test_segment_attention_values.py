@@ -67,9 +67,7 @@ def _run(rank, rendezvous):
         )
         for name, value in matrices.items():
             layer.projection.projections[name].weight.data.copy_(value)
-        layer.attention = vsa.SegmentAttention(
-            vsa.BlockAttention(WIDTH**-0.5, tile_size=SEGMENT_TILE)
-        )
+        layer.attention = vsa.SegmentAttention(vsa.BlockAttention(WIDTH**-0.5))
         parallelize_(
             layer,
             mesh,

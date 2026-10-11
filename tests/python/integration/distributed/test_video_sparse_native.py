@@ -239,7 +239,7 @@ def test_block128_attention_attends_selected_blocks_of_valid_keys(heads):
     keys = torch.where(selected, torch.arange(tiles, device="cuda"), tiles)
     indices = keys.sort(-1).values.clamp_max(tiles - 1).to(torch.int32)
 
-    module = vsa.BlockAttention(width**-0.5, tile_size=tile)
+    module = vsa.BlockAttention(width**-0.5)
     batch = vsa.BlockInput(
         vsa.Pattern(((tiles,) * tiles,), 0, 0, tile),
         indices,

@@ -19,27 +19,22 @@ from uniserve.distributed import DeviceMesh
 from uniserve.nn import _binding
 
 from ..config import AttentionParallelConfig
-from .inputs import TILE_SIZES, BlockInput, Input, NormRope, Workspace
+from .inputs import BlockInput, Input, NormRope, Workspace
 
 
 class BlockAttention(nn.Module):
     """Compute attention over an explicit per-head selected key-block domain.
 
-    ``tile_size`` rows form one query tile and one key block; the block
-    inputs this layer attends declare the same size (``Pattern.tile``).
+    Each block input declares the rows of its query tiles and key blocks
+    (``Pattern.tile``), and the backend that evaluates it is resolved for
+    that tile.
     """
 
-    def __init__(self, scale: float, tile_size: int = 64):
+    def __init__(self, scale: float):
         super().__init__()
-        if (
-            not math.isfinite(scale)
-            or scale <= 0
-            or tile_size not in TILE_SIZES
-        ):
-            raise ValueError(
-                f"VSA requires a positive scale and a tile of {TILE_SIZES} rows"
-            )
-        self.scale, self.tile_size = scale, tile_size
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("VSA requires a positive scale")
+        self.scale = scale
 
     @contextmanager
     def _operator(self, q, batch):
@@ -75,8 +70,6 @@ class BlockAttention(nn.Module):
             buffers.close()
 
     def forward(self, q, k, v, batch: BlockInput, *, out=None):
-        if batch.pattern.tile != self.tile_size:
-            raise ValueError("VSA block input must use this layer's tile size")
         if out is None:
             out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
         with self._operator(q, batch) as operator:
@@ -197,17 +190,13 @@ class Attention(nn.Module):
         self,
         attention: BlockAttention,
         *,
-        tile_size: int = 64,
         mesh: DeviceMesh | None = None,
     ):
         super().__init__()
         # The pooling, block-map and compression kernels of this composition
-        # address 64-row tiles (``SegmentAttention`` serves other tiles).
-        if tile_size != 64 or tile_size != attention.tile_size:
-            raise ValueError(
-                "VSA selection and block attention must share 64-row tiles"
-            )
-        self.attention, self.tile_size = attention, tile_size
+        # address 64-row tiles, the tile of every pattern ``Input`` declares
+        # (``SegmentAttention`` serves other tiles).
+        self.attention = attention
         self.mesh = (
             DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0)
             if mesh is None
@@ -296,7 +285,7 @@ class Attention(nn.Module):
             raise ValueError(
                 "VSA query domain requires a matching bound context partition"
             )
-        return parallel.context_group.rank * query_tokens // self.tile_size
+        return parallel.context_group.rank * query_tokens // 64
 
     def _compress(self, batch, workspace):
         scores = workspace.tile_scores
