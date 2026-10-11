@@ -37,6 +37,7 @@ from uniserve.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
+from uniserve.quantization import Quantizer
 from uniserve.runtime import PrefixCache, TensorBuffers
 from uniserve.runtime.backends.attention import resolve
 from uniserve.runtime.backends.attention.torch import Backend as TorchBackend
@@ -489,3 +490,30 @@ def test_windowed_layers_without_native_storage_raise_when_prepared():
             workspace={},
             window=1023,
         )
+
+
+def test_a_per_block_fp8_cache_has_no_native_kernel_and_raises_when_prepared():
+    # Native kernels read half-precision pages only.
+    with PrefixCache(
+        Config({"attention": mha.Config(2, 128, (0,), torch.bfloat16)}),
+        num_units=4,
+        block_size=64,
+        device="cuda",
+        quantization={"attention": Quantizer("fp8", axis=0)},
+    ) as cache:
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"no native attention kernel.*dimension 128.*"
+                r"per-block FP8 cache of 64-token pages"
+            ),
+        ):
+            resolve("auto", device=torch.device("cuda", 0)).prepare(
+                num_heads=8,
+                num_kv_heads=2,
+                head_dim=128,
+                dtype=torch.bfloat16,
+                size=TextSize(8, 1),
+                cache=cache.state("attention"),
+                workspace={},
+            )

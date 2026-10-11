@@ -491,64 +491,50 @@ class Backend(_Backend):
         ):
             return {"torch": self._portable}
 
-        # Native kernels require half precision and unquantized cache state.
-        if dtype not in {torch.float16, torch.bfloat16} or (
-            pages is not None and pages.quantized
-        ):
-            return {}
-
-        from .prefix_block import unsupported
-
-        # Restrict candidates to each kernel's head-dimension, cache-block and
-        # history-window constraints. The pinned SM100 TensorRT-LLM cubins
-        # specialize head dimension 512 context kernels only for causal and
-        # dense masks over 16-, 32- and 64-token pages; FlashAttention
-        # kernels do not take UniServe's history windows.
+        # Each provider states what it serves; a layer a provider refuses
+        # never reaches it as a candidate.
         return {
             name: backend
             for name, backend in self._native.items()
-            if (
-                name != "trtllm"
-                or head_dim in {64, 128, 256}
-                or (
-                    head_dim == 512
-                    and window is None
-                    and pages is not None
-                    and pages.page_tokens in {16, 32, 64}
-                )
+            if self._refusal(
+                name,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                pages=pages,
+                window=window,
             )
-            and (
-                name != "prefix_block"
-                or unsupported(
-                    num_heads=num_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_dim=head_dim,
-                    dtype=dtype,
-                    pages=pages,
-                )
-                is None
-            )
-            and (window is None or name not in {"sgl_kernel", "flash_attn_4"})
-            and (
-                name != "sgl_kernel"
-                or (
-                    head_dim <= 256
-                    and head_dim % 8 == 0
-                    and (pages is None or pages.page_tokens % 256 == 0)
-                )
-            )
-            and (
-                name != "flash_attn_4"
-                or (
-                    head_dim % 8 == 0
-                    and (
-                        head_dim <= 128
-                        or head_dim == 256
-                        or (self._architecture == 9 and head_dim <= 256)
-                    )
-                )
-            )
+            is None
         }
+
+    def _refusal(
+        self, name, *, num_heads, num_kv_heads, head_dim, dtype, pages, window
+    ):
+        """Return why provider ``name`` cannot serve a layer, or None."""
+        from . import flash_attn, flash_attn_4, prefix_block, trtllm
+
+        layer = {
+            "head_dim": head_dim,
+            "dtype": dtype,
+            "pages": pages,
+            "window": window,
+        }
+        if name == "sgl_kernel":
+            return flash_attn.unsupported(**layer)
+        if name == "flash_attn_4":
+            return flash_attn_4.unsupported(
+                **layer, architecture=self._architecture
+            )
+        if name == "trtllm":
+            return trtllm.unsupported(**layer)
+        return prefix_block.unsupported(
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            pages=pages,
+        )
 
     def reads_pages(
         self, *, num_heads, num_kv_heads, head_dim, dtype, window, pages
