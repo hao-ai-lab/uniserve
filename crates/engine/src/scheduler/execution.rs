@@ -2914,6 +2914,17 @@ impl Scheduler {
                 tracing::error!(worker = %failure.worker_id, ?code, "control-plane invariant failed: {error}");
             } else if code == Some("InputError") {
                 tracing::info!(worker = %failure.worker_id, ?code, "Worker rejected request: {error}");
+            } else if !failure.refusals.is_empty()
+                && failure
+                    .requests
+                    .iter()
+                    .all(|request| failure.refusals.contains_key(request))
+            {
+                tracing::info!(
+                    worker = %failure.worker_id,
+                    refusals = ?failure.refusals,
+                    "Worker refused requests as invalid"
+                );
             } else {
                 tracing::warn!(worker = %failure.worker_id, ?code, "Worker failed affected work: {error}");
             }
@@ -3593,8 +3604,10 @@ impl Scheduler {
     ///
     /// Only the request epochs `loss` names fail, together with requests whose
     /// queued work targets an invalidated worker incarnation or reads an
-    /// invalidated buffer; every other request continues. A retired call that
-    /// has no pending record latches engine-fatal and stops reconciliation.
+    /// invalidated buffer; every other request continues. A media request
+    /// `loss` names as refused is rejected with the reason the worker stated
+    /// rather than failed. A retired call that has no pending record latches
+    /// engine-fatal and stops reconciliation.
     fn fail_after_worker_failure(&mut self, loss: &WorkerFailure) {
         // Blocks published from an invalidated worker incarnation leave
         // prefix-cache lookup; pages still referenced keep their owners.
@@ -3689,12 +3702,14 @@ impl Scheduler {
         });
 
         // Fail each affected request that is still on the named epoch: a media
-        // request records a failure intent; a token request emits an error
+        // request records a failure intent, or a rejection with the worker's
+        // reason when the worker refused it; a token request emits an error
         // unless an error finish is already pending, and defers an error
         // finish until its in-flight calls drain.
         let engine_id = self.engine_id;
         for request in requests {
             let id = request.request_id;
+            let refusal = loss.refusals.get(&request);
             let error_emitted = self
                 .inflight
                 .pending_finishes
@@ -3702,7 +3717,10 @@ impl Scheduler {
                 .is_some_and(|finish| finish.reason == FinishReason::Error);
             if let Some(state) = self.media_state_mut(id) {
                 if state.admission.request_key == request {
-                    state.terminal_intent = TerminalIntent::Failure(loss.message.clone());
+                    state.terminal_intent = match refusal {
+                        Some(reason) => TerminalIntent::Rejected(reason.clone()),
+                        None => TerminalIntent::Failure(loss.message.clone()),
+                    };
                 }
             } else if let Some(state) = self.running.get_mut(&id) {
                 if request != RequestKey::new(engine_id, id, state.request_epoch) {
@@ -3770,7 +3788,11 @@ impl Scheduler {
                 .is_some_and(|state| state.admission.request_key == request)
             {
                 if !self.inflight.has_pending_calls(id) {
-                    self.finish_media(id, DiffusionTerminal::Failed(loss.message.clone()));
+                    let terminal = match refusal {
+                        Some(reason) => DiffusionTerminal::Rejected(reason.clone()),
+                        None => DiffusionTerminal::Failed(loss.message.clone()),
+                    };
+                    self.finish_media(id, terminal);
                 }
             } else if self.running.contains_key(&id) {
                 self.finish_after_inflight(id, FinishReason::Error, None);

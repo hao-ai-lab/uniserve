@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
+from uniserve.runtime.resources import close_resources
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch import BatchState
@@ -150,12 +151,16 @@ def refused_output(
 ) -> PendingOutput:
     """Report a call of a refused request without running it.
 
-    The call fills none of its reserved writes, so they are abandoned, and
-    its output reports ``ErrorCode.INVALID_REQUEST`` with the refusal's
+    The call fills none of its reserved writes and configures none of the
+    host tasks reserved for it, so both are abandoned: an unconfigured task
+    left with the output would be submitted when the output materializes.
+    The output reports ``ErrorCode.INVALID_REQUEST`` with the refusal's
     reason, which the engine returns to the client.
     """
     tensor_store.abandon_writes(tuple(pending.writes))
     pending.writes.clear()
+    tasks, pending.host.tasks = pending.host.tasks, ()
+    close_resources(*(task.abandon for task in tasks))
     pending.status = CallStatus.ERROR
     pending.error_code = ErrorCode.INVALID_REQUEST
     pending.error_message = pending.request.refusal

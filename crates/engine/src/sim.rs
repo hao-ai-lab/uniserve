@@ -23,8 +23,8 @@ use std::time::Duration;
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::executor::{
-    BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, WorkerId,
-    logical_result,
+    BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, WorkerFailure,
+    WorkerId, logical_result,
 };
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
@@ -79,6 +79,9 @@ pub struct SimExecutor {
     /// Products declared by submitted calls that no acknowledged `Free` or
     /// `Finish` has released yet.
     products: HashSet<TensorRef>,
+    /// A result holding failed calls, handed back by the poll after the one
+    /// that reports their failure.
+    held: Option<(BatchResult, Vec<uniserve_worker_ipc::BatchCommand>)>,
 }
 
 /// What the simulated executor observed at its boundary, in the order it
@@ -157,6 +160,7 @@ impl SimExecutor {
             handle: Some(handle),
             admissions: HashSet::new(),
             products: HashSet::new(),
+            held: None,
         }
     }
 
@@ -218,6 +222,51 @@ impl SimExecutor {
             self.in_flight = self.in_flight.saturating_sub(1);
         }
         Ok(result)
+    }
+
+    /// The failure a result's failed calls amount to, as `WorkerExecutor`
+    /// reports it: their requests, the buffers those calls would have
+    /// produced, and the reason of each request the simulated model refused.
+    /// `None` when every call of the result succeeded.
+    fn call_failure(&self, result: &BatchResult) -> Option<WorkerFailure> {
+        let failed = || {
+            result
+                .results
+                .iter()
+                .map(|completion| &completion.output)
+                .filter(|output| output.status == CallStatus::Error)
+        };
+        let calls = failed()
+            .map(|output| (output.request_key, output.call_id))
+            .collect::<HashSet<_>>();
+        if calls.is_empty() {
+            return None;
+        }
+
+        let requests = calls
+            .iter()
+            .map(|(request, _)| *request)
+            .collect::<HashSet<_>>();
+        let refusals = failed()
+            .filter(|output| output.error_code == Some(ErrorCode::InvalidRequest))
+            .filter_map(|output| Some((output.request_key, output.error_message.clone()?)))
+            .collect();
+        let buffers = self
+            .products
+            .iter()
+            .map(TensorRef::buffer_id)
+            .filter(|buffer| calls.contains(&(buffer.owner, buffer.producer_call_id)))
+            .collect::<HashSet<_>>();
+        Some(WorkerFailure {
+            worker_id: WorkerId("sim".to_owned()),
+            endpoints: Vec::new(),
+            requests: requests.into_iter().collect(),
+            refusals,
+            retired: Vec::new(),
+            buffers: buffers.into_iter().collect(),
+            execution: None,
+            message: "call failed before its dependent work could complete".into(),
+        })
     }
 
     /// Closes the simulated physical worker.
@@ -312,9 +361,23 @@ impl Executor for SimExecutor {
 
     /// Returns the next batch result and applies its acknowledged `Free` and
     /// `Finish` commands to the ownership sets `command_has_capacity` reads.
+    ///
+    /// As `WorkerExecutor` does, a result holding failed calls is preceded by
+    /// the `WorkerFailure` that names them, returned as an error; the result
+    /// itself comes back from the next poll.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
-        let Some((result, commands)) = self.poll_batch(timeout)? else {
-            return Ok(None);
+        let (result, commands) = match self.held.take() {
+            Some(held) => held,
+            None => {
+                let Some((result, commands)) = self.poll_batch(timeout)? else {
+                    return Ok(None);
+                };
+                if let Some(failure) = self.call_failure(&result) {
+                    self.held = Some((result, commands));
+                    return Err(failure.into());
+                }
+                (result, commands)
+            }
         };
         for receipt in &result.command_results {
             // A failed command keeps its physical ownership.
