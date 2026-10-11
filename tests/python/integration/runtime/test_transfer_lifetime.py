@@ -429,32 +429,6 @@ def test_cuda_vmm_serves_a_fanout_and_refuses_a_retired_publication() -> None:
         event_pool.close()
 
 
-def test_cuda_vmm_rejects_a_changed_registered_view() -> None:
-    event_pool = EventPool()
-    transport = make_transport(
-        "cuda_vmm",
-        byte_capacity=8 << 20,
-        ticket_capacity=2,
-        event_pool=event_pool,
-    )
-    locator = transport.publish(torch.arange(1024, device="cuda:0"))
-    try:
-        changed = replace(
-            locator,
-            shape=(512,),
-            nbytes=locator.nbytes // 2,
-            transport=replace(locator.transport, span_lengths=(512,)),
-        )
-        with pytest.raises(WorkerError, match="invalid"):
-            _await_ticket(
-                transport.fetch(changed, device=torch.device("cuda:0"))
-            )
-    finally:
-        transport.release(locator)
-        transport.close()
-        event_pool.close()
-
-
 def test_local_read_keeps_its_producer_fence_after_publication_retirement() -> (
     None
 ):
@@ -583,14 +557,12 @@ def test_cuda_vmm_reports_an_unusable_handle_to_its_reader() -> None:
 def _read_shm_publication(channel, slot: int) -> None:
     """External reader that acknowledges the segment only when told to.
 
-    The reader finds everything it needs in the segment: the digest that
-    binds it to the locator, the readiness word, and its own acknowledgment
-    word. It claims that word before its first read, as the transport does,
-    and holds the claim across the producer's release so retirement is
-    observed to wait for it.
+    The reader finds everything it needs in the segment the locator names:
+    the readiness word and its own acknowledgment word. It claims that word
+    before its first read, as the transport does, and holds the claim across
+    the producer's release so retirement is observed to wait for it.
     """
     from uniserve_worker.transport import segment
-    from uniserve_worker.transport.endpoint import locator_digest
     from uniserve_worker.transport.shared_storage import open_shared_storage
 
     channel.send("ready")
@@ -600,7 +572,6 @@ def _read_shm_publication(channel, slot: int) -> None:
     )
     try:
         header = memoryview(storage)
-        assert segment.digest(header) == locator_digest(locator)
         segment.claim(header, slot)
         segment.await_ready(header)
         payload = segment.HEADER_BYTES
@@ -861,7 +832,7 @@ def test_shm_producer_failure_fails_its_pending_read_and_preserves_independent_r
         )
         with pytest.raises(WorkerError, match="failed before readiness"):
             pending.result()
-        with pytest.raises(WorkerError, match="retired, invalid"):
+        with pytest.raises(WorkerError, match="retired"):
             _await_ticket(consumer.fetch(locator, device=torch.device("cpu")))
         actual = _await_ticket(
             consumer.fetch(healthy, device=torch.device("cpu"))
@@ -1044,15 +1015,21 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
         events.close()
 
 
-@pytest.mark.parametrize("backend", ("local", "shm", "cuda_vmm"))
-def test_publication_rejects_changed_producer_identity(backend: str) -> None:
-    """A read names the producer it was published by, or is refused.
+@pytest.mark.parametrize(
+    ("backend", "fields"),
+    (
+        ("local", (("node", "another-node"), ("address_space", "another"))),
+        ("shm", (("node", "another-node"),)),
+    ),
+)
+def test_read_refuses_a_publication_addressed_elsewhere(
+    backend: str, fields: tuple[tuple[str, str], ...]
+) -> None:
+    """A mechanism reads only where its publications are addressable.
 
-    A host segment carries the digest of its own locator, so any change to
-    the source is caught in the header. A device publication is checked
-    against its owner where that owner is in reach; beyond this address space
-    a device locator is the engine's word, which binds only what a producer
-    reported, so the fields that move a read out of reach are not forged here.
+    A local key belongs to one address space and a segment name to one
+    host's namespace, so a locator published elsewhere is refused rather
+    than resolved here.
     """
     device = torch.device("cuda:0")
     events = EventPool()
@@ -1068,17 +1045,6 @@ def test_publication_rejects_changed_producer_identity(backend: str) -> None:
     destination = torch.empty_like(source)
     locator = transport.publish(source)
     try:
-        assert locator.source == endpoint
-        fields = [
-            ("worker_id", "encoder-1"),
-            ("rank", 1),
-            ("incarnation", "another-incarnation"),
-        ]
-        if backend != "cuda_vmm":
-            fields += [
-                ("node", "another-node"),
-                ("address_space", "another-process"),
-            ]
         for field, value in fields:
             changed = replace(
                 locator, source=replace(endpoint, **{field: value})
@@ -1245,44 +1211,6 @@ def test_cuda_vmm_publishes_a_row_whose_bytes_arrive_later() -> None:
             process.terminate()
             process.join(30)
         parent.close()
-        if locator is not None:
-            transport.release(locator)
-        transport.close()
-        events.close()
-
-
-def test_cuda_vmm_refuses_a_descriptor_handle_from_another_host() -> None:
-    """A device product crosses hosts as a fabric handle and not otherwise.
-
-    A process descriptor names an allocation only within the host that
-    exported it, so a consumer elsewhere is told that rather than being left
-    to fail inside the driver. A fabric handle carries no such restriction,
-    which is what lets a rank read a product produced on another machine.
-    """
-    from dataclasses import replace
-
-    device = torch.device("cuda:0")
-    events = EventPool()
-    transport = make_transport(
-        "cuda_vmm", byte_capacity=1 << 20, ticket_capacity=1, event_pool=events
-    )
-    locator = None
-    try:
-        locator = transport.publish(torch.ones(256, device=device))
-        elsewhere = replace(
-            locator, source=replace(locator.source, node="another-host")
-        )
-
-        handle = elsewhere.transport
-        if len(handle.allocation_handle) == 64:
-            # This device exports fabric handles, so the crossing is allowed
-            # and the read fails for want of a live producer there instead.
-            with pytest.raises(WorkerError):
-                _await_ticket(transport.fetch(elsewhere, device=device))
-        else:
-            with pytest.raises(WorkerError, match="fabric handle"):
-                _await_ticket(transport.fetch(elsewhere, device=device))
-    finally:
         if locator is not None:
             transport.release(locator)
         transport.close()

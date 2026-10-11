@@ -40,6 +40,7 @@ import torch
 from uniserve.cache import mha
 from uniserve.cache.state import decode_region
 from uniserve.quantization import QuantizedTensor, Quantizer
+from uniserve.tensors import BufferConfig
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.execution.host import HostLane
 from uniserve_worker.protocol.identity import BufferId, RequestKey
@@ -57,31 +58,30 @@ if TYPE_CHECKING:
     from uniserve_worker.storage.kv_cache import KVCacheManager
 
 
+def import_workers(capacity: int) -> int:
+    """Return the threads, each with its own workspace, that run imports."""
+    return min(4, int(capacity))
+
+
 def cache_transfer_workspace_bytes(
     *,
     page_elements: int,
     page_scales: int,
     capacity: int,
 ) -> int:
-    """Return the startup bytes for every bounded import workspace.
+    """Return the startup bytes of every import workspace.
 
-    Startup memory accounting (`bootstrap.report`) reserves this amount, so it
-    must match the `TransferBuffer` allocation in `CacheImports.__init__`.
-    ``page_elements`` is the largest ``page_tokens * layers * kv_heads *
-    head_dim`` of any cache group and ``page_scales`` the largest
-    ``page_tokens * layers * kv_heads``. Each import thread has two raw pages
-    (one per K/V field) large enough for float64 elements, one FP32
-    conversion page, and an FP32 scale buffer of ``[page_tokens, 2, layers,
-    kv_heads]``: a destination span touches at most one source page per
-    token and one source scale group per head. The tail of a raw page serves
-    as rounding scratch while it holds an FP8 input. No prefix-sized
-    conversion allocation is needed.
+    Startup memory accounting (`bootstrap.report`) reserves this amount:
+    one `TransferBuffer` per import worker, as `CacheImports.__init__`
+    allocates them. ``page_elements`` and ``page_scales`` are as
+    `import_page_sizes` returns them for the pool.
     """
-    workers = min(4, int(capacity))
-    # 20 bytes per element: two raw float64 pages (2 x 8) plus one FP32
-    # conversion page (4). Scale entries are FP32 (4 bytes each), two per
-    # token, layer and head.
-    return workers * (20 * int(page_elements) + 8 * int(page_scales))
+    buffers = TransferBuffer.buffers(
+        page_elements=page_elements, page_scales=page_scales
+    )
+    return import_workers(capacity) * sum(
+        config.nbytes for config in buffers.values()
+    )
 
 
 def import_page_sizes(pool: KVCacheManager) -> tuple[int, int]:
@@ -154,6 +154,26 @@ class TransferBuffer:
     scales: torch.Tensor
     stream: torch.cuda.Stream | None
 
+    @staticmethod
+    def buffers(
+        *, page_elements: int, page_scales: int
+    ) -> dict[str, BufferConfig]:
+        """Describe one workspace's page buffers by field.
+
+        `CacheImports.__init__` allocates exactly these for each import
+        worker, and `cache_transfer_workspace_bytes` sums them. A destination
+        span touches at most one source page per token and one source scale
+        group per head, so one page of the largest group suffices and no
+        prefix-sized conversion storage is needed. The tail of a raw page
+        serves as rounding scratch while it holds an FP8 input.
+        """
+        elements = int(page_elements)
+        return {
+            "raw": BufferConfig((2, elements * 8), torch.uint8),
+            "values": BufferConfig((elements,), torch.float32),
+            "scales": BufferConfig((2 * int(page_scales),), torch.float32),
+        }
+
 
 class CacheImports:
     """Own bounded import execution, destination leases and conversion storage.
@@ -169,29 +189,27 @@ class CacheImports:
 
     def __init__(self, pool: KVCacheManager, *, capacity: int) -> None:
         self.pool = pool
-        # `cache_transfer_workspace_bytes` accounts for one workspace per
-        # thread with the same bound.
-        workers = min(4, int(capacity))
+        workers = import_workers(capacity)
         self._tasks = HostLane(max_inflight=capacity, workers=workers)
 
         # One conversion page holds the largest group's full page, which
         # every group views as its [tokens, layers, heads, dim].
         elements, scale_entries = import_page_sizes(pool)
+        buffers = TransferBuffer.buffers(
+            page_elements=elements, page_scales=scale_entries
+        )
 
         # Idle workspaces. A task leases one in `_acquire`; `_reclaim` returns
         # it only after the task's physical access has retired.
         device = pool.cache.device
         self._available = deque(
             TransferBuffer(
-                raw=torch.empty(
-                    (2, elements * 8), dtype=torch.uint8, device=device
-                ),
-                values=torch.empty(
-                    elements, dtype=torch.float32, device=device
-                ),
-                scales=torch.empty(
-                    2 * scale_entries, dtype=torch.float32, device=device
-                ),
+                **{
+                    name: torch.empty(
+                        config.shape, dtype=config.dtype, device=device
+                    )
+                    for name, config in buffers.items()
+                },
                 stream=torch.cuda.Stream(device=device)
                 if device.type == "cuda"
                 else None,

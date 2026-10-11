@@ -31,7 +31,7 @@ from uniserve_worker.protocol.transfer import (
     WorkerEndpoint,
 )
 from uniserve_worker.transport import segment
-from uniserve_worker.transport.endpoint import Publications, locator_digest
+from uniserve_worker.transport.endpoint import Publications
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.layout import (
     copy_pairs,
@@ -61,9 +61,9 @@ if TYPE_CHECKING:
 class _ShmSource:
     """Own a shared segment and any unfinished device-to-host publication.
 
-    The segment begins with the header of ``segment``: the publication's
-    digest, its readiness word and one acknowledgment word per instance rank.
-    ``consumers`` are the slots whose words return the segment.
+    The segment begins with the header of ``segment``: its readiness word and
+    one acknowledgment word per instance rank. ``consumers`` are the slots
+    whose words return the segment.
     """
 
     shm: Any
@@ -133,18 +133,16 @@ class HostBorrow:
 def _shared_read(locator: Locator, slot: int, *, check=None):
     """Own a mapping and claim through its last read, including failure.
 
-    Opens the segment named by ``locator``, checks its digest, claims this
-    rank's ``slot`` and waits for readiness before yielding the mapping.
-    Leaving the context, normally or by an exception, acknowledges a claimed
-    slot and closes the mapping. ``check`` is forwarded to
-    `segment.await_ready`.
+    Opens the segment named by ``locator``, claims this rank's ``slot`` and
+    waits for readiness before yielding the mapping. Leaving the context,
+    normally or by an exception, acknowledges a claimed slot and closes the
+    mapping. ``check`` is forwarded to `segment.await_ready`.
 
     Raises:
         WorkerError: `invalid_descriptor` when ``locator`` is not a shared
-            storage locator, or its segment is missing or holds another
-            view; `resource_error` when the producer failed or readiness
-            timed out. Whatever ``check`` raises, and any other error opening
-            the segment, propagates.
+            storage locator or its segment is missing; `resource_error` when
+            the producer failed or readiness timed out. Whatever ``check``
+            raises, and any other error opening the segment, propagates.
     """
     handle = locator.transport
     if not isinstance(handle, PosixShmTransfer):
@@ -155,16 +153,12 @@ def _shared_read(locator: Locator, slot: int, *, check=None):
         )
     except FileNotFoundError:
         raise invalid_descriptor(
-            "publication is retired, invalid, or belongs to another view"
+            "shared storage publication is retired or was never published"
         ) from None
 
     header = memoryview(shm)
     claimed = False
     try:
-        if segment.digest(header) != locator_digest(locator):
-            raise invalid_descriptor(
-                "publication is retired, invalid, or belongs to another view"
-            )
         segment.claim(header, slot)
         claimed = True
         segment.await_ready(header, check=check)
@@ -183,11 +177,10 @@ def _shared_read(locator: Locator, slot: int, *, check=None):
 class ShmTransport(Transport):
     """Shared storage publication whose segment carries its own readiness.
 
-    A consumer opens the segment by name, checks the digest in its header
-    against the locator, waits on the readiness word and writes its own
-    acknowledgment word once it has copied the payload out. The producer
-    unlinks the segment once every named consumer has acknowledged, so a
-    read needs no connection to the producing rank.
+    A consumer opens the segment by name, waits on the readiness word and
+    writes its own acknowledgment word once it has copied the payload out.
+    The producer unlinks the segment once every named consumer has
+    acknowledged, so a read needs no connection to the producing rank.
     """
 
     name = "shm"
@@ -208,7 +201,6 @@ class ShmTransport(Transport):
         # `_reclaim` completes a retirement before returning, so `close` has
         # no in-flight reclamation to drain.
         self._publications = Publications[_ShmSource](
-            capacity=256,
             reclaim=self._reclaim,
             drain=lambda source: None,
             settled=self._settled,
@@ -402,10 +394,10 @@ class ShmTransport(Transport):
         Raises:
             WorkerError: `invalid_descriptor` when `publication_views`
                 refuses the source or the locator's identity is already
-                registered; `resource_error` when transfer bytes or
-                the publication table are exhausted, the table is closing,
-                or the CUDA driver refuses to register the segment.
-                Allocation and copy errors propagate.
+                registered; `resource_error` when transfer bytes are
+                exhausted, the table is closing, or the CUDA driver refuses
+                to register the segment. Allocation and copy errors
+                propagate.
         """
         import torch
 
@@ -446,10 +438,7 @@ class ShmTransport(Transport):
                 offset=offset,
                 device=str(first.device),
             )
-            # The header names the exact view this segment holds, so a
-            # consumer holding a locator for another view refuses it without
-            # asking this rank.
-            segment.initialize(buffer, locator_digest(locator))
+            segment.initialize(buffer)
             payload = buffer[segment.HEADER_BYTES :]
 
             packed = torch.frombuffer(payload, dtype=first.dtype).reshape(shape)
@@ -660,8 +649,8 @@ class ShmTransport(Transport):
         Raises:
             WorkerError: `invalid_descriptor` when ``locator`` is not a
                 shared storage locator on this node or `row_span` refuses
-                ``region``; otherwise as `_shared_read` raises when opening,
-                identifying or awaiting the segment.
+                ``region``; otherwise as `_shared_read` raises when opening
+                or awaiting the segment.
         """
         handle = locator.transport
         if not isinstance(handle, PosixShmTransfer):

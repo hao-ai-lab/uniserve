@@ -37,7 +37,6 @@ from uniserve.runtime import EventPool
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
     DESCRIPTOR_HANDLE_BYTES,
-    FABRIC_HANDLE_BYTES,
     CudaVmmTransfer,
     Locator,
     WorkerEndpoint,
@@ -221,7 +220,6 @@ class CudaVmmTransport(Transport):
         # was copied into its chunk, and the chunk is what waits for the
         # consumers, swept separately in reap().
         self._publications = Publications[_CudaSource](
-            capacity=256,
             reclaim=self._reclaim,
             drain=self._drain,
             # A device publication's chunk is held by the pool until its
@@ -632,17 +630,6 @@ class CudaVmmTransport(Transport):
             raise invalid_descriptor(
                 "CUDA VMM read requires a CUDA VMM locator"
             )
-        # A device product reaches another host as a fabric handle and not as
-        # a process descriptor, which names an allocation only within the host
-        # that exported it. The head refuses an edge whose devices cannot
-        # export one, so this is the rank restating what it was given.
-        if (
-            locator.source.node != self.source.node
-            and len(locator.transport.allocation_handle) != FABRIC_HANDLE_BYTES
-        ):
-            raise invalid_descriptor(
-                "a device product crosses hosts only as a fabric handle"
-            )
         if device.type != "cuda":
             raise invalid_descriptor(
                 "CUDA VMM destination must be a CUDA device"
@@ -699,10 +686,7 @@ class CudaVmmTransport(Transport):
                     # and producer fence directly; no IPC mapping is needed.
                     with _endpoint_lock:
                         owner = _endpoints.get(handle.endpoint)
-                    if (
-                        not isinstance(owner, CudaVmmTransport)
-                        or owner.source != locator.source
-                    ):
+                    if not isinstance(owner, CudaVmmTransport):
                         raise invalid_descriptor(
                             "CUDA publication has no live local owner"
                         )

@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     from uniserve_worker.protocol.output import ForwardStats
 
 
-import inspect
 import logging
 import os
 import time
@@ -35,17 +34,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from uniserve.env import flag_from_value, int_from_value
 from uniserve.profiling import profile_range
 from uniserve_worker.errors import WorkerError, should_capture_trace
-
-torch: Any | None
-try:  # torch is an optional import for CPU-only control-plane tests.
-    import torch as _torch_module
-except Exception:  # pragma: no cover - exercised only in torch-free envs.
-    torch = None
-else:  # pragma: no cover
-    torch = _torch_module
 
 __all__ = [
     "WorkerProfiler",
@@ -237,16 +230,13 @@ class WorkerProfiler:
             torch_activities = _torch_profiler_activities(
                 self.config.activities
             )
-            if torch_activities and torch is not None:
-                kwargs = {
-                    "activities": torch_activities,
-                    "with_stack": self.config.with_stack,
-                    "record_shapes": self.config.record_shapes,
-                }
-                # Passed only when the installed torch accepts it.
-                if _accepts_torch_profiler_arg("acc_events"):
-                    kwargs["acc_events"] = True
-                profiler = torch.profiler.profile(**kwargs)
+            if torch_activities:
+                profiler = torch.profiler.profile(
+                    activities=torch_activities,
+                    with_stack=self.config.with_stack,
+                    record_shapes=self.config.record_shapes,
+                    acc_events=True,
+                )
                 profiler.start()
                 self._torch_profiler = profiler
 
@@ -368,10 +358,8 @@ def _torch_profiler_activities(activities: tuple[str, ...]):
     """Map activity names to `torch.profiler.ProfilerActivity` values.
 
     ``GPU`` maps to ``CUDA`` and is dropped with a warning when CUDA is
-    unavailable. Returns an empty list without torch.
+    unavailable.
     """
-    if torch is None:
-        return []
     out = []
     if "CPU" in activities:
         out.append(torch.profiler.ProfilerActivity.CPU)
@@ -386,19 +374,9 @@ def _torch_profiler_activities(activities: tuple[str, ...]):
     return out
 
 
-def _accepts_torch_profiler_arg(name: str) -> bool:
-    """Return whether the installed profiler accepts a named option."""
-    if torch is None:
-        return False
-    try:
-        return name in inspect.signature(torch.profiler.profile).parameters
-    except (TypeError, ValueError):
-        return False
-
-
 def _cuda_profiler_start() -> None:
     """Start CUDA profiler collection when CUDA is available."""
-    if torch is None or not torch.cuda.is_available():
+    if not torch.cuda.is_available():
         logger.warning("CUDA profiler requested but CUDA is unavailable")
         return
     torch.cuda.cudart().cudaProfilerStart()
@@ -406,7 +384,7 @@ def _cuda_profiler_start() -> None:
 
 def _cuda_profiler_stop() -> None:
     """Stop CUDA profiler collection when CUDA is available."""
-    if torch is None or not torch.cuda.is_available():
+    if not torch.cuda.is_available():
         return
     torch.cuda.cudart().cudaProfilerStop()
 

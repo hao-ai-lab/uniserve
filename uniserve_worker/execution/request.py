@@ -195,51 +195,28 @@ class RequestPool:
             for row in self._rows
         )
 
-    def bind_calls(
-        self,
-        calls: Sequence[Call],
-        request_pool_indices: Sequence[int],
-    ) -> tuple[RequestState, ...]:
-        """Resolve admitted requests after validating their slot ownership.
+    def bind_calls(self, calls: Sequence[Call]) -> tuple[RequestState, ...]:
+        """Resolve the admitted request of each call.
 
         Returns:
             The request of each call, in call order.
 
         Raises:
-            WorkerError: From `invalid_descriptor` when the indices are not
-                aligned with the calls, a request or slot repeats, a slot is
-                out of range, a call names an unknown, stale, or closed
-                request or a slot the request does not hold, or a call is
-                already pending. A refused request's calls still in flight
-                when its refusal closed it bind, and report the refusal.
+            WorkerError: From `invalid_descriptor` when a call names an
+                unknown, stale, or closed request, or is already pending. A
+                refused request's calls still in flight when its refusal
+                closed it bind, and report the refusal.
             RuntimeError: The pool is closed.
         """
-        if len(calls) != len(request_pool_indices):
-            raise invalid_descriptor(
-                "request-pool indices are not aligned with calls"
-            )
-        if len({call.request_key for call in calls}) != len(calls):
-            raise invalid_descriptor("a batch repeats a request")
-
-        slots = tuple(
-            self._validate_slot(value) for value in request_pool_indices
-        )
-        if len(set(slots)) != len(slots):
-            raise invalid_descriptor("a batch repeats a request-pool index")
+        if self._closed:
+            raise RuntimeError("request pool is closed")
 
         requests = []
-        for call, slot in zip(calls, slots, strict=True):
+        for call in calls:
             request = self.get(call.request_key.request_id)
             if request.request_key != call.request_key:
                 raise invalid_descriptor(
                     f"call {call.call_id} has a stale request key"
-                )
-            if (
-                self._rows[slot] is not request
-                or request.request_pool_idx != slot
-            ):
-                raise invalid_descriptor(
-                    f"call {call.call_id} has a stale request slot"
                 )
             if request.closed and request.refusal is None:
                 raise invalid_descriptor(

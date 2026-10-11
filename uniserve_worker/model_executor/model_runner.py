@@ -624,7 +624,6 @@ class ModelRunner(Execution, ABC):
                             selected=shape,
                             borrow_output=borrow_output,
                         )
-                        result.validate_for(batch)
                     peer.context.join_expert_layers()
                     return result
 

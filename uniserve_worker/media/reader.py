@@ -11,9 +11,10 @@ reference's own:
   on several threads (``resample.lanczos``), and the planned crop
   (``ImageFit``): a stretched keyframe, a cover-cropped one, or an image
   reference at its 2048-pixel short edge.
-- ``read_video``: one FFmpeg pass resampling the video to 24 fps, skipping
-  the planned start frames and scaling onto the planned canvas with LANCZOS
-  (``fps=24,trim=start_frame=S,scale=W:H:flags=lanczos,setsar=1``) to RGB24.
+- ``read_video``: one FFmpeg pass resampling the video to the model's frame
+  rate, skipping the planned start frames and scaling onto the planned canvas
+  with LANCZOS (``fps=R,trim=start_frame=S,scale=W:H:flags=lanczos,setsar=1``)
+  to RGB24.
 - ``read_audio``: PyAV decoding to planar float at the track's native rate
   and channel layout, the planned native samples kept, a mono track
   duplicated to stereo, and one torchaudio resample to the model's rate.
@@ -43,9 +44,6 @@ from uniserve_worker.protocol.video import (
 
 #: Where Linux mounts POSIX shared memory: a published object's file path.
 SHARED_MEMORY = Path("/dev/shm")
-
-#: The frame rate the model conditions on, and video references resample to.
-FRAME_RATE = 24
 
 
 def media_path(locator: MediaLocator) -> Path:
@@ -99,12 +97,15 @@ def read_image(data: bytes, fit: ImageFit) -> np.ndarray:
     return pixels[None]
 
 
-def read_video(path: Path, clip: VideoClip, *, ffmpeg: str) -> np.ndarray:
+def read_video(
+    path: Path, clip: VideoClip, *, frame_rate: int, ffmpeg: str
+) -> np.ndarray:
     """Decode a reference video's kept frames on its planned canvas.
 
-    The video is resampled to 24 fps before its start frames are skipped,
-    so the offset counts frames of the 24 fps timeline. Scaling follows the
-    trim and is per frame, so it never sees a skipped frame.
+    The video is resampled to ``frame_rate``, the model's output frame rate,
+    before its start frames are skipped, so the offset counts frames of that
+    timeline. Scaling follows the trim and is per frame, so it never sees a
+    skipped frame.
 
     Returns:
         ``[frames, height, width, 3]`` uint8 RGB, ``clip.frames`` frames at
@@ -124,7 +125,7 @@ def read_video(path: Path, clip: VideoClip, *, ffmpeg: str) -> np.ndarray:
         "0:v:0",
         "-an",
         "-vf",
-        f"fps={FRAME_RATE},trim=start_frame={clip.start_frame},"
+        f"fps={frame_rate},trim=start_frame={clip.start_frame},"
         f"scale={canvas.width}:{canvas.height}:flags=lanczos,setsar=1",
         "-frames:v",
         str(clip.frames),
@@ -240,7 +241,6 @@ def read_audio(source: bytes | Path, clip: AudioClip, *, rate: int):
 
 
 __all__ = [
-    "FRAME_RATE",
     "SHARED_MEMORY",
     "media_path",
     "read_audio",

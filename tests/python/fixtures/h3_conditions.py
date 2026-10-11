@@ -295,6 +295,7 @@ def read(conditions, vision, ffmpeg):
         patches=patches,
         vision=vision,
         sample_rate=SAMPLE_RATE,
+        frame_rate=FPS,
         ffmpeg=ffmpeg,
     )
     return pixels, samples, patches

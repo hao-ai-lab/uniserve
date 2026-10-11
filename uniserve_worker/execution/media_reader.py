@@ -77,6 +77,7 @@ def read_conditions(
     patches: torch.Tensor | None,
     vision: TubeletEncoder,
     sample_rate: int,
+    frame_rate: int,
     ffmpeg: str,
 ) -> None:
     """Decode a request's conditions into its condition products.
@@ -85,8 +86,8 @@ def read_conditions(
     ``condition_pixels``, ``condition_samples`` and ``vision_pixels``
     storage, each None when no condition contributes to it. ``vision``
     packs the conditioner's patch rows, ``sample_rate`` is the audio
-    encoder's rate and ``ffmpeg`` the executable reference videos decode
-    with.
+    encoder's rate, ``frame_rate`` the output frame rate reference videos
+    resample to and ``ffmpeg`` the executable they decode with.
 
     Raises:
         ValueError: A condition decodes to other extents than planned, or
@@ -113,7 +114,10 @@ def read_conditions(
         else:
             assert condition.video is not None
             frames = read_video(
-                media_path(source), condition.video, ffmpeg=ffmpeg
+                media_path(source),
+                condition.video,
+                frame_rate=frame_rate,
+                ffmpeg=ffmpeg,
             )
         view = condition.vision
         if view is None:
@@ -210,6 +214,9 @@ def execute(
     audio = capability(model_runner.model, AudioEncoder)
     if vision is None or audio is None:
         raise RuntimeError("media reading requires the condition encoders")
+    postprocessor = model_runner.video_postprocessor
+    if postprocessor is None:
+        raise RuntimeError("media reading requires the output frame rate")
 
     # Each product's storage is reserved now and filled by the host task;
     # the products are published only once it completes.
@@ -237,6 +244,7 @@ def execute(
             patches=target(VISION_PIXELS),
             vision=vision,
             sample_rate=audio.sample_rate,
+            frame_rate=postprocessor.frame_rate,
             ffmpeg=model_runner.worker_config.ffmpeg,
         ),
         profile_name=(

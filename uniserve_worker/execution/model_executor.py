@@ -2591,7 +2591,6 @@ class ModelExecutor:
                             eligible=graph_eligible,
                             borrow_output=borrow_output,
                         )
-                        output.validate_for(populated[0])
                     else:
                         output = entry.run_microbatches(
                             batches,

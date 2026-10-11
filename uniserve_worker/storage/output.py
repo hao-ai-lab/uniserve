@@ -801,23 +801,20 @@ class OutputBuffer:
 class OutputPool:
     """Bounded owner of reusable pinned lane-output allocations.
 
-    At most ``capacity`` buffers are ever allocated, and no lease may exceed
-    ``max_words`` int64 words. A retired buffer is reused, grown if needed,
-    by a later lease.
+    At most ``capacity`` buffers are ever allocated. A retired buffer is
+    reused, grown if needed, by a later lease.
     """
 
     def __init__(
         self,
         *,
         capacity: int,
-        max_words: int,
         event_pool: EventPool,
     ) -> None:
         """Allocate a bounded set of reusable pinned completion buffers."""
         self.capacity = int(capacity)
-        self.max_words = int(max_words)
-        if self.capacity < 1 or self.max_words < 1:
-            raise ValueError("output-pool bounds must be positive")
+        if self.capacity < 1:
+            raise ValueError("output-pool capacity must be positive")
 
         self.event_pool = event_pool
         self._buffers: list[OutputBuffer] = []
@@ -834,16 +831,11 @@ class OutputPool:
     ) -> OutputBuffer:
         """Lease a reset or newly allocated output buffer within pool bounds.
 
-        Raises ``resource_error`` when ``token_capacity`` exceeds
-        ``max_words``, the pool is closed, or all ``capacity`` buffers are
-        leased; the leased buffer's own row-count checks also apply.
+        Raises ``resource_error`` when the pool is closed or all ``capacity``
+        buffers are leased; the leased buffer's own row-count checks also
+        apply.
         """
         words = int(token_capacity)
-        if words > self.max_words:
-            raise resource_error(
-                "lane output exceeds its startup storage bound"
-            )
-
         with self._lock:
             if self._closed:
                 raise resource_error("output pool is closed")

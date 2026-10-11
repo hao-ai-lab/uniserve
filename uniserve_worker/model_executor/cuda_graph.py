@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field, is_dataclass
-from itertools import count
 from types import MappingProxyType
 from typing import Any, Self
 
@@ -332,10 +331,6 @@ class CUDAGraphRunner:
         self.executable.close()
 
 
-# Process-wide recency counter for ``GraphBucket.last_used``.
-_USES = count()
-
-
 @dataclass
 class GraphBucket:
     """Variants sharing one prepared numerical shape and its fixed backing.
@@ -348,11 +343,7 @@ class GraphBucket:
     """
 
     graphs: dict = field(default_factory=dict)
-    last_used: int = field(default_factory=lambda: next(_USES))
     expert_layers: frozenset[int] = frozenset()
-
-    def touch(self):
-        self.last_used = next(_USES)
 
     def close(self):
         try:

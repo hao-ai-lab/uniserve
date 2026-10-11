@@ -282,6 +282,15 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         raise NotImplementedError
 
     @property
+    def text_only(self) -> bool:
+        """Whether the network serves requests that bring no conditions.
+
+        Every other request brings at least one condition and evaluates in a
+        layout of its own.
+        """
+        raise NotImplementedError
+
+    @property
     def schedule_shifts(self) -> Mapping[str, float]:
         """Each modality's trained schedule shift."""
         # ``__init__`` admits only fixed grids, which carry a trained shift.

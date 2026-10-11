@@ -2,15 +2,16 @@
 
 A host product published over shared storage carries everything a consumer
 needs inside the segment itself, so that no connection to the producer is
-required: the publication's identity, its readiness, and one acknowledgment
-word per instance rank. A consumer claims its word when it begins reading
-and acknowledges it once its reads are done, so a producer whose
-publication the engine has retired can tell a consumer still reading from
-one that never began: the engine retires a publication only after every
-consumer's call has resolved or will never be submitted, so no consumer
-begins reading after that. The words are written and read with release and
-acquire ordering, because the readiness word announces the payload written
-before it and the two live in different processes.
+required: its readiness, and one acknowledgment word per instance rank. The
+segment's name, which the locator carries, identifies the publication. A
+consumer claims its word when it begins reading and acknowledges it once its
+reads are done, so a producer whose publication the engine has retired can
+tell a consumer still reading from one that never began: the engine retires a
+publication only after every consumer's call has resolved or will never be
+submitted, so no consumer begins reading after that. The words are written
+and read with release and acquire ordering, because the readiness word
+announces the payload written before it and the two live in different
+processes.
 
 `ShmTransport` writes the header as producer and reads it as consumer. The
 acknowledgment slot count and word size are shared with the device pool's
@@ -29,9 +30,6 @@ from uniserve_worker.transport.vmm_pool import (
     MAX_ACKNOWLEDGMENT_SLOTS,
 )
 
-#: Byte offset and length of the locator digest that identifies the segment.
-DIGEST_OFFSET = 0
-DIGEST_BYTES = 32
 #: Byte offset of the readiness word.
 STATE_OFFSET = 32
 #: Readiness word values: the producer is still writing, the bytes are
@@ -62,21 +60,15 @@ def ack_offset(slot: int) -> int:
     return ACK_OFFSET + slot * ACK_WORD_BYTES
 
 
-def initialize(buffer: memoryview, digest: bytes) -> None:
-    """Write a fresh header: this digest, pending, no acknowledgments.
+def initialize(buffer: memoryview) -> None:
+    """Write a fresh header: pending, no acknowledgments.
 
     The producer calls this before the locator naming the segment leaves
     `ShmTransport.publish`, so no consumer can observe a partial header.
     """
-    buffer[DIGEST_OFFSET : DIGEST_OFFSET + DIGEST_BYTES] = digest
     for slot in range(MAX_ACKNOWLEDGMENT_SLOTS):
         atomic_store_u32(buffer, ack_offset(slot), 0)
     atomic_store_u32(buffer, STATE_OFFSET, PENDING)
-
-
-def digest(buffer: memoryview) -> bytes:
-    """Return the digest the producer wrote."""
-    return bytes(buffer[DIGEST_OFFSET : DIGEST_OFFSET + DIGEST_BYTES])
 
 
 def set_state(buffer: memoryview, state: int) -> None:

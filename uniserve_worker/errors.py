@@ -48,21 +48,18 @@ class WorkerErrorCode(StrEnum):
     Members are strings because the IPC error response carries the value
     (for example ``"InvariantViolation"``) as its ``code`` field. The engine
     matches on these values (``WorkerGroup::join_rank_errors``, for example,
-    escalates ``SchedulerBug`` and ``InvariantViolation`` as it does fatal
-    errors), so changing a value is a wire-protocol change.
+    escalates ``InvariantViolation`` as it does fatal errors), so changing a
+    value is a wire-protocol change.
     """
 
     UNSUPPORTED_CALL = "UnsupportedCall"
-    UNSUPPORTED_CONTROL = "UnsupportedControl"
     INVALID_DESCRIPTOR = "InvalidDescriptor"
     UNSUPPORTED_SETUP = "UnsupportedSetup"
-    RESOURCE_LEASE_VIOLATION = "ResourceLeaseViolation"
     INPUT_ERROR = "InputError"
     COMPUTE_ERROR = "ComputeError"
     RESOURCE_ERROR = "ResourceError"
     INVARIANT_VIOLATION = "InvariantViolation"
     FATAL_WORKER_FAILURE = "FatalWorkerFailure"
-    SCHEDULER_BUG = "SchedulerBug"
 
 
 class ErrorPolicy(NamedTuple):
@@ -89,16 +86,13 @@ _DEFAULT_POLICY = ErrorPolicy(fatal=False, capture_trace=False)
 
 _POLICY: dict[WorkerErrorCode, ErrorPolicy] = {
     WorkerErrorCode.UNSUPPORTED_CALL: ErrorPolicy(False, False),
-    WorkerErrorCode.UNSUPPORTED_CONTROL: ErrorPolicy(False, False),
     WorkerErrorCode.INVALID_DESCRIPTOR: ErrorPolicy(False, False),
     WorkerErrorCode.UNSUPPORTED_SETUP: ErrorPolicy(False, False),
-    WorkerErrorCode.RESOURCE_LEASE_VIOLATION: ErrorPolicy(False, False),
     WorkerErrorCode.INPUT_ERROR: ErrorPolicy(False, False),
     WorkerErrorCode.COMPUTE_ERROR: ErrorPolicy(False, True),
     WorkerErrorCode.RESOURCE_ERROR: ErrorPolicy(False, True),
     WorkerErrorCode.INVARIANT_VIOLATION: ErrorPolicy(True, True),
     WorkerErrorCode.FATAL_WORKER_FAILURE: ErrorPolicy(True, True),
-    WorkerErrorCode.SCHEDULER_BUG: ErrorPolicy(False, False),
 }
 
 

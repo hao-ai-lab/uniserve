@@ -150,7 +150,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
         device=device,
     )
     events = EventPool()
-    outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
+    outputs = OutputPool(capacity=1, event_pool=events)
     request = RequestKey(1, 1, 1)
     values = torch.arange(1, 5, dtype=torch.float32, device=device).reshape(
         4, 1, 1
@@ -251,7 +251,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
 def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reuse(  # noqa: E501
 ) -> None:
     events = EventPool()
-    outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
+    outputs = OutputPool(capacity=1, event_pool=events)
     transport = make_transport(
         "local", byte_capacity=4096, ticket_capacity=2, event_pool=events
     )
