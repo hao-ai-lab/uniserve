@@ -541,7 +541,7 @@ table VideoAdmission {
   conditions:[VideoCondition];
 }
 
-table ArRequestParams {
+table GenerationParams {
   sampling:SamplingParams;
   negative_token_ids:[uint];
   finish_token_ids:[uint];
@@ -560,7 +560,7 @@ table DiffusionSamplingParams {
 table NewRequest {
   request_key:RequestKey;
   request_pool_idx:uint;
-  ar:ArRequestParams;
+  generation:GenerationParams;
   image:ImageParams;
   diffusion:DiffusionSamplingParams;
   prompt_token_ids:[uint];

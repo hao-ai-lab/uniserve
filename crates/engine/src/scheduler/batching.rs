@@ -415,7 +415,7 @@ impl Scheduler {
                             NewRequest::new(
                                 request_key,
                                 request_pool_idx,
-                                Some(ArRequestParams {
+                                Some(GenerationParams {
                                     sampling: st.req.sampling.clone(),
                                     negative_token_ids: st.req.negative_prompt_token_ids.clone(),
                                     finish_token_ids,

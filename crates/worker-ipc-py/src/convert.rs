@@ -43,12 +43,12 @@ use uniserve_core::{
     VideoCondition,
 };
 use uniserve_worker_ipc::{
-    ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
-    BufferAllocation, BufferId, CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType,
-    DecodeRange, DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode, FeatureKind,
-    FinishFlags, ForwardStats, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaOutput,
-    NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication, TensorRef,
-    TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
+    ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, BufferAllocation, BufferId,
+    CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType, DecodeRange,
+    DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags,
+    ForwardStats, GenerationParams, KvGroupTransfer, KvTransfer, LatentParams, Locator,
+    MediaOutput, NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication,
+    TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
     WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
@@ -828,9 +828,9 @@ fn admission_to_py<'py>(
     dict.set_item(
         intern!(py, "generation"),
         admission
-            .ar
+            .generation
             .as_ref()
-            .map(|ar| ar_params_to_py(py, ar))
+            .map(|generation| generation_params_to_py(py, generation))
             .transpose()?,
     )?;
     dict.set_item(
@@ -977,18 +977,24 @@ fn video_condition_to_py<'py>(
 }
 
 /// Converts autoregressive admission parameters into a Python record.
-fn ar_params_to_py<'py>(py: Python<'py>, ar: &ArRequestParams) -> PyResult<Bound<'py, PyAny>> {
+fn generation_params_to_py<'py>(
+    py: Python<'py>,
+    generation: &GenerationParams,
+) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "sampling"), sampling_to_py(py, &ar.sampling)?)?;
+    dict.set_item(
+        intern!(py, "sampling"),
+        sampling_to_py(py, &generation.sampling)?,
+    )?;
     dict.set_item(
         intern!(py, "negative_token_ids"),
-        u32_tuple(py, &ar.negative_token_ids)?,
+        u32_tuple(py, &generation.negative_token_ids)?,
     )?;
     dict.set_item(
         intern!(py, "finish_token_ids"),
-        u32_tuple(py, &ar.finish_token_ids)?,
+        u32_tuple(py, &generation.finish_token_ids)?,
     )?;
-    dict.set_item(intern!(py, "initial_position"), ar.initial_position)?;
+    dict.set_item(intern!(py, "initial_position"), generation.initial_position)?;
     construct(py, "GenerationParams", &dict)
 }
 
@@ -2183,7 +2189,7 @@ mod tests {
         let admission = NewRequest::new(
             request_key,
             1,
-            Some(ArRequestParams {
+            Some(GenerationParams {
                 sampling: SamplingParams {
                     temperature: 0.0,
                     ignore_eos: true,

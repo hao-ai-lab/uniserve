@@ -212,16 +212,16 @@ fn image<'a>(
     )
 }
 
-fn ar<'a>(
+fn generation<'a>(
     b: &mut FlatBufferBuilder<'a>,
-    v: &ArRequestParams,
-) -> WIPOffset<fbs::ArRequestParams<'a>> {
+    v: &GenerationParams,
+) -> WIPOffset<fbs::GenerationParams<'a>> {
     let sampling = Some(sampling(b, &v.sampling));
     let negative_token_ids = Some(b.create_vector(&v.negative_token_ids));
     let finish_token_ids = Some(b.create_vector(&v.finish_token_ids));
-    fbs::ArRequestParams::create(
+    fbs::GenerationParams::create(
         b,
-        &fbs::ArRequestParamsArgs {
+        &fbs::GenerationParamsArgs {
             sampling,
             negative_token_ids,
             finish_token_ids,
@@ -352,7 +352,7 @@ fn video_admission<'a>(
 
 fn admission<'a>(b: &mut FlatBufferBuilder<'a>, v: &NewRequest) -> WIPOffset<fbs::NewRequest<'a>> {
     let request_key = Some(request_key(b, &v.request_key));
-    let ar = v.ar.as_ref().map(|value| ar(b, value));
+    let generation = v.generation.as_ref().map(|value| generation(b, value));
     let image = v.image.as_ref().map(|value| image(b, value));
     let diffusion = v.diffusion.as_ref().map(|value| diffusion(b, value));
     let video = v.video.as_ref().map(|value| video_admission(b, value));
@@ -362,7 +362,7 @@ fn admission<'a>(b: &mut FlatBufferBuilder<'a>, v: &NewRequest) -> WIPOffset<fbs
         &fbs::NewRequestArgs {
             request_key,
             request_pool_idx: v.request_pool_idx,
-            ar,
+            generation,
             image,
             diffusion,
             prompt_token_ids,

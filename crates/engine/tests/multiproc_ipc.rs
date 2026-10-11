@@ -37,8 +37,8 @@ use uniserve_engine::{
     WorkerProcessArgs,
 };
 use uniserve_worker_ipc::{
-    ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CacheUnitAllocation, Call, CallId,
-    CallKind, CallStatus, DType, DimBound, ErrorCode, ForwardBatch, Locator, NewRequest,
+    Batch, BatchCommand, BlockTable, Bounds, CacheUnitAllocation, Call, CallId, CallKind,
+    CallStatus, DType, DimBound, ErrorCode, ForwardBatch, GenerationParams, Locator, NewRequest,
     RequestKey, ShapeBound, TensorPublication, TensorRef, TransferHandle, TransferTransport,
 };
 
@@ -1732,7 +1732,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert_eq!(info.max_batch_tokens, 256);
 
     let mut admission = text_admission(11, 1, 1)?;
-    let sampling = &mut admission.ar.as_mut().unwrap().sampling;
+    let sampling = &mut admission.generation.as_mut().unwrap().sampling;
     sampling.return_logprobs = true;
     sampling.n_logprobs = 1;
     sampling.return_prompt_logprobs = true;
@@ -3180,7 +3180,7 @@ fn text_admission(
     Ok(NewRequest::new(
         RequestKey::new(1, RequestId(request_id), request_epoch),
         request_pool_idx,
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: SamplingParams {
                 temperature: 0.0,
                 ignore_eos: true,

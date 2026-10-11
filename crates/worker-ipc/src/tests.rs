@@ -185,7 +185,7 @@ fn admission() -> NewRequest {
     NewRequest::new(
         request_key(),
         u32::try_from(request_key().request_id.0).unwrap(),
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: SamplingParams::default(),
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![2, 7],
@@ -575,7 +575,7 @@ fn canvas_step_batch() -> Batch {
     let admission = NewRequest::new(
         request_key(),
         u32::try_from(request_key().request_id.0).unwrap(),
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: SamplingParams {
                 seed: Some(11),
                 ..SamplingParams::default()
@@ -1755,7 +1755,7 @@ fn comprehensive_batches() -> Vec<Batch> {
     let ar_params = NewRequest::new(
         key_for_request(100),
         100,
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: full_sampling(),
             negative_token_ids: vec![100, 101],
             finish_token_ids: vec![2, 7],

@@ -41,15 +41,15 @@ use uniserve_core::{KvCacheGroup, KvGroupKind, RequestId, SamplingParams, TokenL
 
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
-    ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds,
-    BufferAllocation, BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind,
-    CallStatus, CanvasStep, DType, DecodeRange, DiffusionSamplingParams, DimBound,
-    ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
-    ForwardStats, KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall,
-    MediaOutput, NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind,
-    SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
-    TransferHandle, TransferMode, TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint,
-    WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
+    ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds, BufferAllocation,
+    BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallStatus, CanvasStep,
+    DType, DecodeRange, DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode,
+    FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats, GenerationParams,
+    KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall, MediaOutput,
+    NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind, SamplingState,
+    ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle,
+    TransferMode, TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint, WorkerInfo,
+    WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 use uniserve_core::{
     AudioClip, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator, VideoClip,
@@ -445,7 +445,10 @@ fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewReques
             .map(|ids| ids.iter().collect())
             .unwrap_or_default(),
         input_images: admission.input_images(),
-        ar: admission.ar().map(ar_params_from_table).transpose()?,
+        generation: admission
+            .generation()
+            .map(generation_params_from_table)
+            .transpose()?,
         image: admission.image().map(image_from_table).transpose()?,
         diffusion: admission
             .diffusion()
@@ -562,8 +565,10 @@ fn video_condition_from_table(table: fbs::VideoCondition<'_>) -> CodecResult<Vid
 }
 
 /// Decodes autoregressive admission parameters, including sampling state.
-fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRequestParams> {
-    Ok(ArRequestParams {
+fn generation_params_from_table(
+    admission: fbs::GenerationParams<'_>,
+) -> CodecResult<GenerationParams> {
+    Ok(GenerationParams {
         sampling: sampling_from_table(
             admission
                 .sampling()

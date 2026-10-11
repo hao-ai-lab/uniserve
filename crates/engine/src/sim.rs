@@ -488,7 +488,7 @@ impl SimRequestState {
     /// Creates request state from an admitted request.
     fn new(admission: NewRequest) -> Self {
         let prefix_len = admission
-            .ar
+            .generation
             .as_ref()
             .map_or(0, |branch| branch.initial_position);
         Self {
@@ -523,7 +523,7 @@ impl SimRequestState {
 
     /// Returns shared access to the simulated sampling configuration.
     fn sampling(&self) -> Option<&SamplingParams> {
-        self.admission.ar.as_ref().map(|und| &und.sampling)
+        self.admission.generation.as_ref().map(|und| &und.sampling)
     }
 
     /// Returns shared access to the simulated image configuration.
@@ -839,7 +839,7 @@ impl SimEngine {
                     // call forces a finish.
                     let admitted_stops = request
                         .admission
-                        .ar
+                        .generation
                         .as_ref()
                         .map_or(&[][..], |und| und.finish_token_ids.as_slice());
                     let continuation = admitted_stops.binary_search(&output.token).is_err()
@@ -1467,7 +1467,7 @@ impl SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_ipc::{
-        ArRequestParams, Bounds, CallId, DType, ForwardBatch, RequestKey, ShapeBound, TensorRef,
+        Bounds, CallId, DType, ForwardBatch, GenerationParams, RequestKey, ShapeBound, TensorRef,
     };
 
     fn request_key() -> RequestKey {
@@ -1478,7 +1478,7 @@ mod tests {
         NewRequest::new(
             request_key(),
             1,
-            Some(ArRequestParams {
+            Some(GenerationParams {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),

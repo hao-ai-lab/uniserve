@@ -96,10 +96,10 @@ use uniserve_core::{
 };
 use uniserve_core::{RejectionKind, UnitId, encoder_cache_key};
 use uniserve_worker_ipc::{
-    ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
+    BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
-    DimBound, ForwardBatch, ForwardStats, LatentParams, NewRequest, RequestKey, SamplingState,
-    ShapeBound, TensorRef, TimingCounters, WorkerInfo,
+    DimBound, ForwardBatch, ForwardStats, GenerationParams, LatentParams, NewRequest, RequestKey,
+    SamplingState, ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
 
 use crate::executor::WorkerFailure;
@@ -479,7 +479,7 @@ fn add_worker_forward_map(target: &Mutex<BTreeMap<String, u64>>, delta: &BTreeMa
 /// The sorted, deduplicated list holds the request's stop token ids, the EOS
 /// ids unless `ignore_eos` is set, and the image-generation trigger when the
 /// request generates images through a direct trigger token. It reaches the
-/// worker in `ArRequestParams::finish_token_ids` and bounds verified-draft
+/// worker in `GenerationParams::finish_token_ids` and bounds verified-draft
 /// prefixes in `validate_generation_result`.
 ///
 /// Terminal stop/EOS tokens end the request. A direct Gen trigger instead ends
