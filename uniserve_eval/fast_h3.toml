@@ -41,7 +41,6 @@ num_prompts = 72
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.gb200-4-bf16-latency.metrics]
@@ -62,7 +61,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
@@ -84,7 +82,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 2
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
@@ -106,7 +103,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 4
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
@@ -128,7 +124,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 8
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
@@ -158,7 +153,6 @@ num_prompts = 72
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.gb200-4-nvfp4-latency.metrics]
@@ -179,7 +173,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
@@ -201,7 +194,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 2
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
@@ -223,7 +215,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 4
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
@@ -245,7 +236,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 8
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
@@ -275,7 +265,6 @@ num_prompts = 72
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.gb200-8-bf16-latency.metrics]
@@ -304,7 +293,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
@@ -326,7 +314,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 2
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
@@ -348,7 +335,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 4
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
@@ -370,7 +356,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 8
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
@@ -392,7 +377,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 16
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c16.jsonl"
 
@@ -422,7 +406,6 @@ num_prompts = 72
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.gb200-8-nvfp4-latency.metrics]
@@ -451,7 +434,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
@@ -473,7 +455,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 2
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
@@ -495,7 +476,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 4
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
@@ -517,7 +497,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 8
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
@@ -539,7 +518,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 16
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c16.jsonl"
 
@@ -566,7 +544,6 @@ num_prompts = 72
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.rtx-pro-6000-8-bf16-latency.metrics]
@@ -592,7 +569,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
@@ -614,7 +590,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 2
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
@@ -636,7 +611,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 4
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
@@ -658,7 +632,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 8
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
@@ -680,7 +653,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 16
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c16.jsonl"
 
@@ -707,7 +679,6 @@ num_prompts = 72
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-latency.metrics]
@@ -733,7 +704,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
@@ -755,7 +725,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 2
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
@@ -777,7 +746,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 4
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
@@ -799,7 +767,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 8
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
@@ -821,7 +788,6 @@ num_prompts = 32
 request_rate = inf
 max_concurrency = 16
 request_timeout_s = 21600
-seed = 20260925
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c16.jsonl"
 

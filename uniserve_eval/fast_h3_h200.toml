@@ -35,7 +35,6 @@ num_prompts = 3
 request_rate = inf
 max_concurrency = 1
 warmup_requests = 1
-seed = 1000
 
 [benchmarks.h200-ulysses4-5s-1k.metrics]
 videos_per_second = "higher"
@@ -71,7 +70,6 @@ num_prompts = 3
 request_rate = inf
 max_concurrency = 1
 warmup_requests = 1
-seed = 1000
 
 [benchmarks.h200-ulysses8-5s-1k.metrics]
 videos_per_second = "higher"
@@ -93,7 +91,6 @@ num_prompts = 3
 request_rate = inf
 max_concurrency = 1
 warmup_requests = 1
-seed = 1000
 
 [benchmarks.h200-ulysses8-5s-10k.metrics]
 videos_per_second = "higher"
@@ -115,7 +112,6 @@ num_prompts = 3
 request_rate = inf
 max_concurrency = 1
 warmup_requests = 1
-seed = 1000
 
 [benchmarks.h200-ulysses8-10s-1k.metrics]
 videos_per_second = "higher"
@@ -137,7 +133,6 @@ num_prompts = 3
 request_rate = inf
 max_concurrency = 1
 warmup_requests = 1
-seed = 1000
 
 [benchmarks.h200-ulysses8-10s-10k.metrics]
 videos_per_second = "higher"
@@ -159,7 +154,6 @@ num_prompts = 3
 request_rate = inf
 max_concurrency = 1
 warmup_requests = 1
-seed = 1000
 
 [benchmarks.h200-ulysses8-15s-1k.metrics]
 videos_per_second = "higher"
@@ -181,7 +175,6 @@ num_prompts = 3
 request_rate = inf
 max_concurrency = 1
 warmup_requests = 1
-seed = 1000
 
 [benchmarks.h200-ulysses8-15s-10k.metrics]
 videos_per_second = "higher"
@@ -217,7 +210,6 @@ num_prompts = 3
 request_rate = inf
 max_concurrency = 1
 warmup_requests = 1
-seed = 1000
 
 [benchmarks.h200-gather8-5s-10k.metrics]
 videos_per_second = "higher"
@@ -261,7 +253,6 @@ num_prompts = 3
 request_rate = inf
 max_concurrency = 1
 warmup_requests = 1
-seed = 1000
 
 [benchmarks.h200-fp8-ulysses8-5s-1k.metrics]
 videos_per_second = "higher"
@@ -283,7 +274,6 @@ num_prompts = 3
 request_rate = inf
 max_concurrency = 1
 warmup_requests = 1
-seed = 1000
 
 [benchmarks.h200-fp8-ulysses8-15s-10k.metrics]
 videos_per_second = "higher"
@@ -305,7 +295,6 @@ num_prompts = 16
 request_rate = inf
 max_concurrency = 8
 warmup_requests = 8
-seed = 1000
 
 [benchmarks.h200-fp8-dp8-5s-1k.metrics]
 videos_per_second = "higher"
@@ -341,7 +330,6 @@ num_prompts = 16
 request_rate = inf
 max_concurrency = 8
 warmup_requests = 8
-seed = 1000
 
 [benchmarks.h200-dp8-5s-1k.metrics]
 videos_per_second = "higher"
