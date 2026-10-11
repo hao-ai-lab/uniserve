@@ -773,6 +773,15 @@ pub(super) fn plan_image_extend(
     finish_plan(request, call, 0)
 }
 
+/// Returns the call kind that runs one image encoder stage: the latent
+/// encoder of `VaeEncode` and the vision encoder of `VitEncode`.
+pub(crate) const fn encoder_call(step: ImageIngestStep) -> CallKind {
+    match step {
+        ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
+        ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
+    }
+}
+
 /// Encodes host image bytes or an existing device image into a feature tensor.
 ///
 /// A device `source` takes precedence over `image_base64`. Fails with
@@ -794,11 +803,7 @@ pub(super) fn plan_encode(
     } else if source.is_none() && image_base64.is_empty() {
         return Err(PlanningError::MissingImageInput);
     }
-    let code = match step {
-        ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
-        ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
-    };
-    let mut call = computation(request, code);
+    let mut call = computation(request, encoder_call(step));
     if source.is_none() && !image_base64.is_empty() {
         call.input_image = Some(image_base64.into());
     }

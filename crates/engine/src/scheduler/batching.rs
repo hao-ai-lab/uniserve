@@ -639,10 +639,7 @@ impl Scheduler {
         if st.phase == Phase::Prefill
             && let Some((_, step)) = self.next_context_encode(id)
         {
-            return Some(match step {
-                ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
-                ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
-            });
+            return Some(generation::encoder_call(step));
         }
         Some(match st.phase {
             Phase::IngestState => CallKind::Forward(ForwardMode::Prefill),
@@ -659,14 +656,12 @@ impl Scheduler {
             Phase::FeedbackEncode => {
                 let feedback = &st.req.image_generation;
                 feedback.feedback_source.as_ref()?;
-                match &feedback
-                    .feedback_encoders
-                    .get(st.feedback_encoder_index)?
-                    .encoder
-                {
-                    ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
-                    ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
-                }
+                generation::encoder_call(
+                    feedback
+                        .feedback_encoders
+                        .get(st.feedback_encoder_index)?
+                        .encoder,
+                )
             }
             Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
             Phase::Readout | Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),

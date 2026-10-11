@@ -2272,14 +2272,12 @@ impl Scheduler {
             Phase::FeedbackEncode => {
                 let feedback = &state.req.image_generation;
                 feedback.feedback_source.as_ref()?;
-                match feedback
-                    .feedback_encoders
-                    .get(self.scheduled_feedback(id)?.0)?
-                    .encoder
-                {
-                    ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
-                    ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
-                }
+                generation::encoder_call(
+                    feedback
+                        .feedback_encoders
+                        .get(self.scheduled_feedback(id)?.0)?
+                        .encoder,
+                )
             }
             Phase::IngestState => return None,
         })
