@@ -18,8 +18,7 @@ use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::{
-    DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, FlashInferBackend, LaneConfig,
+    DEFAULT_COMPONENT, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_SEQS, FlashInferBackend, LaneConfig,
     TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::profile::diffusion_gemma::DenoisingOverrides;
@@ -307,7 +306,8 @@ pub(crate) struct SharedRuntimeArgs {
     /// Maximum number of calls assembled into one forward batch.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub max_batch: Option<usize>,
-    /// Maximum transformer-token work admitted in one scheduling step.
+    /// Maximum transformer-token work admitted in one scheduling step. Token
+    /// models only: a video pipeline refuses it.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_batched_tokens: Option<usize>,
     /// Maximum number of concurrently resident requests.
@@ -318,7 +318,8 @@ pub(crate) struct SharedRuntimeArgs {
     /// overloaded. Unbounded when unset.
     #[arg(long = "max-queued-requests", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_waiting: Option<usize>,
-    /// Maximum number of prompt tokens processed per request in one prefill step.
+    /// Maximum number of prompt tokens processed per request in one prefill
+    /// step. Token models only: a video pipeline refuses it.
     #[arg(long = "chunked-prefill-size", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub long_prefill_threshold: Option<usize>,
     /// Waiting queue policy used by the scheduler.
@@ -507,14 +508,10 @@ impl SharedRuntimeArgs {
 
         EngineSettings {
             max_batch: self.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
-            max_num_batched_tokens: self
-                .max_num_batched_tokens
-                .unwrap_or(DEFAULT_MAX_NUM_BATCHED_TOKENS),
+            max_num_batched_tokens: self.max_num_batched_tokens,
             max_num_seqs: self.max_num_seqs.unwrap_or(DEFAULT_MAX_NUM_SEQS),
             max_num_waiting: self.max_num_waiting,
-            long_prefill_threshold: self
-                .long_prefill_threshold
-                .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),
+            long_prefill_threshold: self.long_prefill_threshold,
             prefix_cache: !self.disable_prefix_cache,
             scheduler_policy: self.scheduler_policy.into(),
             // `None` lets `build_state` derive the model's real context length;

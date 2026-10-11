@@ -39,10 +39,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use uniserve_core::{MediaKind, VideoTask};
-use uniserve_engine::{
-    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    SchedulingPolicy, WorkerConfig, WorkerProcessArgs,
-};
+use uniserve_engine::{DEFAULT_MAX_BATCH, SchedulingPolicy, WorkerConfig, WorkerProcessArgs};
 use uniserve_server::{
     AppState, Config, EngineSettings, HttpListenerMode, ModelDescription,
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
@@ -250,10 +247,10 @@ impl DynamoFastH3Engine {
         let config = Config {
             engine: EngineSettings {
                 max_batch: DEFAULT_MAX_BATCH,
-                max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
+                max_num_batched_tokens: None,
                 max_num_seqs: self.args.max_running_requests,
                 max_num_waiting: None,
-                long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
+                long_prefill_threshold: None,
                 prefix_cache: true,
                 scheduler_policy: SchedulingPolicy::Fcfs,
                 max_model_len: Some(self.args.max_model_len),
