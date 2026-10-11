@@ -210,9 +210,9 @@ def _publish_current_latent(
 ) -> TensorPublication:
     """Publish the committed trajectory's current latent pages as a product.
 
-    ``LatentPool.reserve_current_publication`` requires the staged start
-    step, the input's generation, units, raster and pages to match the
-    slot's committed trajectory. The product must be the call's declared
+    ``LatentPool.reserve_current_publication`` requires the input's
+    generation, units, raster and pages to match the slot's committed
+    trajectory. The product must be the call's declared
     latent output, and publication leaves the request's generation and step
     unchanged.
     """
@@ -227,12 +227,13 @@ def _publish_current_latent(
     if params is None or staging is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
+    step = latent_pool.committed_step(row.request.request_pool_idx)
     source = latent_pool.reserve_current_publication(
         product,
         request_pool_idx=row.request.request_pool_idx,
         page_table=params.page_table,
         generation=reference.generation,
-        step=params.start_step,
+        step=step,
         latent_units=params.latent_units,
         height=params.height,
         width=params.width,
@@ -242,7 +243,7 @@ def _publish_current_latent(
         product,
         source,
         row,
-        step=params.start_step,
+        step=step,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
         state=state,

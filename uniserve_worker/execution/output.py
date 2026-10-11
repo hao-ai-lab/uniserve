@@ -37,7 +37,12 @@ from uniserve_worker.execution.request import (
 )
 from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.protocol.batch import LatentParams, TensorPublication
-from uniserve_worker.protocol.call import Call, CallKind, CallStatus
+from uniserve_worker.protocol.call import (
+    Call,
+    CallKind,
+    CallStatus,
+    MediaCall,
+)
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.output import (
     FinishFlags,
@@ -333,7 +338,6 @@ class PendingOutput:
         self.progress: RequestProgress = RequestProgress(
             logical_position=call.coordinates.logical_position,
             rng_counter=request.rng_counter,
-            flow_step=call.coordinates.flow_step,
             kv_visible_len=call.coordinates.kv_visible_len,
             kv_computed_len=call.coordinates.kv_computed_len,
             prompt_logits_ready=request.prompt_logits_ready,
@@ -434,6 +438,18 @@ class PendingOutput:
     @property
     def kind(self) -> CallKind:
         return self.call.kind
+
+    def completed_steps(self, status: CallStatus) -> int:
+        """Return the denoising steps the trajectory completed with this call.
+
+        A successful denoising call reports the step its latent update
+        publishes; every other call reports zero, since only a denoising
+        result advances the engine's step progress.
+        """
+        denoising = self.call.kind is MediaCall.DENOISING
+        if status is not CallStatus.OK or not denoising:
+            return 0
+        return int(self.latent.update.step)
 
     def ready(self) -> bool:
         """Query host output readiness without changing request acceptance."""
@@ -649,9 +665,7 @@ class PendingOutput:
             kv_computed_len=0
             if runtime is None
             else int(runtime.kv_computed_len),
-            num_completed_steps=0
-            if runtime is None
-            else int(runtime.flow_step),
+            num_completed_steps=self.completed_steps(status),
             committed_tokens=tokens,
             sampled_logprob=None if scores is None else scores[0],
             top_logprobs=() if scores is None else scores[1],

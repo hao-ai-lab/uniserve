@@ -471,6 +471,16 @@ class LatentPool:
             -1, self.latent_width
         )
 
+    def committed_step(self, request_pool_idx: int) -> int:
+        """Return the solver step of the slot's committed trajectory.
+
+        The pool is the worker's ledger of completed steps: a publication
+        advances it at its batch commit and an adopted import sets it, so a
+        call reads the step it advances here. An empty slot is at step zero.
+        """
+        slot = self._validate_slot(int(request_pool_idx))
+        return int(self._steps[slot].item())
+
     def initial_bank(
         self,
         request_pool_idx: int,

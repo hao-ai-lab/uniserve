@@ -970,7 +970,6 @@ impl SimEngine {
                 logical_position: request.logical_position,
                 kv_visible_len: request.kv_visible_len,
                 kv_computed_len: request.kv_visible_len,
-                flow_step: u32::from(request.flow_step),
             };
             anyhow::ensure!(
                 stated == held,
@@ -1798,7 +1797,6 @@ mod tests {
             logical_position: 2,
             kv_visible_len: 2,
             kv_computed_len: 2,
-            flow_step: 0,
         };
         selected.requests.push(successor);
 

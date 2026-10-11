@@ -96,8 +96,8 @@ use uniserve_core::{RejectionKind, UnitId, encoder_cache_key};
 use uniserve_worker_ipc::{
     BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
-    DimBound, ForwardBatch, ForwardStats, GenerationParams, LatentParams, NewRequest, RequestKey,
-    SamplingState, ShapeBound, TensorRef, TimingCounters, WorkerInfo,
+    DimBound, ForwardBatch, ForwardStats, GenerationParams, NewRequest, RequestKey, SamplingState,
+    ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
 
 use crate::executor::WorkerFailure;

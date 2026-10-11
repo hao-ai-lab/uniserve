@@ -192,11 +192,6 @@ def prepare_latent(
         raise invalid_descriptor(
             "media preparation has no admitted image parameters"
         )
-    if calls.require_progress(request).flow_step != 0:
-        raise invalid_descriptor(
-            "media preparation repeats an active latent trajectory"
-        )
-
     if call.image_index is None:
         raise invalid_descriptor("media preparation names no image index")
     if int(output.generation) < 1:
@@ -259,7 +254,7 @@ def prepare_latent(
     )
 
     request.status = CallStatus.OK
-    request.progress = calls.execution_runtime(request, cache, flow_step=0)
+    request.progress = calls.execution_runtime(request, cache)
     request.finish_flags = FinishFlags()
     request.products = products
     return request
@@ -277,7 +272,7 @@ def initialize(
     """Open a denoising call's trajectory from its exact input generation.
 
     Validates the call's conditioning publication and latent generations,
-    gathers the committed bank at ``params.start_step`` into the call's
+    gathers the committed bank at the slot's committed step into the call's
     staging, and returns the request's ``DiffusionState``, reopening it when
     it is absent or has a different size. ``KVConditioning.cache`` is set
     from this call's descriptors and ``entries`` is cleared for
@@ -331,7 +326,7 @@ def initialize(
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
     pool = latent_pool
-    start_step = int(params.start_step)
+    start_step = pool.committed_step(row.request.request_pool_idx)
     pool.gather_current(
         row.request.request_pool_idx,
         staging,
@@ -527,8 +522,8 @@ def finish(
     ``forward.integrate_predictions`` calls this after applying the last
     solver step of the call's declared interval to its staging. Scatters the
     staging to the inactive bank and records the ``LatentUpdate`` that
-    advances the request from ``params.start_step`` by ``params.step_count``
-    steps at the batch commit. When that final step reaches the admitted
+    advances the request from the slot's committed step by one step at the
+    batch commit. When that final step reaches the admitted
     ``image.steps``, the alternative-prefix slots of the guidance branches
     are released here, before the batch commit.
     """
@@ -550,8 +545,8 @@ def finish(
     ):
         raise invalid_descriptor("flow completion lost its trajectory state")
 
-    start_step = int(params.start_step)
-    final_step = start_step + int(params.step_count)
+    start_step = latent_pool.committed_step(row.request.request_pool_idx)
+    final_step = start_step + 1
     latent_pool.write_inactive(
         row.request.request_pool_idx,
         staging,
@@ -581,11 +576,7 @@ def finish(
 
     request.status = CallStatus.OK
     kv = kv_conditioning(trajectory)
-    request.progress = calls.execution_runtime(
-        request,
-        kv.cache,
-        flow_step=final_step,
-    )
+    request.progress = calls.execution_runtime(request, kv.cache)
     request.finish_flags = FinishFlags()
     request.products = products
 

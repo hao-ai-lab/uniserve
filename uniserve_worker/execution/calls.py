@@ -36,7 +36,6 @@ def execution_runtime(
     request: PendingOutput,
     cache: tuple[int, int, int] | None,
     *,
-    flow_step: int | None = None,
     computed_len: int | None = None,
 ) -> RequestProgress:
     """Project the coordinates used by a call's numerical consumers.
@@ -45,8 +44,7 @@ def execution_runtime(
     ``cache`` None, the KV extents are kept from ``request.progress`` and
     ``computed_len`` is ignored. With a `cache_coordinates` tuple, the visible
     length comes from the tuple and the computed length equals it unless
-    ``computed_len`` is given. ``flow_step`` replaces the solver step when
-    given.
+    ``computed_len`` is given.
     """
     progress = request.progress
     if cache is None:
@@ -59,7 +57,6 @@ def execution_runtime(
         progress,
         kv_visible_len=visible,
         kv_computed_len=computed,
-        flow_step=progress.flow_step if flow_step is None else int(flow_step),
     )
 
 

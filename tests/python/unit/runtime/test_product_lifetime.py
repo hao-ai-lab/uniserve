@@ -793,9 +793,7 @@ def latent_output():
         key = RequestKey(1, slot, 1)
         return LatentUpdate(
             request_pool_idx=slot,
-            params=LatentParams(
-                key, CallId(1, 0), pages, units, height, width, 0, 0
-            ),
+            params=LatentParams(key, CallId(1, 0), pages, units, height, width),
             generation=1,
         )
 

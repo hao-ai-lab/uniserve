@@ -493,25 +493,31 @@ def test_lane_and_graph_binding_preserve_token_and_flow_results(
             worker,
             worker.submit(execution_batch(batch_id=13, calls=(sequence,))),
         )
-        flow, output_latent = diffusion_step_call(
-            flow_admission.request_key,
-            call_id=CallId(14, 0),
-            predecessor=preparation_observation.call_id,
-            conditioning=conditioning,
-            latent=latent,
-            steps=steps,
-        )
-        flow_result = finalized_report(
-            worker,
-            worker.submit(execution_batch(batch_id=14, calls=(flow,))),
-        )
+        # Each denoising call advances the trajectory by one step.
+        observation = preparation_observation
+        output_latent = latent
+        for step in range(steps):
+            flow, output_latent = diffusion_step_call(
+                flow_admission.request_key,
+                call_id=CallId(14 + step, 0),
+                predecessor=observation.call_id,
+                conditioning=conditioning,
+                latent=output_latent,
+            )
+            flow_result = finalized_report(
+                worker,
+                worker.submit(
+                    execution_batch(batch_id=14 + step, calls=(flow,))
+                ),
+            )
+            observation = record_completion(flow, flow_result)
         artifact = _finalized_artifact(
             worker,
             flow_admission,
             output_latent,
-            record_completion(flow, flow_result),
-            call_id=CallId(15, 0),
-            batch_id=15,
+            observation,
+            call_id=CallId(14 + steps, 0),
+            batch_id=14 + steps,
         )
         return sequence_result, flow_result, artifact
 
@@ -565,7 +571,6 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
             predecessor=prepared.call_id,
             conditioning=conditioning,
             latent=initial,
-            steps=1,
         )
         stepped = worker.submit(
             execution_batch(batch_id=3, calls=(step,), commands=())
@@ -605,7 +610,6 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
             predecessor=prepared.call_id,
             conditioning=conditioning,
             latent=initial,
-            steps=1,
         )
         stepped = worker.submit(
             execution_batch(batch_id=6, calls=(step,), commands=())
@@ -870,7 +874,7 @@ def test_output_validation_failure_discards_all_candidate_state():
 def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact():  # noqa: E501
     worker = execution_worker(block_size=4)
     admission = umm_params(
-        5, ImageParams(steps=2, height=64, width=64, seed=29)
+        5, ImageParams(steps=1, height=64, width=64, seed=29)
     )
     conditioning = _publish_conditioning(
         worker, admission, call_id=CallId(40, 0), batch_id=12
@@ -889,7 +893,6 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         predecessor=preparation_observation.call_id,
         conditioning=conditioning,
         latent=latent,
-        steps=2,
     )
 
     valid_batch = execution_batch(
@@ -922,14 +925,13 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         predecessor=preparation_observation.call_id,
         conditioning=conditioning,
         latent=latent,
-        steps=2,
     )
     recovered = finalized_report(
         worker,
         worker.submit(execution_batch(batch_id=16, calls=(replacement,))),
     )
     assert recovered.completions[0].status is CallStatus.OK
-    assert recovered.completions[0].num_completed_steps == 2
+    assert recovered.completions[0].num_completed_steps == 1
     recovered_observation = record_completion(replacement, recovered)
     recovered_artifact = _finalized_artifact(
         worker,
@@ -958,7 +960,6 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         predecessor=reference_preparation_observation.call_id,
         conditioning=reference_conditioning,
         latent=reference_latent,
-        steps=2,
     )
     reference_result = reference.submit(
         execution_batch(
@@ -1007,7 +1008,6 @@ def test_initial_flow_noise_is_stable_across_call_schedules():
             predecessor=preparation_observation.call_id,
             conditioning=conditioning,
             latent=latent,
-            steps=1,
         )
         flow_report = worker.submit(
             execution_batch(
@@ -1032,95 +1032,6 @@ def test_initial_flow_noise_is_stable_across_call_schedules():
         worker.close()
 
     assert artifacts[1] == artifacts[0]
-
-
-@pytest.mark.parametrize(
-    ("height", "width", "cfg_text_scale", "cfg_img_scale", "negative_prompt"),
-    (
-        (16, 16, 1.0, 1.0, ()),
-        (16, 32, 4.0, 1.0, ()),
-        (32, 32, 4.0, 2.0, ()),
-        # The text-unconditional branch materializes its own KV prefix from
-        # the negative prompt and reuses it on every later solver step.
-        (16, 32, 4.0, 1.0, (5, 6, 7)),
-    ),
-)
-def test_multi_step_quantum_matches_the_serial_model_artifact(
-    height: int,
-    width: int,
-    cfg_text_scale: float,
-    cfg_img_scale: float,
-    negative_prompt: tuple[int, ...],
-) -> None:
-    def run(step_quantum: int) -> bytes:
-        worker = execution_worker()
-        admission = umm_params(
-            76,
-            ImageParams(
-                steps=4,
-                height=height,
-                width=width,
-                seed=31,
-                cfg_text_scale=cfg_text_scale,
-                cfg_img_scale=cfg_img_scale,
-            ),
-        )
-        if negative_prompt:
-            admission = replace(
-                admission,
-                generation=GenerationParams(negative_token_ids=negative_prompt),
-            )
-        conditioning = _publish_conditioning(
-            worker, admission, call_id=CallId(1, 0), batch_id=1
-        )
-        latent, observation = _prepare_media(
-            worker,
-            admission,
-            conditioning,
-            call_id=CallId(2, 0),
-            predecessor=root_parent(admission),
-            batch_id=2,
-        )
-        step = 0
-        call_id = 3
-        while step < 4:
-            count = min(step_quantum, 4 - step)
-            call, successor = diffusion_step_call(
-                admission.request_key,
-                call_id=CallId(call_id, 0),
-                predecessor=observation.call_id,
-                conditioning=conditioning,
-                latent=latent,
-                steps=count,
-            )
-            report = finalized_report(
-                worker,
-                worker.submit(
-                    execution_batch(
-                        batch_id=call_id,
-                        calls=(call,),
-                        commands=(),
-                    )
-                ),
-            )
-            assert report.completions[0].status is CallStatus.OK
-            step += count
-            assert report.completions[0].num_completed_steps == step
-            latent = successor
-            observation = record_completion(call, report)
-            call_id += 1
-        artifact = _finalized_artifact(
-            worker,
-            admission,
-            latent,
-            observation,
-            call_id=CallId(call_id, 0),
-            batch_id=call_id,
-        )
-        worker.close()
-        return artifact
-
-    assert run(4) == run(1)
 
 
 @pytest.mark.parametrize(
@@ -1248,9 +1159,8 @@ def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
 
 
 def test_flow_run_results_cumulative_denoise_step_in_latent_len():
-    # The ordered-observation validator matches latent_len against the
-    # cumulative denoise step (start_step + step_count), not a constant token
-    # count, so two single-step quanta must report 1 then 2.
+    # Each denoising call reports the cumulative step the worker's latent
+    # pool has committed, so two single-step calls must report 1 then 2.
     worker = execution_worker()
     admission = umm_params(
         2, ImageParams(steps=2, height=16, width=16, seed=29)
@@ -1272,7 +1182,6 @@ def test_flow_run_results_cumulative_denoise_step_in_latent_len():
         predecessor=preparation_observation.call_id,
         conditioning=conditioning,
         latent=initial_latent,
-        steps=1,
     )
     first_report = finalized_report(
         worker,
@@ -1292,7 +1201,6 @@ def test_flow_run_results_cumulative_denoise_step_in_latent_len():
         predecessor=observation.call_id,
         conditioning=conditioning,
         latent=first_latent,
-        steps=1,
     )
     second_report = finalized_report(
         worker,
@@ -1337,7 +1245,6 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
             predecessor=observation.call_id,
             conditioning=conditioning,
             latent=current,
-            steps=1,
         )
         report = finalized_report(
             worker,
@@ -1370,7 +1277,6 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
         predecessor=observation.call_id,
         conditioning=conditioning,
         latent=stale,
-        steps=1,
     )
     stale_report = worker.submit(
         execution_batch(batch_id=54, calls=(stale_call,))
@@ -1916,7 +1822,6 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
         predecessor=preparation_observation.call_id,
         conditioning=conditioning,
         latent=initial_latent,
-        steps=1,
     )
     produced = producer.submit(
         execution_batch(
@@ -2037,7 +1942,6 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             replace(
                 allocation,
                 page_table=tuple(reversed(allocation.page_table)),
-                start_step=1,
             )
             for allocation in batch.latent_params
         ),
@@ -2135,7 +2039,6 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             predecessor=observation.call_id,
             conditioning=conditioning,
             latent=latent,
-            steps=1,
         )
         stepped = finalized_report(
             worker,
@@ -2229,7 +2132,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         understanding.request_key,
         request_pool_idx=understanding.request_pool_idx,
         generation=understanding.generation,
-        image=ImageParams(steps=2, height=16, width=16, seed=29),
+        image=ImageParams(steps=1, height=16, width=16, seed=29),
     )
     extend = token_call(
         admission.request_key,
@@ -2277,7 +2180,6 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         predecessor=preparation_observation.call_id,
         conditioning=conditioning,
         latent=initial_latent,
-        steps=2,
     )
     flow_report = worker.submit(
         execution_batch(
@@ -2402,7 +2304,6 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         predecessor=_next_preparation_observation.call_id,
         conditioning=next_conditioning,
         latent=next_latent,
-        steps=2,
     )
     next_report = finalized_report(
         worker,
@@ -2415,7 +2316,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         ),
     )
     assert next_report.completions[0].status is CallStatus.OK
-    assert next_report.completions[0].num_completed_steps == 2
+    assert next_report.completions[0].num_completed_steps == 1
     next_observation = record_completion(next_flow, next_report)
     assert base64.b64decode(
         _finalized_artifact(
@@ -2486,7 +2387,6 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         predecessor=observation.call_id,
         conditioning=conditioning,
         latent=initial,
-        steps=1,
     )
     # An external consumer, named on the call, holds the first latent
     # unacknowledged across its semantic Free.
@@ -2526,7 +2426,6 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
                 predecessor=observation.call_id,
                 conditioning=conditioning,
                 latent=first_latent,
-                steps=1,
             )
             second_report = finalized_report(
                 worker,
@@ -2546,7 +2445,6 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
                 predecessor=observation.call_id,
                 conditioning=conditioning,
                 latent=second_latent,
-                steps=1,
             )
             prepared = worker.submit(
                 execution_batch(
@@ -2624,7 +2522,6 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
                 predecessor=observation.call_id,
                 conditioning=conditioning,
                 latent=latent,
-                steps=1,
             )
             report = finalized_report(
                 worker,
@@ -2648,7 +2545,6 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
             predecessor=observation.call_id,
             conditioning=conditioning,
             latent=latent,
-            steps=1,
         )
         waiting = execution_batch(batch_id=5, calls=(third,), commands=())
         release = execution_batch(

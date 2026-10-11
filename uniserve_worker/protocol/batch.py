@@ -330,11 +330,12 @@ def _validate_forward_inputs(
 
 @dataclass(frozen=True, slots=True)
 class LatentParams:
-    """Solver-step range and optional paged storage of one trajectory.
+    """Paged storage and raster of one image trajectory.
 
-    For a paged trajectory, `LatentPool` records the pages, units, and raster
-    when the trajectory's slot is initialized and checks later calls against
-    them.
+    The scheduler's allocator assigns the pages. `LatentPool` records the
+    pages, units, and raster when the trajectory's slot is initialized and
+    checks later calls against them. A standalone denoiser's request slot
+    fixes its own pages, so its calls carry no parameters.
     """
 
     request_key: identity.RequestKey
@@ -349,9 +350,6 @@ class LatentParams:
     # Output height and width in pixels.
     height: int
     width: int
-    # The call runs solver steps [start_step, start_step + step_count).
-    start_step: int
-    step_count: int
 
     def __post_init__(self) -> None:
         """Validate the call identity, raster, and page-table/unit agreement.

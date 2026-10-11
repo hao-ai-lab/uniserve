@@ -84,7 +84,6 @@ fn coordinates<'a>(
             logical_position: v.logical_position,
             kv_visible_len: v.kv_visible_len,
             kv_computed_len: v.kv_computed_len,
-            flow_step: v.flow_step,
         },
     )
 }
@@ -415,8 +414,6 @@ fn latent_params<'a>(
             latent_units: v.latent_units,
             height: v.height,
             width: v.width,
-            start_step: v.start_step,
-            step_count: v.step_count,
         },
     )
 }
@@ -1378,6 +1375,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
         b,
         &fbs::WorkerInfoArgs {
             endpoint,
+                frames,
             fabric_handles: v.fabric_handles,
             components,
             supported_calls,

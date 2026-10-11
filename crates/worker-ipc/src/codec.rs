@@ -678,8 +678,6 @@ fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<Latent
         latent_units: params.latent_units(),
         height: params.height(),
         width: params.width(),
-        start_step: params.start_step(),
-        step_count: params.step_count(),
     })
 }
 
@@ -725,7 +723,6 @@ fn coordinates_from_table(table: Option<fbs::CallCoordinates<'_>>) -> CodecResul
         logical_position: value.logical_position(),
         kv_visible_len: value.kv_visible_len(),
         kv_computed_len: value.kv_computed_len(),
-        flow_step: value.flow_step(),
     })
 }
 

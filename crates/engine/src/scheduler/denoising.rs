@@ -8,11 +8,13 @@
 
 use uniserve_worker_ipc::{CallId, LatentParams, MediaCall, RequestKey, TensorRef};
 
-/// Where a request's latent lives on its worker and the raster it describes.
+/// Where an image request's latent lives on its worker and the raster it
+/// describes.
 ///
-/// Denoising progress carries it into every call's parameters without
-/// interpreting it: the pages are the worker's physical storage and the raster
-/// is the media the samples decode to.
+/// The scheduler's latent allocator assigns the pages from the worker's pool,
+/// so the worker learns them from the calls that name them; the raster is the
+/// image the samples decode to. A standalone denoiser's request slot fixes
+/// its own pages, which the worker derives from its pool geometry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LatentPlacement {
     /// Pages the request owns in its worker's latent pool.
@@ -20,10 +22,9 @@ pub(crate) struct LatentPlacement {
     /// Latent units the trajectory occupies in those pages, in the
     /// model-defined unit the worker sizes pages by (`latent_page_units`).
     pub(crate) latent_units: u32,
-    /// Raster height in pixels: the requested image height for image
-    /// generation, the request's canvas height for video.
+    /// Raster height in pixels: the requested image height.
     pub(crate) height: u32,
-    /// Raster width, from the same source as `height`.
+    /// Raster width in pixels: the requested image width.
     pub(crate) width: u32,
 }
 
@@ -75,21 +76,16 @@ impl Denoising {
 
     /// Returns the steps covered once the request's submitted calls complete.
     ///
-    /// `pending` lists the request's submitted calls in submission order with
-    /// their latent parameters: latent preparation opens a trajectory and
-    /// image decoding closes one, both leaving it at step zero, and each
-    /// denoising call adds its interval.
-    pub(crate) fn scheduled<'a>(
-        &self,
-        pending: impl IntoIterator<Item = (MediaCall, Option<&'a LatentParams>)>,
-    ) -> u32 {
+    /// `pending` lists the request's submitted media calls in submission
+    /// order: latent preparation opens a trajectory and image decoding closes
+    /// one, both leaving it at step zero, and each denoising call covers the
+    /// next step of the schedule.
+    pub(crate) fn scheduled(&self, pending: impl IntoIterator<Item = MediaCall>) -> u32 {
         pending
             .into_iter()
-            .fold(self.completed, |steps, (call, latent)| match call {
+            .fold(self.completed, |steps, call| match call {
                 MediaCall::LatentPreparation | MediaCall::ImageDecoding => 0,
-                MediaCall::Denoising => {
-                    steps.saturating_add(latent.map_or(0, |params| params.step_count))
-                }
+                MediaCall::Denoising => steps.saturating_add(1),
                 _ => steps,
             })
     }
@@ -99,21 +95,11 @@ impl Denoising {
         step.saturating_add(1) == self.steps
     }
 
-    /// Returns whether a worker's accepted step count completes an interval.
-    pub(crate) const fn completes(interval: &LatentParams, completed: u32) -> bool {
-        interval.start_step.saturating_add(interval.step_count) == completed
-    }
-
     /// Returns the parameters of one call on this trajectory.
-    ///
-    /// Preparation and decoding calls cover no steps (`count` zero); a
-    /// denoising call covers the one step at `start`.
     pub(crate) fn params(
         request_key: RequestKey,
         call_id: CallId,
         placement: &LatentPlacement,
-        start: u32,
-        count: u32,
     ) -> LatentParams {
         LatentParams {
             request_key,
@@ -122,8 +108,6 @@ impl Denoising {
             latent_units: placement.latent_units,
             height: placement.height,
             width: placement.width,
-            start_step: start,
-            step_count: count,
         }
     }
 
@@ -135,16 +119,14 @@ impl Denoising {
 
     /// Accepts a completed denoising call and its successor latent.
     ///
-    /// Returns `false`, leaving progress unchanged, when the worker's accepted
-    /// step count is not the end of the call's interval or exceeds the
-    /// schedule. A `None` latent keeps the previously accepted product.
-    pub(crate) fn accept(
-        &mut self,
-        interval: &LatentParams,
-        completed: u32,
-        latent: Option<TensorRef>,
-    ) -> bool {
-        if !Self::completes(interval, completed) || completed > self.steps {
+    /// The worker owns the trajectory's step ledger and reports the steps it
+    /// has completed; the report becomes the request's progress. Returns
+    /// `false`, leaving progress unchanged, when the report does not advance
+    /// it, since a denoising call that makes no progress would be scheduled
+    /// again without end. A `None` latent keeps the previously accepted
+    /// product.
+    pub(crate) fn accept(&mut self, completed: u32, latent: Option<TensorRef>) -> bool {
+        if completed <= self.completed {
             return false;
         }
         self.completed = completed;

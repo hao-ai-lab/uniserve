@@ -221,8 +221,8 @@ class CallCoordinates:
     """The coordinates a call executes at, as the engine states them.
 
     A rank would otherwise chain these from the calls that preceded it. The
-    engine holds the request state they come from, so it sends them and the
-    rank asserts its own ledger agrees. All lengths count tokens.
+    engine holds the request state they come from, so it sends them. All
+    lengths count tokens.
     """
 
     # Position of this call's first token in the request's logical sequence.
@@ -232,8 +232,6 @@ class CallCoordinates:
     # Tokens whose KV is initialized at submission; never below the visible
     # extent, and above it while a verifier's rejected drafts stay initialized.
     kv_computed_len: int = 0
-    # Denoising steps completed for this request at submission.
-    flow_step: int = 0
 
 
 @dataclass(frozen=True, slots=True)

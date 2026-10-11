@@ -702,15 +702,6 @@ def _build_warmup_batch(
         page_table.extend(allocated)
         occupied_latent_pages.update(allocated)
 
-        # The call runs solver steps from the request's accepted flow step;
-        # warmup takes a DENOISING call's step count from its
-        # ``bounds.max_tokens``.
-        request = requests.worker.requests.peek(
-            int(call.request_key.request_id)
-        )
-        start_step = (
-            0 if request is None else int(request.accepted_progress.flow_step)
-        )
         latent_params[(call.request_key, call.call_id)] = LatentParams(
             request_key=call.request_key,
             call_id=call.call_id,
@@ -718,12 +709,6 @@ def _build_warmup_batch(
             latent_units=latent_units,
             height=height,
             width=width,
-            start_step=start_step,
-            step_count=(
-                int(call.bounds.max_tokens)
-                if call.kind is MediaCall.DENOISING
-                else 0
-            ),
         )
 
         # A DENOISING call adds the alternative prefix's block table, if any,
@@ -773,10 +758,11 @@ def _warmup_flow_tables(
 ]:
     """Build KV tables and forward rows for a DENOISING call's CFG branches.
 
-    The branches are those the request's guidance evaluates at its accepted
-    flow step, with prefixes from `resolve_prefix`. A branch that reuses the
-    request's conditioning reads the main slot; all other branches must
-    share one alternative prefix. A nonempty alternative prefix is leased KV
+    The branches are those the request's guidance evaluates at its latent
+    trajectory's committed step, with prefixes from `resolve_prefix`. A
+    branch that reuses the request's conditioning reads the main slot; all
+    other branches must share one alternative prefix. A nonempty alternative
+    prefix is leased KV
     units in every group and a request slot of its own, and the rows start
     with one
     row that writes it into KV. Then follows one read-only row per branch
@@ -806,8 +792,11 @@ def _warmup_flow_tables(
     guidance = trajectory.guidance
     if guidance is None:
         raise invalid_descriptor("generation warmup requires image guidance")
+    pool = requests.worker.latent_pool
+    if pool is None:
+        raise invalid_descriptor("generation warmup has no latent pool")
     branches = guidance.branches(
-        trajectory.schedules["image"], request.accepted_progress.flow_step
+        trajectory.schedules["image"], pool.committed_step(main_slot)
     )
 
     runtime = request.accepted_progress
@@ -1444,7 +1433,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                     Call(
                         request_key=key,
                         call_id=call_id,
-                        coordinates=CallCoordinates(flow_step=quantum),
+                        coordinates=CallCoordinates(),
                         kind=MediaCall.DENOISING,
                         bounds=Bounds(max_tokens=1),
                         kv_input=conditioning,

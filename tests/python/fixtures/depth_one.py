@@ -79,7 +79,6 @@ _CALL_PROJECTIONS: dict[tuple[RequestKey, CallId], tuple[str, int]] = {}
 # which state their own coordinates and are left untouched. Each entry holds
 # its run so the identity stays valid until the run is submitted.
 _FIXTURE_BATCHES: dict[int, Batch] = {}
-_LATENT_STEPS: dict[TensorRef, int] = {}
 _MAX_CFG_BRANCHES = 1
 _REQUEST_POOL_SIZE = 1
 _CACHE_PAGES = 1
@@ -150,10 +149,6 @@ def _reset_request(rk: RequestKey) -> None:
         ledger.detached.difference_update(
             identity for identity in tuple(ledger.detached) if identity[0] == rk
         )
-    for product in tuple(
-        product for product in _LATENT_STEPS if product.request_key == rk
-    ):
-        _LATENT_STEPS.pop(product, None)
     for buffer in tuple(
         buffer for buffer in _BUFFER_ALLOCATIONS if buffer.owner == rk
     ):
@@ -183,10 +178,6 @@ def _latent_params(call: Call) -> LatentParams:
         * (int(image.width) // _LATENT_DOWNSAMPLE),
     )
     page_count = (latent_units + _LATENT_PAGE_UNITS - 1) // _LATENT_PAGE_UNITS
-    latent_input = call.latent_input
-    start_step = (
-        0 if latent_input is None else _LATENT_STEPS.get(latent_input, 0)
-    )
     return LatentParams(
         request_key=call.request_key,
         call_id=call.call_id,
@@ -194,12 +185,6 @@ def _latent_params(call: Call) -> LatentParams:
         latent_units=latent_units,
         height=int(image.height),
         width=int(image.width),
-        start_step=start_step,
-        step_count=(
-            int(call.bounds.max_tokens)
-            if call.kind is MediaCall.DENOISING
-            else 0
-        ),
     )
 
 
@@ -215,11 +200,6 @@ def _ledger(worker: object) -> _Ledger:
 def _project_tokens(rk: RequestKey, call_id: CallId, tokens: int) -> None:
     """Record a call that adds `tokens` positions and initializes them."""
     _CALL_PROJECTIONS[(rk, call_id)] = ("tokens", int(tokens))
-
-
-def _project_flow_step(rk: RequestKey, call_id: CallId, flow_step: int) -> None:
-    """Record that a call leaves the request's trajectory at `flow_step`."""
-    _CALL_PROJECTIONS[(rk, call_id)] = ("flow_step", int(flow_step))
 
 
 class _Ledger:
@@ -242,14 +222,11 @@ def _projected(
     entry: CallCoordinates, rule: tuple[str, int]
 ) -> CallCoordinates:
     """Apply one call's recorded effect to where the request stands."""
-    name, value = rule
-    if name == "flow_step":
-        return replace(entry, flow_step=value)
+    _name, value = rule
     return CallCoordinates(
         logical_position=entry.logical_position + value,
         kv_visible_len=entry.kv_visible_len + value,
         kv_computed_len=entry.kv_visible_len + value,
-        flow_step=entry.flow_step,
     )
 
 
@@ -443,7 +420,6 @@ def observe_completions(worker: object, report: BatchOutput) -> None:
             ),
             kv_visible_len=record.kv_visible_len,
             kv_computed_len=record.kv_computed_len,
-            flow_step=record.num_completed_steps,
         )
 
 
@@ -867,7 +843,6 @@ def diffusion_prepare_call(
         shape_bound=ShapeBound(),
     )
     _record_existing_kv(rk, call_id, predecessor, 0)
-    _project_flow_step(rk, call_id, 0)
     call = Call(
         request_key=rk,
         call_id=call_id,
@@ -879,7 +854,6 @@ def diffusion_prepare_call(
         completion_output=ready,
         image_index=int(image_index),
     )
-    _LATENT_STEPS[latent] = 0
     return call, latent
 
 
@@ -890,7 +864,6 @@ def diffusion_step_call(
     predecessor: CallId,
     conditioning: BufferId,
     latent: TensorRef,
-    steps: int,
 ) -> tuple[Call, TensorRef]:
     output = TensorRef(
         request_key=rk,
@@ -901,18 +874,16 @@ def diffusion_step_call(
         shape_bound=latent.shape_bound,
     )
     _record_existing_kv(rk, call_id, predecessor, 0)
-    _project_flow_step(rk, call_id, _LATENT_STEPS.get(latent, 0) + int(steps))
     call = Call(
         request_key=rk,
         call_id=call_id,
         coordinates=CallCoordinates(),
         kind=MediaCall.DENOISING,
-        bounds=Bounds(max_tokens=int(steps)),
+        bounds=Bounds(max_tokens=1),
         kv_input=conditioning,
         latent_input=latent,
         latent_output=output,
     )
-    _LATENT_STEPS[output] = _LATENT_STEPS.get(latent, 0) + int(steps)
     return call, output
 
 
@@ -958,7 +929,6 @@ def diffusion_finalize_call(
             dtype=DType.BF16,
             shape_bound=ShapeBound((DeviceDim(3 * 16 * 16),)),
         )
-    _project_flow_step(rk, call_id, 0)
     return Call(
         request_key=rk,
         call_id=call_id,

@@ -33,7 +33,6 @@ import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future
-from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, cast
 
@@ -589,12 +588,10 @@ def prepare_inputs(
                     value.latent_units,
                     value.height,
                     value.width,
-                    value.step,
                 ) != (
                     params.latent_units,
                     params.height,
                     params.width,
-                    params.start_step,
                 ):
                     raise invalid_descriptor(
                         "latent transfer disagrees with its scheduler params"
@@ -1461,12 +1458,10 @@ def _bind_latent_inputs(
 ) -> None:
     """Validate trajectory parameters and bind rank-local latent staging.
 
-    Only the params of the given (active) calls are considered. With an
-    image builder, the params are checked against the admitted image
-    dimensions and the committed solver step, and every row receives a
-    `LatentPool.stage` view in `latent.staging`. Without one, the params are
-    validated by `_validate_sample_params` and only recorded. Raises
-    `invalid_descriptor` errors on any disagreement.
+    Only the params of the given (active) calls are considered. Each row is
+    checked against the admitted image dimensions and receives a
+    `LatentPool.stage` view in `latent.staging`. Raises `invalid_descriptor`
+    errors on any disagreement.
     """
     identities = {calls.call_identity(call) for call in scheduled}
     parameters = tuple(
@@ -1479,41 +1474,35 @@ def _bind_latent_inputs(
 
     pool = latent_pool
     requests = {
-        calls.call_identity(call): (
-            call,
-            state.pending_output(call.request_key.request_id),
+        calls.call_identity(call): state.pending_output(
+            call.request_key.request_id
         )
         for call in scheduled
     }
 
     if pool is None:
         raise invalid_descriptor("latent params require a resident latent pool")
+    if model_runner.image_builder is None:
+        raise invalid_descriptor("latent params have no image denoiser")
 
     # Image trajectories bind validated image dimensions and page ownership
-    # and borrow the pool's step staging. A standalone denoiser's runner
-    # stages its own steps, so its calls keep only their parameters.
+    # and borrow the pool's step staging.
+    flow = model_runner.image_builder
     rows: list[tuple[CallIdentity, LatentParams, int]] = []
     for params in parameters:
         identity = (params.request_key, params.call_id)
-        selected = requests.get(identity)
-        if selected is None:
+        request = requests.get(identity)
+        if request is None:
             raise invalid_descriptor(
                 "latent params names a call outside its batch"
             )
-        call, request = selected
         slot = int(request.request.request_pool_idx)
-
-        if model_runner.image_builder is None:
-            _validate_sample_params(call, request, params, model_runner)
-            request.latent.input_params = params
-            continue
 
         image = request.request.image
         if image is None:
             raise invalid_descriptor(
                 "latent params has no admitted image dimensions"
             )
-        flow = model_runner.image_builder
         expected_units = int(
             flow.denoiser.latent_shape(
                 "image",
@@ -1527,50 +1516,6 @@ def _bind_latent_inputs(
         ):
             raise invalid_descriptor(
                 "latent params disagrees with admitted model dimensions"
-            )
-
-        # A transferred trajectory commits at the step it was published at;
-        # a resident trajectory commits at its recorded solver step.
-        transferred = next(
-            (
-                publication.value
-                for publication in state.input_products
-                if publication.product in call.tensor_inputs()
-                and isinstance(publication.value, LatentTransferValue)
-            ),
-            None,
-        )
-        committed_step = (
-            int(calls.require_progress(request).flow_step)
-            if transferred is None
-            else transferred.step
-        )
-
-        if call.kind is MediaCall.LATENT_PREPARATION:
-            if int(params.start_step) != 0 or int(params.step_count) != 0:
-                raise invalid_descriptor(
-                    "media preparation params carries denoise steps"
-                )
-        elif call.kind is MediaCall.DENOISING:
-            if (
-                int(params.start_step) != committed_step
-                or int(params.step_count) < 1
-                or int(params.start_step) + int(params.step_count)
-                > int(image.steps)
-                or (
-                    int(call.bounds.max_tokens) > 0
-                    and int(params.step_count) > int(call.bounds.max_tokens)
-                )
-            ):
-                raise invalid_descriptor(
-                    "media denoise params exceeds its committed schedule"
-                )
-        elif (
-            int(params.start_step) != committed_step
-            or int(params.step_count) != 0
-        ):
-            raise invalid_descriptor(
-                "latent reader params disagrees with committed step state"
             )
 
         rows.append((identity, params, slot))
@@ -1594,43 +1539,6 @@ def _bind_latent_inputs(
         request = state.pending_output(identity[0].request_id)
         request.latent.input_params = params
         request.latent.staging = value
-
-
-def _validate_sample_params(
-    call: Call,
-    request: PendingOutput,
-    params: LatentParams,
-    model_runner: ModelExecutor,
-) -> None:
-    """Validate a standalone denoiser's trajectory parameters.
-
-    The request's pages are the run its slot owns, and each call covers the
-    fixed step interval of its kind: preparation opens the trajectory at step
-    zero and each denoising call advances one step from the committed one.
-    """
-    builder = model_runner.media_builder
-    if builder is None:
-        raise invalid_descriptor("latent params has no denoiser to advance")
-    slot = int(request.request.request_pool_idx)
-    if (
-        tuple(params.page_table) != builder.slot_pages(slot)
-        or int(params.latent_units) != builder.sample_pages.units
-    ):
-        raise invalid_descriptor(
-            "latent params does not name the pages of its request slot"
-        )
-
-    step = int(calls.require_progress(request).flow_step)
-    if call.kind is MediaCall.LATENT_PREPARATION:
-        valid = int(params.start_step) == 0 and int(params.step_count) == 0
-    elif call.kind is MediaCall.DENOISING:
-        valid = int(params.start_step) == step and int(params.step_count) == 1
-    else:
-        valid = int(params.start_step) == step and int(params.step_count) == 0
-    if not valid:
-        raise invalid_descriptor(
-            "latent params disagrees with the request's committed step"
-        )
 
 
 def _bind_cache_tables(
@@ -1800,8 +1708,8 @@ def _stage_input_products(
     resident publication of its buffer, and every other non-borrowed input
     must be query-ready; violations raise `invalid_descriptor`. A latent
     import is adopted by the `LatentPool` as a live trajectory at its
-    transferred step, and the destination's projected `flow_step` moves to
-    that step. A device or encoder import is completed in the `TensorStore`.
+    transferred step. A device or encoder import is completed in the
+    `TensorStore`.
     Borrowed inputs are skipped.
     """
     # KV imports consumed by this batch must be complete and conflict-free
@@ -1858,16 +1766,9 @@ def _stage_input_products(
                 value.latent_units != int(params.latent_units)
                 or value.height != int(params.height)
                 or value.width != int(params.width)
-                or value.step != int(params.start_step)
             ):
                 raise invalid_descriptor(
                     "latent transfer disagrees with its scheduler params"
-                )
-
-            request = state.pending_output(product.request_key.request_id)
-            if int(calls.require_progress(request).flow_step) != 0:
-                raise invalid_descriptor(
-                    "latent transfer destination already owns a trajectory"
                 )
 
             binding = state.latent_imports.get(product.buffer_id)
@@ -1884,7 +1785,7 @@ def _stage_input_products(
                 )
 
             # The reserved import becomes a live trajectory at the transferred
-            # solver step, replacing the destination's empty progress.
+            # solver step, which the pool records as the slot's committed step.
             assert latent_pool is not None
             latent_pool.adopt_import(
                 binding,
@@ -1894,9 +1795,6 @@ def _stage_input_products(
                 width=value.width,
             )
             row.latent.imported = True
-            request.progress = replace(
-                calls.require_progress(request), flow_step=value.step
-            )
             continue
 
         consumers = tuple(

@@ -426,7 +426,6 @@ impl<'py> RequestConversion<'py> {
             call.coordinates.logical_position,
             call.coordinates.kv_visible_len,
             call.coordinates.kv_computed_len,
-            call.coordinates.flow_step,
         ))?;
         let bounds = self.types.bounds.bind(self.py).call1((
             call.bounds.max_tokens,
@@ -725,7 +724,7 @@ fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyAny
     native.types.batch_from_validated.bind(py).call1(arguments)
 }
 
-/// Converts one trajectory's solver-step range and latent page table into a
+/// Converts one trajectory's raster geometry and latent page table into a
 /// Python `LatentParams` record.
 fn latent_params_to_py<'py>(
     py: Python<'py>,
@@ -745,8 +744,6 @@ fn latent_params_to_py<'py>(
     dict.set_item(intern!(py, "latent_units"), params.latent_units)?;
     dict.set_item(intern!(py, "height"), params.height)?;
     dict.set_item(intern!(py, "width"), params.width)?;
-    dict.set_item(intern!(py, "start_step"), params.start_step)?;
-    dict.set_item(intern!(py, "step_count"), params.step_count)?;
     construct(py, "LatentParams", &dict)
 }
 
@@ -2287,7 +2284,14 @@ mod tests {
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
-            latent_output: None,
+            latent_output: Some(TensorRef {
+                request_key: media_key,
+                producer_call_id: CallId::new(12, 0),
+                output_index: 0,
+                generation: 6,
+                dtype: DType::F32,
+                shape_bound: ShapeBound::default(),
+            }),
             image_input: None,
             image_output: None,
             completion_output: None,
@@ -2319,8 +2323,6 @@ mod tests {
             latent_units: 64,
             height: 768,
             width: 1344,
-            start_step: 0,
-            step_count: 0,
         }];
         let kv_key = RequestKey::new(1, RequestId(4), 1);
         let kv_source = BufferId {
@@ -2819,11 +2821,9 @@ mod tests {
                                     "latent_params.0.latent_units",
                                     "latent_params.0.height",
                                     "latent_params.0.width",
-                                    "latent_params.0.start_step",
-                                    "latent_params.0.step_count",
                                 ],
                             ),
-                            [12, 1, 64, 768, 1344, 0, 0]
+                            [12, 1, 64, 768, 1344]
                         );
                         server
                             .respond(py, &acknowledgement(py, batch.batch_id))

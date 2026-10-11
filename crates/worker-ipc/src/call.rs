@@ -243,8 +243,6 @@ pub struct CallCoordinates {
     pub kv_visible_len: u32,
     /// Tokens whose KV is initialized at submission; never below the visible extent.
     pub kv_computed_len: u32,
-    /// Denoising steps completed for this request at submission.
-    pub flow_step: u32,
 }
 
 impl CallCoordinates {
@@ -436,6 +434,15 @@ pub struct Call {
 }
 
 impl Call {
+    /// Returns whether the call reads or writes a latent product held in the
+    /// scheduler-allocated latent pages of an image trajectory, which its
+    /// batch then describes with [`LatentParams`]. A standalone denoiser's
+    /// calls address pages their worker fixes per request slot and carry no
+    /// latent product.
+    pub fn addresses_latent_pages(&self) -> bool {
+        self.latent_input.is_some() || self.latent_output.is_some()
+    }
+
     /// Tensor dependencies in the call signature, excluding its predicate.
     ///
     /// Includes `token_input` and `latent_input`, which [`Self::buffer_inputs`]
@@ -1374,7 +1381,7 @@ impl ForwardBatch {
     }
 }
 
-/// Solver-step range and optional paged storage for one request trajectory.
+/// Raster geometry and optional paged storage for one request trajectory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentParams {
     /// Request that owns the trajectory.
@@ -1389,10 +1396,6 @@ pub struct LatentParams {
     pub height: u32,
     /// Output width in pixels.
     pub width: u32,
-    /// First denoising step assigned to the call.
-    pub start_step: u32,
-    /// Number of denoising steps assigned to the call.
-    pub step_count: u32,
 }
 
 impl LatentParams {
@@ -1668,13 +1671,8 @@ impl Batch {
             let call = calls
                 .get(&identity)
                 .ok_or_else(|| invalid_message!("latent params does not name a batch call"))?;
-            let addresses_trajectory = matches!(
-                call.kind,
-                CallKind::Media(MediaCall::LatentPreparation)
-                    | CallKind::Media(MediaCall::Denoising)
-            ) || call.latent_input.is_some();
             ensure_valid!(
-                addresses_trajectory,
+                call.addresses_latent_pages(),
                 "latent params names work without a trajectory"
             );
             ensure_valid!(
@@ -1687,13 +1685,9 @@ impl Batch {
         }
 
         for call in &self.calls {
-            let needs_latent = matches!(
-                call.kind,
-                CallKind::Media(MediaCall::LatentPreparation)
-                    | CallKind::Media(MediaCall::Denoising)
-            ) || call.latent_input.is_some();
             ensure_valid!(
-                !needs_latent || latent_ids.contains(&(call.request_key, call.call_id)),
+                !call.addresses_latent_pages()
+                    || latent_ids.contains(&(call.request_key, call.call_id)),
                 "call that addresses a trajectory has no latent params"
             );
         }

@@ -42,24 +42,18 @@ if TYPE_CHECKING:
 class RequestProgress:
     """Accepted or projected coordinates for a state-consuming call.
 
-    KV lengths count tokens, and `flow_step` counts the completed solver
-    steps of a diffusion trajectory. Construction rejects negative
-    coordinates and a visible KV length outside `[0, kv_computed_len]`.
+    KV lengths count tokens. Construction rejects negative coordinates and a
+    visible KV length outside `[0, kv_computed_len]`.
     """
 
     logical_position: int = 0
     rng_counter: int = 0
-    flow_step: int = 0
     kv_visible_len: int = 0
     kv_computed_len: int = 0
     prompt_logits_ready: bool = False
 
     def __post_init__(self) -> None:
-        if (
-            self.logical_position < 0
-            or self.rng_counter < 0
-            or self.flow_step < 0
-        ):
+        if self.logical_position < 0 or self.rng_counter < 0:
             raise invalid_descriptor(
                 "request execution coordinates are negative"
             )

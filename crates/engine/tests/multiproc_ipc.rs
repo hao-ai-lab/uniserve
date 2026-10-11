@@ -771,7 +771,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         logical_position: 3,
         kv_visible_len: 3,
         kv_computed_len: 5,
-        flow_step: 0,
     };
     for mut batch in [first, successor, verifier, resumed] {
         let batch_id = batch.batch_id;
@@ -3186,7 +3185,6 @@ fn coordinates_after(output: &uniserve_worker_ipc::RequestOutput) -> CallCoordin
         logical_position: output.kv_visible_len,
         kv_visible_len: output.kv_visible_len,
         kv_computed_len: output.kv_computed_len,
-        flow_step: output.num_completed_steps,
     }
 }
 
@@ -3231,7 +3229,6 @@ fn token_batch(
             logical_position: prefix_length,
             kv_visible_len: prefix_length,
             kv_computed_len: prefix_length,
-            flow_step: 0,
         },
         token_input: None,
         token_output: Some(token_output),
