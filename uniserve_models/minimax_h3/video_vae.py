@@ -418,12 +418,16 @@ class TransformerLayer(nn.Module):
             config.decoder_attention_head_dim,
         )
         self.output = RowParallelLinear(width, width)
-        # The reference SwiGLU multiplies the value by ``silu(gate)`` in the
-        # activation dtype, rounding after each operation.
+        # FIXME: the reference SwiGLU multiplies the value by ``silu(gate)``
+        # in the activation dtype, rounding after each operation, while this
+        # decoder's fused kernels evaluate the gating with one rounding.
+        # Per-operation gating reproduces the reference expression exactly on
+        # the checkpoint's weights, but it is not adopted until a
+        # whole-decoder comparison against the reference shows it closer.
         self.mlp = GatedMLP(
             width,
             width * config.decoder_ffn_mult,
-            rounding=functional.Rounding.STEPWISE,
+            rounding=functional.Rounding.ONCE,
             bias=True,
         )
 
