@@ -632,6 +632,7 @@ fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServer>()?;
     m.add_class::<PyStreamSignal>()?;
     m.add_class::<PyErrorCode>()?;
+    m.add("SOCKET_CHANNEL", uniserve_worker_ipc::SOCKET_CHANNEL)?;
     m.add_function(wrap_pyfunction!(service_name, m)?)?;
     m.add_function(wrap_pyfunction!(call_kinds, m)?)?;
     m.add_function(wrap_pyfunction!(state_advancing_calls, m)?)?;

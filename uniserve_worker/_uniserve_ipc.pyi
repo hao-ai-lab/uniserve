@@ -218,6 +218,9 @@ class StreamSignal:
         """
         ...
 
+SOCKET_CHANNEL: str
+"""The channel mechanism name of a rank off the head's host: a TCP stream."""
+
 def service_name(id: str) -> str:
     """Return the shared-storage service name for one endpoint identifier.
 
