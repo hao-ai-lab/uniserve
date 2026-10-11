@@ -796,8 +796,62 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
+# W1 and W2 of uniserve_eval/minimax_h3.toml on the same deployment: 8 and 4
+# requests at one at a time. The requests state no schedule: the server serves
+# the checkpoint's, 9 sigma points (8 DMD forwards) with shifts 10 and 3.
+[benchmarks.gb200-4-bf16-w1]
+server = "gb200-4-bf16"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-bf16-w1.video]
+task = "t2va"
+aspect_ratio = "16:9"
+
+[benchmarks.gb200-4-bf16-w1.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
+
+[benchmarks.gb200-4-bf16-w1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-bf16-w2]
+server = "gb200-4-bf16"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-bf16-w2.video]
+task = "t2va"
+aspect_ratio = "16:9"
+
+[benchmarks.gb200-4-bf16-w2.load]
+num_prompts = 4
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
+
+[benchmarks.gb200-4-bf16-w2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
 [suites.gb200-4-bf16]
 points = ["gb200-4-bf16-latency", "gb200-4-bf16-throughput-c1", "gb200-4-bf16-throughput-c2", "gb200-4-bf16-throughput-c4", "gb200-4-bf16-throughput-c8"]
+
+[suites.gb200-4-bf16-w1-w2]
+points = ["gb200-4-bf16-w1", "gb200-4-bf16-w2"]
 
 [suites.gb200-4-nvfp4]
 points = ["gb200-4-nvfp4-latency", "gb200-4-nvfp4-throughput-c1", "gb200-4-nvfp4-throughput-c2", "gb200-4-nvfp4-throughput-c4", "gb200-4-nvfp4-throughput-c8"]
