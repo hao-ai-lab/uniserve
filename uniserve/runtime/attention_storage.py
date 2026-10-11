@@ -111,19 +111,14 @@ def allocate_attention_context(
     heads: int,
     head_dim: int,
     dtype: torch.dtype,
-    block_size: int,
 ) -> AttentionBuffers:
-    """Allocate the compact context K/V domain and its fences.
+    """Allocate the compact context K/V domain.
 
     Every rank holds the whole context's rows: its own window is where it
     publishes, and the gather fills the rest.
     """
-    if min(rows, heads, head_dim, block_size) < 1:
+    if min(rows, heads, head_dim) < 1:
         raise ValueError("attention context extents must be positive")
-    if rows % block_size:
-        raise ValueError(
-            "attention context rows must align to its validity blocks"
-        )
 
     shape = (rows, heads, head_dim)
     # Replicated compact domain: each rank owns one contiguous row window.
@@ -136,19 +131,7 @@ def allocate_attention_context(
         key[begin : begin + rows],
         value[begin : begin + rows],
     )
-
-    # Trailing fields: per-block valid-row counts, local fence, per-peer fences.
-    return AttentionBuffers(
-        key,
-        value,
-        local_key,
-        local_value,
-        torch.empty(
-            key.shape[0] // block_size, dtype=torch.int32, device=group.device
-        ),
-        torch.zeros(1, dtype=torch.int32, device=group.device),
-        torch.empty(group.size, dtype=torch.int32, device=group.device),
-    )
+    return AttentionBuffers(key, value, local_key, local_value)
 
 
 def allocate_context_storage(
@@ -158,14 +141,13 @@ def allocate_context_storage(
     heads: int,
     head_dim: int,
     dtype: torch.dtype,
-    block_size: int,
 ) -> Mapping[ParallelAttention, AttentionBuffers]:
     """Allocate context capacity shared by serialized layers of one caller.
 
     Rows describe each context partition. Numerical layers only borrow the
     resulting views when the caller enters ``context_scope``.
     """
-    # All layers in this call share head dimensions, dtype and block size.
+    # All layers in this call share head dimensions and dtype.
     # Only the communicator and the row count can vary per layer.
     allocations: dict[tuple[Communicator, int], AttentionBuffers] = {}
     bindings = {}
@@ -182,7 +164,6 @@ def allocate_context_storage(
                 heads=heads,
                 head_dim=head_dim,
                 dtype=dtype,
-                block_size=block_size,
             )
 
         bindings[layer] = allocations[key]

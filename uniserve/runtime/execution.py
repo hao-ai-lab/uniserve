@@ -430,7 +430,6 @@ class ExecutionContext(Generic[SizeT]):
                 heads=heads,
                 head_dim=head_dim,
                 dtype=dtype,
-                block_size=64,
             )
             self._vsa_transport[key] = (output, contexts.get(parallel))
 
@@ -700,7 +699,6 @@ class ExecutionContext(Generic[SizeT]):
                 heads=layer.local_kv_heads,
                 head_dim=layer.head_dim,
                 dtype=dtype,
-                block_size=1,
             )[parallel]
 
         buffers = self._context_backing[key]
