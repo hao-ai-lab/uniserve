@@ -15,6 +15,7 @@ from .denoiser import Denoiser
 from .encoder import text_encoder
 from .encoding import AudioEncoder, VideoEncoder
 from .output import VideoPostprocessor
+from .packing import AUDIO_SAMPLE_RATE, FPS
 
 
 class Model(nn.Module):
@@ -51,15 +52,13 @@ class Model(nn.Module):
         attention = next(iter(config.denoisers.values())).attention
         self.video_decoder = VideoDecoder(config.video_vae, attention=attention)
         self.audio_decoder = AudioDecoder(
-            config.audio_vae, sample_rate=config.output.sample_rate
+            config.audio_vae, sample_rate=AUDIO_SAMPLE_RATE
         )
         self.video_encoder = VideoEncoder(config.video_vae)
         self.audio_encoder = AudioEncoder(
-            config.audio_vae, sample_rate=config.output.sample_rate
+            config.audio_vae, sample_rate=AUDIO_SAMPLE_RATE
         )
-        self.video_postprocessor = VideoPostprocessor(
-            frame_rate=config.output.frame_rate
-        )
+        self.video_postprocessor = VideoPostprocessor(frame_rate=FPS)
 
 
 def _denoiser_entry(name: str) -> ComponentEntry:

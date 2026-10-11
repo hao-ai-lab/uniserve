@@ -28,10 +28,10 @@ from uniserve.media import image
 from uniserve.nn.functional import Rounding
 from uniserve_models import qwen3_vl
 
-from . import audio_vae, output, video_vae
+from . import audio_vae, video_vae
 from .checkpoint import TASK_PARTITIONS, Layout, detect
 from .encoder import TextEncoderConfig
-from .packing import CANVAS_MULTIPLE, VIDEO_TILE_SHAPES
+from .packing import AUDIO_SAMPLE_RATE, CANVAS_MULTIPLE, VIDEO_TILE_SHAPES
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -357,7 +357,6 @@ class Config:
     denoisers: Mapping[str, DenoiserConfig]
     video_vae: video_vae.Config
     audio_vae: audio_vae.Config
-    output: output.Config = output.Config()
 
     def __post_init__(self) -> None:
         if not isinstance(self.denoisers, Mapping) or not self.denoisers:
@@ -391,7 +390,6 @@ class Config:
             ("text_encoder", self.text_encoder, TextEncoderConfig()),
             ("video_vae", self.video_vae, video_vae.Config()),
             ("audio_vae", self.audio_vae, audio_vae.Config()),
-            ("output", self.output, output.Config()),
             *(
                 (f"{name}.transformer", value.transformer, TransformerConfig())
                 for name, value in self.denoisers.items()
@@ -663,9 +661,12 @@ def normalize(
     ):
         if not isinstance(metadata.get(name), Mapping):
             raise ValueError(f"MiniMax-H3 requires {name} metadata")
-    if metadata["audio_vae"].get("sampling_rate") != 32000:
+    # Request planning resamples every soundtrack to the timeline's
+    # AUDIO_SAMPLE_RATE, so the audio VAE must run at it.
+    if metadata["audio_vae"].get("sampling_rate") != AUDIO_SAMPLE_RATE:
         raise ValueError(
-            "MiniMax-H3 audio output requires a 32000 Hz sampling clock"
+            f"MiniMax-H3 audio output requires a {AUDIO_SAMPLE_RATE} Hz "
+            "sampling clock"
         )
     shifts = _shifts(metadata)
     contract = layout.contract
