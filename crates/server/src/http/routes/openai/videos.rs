@@ -510,8 +510,8 @@ fn missing_video() -> Response {
         .into_response()
 }
 
-/// Lists every retained job, newest first. The list is returned whole (at most
-/// `MAX_VIDEO_JOBS` records), so `has_more` is always `false`.
+/// Lists every retained job, newest first. The store's retention bounds the
+/// records, so the list is returned whole and `has_more` is always `false`.
 pub(crate) async fn videos_list(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(
         serde_json::json!({"object": "list", "data": state.videos.list(), "has_more": false}),
