@@ -139,9 +139,6 @@ def text(
     request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
-    request.product_generations = tuple(
-        output.generation for output in call.tensor_outputs()
-    )
     request.products = products
     return request
 
@@ -486,7 +483,6 @@ def state_outcome(
     request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, cache)
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.token.committed_tokens = ()
     request.products = products
     return request
@@ -508,7 +504,6 @@ def non_state_outcome(
     request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
     request.host.tasks = completion_tasks
     return request

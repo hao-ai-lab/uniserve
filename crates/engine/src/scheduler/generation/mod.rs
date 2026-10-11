@@ -1076,10 +1076,7 @@ pub(crate) fn validate_generation_result(
         });
     }
     if record.status == CallStatus::Predicated {
-        if call.predicate.as_ref().is_none()
-            || !record.committed_tokens.as_slice().is_empty()
-            || !record.product_generations.is_empty()
-        {
+        if call.predicate.as_ref().is_none() || !record.committed_tokens.as_slice().is_empty() {
             return Err(GenerationResultError::Status {
                 detail: "invalid_predicated_result",
             });
@@ -1104,19 +1101,6 @@ pub(crate) fn validate_generation_result(
                 detail: "denoise_step_mismatch",
             });
         }
-    }
-
-    // The worker reports one generation per tensor output, in
-    // `Call::tensor_outputs` order.
-    if !record
-        .product_generations
-        .iter()
-        .copied()
-        .eq(call.tensor_outputs().map(|tensor| tensor.generation))
-    {
-        return Err(GenerationResultError::Product {
-            detail: "tensor_generation_mismatch",
-        });
     }
 
     // Read the PNG header to check the requested dimensions. The output path

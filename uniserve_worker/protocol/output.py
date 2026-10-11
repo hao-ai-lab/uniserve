@@ -18,11 +18,8 @@ from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import identity, transfer
 from uniserve_worker.protocol.batch import TensorPublication
 from uniserve_worker.protocol.call import (
-    CallKind,
     CallStatus,
     ErrorCode,
-    ForwardMode,
-    TransferMode,
 )
 
 
@@ -105,16 +102,9 @@ class RequestOutput:
     request_key: identity.RequestKey
     call_id: identity.CallId
     status: CallStatus
-    # Allocation generations of the products the call emitted.
-    product_generations: tuple[int, ...]
     # Set exactly when status is ERROR.
     error_code: ErrorCode | None
     timing_counters: TimingCounters
-    # Kind of the call that produced this result; the engine requires it to
-    # match the submitted call.
-    kind: CallKind
-    # Logical position of the request's next input token.
-    position: int
     # Accepted KV prefix a successor may attend to, in tokens.
     kv_visible_len: int
     # KV extent execution initialized, in tokens, including rejected
@@ -149,30 +139,24 @@ class RequestOutput:
 
         Raises:
             WorkerError: The call id is not positive; a KV publication is
-                attached to anything but a successful KV_PUBLISH of this
+                attached to anything but a successful completion of its own
                 call; the visible KV extent exceeds the computed one; a
                 coordinate is negative; the error code does not match the
                 status; a refused request's completion states no reason, or
                 another completion does; a completion other than a successful
-                token denoising carries candidate log-probabilities; or a
-                predicated completion carries tokens, logprobs, products, or
-                finish flags.
+                one carries candidate log-probabilities; or a predicated
+                completion carries tokens, logprobs, or finish flags.
         """
         if self.call_id.batch_id < 1:
             raise invalid_descriptor("completion call id must be positive")
 
-        if self.candidate_logprobs and (
-            self.status is not CallStatus.OK
-            or self.kind is not ForwardMode.TOKEN_DENOISING
-        ):
+        if self.candidate_logprobs and self.status is not CallStatus.OK:
             raise invalid_descriptor(
-                "candidate log-probabilities belong to a successful "
-                "token-denoising completion"
+                "candidate log-probabilities belong to a successful completion"
             )
 
         if self.kv_output is not None and (
             self.status is not CallStatus.OK
-            or self.kind is not TransferMode.KV_PUBLISH
             or self.kv_output.source.owner != self.request_key
             or self.kv_output.source.producer_call_id != self.call_id
         ):
@@ -186,7 +170,6 @@ class RequestOutput:
             )
         if (
             min(
-                self.position,
                 self.kv_visible_len,
                 self.kv_computed_len,
                 self.num_completed_steps,
@@ -216,7 +199,6 @@ class RequestOutput:
             or self.sampled_logprob is not None
             or self.top_logprobs
             or self.prompt_logprobs
-            or self.product_generations
             or self.finish_flags.eos
             or self.finish_flags.length
             or self.finish_flags.stop
@@ -244,8 +226,6 @@ class RequestOutput:
             },
             "call_id": self.call_id.to_mapping(),
             "status": self.status.value,
-            "code": self.kind.value,
-            "position": self.position,
             "kv_visible_len": self.kv_visible_len,
             "kv_computed_len": self.kv_computed_len,
             "num_completed_steps": self.num_completed_steps,
@@ -274,7 +254,6 @@ class RequestOutput:
             "kv_output": None
             if self.kv_output is None
             else self.kv_output.to_mapping(),
-            "product_generations": list(self.product_generations),
             "error_code": None if error_code is None else error_code.value,
             "error_message": self.error_message,
             "timing_counters": {

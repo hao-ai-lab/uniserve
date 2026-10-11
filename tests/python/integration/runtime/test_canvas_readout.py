@@ -399,7 +399,7 @@ def test_canvas_rows_read_candidates_over_the_cached_prompt(tmp_path):
     torch.testing.assert_close(
         torch.logsumexp(whole, dim=0), torch.tensor(0.0), atol=1e-5, rtol=0
     )
-    assert (record.position, record.kv_visible_len) == (13, 13)
+    assert record.kv_visible_len == 13
     assert record.kv_computed_len == 13
 
 
@@ -538,7 +538,6 @@ def test_image_context_preserves_readout_and_next_token(
         )
         written = _completion(_run(worker, context))
         assert written.kv_visible_len == length
-        assert written.position == length
         record = _completion(_run(worker, _readout(3, length, canvases, slots)))
         _run(worker, Batch(batch_id=4, commands=(Finish(REQUEST),)))
 

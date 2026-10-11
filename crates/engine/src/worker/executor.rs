@@ -1288,9 +1288,29 @@ impl WorkerExecutor {
                     .get(&identity)
                     .context("worker returned an unknown call")?;
                 anyhow::ensure!(seen.insert(identity), "worker returned a duplicate call");
+                // A completion's payload must fit the kind of the call it
+                // answers: only a successful KV-publish call publishes KV,
+                // and only a successful token-denoising call reports
+                // candidate log-probabilities.
+                let output = &completion.output;
+                let successful = output.status == uniserve_worker_ipc::CallStatus::Ok;
                 anyhow::ensure!(
-                    completion.output.code == *kind,
-                    "worker returned a computation code that disagrees with its call"
+                    output.kv_output.is_none()
+                        || (successful
+                            && *kind
+                                == uniserve_worker_ipc::CallKind::Transfer(
+                                    uniserve_worker_ipc::TransferMode::KvPublish
+                                )),
+                    "worker returned a KV publication for a call that does not publish one"
+                );
+                anyhow::ensure!(
+                    output.candidate_logprobs.is_empty()
+                        || (successful
+                            && *kind
+                                == uniserve_worker_ipc::CallKind::Forward(
+                                    uniserve_worker_ipc::ForwardMode::TokenDenoising
+                                )),
+                    "worker returned candidate log-probabilities for a call that reads none"
                 );
             }
             anyhow::ensure!(

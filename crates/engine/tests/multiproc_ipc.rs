@@ -866,7 +866,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     assert_eq!(outputs[&verify_id].kv_computed_len, 5);
     assert_eq!(outputs[&resumed_id].committed_tokens, vec![1002]);
     assert_eq!(outputs[&resumed_id].kv_visible_len, 4);
-    assert_eq!(outputs[&resumed_id].position, 4);
     executor.close()?;
     Ok(())
 }
@@ -1879,7 +1878,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     continuation.calls[0].bounds.max_completion_bytes = 4 + 2 * 12;
     let continued = execute(&mut executor, continuation)?;
     assert_eq!(continued.results[0].output.status, CallStatus::Ok);
-    assert_eq!(continued.results[0].output.position, 3);
+    assert_eq!(continued.results[0].output.kv_visible_len, 3);
     assert!(continued.results[0].output.sampled_logprob.is_some());
     assert_eq!(
         continued.results[0].output.top_logprobs[0].token_id,
@@ -3281,11 +3280,11 @@ fn text_admission(
     )?)
 }
 
-/// The coordinates a call entering after `output` executes at, as the engine
-/// derives them from the completion it observed.
+/// The coordinates a call entering after `output` executes at, for a request
+/// whose completions advance its logical position with its visible KV.
 fn coordinates_after(output: &uniserve_worker_ipc::RequestOutput) -> CallCoordinates {
     CallCoordinates {
-        logical_position: output.position,
+        logical_position: output.kv_visible_len,
         kv_visible_len: output.kv_visible_len,
         kv_computed_len: output.kv_computed_len,
         flow_step: output.num_completed_steps,

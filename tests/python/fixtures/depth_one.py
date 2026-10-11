@@ -427,8 +427,20 @@ def observe_completions(worker: object, report: BatchOutput) -> None:
             if entry is not None:
                 ledger[record.request_key] = entry
             continue
+        # The engine holds the request's logical position itself: the call
+        # advanced it with the KV it accepted.
+        entered = submitted.get((record.request_key, record.call_id))
+        advanced = (
+            record.kv_visible_len - entered.kv_visible_len
+            if entered is not None
+            else 0
+        )
         ledger[record.request_key] = CallCoordinates(
-            logical_position=record.position,
+            logical_position=(
+                entered.logical_position + advanced
+                if entered is not None
+                else record.kv_visible_len
+            ),
             kv_visible_len=record.kv_visible_len,
             kv_computed_len=record.kv_computed_len,
             flow_step=record.num_completed_steps,

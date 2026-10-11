@@ -242,7 +242,6 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
 
     assert extended.completions[0].committed_tokens == (expected_successor(4),)
     assert extended.completions[0].kv_visible_len == 2
-    assert extended.completions[0].position == 2
 
     first_token = extended.completions[0].committed_tokens[0]
     observation = record_completion(extend, extended)
@@ -269,7 +268,6 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
         expected_successor(first_token),
     )
     assert decoded.completions[0].kv_visible_len == 3
-    assert decoded.completions[0].position == 3
 
 
 def test_prefix_reuse_continues_from_the_admitted_logical_position():
@@ -295,7 +293,6 @@ def test_prefix_reuse_continues_from_the_admitted_logical_position():
     )
 
     assert report.completions[0].kv_visible_len == 3
-    assert report.completions[0].position == 3
 
 
 def test_text_extension_rejects_missing_input_tokens() -> None:
@@ -528,14 +525,12 @@ def test_lane_and_graph_binding_preserve_token_and_flow_results(
     token = bound_sequence.completions[0]
     reference_token = plain_sequence.completions[0]
     assert token.committed_tokens == reference_token.committed_tokens
-    assert token.position == reference_token.position
     assert token.kv_visible_len == reference_token.kv_visible_len
     assert token.kv_computed_len == reference_token.kv_computed_len
     assert token.num_completed_steps == reference_token.num_completed_steps
 
     flow_completion = bound_flow.completions[0]
     reference_flow = plain_flow.completions[0]
-    assert flow_completion.position == reference_flow.position
     assert flow_completion.kv_visible_len == reference_flow.kv_visible_len
     assert flow_completion.kv_computed_len == reference_flow.kv_computed_len
     assert (
@@ -2108,10 +2103,6 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
     )
     completion = report.completions[0]
     assert completion.kv_visible_len == session_kv_before
-    assert completion.position == 2
-    assert completion.product_generations
-    assert completion.product_generations[0] == handle
-    assert completion.product_generations[0] != 0
 
 
 @pytest.mark.parametrize(
@@ -2226,7 +2217,6 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             assert completion.error_code is ErrorCode.COMPUTE_ERROR
             assert completion.media_output is None
             assert completion.committed_tokens == ()
-            assert completion.product_generations == ()
         else:
             assert completion.status is CallStatus.OK
             assert _media_bytes(completion) == expected
@@ -2383,7 +2373,6 @@ def test_generated_feedback_commits_absolute_visual_token_state():
 
     completion = report.completions[0]
     assert completion.committed_tokens == (next_token,)
-    assert completion.position == 4
     assert completion.kv_visible_len == 4
 
     feedback_observation = record_completion(state, report)

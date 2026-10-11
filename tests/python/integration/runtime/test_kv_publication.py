@@ -382,7 +382,6 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         ),
     )
     closure_record = closure_result.completions[0]
-    assert closure_record.position == 2
     assert closure_record.kv_visible_len == 3
     assert closure_record.kv_computed_len == 3
 

@@ -131,14 +131,9 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
             )
             completion = report.completions[0]
             assert (
-                completion.position,
                 completion.kv_visible_len,
                 completion.kv_computed_len,
-            ) == (
-                2,
-                2,
-                2,
-            )
+            ) == (2, 2)
             primed.append((extend, report))
 
         decode_ops = []
@@ -177,14 +172,9 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                 expected_successor(expected_successor(prompt_end)),
             )
             assert (
-                completion.position,
                 completion.kv_visible_len,
                 completion.kv_computed_len,
-            ) == (
-                3,
-                3,
-                3,
-            )
+            ) == (3, 3)
 
 
 def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> (
@@ -230,12 +220,6 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> (
 
     assert result.completions[0].committed_tokens == (expected,)
     assert result.completions[1].committed_tokens == (expected,)
-    assert result.completions[0].product_generations == tuple(
-        output.generation for output in first_op.tensor_outputs()
-    )
-    assert result.completions[1].product_generations == tuple(
-        output.generation for output in second_op.tensor_outputs()
-    )
 
 
 def test_verify_commits_every_accepted_position() -> None:

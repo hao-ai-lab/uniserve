@@ -692,12 +692,9 @@ impl SimEngine {
             request_key: call.request_key,
             call_id: call.call_id,
             status: CallStatus::Ok,
-            product_generations: call.tensor_outputs().map(|out| out.generation).collect(),
             error_code: None,
             error_message: None,
             timing_counters: TimingCounters::default(),
-            code: call.code,
-            position: 0,
             kv_visible_len: 0,
             kv_computed_len: 0,
             num_completed_steps: 0,
@@ -707,7 +704,6 @@ impl SimEngine {
             media_output: None,
             kv_output: None,
         };
-        record.position = request.logical_position;
         set_kv_lengths(&mut record, request.kv_visible_len);
 
         match call.code {
@@ -742,7 +738,6 @@ impl SimEngine {
                             .logical_position
                             .saturating_add(call.bounds.max_tokens);
                     }
-                    record.position = request.logical_position;
                     set_kv_lengths(&mut record, request.kv_visible_len);
                 } else if samples_token {
                     let index = request.emitted;
@@ -758,7 +753,6 @@ impl SimEngine {
                     )?
                     else {
                         record.status = CallStatus::Error;
-                        record.product_generations.clear();
                         record.error_code = Some(ErrorCode::InvalidCall);
                         return Ok(record);
                     };
@@ -798,7 +792,6 @@ impl SimEngine {
                             .predicate_values
                             .insert(completion.clone(), transition);
                     }
-                    record.position = 1;
                     // Positions and KV advance by the query length: the whole
                     // bound for a prefill, one token for decode and verify.
                     if !visual_state {
@@ -812,7 +805,6 @@ impl SimEngine {
                             request.logical_position.saturating_add(query_tokens);
                         request.kv_visible_len =
                             request.kv_visible_len.saturating_add(query_tokens);
-                        record.position = request.logical_position;
                         set_kv_lengths(&mut record, request.kv_visible_len);
                     }
                     match work {
@@ -999,12 +991,9 @@ impl SimEngine {
             request_key: call.request_key,
             call_id: call.call_id,
             status: CallStatus::Predicated,
-            product_generations: Vec::new(),
             error_code: None,
             error_message: None,
             timing_counters: TimingCounters::default(),
-            code: call.code,
-            position: request.logical_position,
             kv_visible_len: request.kv_visible_len,
             kv_computed_len: request.kv_visible_len,
             num_completed_steps: u32::from(request.flow_step),
@@ -1341,7 +1330,6 @@ impl SimEngine {
                 (call.code, refused.get(&call.request_key.request_id))
             {
                 completion.status = CallStatus::Error;
-                completion.product_generations.clear();
                 completion.media_output = None;
                 completion.error_code = Some(ErrorCode::InvalidRequest);
                 completion.error_message = Some(reason.clone());

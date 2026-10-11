@@ -428,11 +428,8 @@ def _error_outputs(
             request_key=call.request_key,
             call_id=call.call_id,
             status=CallStatus.ERROR,
-            product_generations=(),
             error_code=completion_code,
             timing_counters=TimingCounters(),
-            kind=call.kind,
-            position=(0 if runtime is None else int(runtime.logical_position)),
             kv_visible_len=(
                 0 if runtime is None else int(runtime.kv_visible_len)
             ),

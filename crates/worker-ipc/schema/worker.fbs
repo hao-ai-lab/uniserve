@@ -488,13 +488,9 @@ table RequestOutput {
   request_key:RequestKey;
   call_id:CallId;
   status:CallStatus;
-  product_generations:[uint];
   /// Present exactly when `status` is `Error`.
   error_code:ErrorCode = null;
   timing_counters:TimingCounters;
-  /// Must match the submitted call's kind.
-  code:CallKind (required);
-  position:uint;
   kv_visible_len:uint;
   kv_computed_len:uint;
   num_completed_steps:uint;

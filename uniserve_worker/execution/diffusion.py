@@ -263,7 +263,6 @@ def prepare_latent(
     request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, cache, flow_step=0)
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
     return request
 
@@ -593,7 +592,6 @@ def finish(
         flow_step=final_step,
     )
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
 
     # Branch prefixes live in pool slots separate from the request's own KV;

@@ -166,13 +166,9 @@ fn completion_record() -> RequestOutput {
         call_id: CallId::new(11, 0),
 
         status: CallStatus::Ok,
-
-        product_generations: vec![3, 4],
         error_code: None,
         error_message: None,
         timing_counters: TimingCounters::default(),
-        code: CallKind::Forward(ForwardMode::Decode),
-        position: 5,
         kv_visible_len: 5,
         kv_computed_len: 5,
         num_completed_steps: 0,
@@ -519,12 +515,10 @@ fn a_readout_and_its_candidate_logprobs_round_trip() {
 
     let mut record = completion_record();
     record.call_id = call_id;
-    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
     record.sampled_logprob = None;
     record.top_logprobs.clear();
     record.prompt_logprobs.clear();
     record.committed_tokens.clear();
-    record.product_generations.clear();
     record.candidate_logprobs = vec![-0.25, -3.5, -17.75];
     let report = lane_report(5, vec![record], Vec::new(), None, None);
     let decoded =
@@ -606,11 +600,9 @@ fn a_canvas_step_and_its_block_round_trip() {
 
     let mut record = completion_record();
     record.call_id = CallId::new(6, 0);
-    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
     record.sampled_logprob = None;
     record.top_logprobs.clear();
     record.prompt_logprobs.clear();
-    record.product_generations.clear();
     record.committed_tokens = (0..256).collect();
     let report = lane_report(6, vec![record], Vec::new(), None, None);
     let decoded =
@@ -641,15 +633,11 @@ fn a_canvas_step_is_a_token_denoising_call_without_input_tokens() {
     }
 }
 
-/// Only a successful token-denoising completion reports candidate
-/// log-probabilities.
+/// Only a successful completion reports candidate log-probabilities.
 #[test]
-fn candidate_logprobs_belong_to_a_successful_token_denoising_completion() {
+fn candidate_logprobs_belong_to_a_successful_completion() {
     let mut record = completion_record();
     record.candidate_logprobs = vec![-1.0];
-    assert!(record.validate().is_err());
-
-    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
     assert!(record.validate().is_ok());
     record.status = CallStatus::Error;
     record.error_code = Some(ErrorCode::ComputeError);
@@ -1042,7 +1030,6 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     let mut report = lane_report(
         5,
         vec![RequestOutput {
-            code: CallKind::Transfer(TransferMode::KvPublish),
             kv_output: Some(KvTransfer {
                 groups: Vec::new(),
                 source,
@@ -1155,7 +1142,6 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
         let report = lane_report(
             5,
             vec![RequestOutput {
-                code: CallKind::Transfer(TransferMode::KvPublish),
                 kv_output: Some(KvTransfer {
                     groups: vec![
                         KvGroupTransfer {
@@ -2035,8 +2021,6 @@ fn full_run_result() -> BatchOutput {
         call_id: CallId::new(11, 0),
 
         status: CallStatus::Ok,
-
-        product_generations: vec![3, 5],
         error_code: None,
         error_message: None,
         timing_counters: TimingCounters {
@@ -2045,8 +2029,6 @@ fn full_run_result() -> BatchOutput {
             copy_us: 43,
             host_us: 44,
         },
-        code: CallKind::Forward(ForwardMode::Decode),
-        position: 5,
         kv_visible_len: 6,
         num_completed_steps: 7,
         kv_computed_len: 8,
@@ -2067,7 +2049,6 @@ fn full_run_result() -> BatchOutput {
     predicated_record.status = CallStatus::Predicated;
     predicated_record.committed_tokens.clear();
     predicated_record.finish_flags = FinishFlags::default();
-    predicated_record.product_generations = Vec::new();
     let mut error_record = ok_record.clone();
     error_record.request_key = key_for_request(102);
     error_record.call_id = CallId::new(11, 2);

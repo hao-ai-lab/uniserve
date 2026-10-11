@@ -242,7 +242,6 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
     )
     tokens = tuple(completion.committed_tokens[0] for completion in completions)
     for position, completion in enumerate(completions, start=2):
-        assert completion.position == position
         assert completion.kv_visible_len == position
         assert completion.kv_computed_len == position
     expected = []

@@ -174,7 +174,6 @@ def publish(
     request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, cache)
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.token.committed_tokens = ()
     return request
 
@@ -318,7 +317,6 @@ def publish_steps(
         request.status = CallStatus.OK
         request.progress = calls.execution_runtime(request, cache)
         request.finish_flags = FinishFlags()
-        request.product_generations = calls.output_generations(call)
         request.token.committed_tokens = ()
         outcomes.append(request)
 

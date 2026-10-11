@@ -271,7 +271,6 @@ def execute(
     request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.host.tasks = (task,)
     request.host.finish = publish
     request.products = ()

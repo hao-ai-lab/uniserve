@@ -989,8 +989,6 @@ pub struct RequestOutput {
     pub call_id: CallId,
     /// Terminal execution status.
     pub status: CallStatus,
-    /// Allocation generations for products emitted by the call.
-    pub product_generations: Vec<u32>,
     /// Error classification when `status` is [`CallStatus::Error`].
     pub error_code: Option<ErrorCode>,
     /// Why the worker refused the request, exactly when `error_code` is
@@ -999,10 +997,6 @@ pub struct RequestOutput {
     pub error_message: Option<String>,
     /// Worker timing measurements for the call.
     pub timing_counters: TimingCounters,
-    /// Kind that produced this result; must match the submitted call.
-    pub code: CallKind,
-    /// Model position for the next input, including image-feedback position advances.
-    pub position: u32,
     /// Accepted KV prefix available to a successor.
     pub kv_visible_len: u32,
     /// KV extent initialized by execution, including rejected speculative positions.
@@ -1029,7 +1023,13 @@ pub struct RequestOutput {
 }
 
 impl RequestOutput {
-    /// Validates completion identity, status, accepted lengths, and product generations.
+    /// Validates completion identity, status, accepted lengths, and the
+    /// ownership of a KV publication.
+    ///
+    /// Rules that relate a completion to the kind of the call it answers
+    /// are the caller's, which holds the call: a KV publication answers a
+    /// successful KV-publish call, and candidate log-probabilities a
+    /// successful token-denoising call.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.call_id.batch_id > 0,
@@ -1039,7 +1039,6 @@ impl RequestOutput {
             publication.validate()?;
             ensure_valid!(
                 self.status == CallStatus::Ok
-                    && self.code == CallKind::Transfer(TransferMode::KvPublish)
                     && publication.source.owner == self.request_key
                     && publication.source.producer_call_id == self.call_id,
                 "KV publication does not belong to its successful completion"
@@ -1065,14 +1064,12 @@ impl RequestOutput {
             "a refused request's completion, and only one, states why"
         );
         ensure_valid!(
-            self.candidate_logprobs.is_empty()
-                || (self.status == CallStatus::Ok
-                    && self.code == CallKind::Forward(ForwardMode::TokenDenoising)),
-            "candidate log-probabilities belong to a successful token-denoising completion"
+            self.candidate_logprobs.is_empty() || self.status == CallStatus::Ok,
+            "candidate log-probabilities belong to a successful completion"
         );
         if self.status == CallStatus::Predicated {
             ensure_valid!(
-                self.committed_tokens.as_slice().is_empty() && self.product_generations.is_empty(),
+                self.committed_tokens.as_slice().is_empty(),
                 "a predicated completion must select its parent without semantic output"
             );
             ensure_valid!(

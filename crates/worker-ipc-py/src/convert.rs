@@ -1602,20 +1602,12 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
         call_id: computation_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
         status,
-        product_generations: u32_vec(&get(dict, intern!(py, "product_generations"))?)?,
         error_code,
         error_message: match get(dict, intern!(py, "error_message")) {
             Some(value) if !value.is_none() => Some(string_of(&value)?),
             _ => None,
         },
         timing_counters,
-        code: {
-            let name = string_of(&get(dict, intern!(py, "code"))?)?;
-            CallKind::ALL
-                .into_iter()
-                .find(|code| code.as_str() == name)?
-        },
-        position: u32_of(&get(dict, intern!(py, "position"))?)?,
         kv_visible_len: u32_of(&get(dict, intern!(py, "kv_visible_len"))?)?,
         kv_computed_len: u32_of(&get(dict, intern!(py, "kv_computed_len"))?)?,
         num_completed_steps: u32_of(&get(dict, intern!(py, "num_completed_steps"))?)?,
@@ -2470,12 +2462,9 @@ mod tests {
                 request_key,
                 call_id: CallId::new(13, 0),
                 status: CallStatus::Ok,
-                product_generations: vec![5],
                 error_code: None,
                 error_message: None,
                 timing_counters: TimingCounters::default(),
-                code: CallKind::Forward(ForwardMode::Decode),
-                position: 2,
                 kv_visible_len: 2,
                 num_completed_steps: 0,
                 kv_computed_len: 2,
@@ -2496,12 +2485,10 @@ mod tests {
         let mut publication = result.completions[0].clone();
         publication.request_key = RequestKey::new(1, RequestId(4), 1);
         publication.call_id = CallId::new(13, 1);
-        publication.code = CallKind::Transfer(TransferMode::KvPublish);
         publication.committed_tokens.clear();
         publication.sampled_logprob = None;
         publication.top_logprobs.clear();
         publication.prompt_logprobs.clear();
-        publication.product_generations.clear();
         publication.kv_output = Some(kv_publication(BufferId {
             owner: publication.request_key,
             producer_call_id: publication.call_id,
@@ -2512,12 +2499,10 @@ mod tests {
         let mut readout = result.completions[0].clone();
         readout.request_key = RequestKey::new(1, RequestId(5), 1);
         readout.call_id = CallId::new(13, 2);
-        readout.code = CallKind::Forward(ForwardMode::TokenDenoising);
         readout.committed_tokens.clear();
         readout.sampled_logprob = None;
         readout.top_logprobs.clear();
         readout.prompt_logprobs.clear();
-        readout.product_generations.clear();
         readout.candidate_logprobs = vec![-0.5, -2.25, -9.0];
         result.completions.push(publication);
         result.completions.push(readout);

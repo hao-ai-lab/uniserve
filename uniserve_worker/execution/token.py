@@ -1146,7 +1146,6 @@ def token_outcome(
 
     request.status = CallStatus.OK
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.token.committed_tokens = committed_tokens
     return request
 

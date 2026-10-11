@@ -1068,10 +1068,6 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
         request_key: request_key_from_table(record.request_key(), "completion.request_key")?,
         call_id: computation_id_from_fb(record.call_id())?,
         status: call_status_from_fb(record.status())?,
-        product_generations: record
-            .product_generations()
-            .map(|items| items.iter().collect())
-            .unwrap_or_default(),
         error_code: record.error_code().map(error_code_from_fb).transpose()?,
         error_message: record.error_message().map(str::to_owned),
         timing_counters: TimingCounters {
@@ -1080,8 +1076,6 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
             copy_us: timing_counters.copy_us(),
             host_us: timing_counters.host_us(),
         },
-        code: computation_from_fb(record.code())?,
-        position: record.position(),
         kv_visible_len: record.kv_visible_len(),
         kv_computed_len: record.kv_computed_len(),
         num_completed_steps: record.num_completed_steps(),

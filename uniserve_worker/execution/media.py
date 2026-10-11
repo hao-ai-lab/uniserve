@@ -1160,7 +1160,6 @@ def execute(
     # denoising step keeps the ``flow_step`` it advanced above.
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
     return request
 

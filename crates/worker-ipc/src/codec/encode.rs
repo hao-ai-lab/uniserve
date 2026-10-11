@@ -1078,14 +1078,12 @@ fn completion<'a>(
     let request_key = Some(request_key(b, &v.request_key));
     let call_id = fbs::CallId::new(v.call_id.batch_id, v.call_id.request_index);
     let status = call_status_to_fb(v.status);
-    let product_generations = Some(b.create_vector(&v.product_generations));
     let error_code = v.error_code.map(error_code_to_fb);
     let error_message = v
         .error_message
         .as_deref()
         .map(|message| b.create_string(message));
     let timing_counters = Some(timing(b, &v.timing_counters));
-    let code = computation_to_fb(v.code);
     let committed_tokens = Some(b.create_vector(&v.committed_tokens));
     let top_logprobs = {
         let items = v.top_logprobs.iter().map(token_logprob).collect::<Vec<_>>();
@@ -1109,12 +1107,9 @@ fn completion<'a>(
             request_key,
             call_id: Some(&call_id),
             status,
-            product_generations,
             error_code,
             error_message,
             timing_counters,
-            code: Some(&code),
-            position: v.position,
             kv_visible_len: v.kv_visible_len,
             kv_computed_len: v.kv_computed_len,
             num_completed_steps: v.num_completed_steps,

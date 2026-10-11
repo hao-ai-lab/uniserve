@@ -316,10 +316,7 @@ def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
                 worker, _step(batch, context, block, step)
             ).completions
             assert record.status is CallStatus.OK
-            assert (record.position, record.kv_visible_len) == (
-                context,
-                context,
-            )
+            assert record.kv_visible_len == context
             return tuple(record.committed_tokens)
 
         actual = _block(run, 13, 0, 2)
