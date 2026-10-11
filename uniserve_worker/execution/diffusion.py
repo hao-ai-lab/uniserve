@@ -192,11 +192,6 @@ def prepare_latent(
         raise invalid_descriptor(
             "media preparation has no admitted image parameters"
         )
-    if calls.require_progress(request).flow_step != 0:
-        raise invalid_descriptor(
-            "media preparation repeats an active latent trajectory"
-        )
-
     if call.image_index is None:
         raise invalid_descriptor("media preparation names no image index")
     if int(output.generation) < 1:
@@ -242,15 +237,15 @@ def prepare_latent(
     # batch cannot expose a partially initialized trajectory.
     request.latent.update.params = params
     request.latent.update.expected_generation = 0
-    request.latent.update.expected_step = 0
+    request.latent.update.expected_step_index = 0
     request.latent.update.generation = int(output.generation)
-    request.latent.update.step = 0
+    request.latent.update.step_index = 0
 
     products = publish_latent_transfer(
         call,
         output,
         row,
-        step=0,
+        step_index=0,
         model_runner=model_runner,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
@@ -259,7 +254,7 @@ def prepare_latent(
     )
 
     request.status = CallStatus.OK
-    request.progress = calls.execution_runtime(request, cache, flow_step=0)
+    request.progress = calls.execution_runtime(request, cache)
     request.finish_flags = FinishFlags()
     request.products = products
     return request
@@ -277,7 +272,7 @@ def initialize(
     """Open a denoising call's trajectory from its exact input generation.
 
     Validates the call's conditioning publication and latent generations,
-    gathers the committed bank at ``params.start_step`` into the call's
+    gathers the committed bank at the slot's committed step into the call's
     staging, and returns the request's ``DiffusionState``, reopening it when
     it is absent or has a different size. ``KVConditioning.cache`` is set
     from this call's descriptors and ``entries`` is cleared for
@@ -331,11 +326,11 @@ def initialize(
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
     pool = latent_pool
-    start_step = int(params.start_step)
+    start_step = pool.committed_step_index(row.request.request_pool_idx)
     pool.gather_current(
         row.request.request_pool_idx,
         staging,
-        step=start_step,
+        step_index=start_step,
         generation=int(latent_input.generation),
         latent_units=int(params.latent_units),
         height=int(params.height),
@@ -527,8 +522,8 @@ def finish(
     ``forward.integrate_predictions`` calls this after applying the last
     solver step of the call's declared interval to its staging. Scatters the
     staging to the inactive bank and records the ``LatentUpdate`` that
-    advances the request from ``params.start_step`` by ``params.step_count``
-    steps at the batch commit. When that final step reaches the admitted
+    advances the request from the slot's committed step by one step at the
+    batch commit. When that final step reaches the admitted
     ``image.steps``, the alternative-prefix slots of the guidance branches
     are released here, before the batch commit.
     """
@@ -550,12 +545,12 @@ def finish(
     ):
         raise invalid_descriptor("flow completion lost its trajectory state")
 
-    start_step = int(params.start_step)
-    final_step = start_step + int(params.step_count)
+    start_step = latent_pool.committed_step_index(row.request.request_pool_idx)
+    final_step = start_step + 1
     latent_pool.write_inactive(
         row.request.request_pool_idx,
         staging,
-        expected_step=start_step,
+        expected_step_index=start_step,
         expected_generation=int(latent_input.generation),
         latent_units=int(params.latent_units),
         height=int(params.height),
@@ -563,15 +558,15 @@ def finish(
     )
     request.latent.update.params = params
     request.latent.update.expected_generation = int(latent_input.generation)
-    request.latent.update.expected_step = start_step
+    request.latent.update.expected_step_index = start_step
     request.latent.update.generation = int(latent_output.generation)
-    request.latent.update.step = final_step
+    request.latent.update.step_index = final_step
 
     products = publish_latent_transfer(
         call,
         latent_output,
         row,
-        step=final_step,
+        step_index=final_step,
         model_runner=model_runner,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
@@ -581,11 +576,7 @@ def finish(
 
     request.status = CallStatus.OK
     kv = kv_conditioning(trajectory)
-    request.progress = calls.execution_runtime(
-        request,
-        kv.cache,
-        flow_step=final_step,
-    )
+    request.progress = calls.execution_runtime(request, kv.cache)
     request.finish_flags = FinishFlags()
     request.products = products
 
@@ -613,7 +604,7 @@ def publish_latent_transfer(
     row: PendingOutput,
     *,
     state: BatchState,
-    step: int,
+    step_index: int,
     model_runner: ModelExecutor,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
@@ -650,7 +641,7 @@ def publish_latent_transfer(
             product,
             source,
             row,
-            step=step,
+            step_index=step_index,
             latent_pool=latent_pool,
             publication_transports=publication_transports,
             state=state,

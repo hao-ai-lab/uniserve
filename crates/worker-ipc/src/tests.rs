@@ -36,7 +36,6 @@ fn ar_decode_call() -> Call {
             logical_position: 7,
             kv_visible_len: 5,
             kv_computed_len: 6,
-            flow_step: 0,
         },
 
         token_output: Some(output_product(CallId::new(11, 0))),
@@ -141,8 +140,8 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
     }
 }
 
-fn completion_record() -> RequestOutput {
-    RequestOutput {
+fn completion_record() -> CallOutput {
+    CallOutput {
         sampled_logprob: Some(-0.25),
         top_logprobs: vec![
             TokenLogprob {
@@ -170,7 +169,7 @@ fn completion_record() -> RequestOutput {
         timing_counters: TimingCounters::default(),
         kv_visible_len: 5,
         kv_computed_len: 5,
-        num_completed_steps: 0,
+        step_index: 0,
 
         committed_tokens: vec![271],
         candidate_logprobs: Vec::new(),
@@ -322,6 +321,12 @@ fn reference_conditions() -> Vec<uniserve_core::VideoCondition> {
 }
 
 /// Encodes `batch` as a submit request, decodes it, and returns the decoded batch.
+/// Reports whether the receiving end of the wire refuses `request`: the
+/// decoder validates every frame, and encoding checks nothing.
+fn is_refused_on_decode(request: &WorkerRequest) -> bool {
+    decode_request(&encode_request(request).unwrap()).is_err()
+}
+
 fn execute_round_trip(batch: Batch) -> Batch {
     let request = WorkerRequest::submit(batch);
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
@@ -347,14 +352,14 @@ fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
     // row naming a call outside the batch are each rejected on encode.
     let mut missing_length = run.clone();
     missing_length.forward.seq_lens.pop();
-    assert!(encode_request(&WorkerRequest::submit(missing_length)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(missing_length)));
 
     let mut short_sequence = run.clone();
     short_sequence.forward.seq_lens[2] = 3;
-    assert!(encode_request(&WorkerRequest::submit(short_sequence)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(short_sequence)));
 
     run.forward.call_indices[2] = 1;
-    assert!(encode_request(&WorkerRequest::submit(run)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(run)));
 }
 
 #[test]
@@ -382,7 +387,7 @@ fn call_coordinates_survive_physical_dispatch_and_reject_collisions() {
 
     let mut collision = run;
     collision.calls[1].call_id = first.call_id;
-    assert!(encode_request(&WorkerRequest::submit(collision)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(collision)));
 }
 
 /// Builds a batch around `calls` with the planner columns `Batch::validate`
@@ -435,11 +440,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 true,
             );
         }
-        if matches!(
-            call.kind,
-            CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
-        ) || call.latent_input.is_some()
-        {
+        if call.addresses_latent_pages() {
             run.latent_params.push(LatentParams {
                 request_key: call.request_key,
                 call_id: call.call_id,
@@ -447,8 +448,6 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 latent_units: 1,
                 height: 1,
                 width: 1,
-                start_step: 0,
-                step_count: u32::from(call.kind == CallKind::Media(MediaCall::Denoising)),
             });
         }
         if matches!(
@@ -476,7 +475,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
 /// overrides `batch_id`.
 fn lane_report(
     batch_id: u64,
-    completions: Vec<RequestOutput>,
+    completions: Vec<CallOutput>,
     products: Vec<TensorPublication>,
     worker_exec_us: Option<u64>,
     forward_stats: Option<ForwardStats>,
@@ -779,8 +778,9 @@ fn decoder_requires_every_call_to_state_its_coordinates() {
 }
 
 #[test]
-fn solver_parameters_round_trip_with_request_or_paged_storage() {
-    let call = call_for(CallKind::Media(MediaCall::Denoising), CallId::new(101, 0));
+fn latent_parameters_round_trip_with_request_or_paged_storage() {
+    let mut call = call_for(CallKind::Media(MediaCall::Denoising), CallId::new(101, 0));
+    call.latent_output = Some(output_product(call.call_id));
     let mut run = batch_with_calls(1, Vec::new(), vec![call]);
     assert_eq!(execute_round_trip(run.clone()), run);
 
@@ -949,13 +949,13 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
             None,
         );
 
-        // A replica differs only in its source rank. A report for another
+        // A replica differs only in its source incarnation. A report for another
         // generation names a different identity: merging it fails and leaves
         // the publication unchanged.
         let original = &mut report.products[0];
         let mut replica = original.clone();
         if let TransferHandle::DeviceProduct { tensor, .. } = &mut replica.value {
-            tensor.locations[0].source.rank = 1;
+            tensor.locations[0].source.incarnation = "replica".into();
         }
         let mut stale = replica.clone();
         stale.product.generation += 1;
@@ -1049,7 +1049,7 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     };
     let mut report = lane_report(
         5,
-        vec![RequestOutput {
+        vec![CallOutput {
             kv_output: Some(KvTransfer {
                 groups: Vec::new(),
                 source,
@@ -1161,7 +1161,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
         }
         let report = lane_report(
             5,
-            vec![RequestOutput {
+            vec![CallOutput {
                 kv_output: Some(KvTransfer {
                     groups: vec![
                         KvGroupTransfer {
@@ -1264,13 +1264,10 @@ fn request_retirement_requires_unique_buffers_from_its_request() {
             request_key: request_key(),
             retained_buffers,
         };
-        assert!(
-            encode_request(&WorkerRequest::submit(
-                batch_with_calls(3, vec![admission()], vec![ar_decode_call()])
-                    .with_commands(vec![command]),
-            ))
-            .is_err()
-        );
+        assert!(is_refused_on_decode(&WorkerRequest::submit(
+            batch_with_calls(3, vec![admission()], vec![ar_decode_call()])
+                .with_commands(vec![command]),
+        )));
     }
 }
 
@@ -1450,6 +1447,29 @@ fn product_validation_enforces_generation_and_shape_bounds() {
 }
 
 #[test]
+fn a_group_batch_is_unplaced_and_each_rank_projection_is_placed() {
+    let mut call = call_for(CallKind::Transfer(TransferMode::Tensor), CallId::new(1, 0));
+    let input = output_product(CallId::new(9, 0));
+    let output = output_product(CallId::new(1, 0));
+    call.bounds.max_transfer_bytes = input.max_bytes();
+    call.inputs = vec![input];
+    call.outputs = vec![output.clone()];
+
+    // A rank's batch names the span of every persistent output in that
+    // rank's own pool.
+    let placed = batch_with_calls(1, Vec::new(), vec![call]);
+    assert_eq!(placed.buffer_allocations.len(), 1);
+    placed.validate().unwrap();
+
+    // A group's batch is validated before any rank's spans are chosen.
+    let mut unplaced = placed.clone();
+    unplaced.buffer_allocations.clear();
+    assert!(unplaced.validate().is_err());
+    unplaced.validate_unplaced().unwrap();
+    assert!(placed.validate_unplaced().is_err());
+}
+
+#[test]
 fn batch_rejects_two_calls_for_one_request() {
     let batch = Batch {
         batch_id: 1,
@@ -1529,7 +1549,7 @@ fn image_encoder_input_round_trips_and_rejects_an_incompatible_call() {
         invalid.kind = code;
         invalid.input_image = image;
         let request = WorkerRequest::submit(batch_with_calls(1, vec![admission()], vec![invalid]));
-        assert!(encode_request(&request).is_err());
+        assert!(is_refused_on_decode(&request));
     }
 }
 
@@ -1610,6 +1630,23 @@ fn worker_info_round_trips() {
                 },
             ],
         }],
+        image_warmups: vec![
+            ImageWarmup {
+                height: 512,
+                width: 768,
+                cfg_text_scale: 4.0,
+                cfg_img_scale: 1.0,
+                negative_token_ids: Vec::new(),
+            },
+            ImageWarmup {
+                height: 1024,
+                width: 1024,
+                cfg_text_scale: 4.0,
+                cfg_img_scale: 2.0,
+                negative_token_ids: vec![151644, 872, 198, 151645],
+            },
+        ],
+        canvas_step_rows: 6,
         ..Default::default()
     };
     // Python startup metadata crosses the serde mapping boundary before
@@ -1635,6 +1672,12 @@ fn kv_free_worker_info_round_trips() {
             audio_shift: 3.0,
             frame_rate: 24,
             audio_sample_rate: 32_000,
+            frames: crate::FrameChunks {
+                min_frames: 22,
+                chunk_frames: 17,
+                chunk_latent_frames: 5,
+                tail_latent_frames: 2,
+            },
             canvases: vec![
                 ServedCanvas {
                     short_edge: 768,
@@ -1766,7 +1809,6 @@ fn full_sampling() -> SamplingParams {
         return_logprobs: true,
         return_prompt_logprobs: true,
         n_prompt_logprobs: 2,
-        logprob_token_ids: vec![7, 8, 9],
         bad_words_ids: vec![vec![1, 2, 3], vec![42]],
         allowed_token_ids: Some(vec![10, 11, 12]),
         typical_p: 0.8,
@@ -1943,7 +1985,7 @@ fn full_caps() -> WorkerInfo {
             ..WorkerInfo::default().kv_cache.unwrap()
         }),
         endpoint: WorkerEndpoint {
-            rank: 1,
+            incarnation: "rank-1".into(),
             ..WorkerInfo::default().endpoint
         },
         max_batch_calls: 64,
@@ -2015,7 +2057,7 @@ fn full_forward_stats() -> ForwardStats {
 }
 
 fn full_run_result() -> BatchOutput {
-    let mut ok_record = RequestOutput {
+    let mut ok_record = CallOutput {
         sampled_logprob: None,
         top_logprobs: Vec::new(),
         prompt_logprobs: Vec::new(),
@@ -2032,7 +2074,7 @@ fn full_run_result() -> BatchOutput {
             host_us: 44,
         },
         kv_visible_len: 6,
-        num_completed_steps: 7,
+        step_index: 7,
         kv_computed_len: 8,
 
         committed_tokens: vec![271, 272],
@@ -2177,4 +2219,45 @@ fn ipc_decode_rejects_malformed_frames() {
     let mut response = encode_response(&WorkerResponse::ok()).unwrap();
     response.truncate(response.len() / 2);
     assert!(decode_response(&response).is_err());
+}
+
+#[test]
+fn frame_chunks_count_decode_units_and_align_requested_frames() {
+    // 17-frame chunks past a final 5-frame window: `17n + 5` frames in `n`
+    // units, five latent frames per chunk and two in the final window.
+    let frames = FrameChunks {
+        min_frames: 22,
+        chunk_frames: 17,
+        chunk_latent_frames: 5,
+        tail_latent_frames: 2,
+    };
+    frames.validate().unwrap();
+
+    assert_eq!([22, 39, 124].map(|count| frames.units(count)), [1, 2, 7]);
+    assert_eq!(
+        [22, 39, 124].map(|count| frames.latent_frames(count)),
+        [7, 12, 37]
+    );
+
+    // A request rounds up to the next legal count and never below the fewest.
+    assert_eq!(
+        [1, 22, 23, 96, 360].map(|count| frames.align_up(count)),
+        [22, 22, 39, 107, 362]
+    );
+
+    // Available frames round down to a whole number of chunks.
+    assert_eq!(frames.align_down(21), None);
+    assert_eq!(
+        [22, 38, 39, 130].map(|count| frames.align_down(count)),
+        [Some(22), Some(22), Some(39), Some(124)]
+    );
+
+    assert!(
+        FrameChunks {
+            chunk_frames: 0,
+            ..frames
+        }
+        .validate()
+        .is_err()
+    );
 }

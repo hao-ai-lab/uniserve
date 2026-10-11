@@ -63,6 +63,7 @@ class OutputBuffer:
         "_rows",
         "_generation",
         "_host",
+        "_capacity",
         "_token_cursor",
         "_byte_cursor",
         "_token_cache",
@@ -105,8 +106,9 @@ class OutputBuffer:
         Args:
             rows: Result rows; each must be observed or discarded before the
                 buffer can retire, unless the lease is abandoned.
-            token_capacity: Allocation size in int64 words, shared by token
-                and byte captures.
+            token_capacity: Words the lease may capture, as int64 elements,
+                shared by token and byte captures. The engine's completion
+                bounds size it, so a capture past them is refused.
             devices: Devices that may produce captures. Non-CUDA devices are
                 dropped, and the allocation is pinned only when a CUDA device
                 remains.
@@ -150,19 +152,14 @@ class OutputBuffer:
             device="cpu",
             pin_memory=bool(self.devices),
         )
+        self._capacity = capacity
         self._token_cursor = 0
         self._byte_cursor = 0
 
         self._token_cache: dict[tuple[int, int], tuple[int, ...]] = {}
         self.logprob_layouts: dict[
             tuple[int, int],
-            tuple[
-                tuple[int, ...],
-                tuple[int, ...],
-                tuple[tuple[int, ...], ...],
-                int,
-                int,
-            ],
+            tuple[tuple[int, ...], tuple[int, ...], int],
         ] = {}
         self._logprob_cache: dict[
             tuple[int, int],
@@ -243,6 +240,7 @@ class OutputBuffer:
 
         self.devices = tuple(normalized)
         self._rows = count
+        self._capacity = capacity
         self._generation = _next_buffer_generation
         _next_buffer_generation += 1
 
@@ -445,8 +443,7 @@ class OutputBuffer:
         captures from the head must not cross.
         """
         return (
-            int(self._host.numel()) * int(self._host.element_size())
-            - self._byte_cursor
+            self._capacity * int(self._host.element_size()) - self._byte_cursor
         )
 
     def seal(self) -> None:

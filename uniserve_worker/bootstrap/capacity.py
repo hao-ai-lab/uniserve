@@ -49,6 +49,7 @@ from uniserve.runtime.device import (
 )
 from uniserve.runtime.kv_cache import Planes
 from uniserve.tensors import BufferConfig
+from uniserve_worker import _uniserve_ipc as _ipc
 from uniserve_worker.bootstrap.cache import resolved_block_size, table_widths
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import (
@@ -73,12 +74,6 @@ from uniserve_worker.storage.tensor_store import (
     TensorStore,
 )
 
-# Relay-arena bytes budgeted per (request slot, relay lane) row across one
-# device's ``TensorStore`` relay arenas.
-# FIXME: A relay arena exists per (dtype, field) of the scalar outputs the
-# engine's calls declare, which the worker does not learn before its
-# capacity is reported. Derive this row size from those outputs.
-_REQUEST_RELAY_ROW_BYTES = 18
 # Relay lanes beyond the unresolved-call window. ``Worker.__init__`` builds
 # ``TensorStore`` with ``relay_depth = max_unresolved_calls + 1`` to match.
 _REQUEST_RELAY_RETIREMENT_LANES = 1
@@ -318,39 +313,33 @@ def local_product_storage_bytes(
 ) -> int:
     """Size the persistent products this rank backs, from its placement.
 
-    A rank backs every product it produces and every product a consumer it
-    holds reads, each at its complete declared extent. The engine reserves a
-    request's products whole when it admits the request, and the store returns
-    a product's storage only once every reader on this rank has retired it, so
-    a product that streams in rounds of media units is still backed whole: the
-    rounds a consumer has not yet read stay bound while later rounds land.
-    Producers and remote consumers each need the complete logical allocation
-    because disjoint regions may subsequently be imported into it. Alignment
-    follows BufferPool's allocation rules.
+    A rank backs every product of a component it executes and every product a
+    consumer it holds reads, each at its complete declared extent. The engine
+    reserves a request's products whole in the pool of each such rank when it
+    admits the request, and the store returns a product's storage only once
+    every reader on this rank has retired it, so a product that streams in
+    rounds of media units is still backed whole: the rounds a consumer has not
+    yet read stay bound while later rounds land. Producers and remote
+    consumers each need the complete allocation because disjoint regions may
+    subsequently be imported into it. Alignment follows BufferPool's
+    allocation rules.
 
-    A rank produces an entry's products when it is one of the producer's
-    ``output_ranks``. Empty ``bindings`` count every entry's products.
+    A rank executes a component when it is one of its members, whether or
+    not it publishes the component's products: every member is handed a span
+    for each persistent output of the call it executes. Empty ``bindings``
+    count every entry's products. The engine's `MediaStorage` derives the same
+    sets from the component placement.
 
     Returns:
         Bytes of one request's products backed on this rank.
     """
     consumers: dict[str, set[str]] = {}
-    # These are the concrete persistent Tensor consumers of the video path.
-    # Denoising state is resident; encoders consume decoded output buffers.
-    for source_call, destination_call in (
-        (MediaCall.MEDIA_READING, MediaCall.VISION_ENCODING),
-        (MediaCall.MEDIA_READING, MediaCall.LATENT_ENCODING),
-        (MediaCall.VISION_ENCODING, MediaCall.TEXT_ENCODING),
-        (MediaCall.LATENT_ENCODING, MediaCall.LATENT_PREPARATION),
-        (MediaCall.TEXT_ENCODING, MediaCall.LATENT_PREPARATION),
-        (MediaCall.DENOISING, MediaCall.VIDEO_DECODING),
-        (MediaCall.DENOISING, MediaCall.AUDIO_DECODING),
-        (MediaCall.VIDEO_DECODING, MediaCall.VIDEO_ENCODING),
-        (MediaCall.AUDIO_DECODING, MediaCall.AUDIO_ENCODING),
-        (MediaCall.VIDEO_ENCODING, MediaCall.MUXING),
-    ):
-        source = media_components.get(source_call)
-        destination = media_components.get(destination_call)
+    # The persistent tensor edges of the video graph, which the schema states
+    # once (`MediaCall::readers`): denoising state is resident, so its
+    # readers are not among them.
+    for source_call, destination_call in _ipc.product_edges():
+        source = media_components.get(MediaCall(source_call))
+        destination = media_components.get(MediaCall(destination_call))
         if source is not None and destination is not None:
             consumers.setdefault(source, set()).add(destination)
 
@@ -358,10 +347,7 @@ def local_product_storage_bytes(
     for entry, outputs in entry_outputs.items():
         if bindings:
             producer = bindings.get(entry)
-            produces = (
-                producer is not None
-                and producer.process_group.rank in producer.output_ranks
-            )
+            produces = producer is not None and producer.owns
             consumes = any(
                 consumer in bindings and bindings[consumer].owns
                 for consumer in consumers.get(entry, ())
@@ -582,7 +568,7 @@ def request_tensor_arena_capacity(
     relay_bytes = (
         (state_slots + 1)
         * (max(1, unresolved_window) + _REQUEST_RELAY_RETIREMENT_LANES)
-        * _REQUEST_RELAY_ROW_BYTES
+        * _ipc.relay_row_bytes()
     )
     return ArenaCapacity(
         device_product_bytes=relay_bytes,
@@ -702,7 +688,7 @@ def model_arena_capacity(
     device_product_bytes = (
         (int(worker_config.max_request_pool_size) + 1)
         * (call_window(depth, max_calls) + _REQUEST_RELAY_RETIREMENT_LANES)
-        * _REQUEST_RELAY_ROW_BYTES
+        * _ipc.relay_row_bytes()
         * device_count
     )
 

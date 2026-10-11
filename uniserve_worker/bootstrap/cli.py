@@ -25,8 +25,10 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     """Build the worker launch parser over identity and the descriptor."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--launch-descriptor", required=True, type=Path)
-    # Identity is repeated on argv so `ps` identifies a worker without reading
-    # its descriptor; the descriptor remains the authority.
+    # The rank's logical position is repeated on argv so `ps` identifies a
+    # worker without reading its descriptor. The rank and world size also
+    # come from the descriptor, which is the authority; the worker id exists
+    # only here, because the engine alone holds which worker a rank serves.
     parser.add_argument("--worker-id", default="worker")
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world-size", type=int, default=1)

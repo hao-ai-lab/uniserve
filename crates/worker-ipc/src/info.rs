@@ -242,10 +242,6 @@ impl OutputInfo {
 /// Backend addresses and storage generations are carried by each publication.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerEndpoint {
-    /// Logical instance selected by the engine.
-    pub worker_id: String,
-    /// Member coordinate within that instance.
-    pub rank: u32,
     /// Host identity, independent of process-local device ordinals.
     pub node: String,
     /// Process lifetime identity; multiple Workers may share it.
@@ -258,11 +254,50 @@ impl WorkerEndpoint {
     /// Checks identities before accepting startup metadata or a publication.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            !self.worker_id.is_empty()
-                && !self.node.is_empty()
-                && !self.address_space.is_empty()
-                && !self.incarnation.is_empty(),
+            !self.node.is_empty() && !self.address_space.is_empty() && !self.incarnation.is_empty(),
             "worker endpoint identity is incomplete"
+        );
+        Ok(())
+    }
+}
+
+/// An image shape a worker's flow runtime is prepared for.
+///
+/// The engine runs one image request of `height` by `width` pixels at these
+/// guidance scales before it serves, so every guidance-branch count the
+/// worker captured has run through the serving path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageWarmup {
+    /// Output height in pixels.
+    pub height: u32,
+    /// Output width in pixels.
+    pub width: u32,
+    /// Classifier-free guidance scale of the text condition.
+    pub cfg_text_scale: f32,
+    /// Classifier-free guidance scale of the image condition.
+    pub cfg_img_scale: f32,
+    /// Tokens of the alternative guidance prefix the worker encodes for an
+    /// empty negative prompt, which the request carries as its negative prompt
+    /// so the engine sizes that prefix as the worker reads it. Empty when no
+    /// guidance branch has an alternative prefix.
+    #[serde(default)]
+    pub negative_token_ids: Vec<u32>,
+}
+
+impl ImageWarmup {
+    /// Checks that the shape names a nonempty raster at positive finite
+    /// guidance scales.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.height > 0 && self.width > 0,
+            "an image warmup shape is empty"
+        );
+        ensure_valid!(
+            self.cfg_text_scale.is_finite()
+                && self.cfg_text_scale > 0.0
+                && self.cfg_img_scale.is_finite()
+                && self.cfg_img_scale > 0.0,
+            "an image warmup guidance scale is not positive"
         );
         Ok(())
     }
@@ -296,6 +331,64 @@ pub struct ReferenceLimits {
     pub total: u32,
 }
 
+/// How the video VAE divides a video's frames into chunks.
+///
+/// A video has `min_frames + n * chunk_frames` frames: one decode unit per
+/// chunk, so `n + 1` units. The VAE encodes each such chunk of a video to
+/// `chunk_latent_frames` latent frames and the final window past the whole
+/// chunks to `tail_latent_frames`. The model states the rule; every count a
+/// request derives from it, the generated frames, the decode units and a
+/// reference video's encoded frames, follows from these four values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameChunks {
+    /// Fewest frames of a video: one chunk and the final window.
+    pub min_frames: u32,
+    /// Frames each further chunk adds.
+    pub chunk_frames: u32,
+    /// Latent frames one chunk encodes to.
+    pub chunk_latent_frames: u32,
+    /// Latent frames of the final window past the chunks.
+    pub tail_latent_frames: u32,
+}
+
+impl FrameChunks {
+    /// Returns the decode units of a video of `frames` legal frames.
+    pub fn units(&self, frames: u32) -> u32 {
+        frames.saturating_sub(self.min_frames) / self.chunk_frames + 1
+    }
+
+    /// Returns the fewest legal frame count that is at least `requested`.
+    pub fn align_up(&self, requested: u32) -> u32 {
+        let beyond = requested.saturating_sub(self.min_frames);
+        self.min_frames + beyond.div_ceil(self.chunk_frames) * self.chunk_frames
+    }
+
+    /// Returns the most legal frames of at most `available`, or `None` below
+    /// the fewest.
+    pub fn align_down(&self, available: u32) -> Option<u32> {
+        let beyond = available.checked_sub(self.min_frames)?;
+        Some(self.min_frames + beyond / self.chunk_frames * self.chunk_frames)
+    }
+
+    /// Returns the latent frames the VAE encodes `frames` legal frames to.
+    pub fn latent_frames(&self, frames: u32) -> u32 {
+        self.units(frames) * self.chunk_latent_frames + self.tail_latent_frames
+    }
+
+    /// Checks that the rule is positive and leaves a final window past the
+    /// first chunk.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.chunk_frames > 0
+                && self.min_frames > self.chunk_frames
+                && self.chunk_latent_frames > 0
+                && self.tail_latent_frames > 0,
+            "a video denoiser declares an empty frame rule"
+        );
+        Ok(())
+    }
+}
+
 /// What the video denoiser a deployment places serves.
 ///
 /// The denoiser fixes its schedule; the tasks, canvases and reference limits
@@ -318,6 +411,9 @@ pub struct VideoDenoiserInfo {
     /// Sample rate, in Hz, of the audio track generated with each video; zero
     /// for a deployment that generates none.
     pub audio_sample_rate: u32,
+    /// How the VAE chunks a video's frames, which counts frames and decode
+    /// units.
+    pub frames: FrameChunks,
     /// The only canvases the deployment serves: those it prepares, in the
     /// order its operator selected them.
     #[serde(default)]
@@ -355,6 +451,7 @@ impl VideoDenoiserInfo {
             self.frame_rate > 0,
             "a video denoiser declares no frame rate"
         );
+        self.frames.validate()?;
         ensure_valid!(
             self.canvases.iter().all(|served| {
                 served.short_edge > 0
@@ -391,6 +488,15 @@ pub struct WorkerInfo {
     /// What the deployment's video denoiser serves, when the model has one.
     #[serde(default)]
     pub video_denoiser: Option<VideoDenoiserInfo>,
+    /// Image shapes this rank's flow runtime is prepared for, each of which
+    /// the engine warms with a batch of real requests before serving.
+    #[serde(default)]
+    pub image_warmups: Vec<ImageWarmup>,
+    /// Canvas rows one sampler chunk of this rank's token denoiser covers,
+    /// which the engine warms every row count of; zero when it generates no
+    /// canvases.
+    #[serde(default)]
+    pub canvas_step_rows: u32,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
     /// Whether this rank's device exports a fabric allocation handle.
@@ -418,7 +524,8 @@ pub struct WorkerInfo {
     /// Physical latent pages including the reserved sentinel page, which
     /// [`WorkerInfo::latent_capacity_units`] excludes.
     pub latent_pages: u32,
-    /// Persistent buffer-pool capacity in bytes.
+    /// Bytes of the persistent buffer pool this rank backs, which the engine
+    /// places this rank's buffers in.
     pub buffer_pool_bytes: u64,
     /// Maximum simultaneously retained encoder feature products.
     pub encoder_cache_entries: u32,
@@ -508,6 +615,9 @@ impl WorkerInfo {
         if let Some(video) = &self.video_denoiser {
             video.validate()?;
         }
+        for warmup in &self.image_warmups {
+            warmup.validate()?;
+        }
         ensure_valid!(
             self.max_batch_calls > 0
                 && self.max_batch_tokens > 0
@@ -549,10 +659,10 @@ impl Default for WorkerInfo {
         Self {
             media_components: Default::default(),
             video_denoiser: None,
+            image_warmups: Vec::new(),
+            canvas_step_rows: 0,
             fabric_handles: false,
             endpoint: WorkerEndpoint {
-                worker_id: "worker".into(),
-                rank: 0,
                 node: "simulation".into(),
                 address_space: "simulation".into(),
                 incarnation: "simulation".into(),

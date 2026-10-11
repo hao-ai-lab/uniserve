@@ -21,23 +21,10 @@ pub(super) enum InflightInput {
         /// Physical KV start and exact token contribution, when known, from the
         /// submitted image-extension input. The call carries its capacity.
         image_kv: Option<(u32, Option<u32>)>,
-        /// The submitted latent interval; cancellation can stop accepted
-        /// progress while later submitted intervals still need validation.
-        latent: Option<LatentParams>,
     },
     Media {
-        latent: Option<LatentParams>,
         decode: Option<DecodeRange>,
     },
-}
-
-impl InflightInput {
-    /// Returns the latent interval a submitted call covers.
-    pub(super) const fn latent(&self) -> Option<&LatentParams> {
-        match self {
-            Self::Generation { latent, .. } | Self::Media { latent, .. } => latent.as_ref(),
-        }
-    }
 }
 
 /// Submitted call awaiting completion, queued per request in submission
@@ -49,7 +36,7 @@ pub(super) struct InflightCall {
 
 /// Completion held until earlier request calls are applied.
 pub(super) struct PendingCompletion {
-    pub(super) record: uniserve_worker_ipc::RequestOutput,
+    pub(super) record: uniserve_worker_ipc::CallOutput,
     /// Claimed media storage stays alive while its result waits or is discarded.
     pub(super) media: Option<Arc<SharedMedia>>,
     /// Engine-wide staging order (`Inflight::next_arrival`), used to order

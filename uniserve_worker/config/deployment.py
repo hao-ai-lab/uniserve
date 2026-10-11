@@ -415,7 +415,6 @@ class ExpertParallelLaunch:
 class WorkerProcessArgs:
     """Aggregates the validated launch configuration for one worker rank."""
 
-    worker_id: str
     ipc: WorkerIpcConfig
     local_rank: int
     distributed_backend: str | None
@@ -467,7 +466,6 @@ class WorkerProcessArgs:
             raise ValueError("CUDA VMM requires a CUDA worker device")
 
         return cls(
-            worker_id=str(namespace.worker_id),
             ipc=WorkerIpcConfig(
                 registration_address=str(namespace.registration_address),
                 channel_transport=str(namespace.channel_transport),

@@ -1,6 +1,6 @@
 //! Scheduling policy and configured queue and batch limits.
 //!
-//! These are requested limits: `Scheduler::with_model_limits` clamps the token
+//! These are requested limits: `Scheduler::new` clamps the token
 //! and sequence limits, and the batch limit when the executor advertises a
 //! nonzero call limit, to the executor's capacity.
 

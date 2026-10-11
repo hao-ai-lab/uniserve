@@ -25,13 +25,14 @@ mod sim;
 /// Scheduler-owned allocation of worker storage; only its `OutOfStorage`
 /// error is public.
 pub mod storage;
+mod warmup;
 mod worker;
 
 pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank, WorkerRole};
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
     ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, ParallelConfig,
-    PoolPlacement, RequestPlacement, SequenceParallel, TransferBackend, TransferConfig,
+    PoolPlacement, RankBuffer, RequestPlacement, SequenceParallel, TransferBackend, TransferConfig,
     TransferConfigError, TransferEdge, WorkerExecError, WorkerFailure, WorkerId, WorkerResult,
 };
 pub use crate::handle::{
@@ -54,5 +55,5 @@ pub use crate::worker::{
     FlashInferBackendParseError, LaneConfig, WorkerExecutor, WorkerGroup, WorkerProcessArgs,
 };
 pub use uniserve_worker_ipc::{
-    DEFAULT_COMPONENT, MediaCall, ReferenceLimits, ServedCanvas, VideoDenoiserInfo,
+    DEFAULT_COMPONENT, FrameChunks, MediaCall, ReferenceLimits, ServedCanvas, VideoDenoiserInfo,
 };

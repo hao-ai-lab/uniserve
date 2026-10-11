@@ -19,7 +19,6 @@ from enum import StrEnum
 from uniserve.media import image
 from uniserve.media import video as media_video
 from uniserve.model import ConditionRole
-from uniserve_worker.errors import invalid_descriptor
 
 
 class VideoTask(StrEnum):
@@ -48,10 +47,6 @@ class MediaLocator:
     # Published byte count.
     bytes: int
 
-    def __post_init__(self) -> None:
-        if not self.name or "/" in self.name or self.bytes < 1:
-            raise invalid_descriptor("a condition's media locator is invalid")
-
 
 @dataclass(frozen=True, slots=True)
 class ImageFit:
@@ -64,17 +59,6 @@ class ImageFit:
     left: int
     top: int
     size: image.Config
-
-    def __post_init__(self) -> None:
-        if (
-            self.left < 0
-            or self.top < 0
-            or self.left + self.size.width > self.resized.width
-            or self.top + self.size.height > self.resized.height
-        ):
-            raise invalid_descriptor(
-                "an image fit keeps a window outside its resized image"
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,12 +75,6 @@ class VideoClip:
     frames: int
     vae_frames: int
 
-    def __post_init__(self) -> None:
-        if self.start_frame < 0 or not 1 <= self.vae_frames <= self.frames:
-            raise invalid_descriptor(
-                "a video clip encodes frames it does not keep"
-            )
-
 
 @dataclass(frozen=True, slots=True)
 class AudioClip:
@@ -110,15 +88,6 @@ class AudioClip:
     start_sample: int
     source_samples: int
     samples: int
-
-    def __post_init__(self) -> None:
-        if (
-            self.sample_rate < 1
-            or self.start_sample < 0
-            or self.source_samples < 1
-            or self.samples < 1
-        ):
-            raise invalid_descriptor("an audio track keeps no samples")
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,10 +103,6 @@ class ConditionVision:
     grid: tuple[int, int, int]
     tokens: int
     frame_indices: tuple[int, ...] = ()
-
-    def __post_init__(self) -> None:
-        if len(self.grid) != 3 or min(self.grid) < 1 or self.tokens < 1:
-            raise invalid_descriptor("a conditioner view covers no patches")
 
     @property
     def patches(self) -> int:
@@ -167,47 +132,8 @@ class VideoCondition:
     audio_rows: int
 
     def __post_init__(self) -> None:
+        # The transport states the role by its wire spelling.
         object.__setattr__(self, "role", ConditionRole(self.role))
-        if (self.image is not None) + (self.video is not None) > 1 or (
-            self.image is not None and self.audio is not None
-        ):
-            raise invalid_descriptor(
-                "a video condition carries an invalid media combination"
-            )
-        if self.image is None and self.video is None and self.audio is None:
-            raise invalid_descriptor("a video condition carries no media")
-        if self.role is not ConditionRole.REFERENCE and self.image is None:
-            raise invalid_descriptor("a keyframe is one still image")
-        if (self.pixels is None) != (not self.latent_units) or any(
-            rows < 1 for rows in self.latent_units
-        ):
-            raise invalid_descriptor(
-                "a condition's latent units disagree with its pixels"
-            )
-        if (self.audio is None) != (self.audio_rows == 0):
-            raise invalid_descriptor(
-                "a condition's audio rows disagree with its audio track"
-            )
-        if self.vision is not None:
-            if self.pixels is None:
-                raise invalid_descriptor(
-                    "the conditioner reads no audio reference"
-                )
-            frames = () if self.video is None else self.vision.frame_indices
-            if self.video is None and (
-                self.vision.frame_indices or self.vision.grid[0] != 1
-            ):
-                raise invalid_descriptor(
-                    "an image's conditioner view samples one frame"
-                )
-            if self.video is not None and (
-                not frames
-                or any(b <= a for a, b in zip(frames, frames[1:]))
-                or frames[-1] >= self.video.frames
-            ):
-                raise invalid_descriptor(
-                    "a video's conditioner view samples frames it does not keep"
-                )
 
     @property
     def pixels(self) -> media_video.Config | None:
@@ -243,11 +169,8 @@ class VideoAdmission:
     conditions: tuple[VideoCondition, ...] = ()
 
     def __post_init__(self) -> None:
+        # The transport states the task by its wire spelling.
         object.__setattr__(self, "task", VideoTask(self.task))
-        if (self.task is VideoTask.T2VA) != (not self.conditions):
-            raise invalid_descriptor(
-                "only a conditioned video task carries conditions"
-            )
 
     def vision_spans(self) -> tuple[tuple[int, int], ...]:
         """The presentation's vision blocks as ``(start, stop)`` token ranges.

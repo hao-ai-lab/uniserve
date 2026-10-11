@@ -959,7 +959,11 @@ mod tests {
     }
 
     fn capabilities(tasks: Value, sizes: Value) -> Value {
-        json!({"tasks": tasks, "fps": 24, "canvas": {"sizes": sizes}})
+        json!({
+            "tasks": tasks,
+            "fps": 24,
+            "canvas": {"sizes": sizes},
+        })
     }
 
     /// The videos of a deployment preparing 768p 16:9 and 9:16 at 24 fps.

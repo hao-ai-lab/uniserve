@@ -670,8 +670,9 @@ pub const MAX_VIDEO_SECONDS: f64 = uniserve_engine::WorkerProcessArgs::DEFAULT_M
 ///
 /// The requested frame count is `seconds * frame_rate` rounded half to even, as the reference
 /// implementations round with Python's `round`, and the output extends it upward to the next
-/// complete native temporal window, a count of the form `17n + 5`. The output may therefore
-/// last longer than requested: at 24 fps, 4 seconds yields 107 frames and 15 seconds 362.
+/// complete native temporal window of `frames`, the rule the denoiser declares. The output may
+/// therefore last longer than requested: for H3 at 24 fps, 4 seconds yields 107 frames and 15
+/// seconds 362.
 ///
 /// # Errors
 ///
@@ -681,6 +682,7 @@ pub fn video_frame_count(
     seconds: f64,
     max_video_seconds: f64,
     frame_rate: u32,
+    frames: &uniserve_engine::FrameChunks,
 ) -> std::result::Result<u32, String> {
     if !seconds.is_finite() || !(MIN_VIDEO_SECONDS..=max_video_seconds).contains(&seconds) {
         return Err(format!(
@@ -690,7 +692,7 @@ pub fn video_frame_count(
     }
     // The range bounds the product well below `u32::MAX`, so the conversion is exact.
     let requested = (seconds * f64::from(frame_rate)).round_ties_even() as u32;
-    Ok(requested + (22 - requested % 17) % 17)
+    Ok(frames.align_up(requested))
 }
 
 /// Returns the chat conversation of a prompt for a model that serves chat only.

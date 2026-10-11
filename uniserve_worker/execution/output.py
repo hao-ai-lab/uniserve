@@ -10,7 +10,7 @@ speculative verification coordinates (`TokenResult`), latent trajectory updates
 
 After the batch commits, `uniserve_worker.execution.commit` drops the
 borrowed device references with `release_execution_references`. The executor
-polls `ready`, calls `materialize` once to resolve the wire `RequestOutput`,
+polls `ready`, calls `materialize` once to resolve the wire `CallOutput`,
 and passes `request_result` to `RequestPool.apply_result`. A discarded batch
 calls `abandon` instead. No method here installs request progress itself.
 """
@@ -37,13 +37,18 @@ from uniserve_worker.execution.request import (
 )
 from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.protocol.batch import LatentParams, TensorPublication
-from uniserve_worker.protocol.call import Call, CallKind, CallStatus
+from uniserve_worker.protocol.call import (
+    Call,
+    CallKind,
+    CallStatus,
+    MediaCall,
+)
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.output import (
+    CallOutput,
     FinishFlags,
     MediaOutput,
     PosixShmArtifact,
-    RequestOutput,
     TimingCounters,
 )
 from uniserve_worker.protocol.transfer import KvTransfer, Locator
@@ -102,16 +107,10 @@ def capture_logprobs(
     """
     if details is None:
         return {}
-    packed, rows, counts, requested_ids, max_count, max_requested = details
+    packed, rows, counts, max_count = details
     capture = output.capture(packed)
     key = capture
-    output.logprob_layouts[key] = (
-        rows,
-        counts,
-        requested_ids,
-        max_count,
-        max_requested,
-    )
+    output.logprob_layouts[key] = (rows, counts, max_count)
     return {index: (*key, index) for index in rows}
 
 
@@ -215,23 +214,6 @@ def sampled_tokens(record: PendingOutput) -> tuple[int, ...]:
     ):
         return draft[:accepted]
     return (*draft[:accepted], token)
-
-
-def logprob_entries(record: PendingOutput, span: tuple[int, int, int]) -> int:
-    """Return the number of score entries one logprob row can report.
-
-    The count is the sampled entry plus the row's top-k count plus its
-    explicitly requested token ids. `uniserve_worker.execution.commit` uses it
-    to bound the logprob payload against `max_completion_bytes`.
-    """
-    if record._buffer is None:
-        raise RuntimeError("logprob output lost its pinned range")
-    offset, count, index = span
-    rows, counts, requested_ids, _max_count, _max_requested = (
-        record._buffer.logprob_layouts[(offset, count)]
-    )
-    local = rows.index(index)
-    return 1 + counts[local] + len(requested_ids[local])
 
 
 def create_outputs(
@@ -356,7 +338,6 @@ class PendingOutput:
         self.progress: RequestProgress = RequestProgress(
             logical_position=call.coordinates.logical_position,
             rng_counter=request.rng_counter,
-            flow_step=call.coordinates.flow_step,
             kv_visible_len=call.coordinates.kv_visible_len,
             kv_computed_len=call.coordinates.kv_computed_len,
             prompt_logits_ready=request.prompt_logits_ready,
@@ -409,7 +390,7 @@ class PendingOutput:
         self._observed = False
 
         self._reports_output = True
-        self.value: RequestOutput | None = None
+        self.value: CallOutput | None = None
 
     def release_execution_references(self) -> None:
         """Drop borrowed device views once their stores own the lifetimes.
@@ -458,6 +439,18 @@ class PendingOutput:
     def kind(self) -> CallKind:
         return self.call.kind
 
+    def completed_steps(self, status: CallStatus) -> int:
+        """Return the denoising steps the trajectory completed with this call.
+
+        A successful denoising call reports the step its latent update
+        publishes; every other call reports zero, since only a denoising
+        result advances the engine's step progress.
+        """
+        denoising = self.call.kind is MediaCall.DENOISING
+        if status is not CallStatus.OK or not denoising:
+            return 0
+        return int(self.latent.update.step_index)
+
     def ready(self) -> bool:
         """Query host output readiness without changing request acceptance."""
         if self.value is not None:
@@ -469,7 +462,7 @@ class PendingOutput:
                 return False
         return True
 
-    def materialize(self) -> RequestOutput:
+    def materialize(self) -> CallOutput:
         """Resolve output fields once.
 
         A call that did not run keeps the request's committed coordinates, so
@@ -655,7 +648,7 @@ class PendingOutput:
             copy_us=self._completion_timing[2],
             host_us=self._completion_timing[3],
         )
-        concrete = RequestOutput(
+        concrete = CallOutput(
             request_key=self.request_key,
             call_id=self.call_id,
             status=status,
@@ -672,9 +665,7 @@ class PendingOutput:
             kv_computed_len=0
             if runtime is None
             else int(runtime.kv_computed_len),
-            num_completed_steps=0
-            if runtime is None
-            else int(runtime.flow_step),
+            step_index=self.completed_steps(status),
             committed_tokens=tokens,
             sampled_logprob=None if scores is None else scores[0],
             top_logprobs=() if scores is None else scores[1],

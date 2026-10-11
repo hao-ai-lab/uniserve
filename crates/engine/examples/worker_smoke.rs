@@ -14,10 +14,11 @@ use std::collections::HashMap;
 use uniserve_core::EngineCoreOutput;
 use uniserve_core::{
     GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, ImageTrigger,
-    RequestId, SamplingParams,
+    ModelDtype, RequestId, SamplingParams,
 };
 use uniserve_engine::{
-    Executor, Scheduler, SpecialTokenIds, WorkerExecutor, WorkerGroup, WorkerId, WorkerProcessArgs,
+    Executor, Scheduler, SchedulerConfig, SimEngine, WorkerExecutor, WorkerGroup, WorkerId,
+    WorkerProcessArgs,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -61,10 +62,17 @@ fn main() -> anyhow::Result<()> {
         WorkerExecutor::try_new(vec![(WorkerId("local".into()), engine)], Default::default())?;
     println!("info from worker: {:?}", engine.info());
 
-    let ctrl = SpecialTokenIds {
-        ..SpecialTokenIds::default()
-    };
-    let mut sched = Scheduler::new(Box::new(engine), ctrl, 32)?;
+    let mut sched = Scheduler::new(
+        Box::new(engine),
+        // The stub model's end-of-text id is the simulator's.
+        SimEngine::special_tokens(),
+        SchedulerConfig {
+            max_batch: 32,
+            ..Default::default()
+        },
+        ModelDtype::BFloat16,
+        SimEngine::generation_limits(),
+    )?;
 
     let mut rxs: HashMap<RequestId, (&str, uniserve_engine::EventRx)> = HashMap::new();
     let mut reqs = Vec::new();

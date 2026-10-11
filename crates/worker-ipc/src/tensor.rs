@@ -40,6 +40,30 @@ pub enum DType {
 }
 
 impl DType {
+    /// Every element type in declaration order, which is its discriminant.
+    pub const ALL: [Self; 7] = [
+        Self::U8,
+        Self::I32,
+        Self::I64,
+        Self::F16,
+        Self::BF16,
+        Self::F32,
+        Self::I16,
+    ];
+
+    /// Returns the spelling the Python worker's `DType` members carry.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::U8 => "u8",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::F16 => "f16",
+            Self::BF16 => "bf16",
+            Self::F32 => "f32",
+            Self::I16 => "i16",
+        }
+    }
+
     /// Storage width of one element in bytes.
     pub fn element_bytes(self) -> u64 {
         tensor_dtype(self).1
@@ -671,8 +695,8 @@ pub enum TransferHandle {
         width: u32,
         /// Logical latent allocation units.
         latent_units: u32,
-        /// Denoising step represented by the tensor.
-        step: u32,
+        /// Denoising step index represented by the tensor.
+        step_index: u32,
         /// Published latent tensor.
         tensor: TensorTransfer,
     },
@@ -797,21 +821,21 @@ impl TensorPublication {
                     height,
                     width,
                     latent_units,
-                    step,
+                    step_index,
                     ..
                 },
                 TransferHandle::Latent {
                     height: other_height,
                     width: other_width,
                     latent_units: other_latent_units,
-                    step: other_step,
+                    step_index: other_step_index,
                     ..
                 },
             ) => {
                 height == other_height
                     && width == other_width
                     && latent_units == other_latent_units
-                    && step == other_step
+                    && step_index == other_step_index
             }
             _ => false,
         };

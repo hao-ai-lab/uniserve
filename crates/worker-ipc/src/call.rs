@@ -6,7 +6,7 @@
 //! it onto the calls each rank owns (`rank_projection`, which narrows forward
 //! rows with `ForwardBatch::select` and sets each call's `consumer_slots`),
 //! and [`crate::codec`] encodes it as FlatBuffers. A rank answers with one
-//! [`BatchOutput`] of per-call [`RequestOutput`] completions. The Python
+//! [`BatchOutput`] of per-call [`CallOutput`] completions. The Python
 //! worker mirrors these types in the `identity`, `call`, `batch`, and `output`
 //! modules of `uniserve_worker.protocol`.
 //!
@@ -123,8 +123,8 @@ pub enum CallKind {
 impl CallKind {
     /// Computations accepted as individual scheduled request items.
     ///
-    /// Mirrored, in the same order, by `CALL_KINDS` in
-    /// `uniserve_worker.protocol.call`; the worker's reports list supported
+    /// The Python worker takes `CALL_KINDS` from this array
+    /// (`uniserve_worker.protocol.call`); the worker's reports list supported
     /// calls in this order.
     pub const ALL: [Self; 19] = [
         Self::Forward(ForwardMode::Prefill),
@@ -150,7 +150,7 @@ impl CallKind {
 
     /// Returns whether a call of this kind advances its request's state.
     ///
-    /// The worker mirrors this set in `uniserve_worker.protocol.call`; its
+    /// The Python worker reads this set through the extension; its
     /// `RequestPool` uses it to choose the call a request's next call follows
     /// and the `Ok` results that move the request's `state_call_id`.
     pub const fn advances_state(self) -> bool {
@@ -234,7 +234,7 @@ impl SamplingState {
 ///
 /// A rank would otherwise derive these by chaining from the calls that
 /// preceded it. The engine holds the request state they come from, so it states
-/// them and the rank asserts its own ledger agrees.
+/// them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallCoordinates {
     /// Position of this call's first token in the request's logical sequence.
@@ -243,8 +243,6 @@ pub struct CallCoordinates {
     pub kv_visible_len: u32,
     /// Tokens whose KV is initialized at submission; never below the visible extent.
     pub kv_computed_len: u32,
-    /// Denoising steps completed for this request at submission.
-    pub flow_step: u32,
 }
 
 impl CallCoordinates {
@@ -283,7 +281,7 @@ pub struct CanvasStep {
 /// token ids `candidate_ids[candidate_offsets[i]..candidate_offsets[i + 1]]`.
 /// The worker reports, in `candidate_ids` order, each candidate's natural-log
 /// probability under the log-softmax over the full vocabulary of the model's
-/// logits at its slot (`RequestOutput::candidate_logprobs`).
+/// logits at its slot (`CallOutput::candidate_logprobs`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Readout {
     /// Index of each slot's token in the call's concatenated canvas rows.
@@ -447,6 +445,31 @@ pub struct Call {
 }
 
 impl Call {
+    /// Element types of the scalar outputs one call relays through its
+    /// request slot's lane: the token (`token_output`), the completion and
+    /// the transition (`completion_output`, `transition_output`), which
+    /// [`Self::validate`] requires of them.
+    pub const RELAY_DTYPES: [DType; 3] = [DType::I64, DType::U8, DType::U8];
+
+    /// Bytes one request slot's lane holds of a call's relayed scalars.
+    ///
+    /// A worker sizes its relay arenas per (request slot, lane) row from it.
+    pub fn relay_row_bytes() -> u64 {
+        Self::RELAY_DTYPES
+            .iter()
+            .map(|dtype| dtype.element_bytes())
+            .sum()
+    }
+
+    /// Returns whether the call reads or writes a latent product held in the
+    /// scheduler-allocated latent pages of an image trajectory, which its
+    /// batch then describes with [`LatentParams`]. A standalone denoiser's
+    /// calls address pages their worker fixes per request slot and carry no
+    /// latent product.
+    pub fn addresses_latent_pages(&self) -> bool {
+        self.latent_input.is_some() || self.latent_output.is_some()
+    }
+
     /// Tensor dependencies in the call signature, excluding its predicate.
     ///
     /// Includes `token_input` and `latent_input`, which [`Self::buffer_inputs`]
@@ -730,6 +753,20 @@ pub enum CallStatus {
     Error = 2,
 }
 
+impl CallStatus {
+    /// Every status in declaration order, which is its discriminant.
+    pub const ALL: [Self; 3] = [Self::Ok, Self::Predicated, Self::Error];
+
+    /// Returns the spelling the Python worker's `CallStatus` members carry.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Predicated => "predicated",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// The failure classes of a worker, carried by a call's completion and by an
 /// error response alike.
 ///
@@ -844,7 +881,7 @@ pub struct MediaOutput {
 /// The completion record a worker emits once for every call, after its copy
 /// event is query-ready and its pinned fields are validated on the host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RequestOutput {
+pub struct CallOutput {
     /// Request completed by the call.
     pub request_key: RequestKey,
     /// Request-local call identifier.
@@ -864,7 +901,7 @@ pub struct RequestOutput {
     /// KV extent initialized by execution, including rejected speculative positions.
     pub kv_computed_len: u32,
     /// Completed denoising steps, independent of latent tensor dimensions.
-    pub num_completed_steps: u32,
+    pub step_index: u32,
     /// Token identifiers accepted by the sampler.
     pub committed_tokens: Vec<u32>,
     /// Natural-log probability of the final accepted token, when requested.
@@ -884,7 +921,7 @@ pub struct RequestOutput {
     pub kv_output: Option<KvTransfer>,
 }
 
-impl RequestOutput {
+impl CallOutput {
     /// Validates completion identity, status, accepted lengths, and the
     /// ownership of a KV publication.
     ///
@@ -1385,7 +1422,7 @@ impl ForwardBatch {
     }
 }
 
-/// Solver-step range and optional paged storage for one request trajectory.
+/// Raster geometry and optional paged storage for one request trajectory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentParams {
     /// Request that owns the trajectory.
@@ -1400,10 +1437,6 @@ pub struct LatentParams {
     pub height: u32,
     /// Output width in pixels.
     pub width: u32,
-    /// First denoising step assigned to the call.
-    pub start_step: u32,
-    /// Number of denoising steps assigned to the call.
-    pub step_count: u32,
 }
 
 impl LatentParams {
@@ -1588,7 +1621,30 @@ impl Batch {
     /// kind and component per batch, allocation tables that match the calls
     /// addressing them, non-overlapping latent pages and buffer spans, and
     /// input products and KV inputs that some call declares.
+    ///
+    /// This is the contract of a batch a worker rank receives, whose buffer
+    /// spans address that rank's pool.
     pub fn validate(&self) -> ValidationResult<()> {
+        self.validate_batch(true)
+    }
+
+    /// Validates a batch before any rank's buffer spans are chosen.
+    ///
+    /// A worker group's ranks each back their own buffer pool, so one batch
+    /// carries no single set of spans. This checks everything
+    /// [`Self::validate`] does except buffer spans, and requires the batch to
+    /// carry none; each rank's projection then passes [`Self::validate`] with
+    /// the spans of that rank's pool.
+    pub fn validate_unplaced(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.buffer_allocations.is_empty(),
+            "an unplaced batch carries no buffer allocations"
+        );
+        self.validate_batch(false)
+    }
+
+    /// Validates the batch, including its buffer spans when `placed`.
+    fn validate_batch(&self, placed: bool) -> ValidationResult<()> {
         // Establish the batch envelope before validating relationships within it.
         ensure_valid!(
             !self.calls.is_empty() || !self.commands.is_empty(),
@@ -1679,13 +1735,8 @@ impl Batch {
             let call = calls
                 .get(&identity)
                 .ok_or_else(|| invalid_message!("latent params does not name a batch call"))?;
-            let addresses_trajectory = matches!(
-                call.kind,
-                CallKind::Media(MediaCall::LatentPreparation)
-                    | CallKind::Media(MediaCall::Denoising)
-            ) || call.latent_input.is_some();
             ensure_valid!(
-                addresses_trajectory,
+                call.addresses_latent_pages(),
                 "latent params names work without a trajectory"
             );
             ensure_valid!(
@@ -1698,13 +1749,9 @@ impl Batch {
         }
 
         for call in &self.calls {
-            let needs_latent = matches!(
-                call.kind,
-                CallKind::Media(MediaCall::LatentPreparation)
-                    | CallKind::Media(MediaCall::Denoising)
-            ) || call.latent_input.is_some();
             ensure_valid!(
-                !needs_latent || latent_ids.contains(&(call.request_key, call.call_id)),
+                !call.addresses_latent_pages()
+                    || latent_ids.contains(&(call.request_key, call.call_id)),
                 "call that addresses a trajectory has no latent params"
             );
         }
@@ -1769,42 +1816,44 @@ impl Batch {
             );
         }
 
-        // Persistent buffers use non-overlapping half-open spans and cover every
-        // declared output. `BufferAllocation::validate` has already rejected
-        // an overflowing span end, so the addition below cannot wrap.
-        let mut buffer_ids = HashSet::with_capacity(self.buffer_allocations.len());
-        let mut buffer_spans = self
-            .buffer_allocations
-            .iter()
-            .map(|params| {
-                params.validate()?;
-                ensure_valid!(
-                    buffer_ids.insert(params.buffer),
-                    "batch repeats a buffer params identity"
-                );
-                Ok((params.offset, params.offset + params.bytes))
-            })
-            .collect::<ValidationResult<Vec<_>>>()?;
-        buffer_spans.sort_unstable();
+        if placed {
+            // Persistent buffers use non-overlapping half-open spans and cover every
+            // declared output. `BufferAllocation::validate` has already rejected
+            // an overflowing span end, so the addition below cannot wrap.
+            let mut buffer_ids = HashSet::with_capacity(self.buffer_allocations.len());
+            let mut buffer_spans = self
+                .buffer_allocations
+                .iter()
+                .map(|params| {
+                    params.validate()?;
+                    ensure_valid!(
+                        buffer_ids.insert(params.buffer),
+                        "batch repeats a buffer params identity"
+                    );
+                    Ok((params.offset, params.offset + params.bytes))
+                })
+                .collect::<ValidationResult<Vec<_>>>()?;
+            buffer_spans.sort_unstable();
 
-        ensure_valid!(
-            buffer_spans.windows(2).all(|pair| pair[0].1 <= pair[1].0),
-            "batch buffer allocations overlap"
-        );
+            ensure_valid!(
+                buffer_spans.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+                "batch buffer allocations overlap"
+            );
 
-        for call in &self.calls {
-            for output in call.buffer_outputs() {
-                let params = self
-                    .buffer_allocations
-                    .iter()
-                    .find(|params| params.buffer == output.buffer_id())
-                    .ok_or_else(|| {
-                        invalid_message!("persistent call output has no buffer params")
-                    })?;
-                ensure_valid!(
-                    params.bytes >= output.max_bytes(),
-                    "buffer params is smaller than its declared output"
-                );
+            for call in &self.calls {
+                for output in call.buffer_outputs() {
+                    let params = self
+                        .buffer_allocations
+                        .iter()
+                        .find(|params| params.buffer == output.buffer_id())
+                        .ok_or_else(|| {
+                            invalid_message!("persistent call output has no buffer params")
+                        })?;
+                    ensure_valid!(
+                        params.bytes >= output.max_bytes(),
+                        "buffer params is smaller than its declared output"
+                    );
+                }
             }
         }
 
@@ -1908,7 +1957,7 @@ pub struct BatchOutput {
     /// Batch identity copied from the submission.
     pub batch_id: u64,
     /// Call completions, one per call the batch carried.
-    pub completions: Vec<RequestOutput>,
+    pub completions: Vec<CallOutput>,
     /// Product values published by completed calls.
     pub products: Vec<TensorPublication>,
     /// Aggregate worker execution time in microseconds, when measured.
@@ -1919,7 +1968,7 @@ pub struct BatchOutput {
 
 impl BatchOutput {
     /// Iterates over call completions in report order.
-    pub fn completions(&self) -> impl Iterator<Item = &RequestOutput> {
+    pub fn completions(&self) -> impl Iterator<Item = &CallOutput> {
         self.completions.iter()
     }
 

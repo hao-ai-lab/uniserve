@@ -60,7 +60,7 @@ def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() 
     assert pool.reserved == 0
 
 
-def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
+def test_buffer_pool_binds_each_buffer_at_its_engine_offset() -> None:
     reference = TensorRef(
         request_key=RequestKey(1, 1, 1),
         producer_call_id=CallId(1, 0),
@@ -69,59 +69,53 @@ def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(32),)),
     )
-    second = replace(reference, producer_call_id=CallId(2, 0))
-    third = replace(reference, producer_call_id=CallId(3, 0))
-    buffers = BufferPool(byte_capacity=512, devices=("cpu",), compact=True)
-    first_binding = buffers.bind(
+    neighbour = replace(reference, producer_call_id=CallId(2, 0))
+    beyond = replace(reference, producer_call_id=CallId(3, 0))
+    buffers = BufferPool(byte_capacity=512, devices=("cpu",))
+    first = buffers.bind(
         reference,
-        BufferAllocation(reference.buffer_id, 4096, 512),
+        BufferAllocation(reference.buffer_id, 256, 128),
         device="cpu",
         dtype=torch.float32,
         shape=(32,),
     )
-    second_binding = buffers.bind(
-        second,
-        BufferAllocation(second.buffer_id, 8192, 512),
-        device="cpu",
-        dtype=torch.float32,
-        shape=(32,),
-    )
-    first_binding.tensor.fill_(1)
-    second_binding.tensor.fill_(2)
-
     try:
-        torch.testing.assert_close(
-            first_binding.tensor,
-            torch.full_like(first_binding.tensor, 1),
-            rtol=0,
-            atol=0,
-        )
-        with pytest.raises(WorkerError, match="exceeds the worker buffer pool"):
+        # The binding occupies the engine's span, not a place the pool chose.
+        first.tensor.fill_(1)
+        assert (first.offset, first.bytes) == (256, 128)
+
+        with pytest.raises(WorkerError, match="overlaps a live worker buffer"):
             buffers.bind(
-                third,
-                BufferAllocation(third.buffer_id, 12288, 512),
+                neighbour,
+                BufferAllocation(neighbour.buffer_id, 320, 128),
                 device="cpu",
                 dtype=torch.float32,
                 shape=(32,),
             )
-        buffers.release(first_binding)
-        third_binding = buffers.bind(
-            third,
-            BufferAllocation(third.buffer_id, 12288, 512),
+        with pytest.raises(WorkerError, match="exceeds the worker buffer pool"):
+            buffers.bind(
+                beyond,
+                BufferAllocation(beyond.buffer_id, 448, 128),
+                device="cpu",
+                dtype=torch.float32,
+                shape=(32,),
+            )
+
+        # A span below the live one binds beside it without disturbing it.
+        below = buffers.bind(
+            neighbour,
+            BufferAllocation(neighbour.buffer_id, 0, 128),
             device="cpu",
             dtype=torch.float32,
             shape=(32,),
         )
-        third_binding.tensor.fill_(3)
+        below.tensor.fill_(2)
         torch.testing.assert_close(
-            second_binding.tensor,
-            torch.full_like(second_binding.tensor, 2),
-            rtol=0,
-            atol=0,
+            first.tensor, torch.full_like(first.tensor, 1), rtol=0, atol=0
         )
-        buffers.release(third_binding)
+        buffers.release(below)
     finally:
-        buffers.release(second_binding)
+        buffers.release(first)
         buffers.close()
 
 
@@ -734,7 +728,7 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
                 1,
                 staging,
                 generation=3,
-                step=2,
+                step_index=2,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -746,12 +740,14 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
         ready = Event()
         ticket.add_done_callback(ready.set)
         assert ready.wait(5)
-        pool.adopt_import(write, generation=3, step=2, height=16, width=176)
+        pool.adopt_import(
+            write, generation=3, step_index=2, height=16, width=176
+        )
         actual = pool.gather_current(
             1,
             staging,
             generation=3,
-            step=2,
+            step_index=2,
             latent_units=11,
             height=16,
             width=176,
@@ -762,7 +758,7 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
                 1,
                 pool.stage(((1, 3, 4),), (11,))[0],
                 generation=3,
-                step=2,
+                step_index=2,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -793,9 +789,7 @@ def latent_output():
         key = RequestKey(1, slot, 1)
         return LatentUpdate(
             request_pool_idx=slot,
-            params=LatentParams(
-                key, CallId(1, 0), pages, units, height, width, 0, 0
-            ),
+            params=LatentParams(key, CallId(1, 0), pages, units, height, width),
             generation=1,
         )
 
@@ -843,7 +837,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
                 request_pool_idx=1,
                 page_table=pages,
                 generation=1,
-                step=0,
+                step_index=0,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -873,7 +867,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         pool.write_inactive(
             1,
             staging,
-            expected_step=0,
+            expected_step_index=0,
             expected_generation=1,
             latent_units=11,
             height=16,
@@ -882,7 +876,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         second = latent_output(1, pages, 11, 16, 176)
         second.expected_generation = 1
         second.generation = 2
-        second.step = 1
+        second.step_index = 1
         pool.validate_updates((second,))
         pool.apply_updates((second,))
         for value in borrowed:
@@ -894,7 +888,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
                 1,
                 staging,
                 generation=2,
-                step=1,
+                step_index=1,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -916,7 +910,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
             pool.write_inactive(
                 1,
                 staging,
-                expected_step=1,
+                expected_step_index=1,
                 expected_generation=2,
                 latent_units=11,
                 height=16,
@@ -931,7 +925,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         pool.write_inactive(
             1,
             staging,
-            expected_step=1,
+            expected_step_index=1,
             expected_generation=2,
             latent_units=11,
             height=16,
@@ -939,9 +933,9 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         )
         third = latent_output(1, pages, 11, 16, 176)
         third.expected_generation = 2
-        third.expected_step = 1
+        third.expected_step_index = 1
         third.generation = 3
-        third.step = 2
+        third.step_index = 2
         pool.validate_updates((third,))
         pool.apply_updates((third,))
         torch.testing.assert_close(
@@ -949,7 +943,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
                 1,
                 staging,
                 generation=3,
-                step=2,
+                step_index=2,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -1053,7 +1047,7 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
                 2,
                 independent,
                 generation=1,
-                step=0,
+                step_index=0,
                 latent_units=4,
                 height=16,
                 width=64,
@@ -1117,7 +1111,7 @@ def test_latent_staging_preserves_live_trajectories(latent_output) -> None:
             actual = pool.gather_current(
                 slot,
                 staging,
-                step=0,
+                step_index=0,
                 generation=1,
                 latent_units=7,
                 height=16,

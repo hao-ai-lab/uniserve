@@ -32,11 +32,10 @@ REGISTRATION_TIMEOUT_SECONDS = 60
 # A socket endpoint binds every interface so a rank on another host can be
 # reached; the port is chosen by the system and reported once it exists.
 SOCKET_BIND_INTERFACE = "0.0.0.0"
-SOCKET_CHANNEL = "tcp"
 
 try:
+    from uniserve_worker._uniserve_ipc import SOCKET_CHANNEL, service_name
     from uniserve_worker._uniserve_ipc import Server as WorkerIpcEndpoint
-    from uniserve_worker._uniserve_ipc import service_name
 except (
     ImportError
 ) as exc:  # pragma: no cover - depends on the installed native extension.

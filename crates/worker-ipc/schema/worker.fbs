@@ -97,7 +97,6 @@ table SamplingParams {
   return_logprobs:bool;
   return_prompt_logprobs:bool;
   n_prompt_logprobs:uint;
-  logprob_token_ids:[uint];
   typical_p:float = 1.0;
   forced_token_ids:[uint];
 }
@@ -146,8 +145,6 @@ table KVCacheInfo {
 }
 
 table WorkerEndpoint {
-  worker_id:string;
-  rank:uint;
   node:string;
   address_space:string;
   incarnation:string;
@@ -203,12 +200,21 @@ table ReferenceLimits {
   total:uint;
 }
 
+/// How the video VAE divides a video's frames into chunks (`FrameChunks`).
+table FrameChunks {
+  min_frames:uint;
+  chunk_frames:uint;
+  chunk_latent_frames:uint;
+  tail_latent_frames:uint;
+}
+
 /// What a deployment's video denoiser serves: its tasks, its fixed schedule
 /// (sigma points including the clean endpoint, and the per-modality shifts),
 /// the frame rate of every video it generates, in frames per second, the
 /// sample rate of the audio it generates with a video (zero when it generates
-/// none), the canvases it prepares and accepts, in the order the deployment
-/// selected them, and the references a request may carry.
+/// none), how the VAE chunks a video's frames, the canvases it prepares and
+/// accepts, in the order the deployment selected them, and the references a
+/// request may carry.
 table VideoDenoiserInfo {
   tasks:[string];
   schedule_points:uint;
@@ -216,6 +222,7 @@ table VideoDenoiserInfo {
   audio_shift:double;
   frame_rate:uint;
   audio_sample_rate:uint;
+  frames:FrameChunks (required);
   canvases:[ServedCanvas];
   references:ReferenceLimits;
 }
@@ -227,6 +234,19 @@ table MediaComponent { call:MediaCall; component:string; }
 /// A loaded rank's identity and capabilities, answered to an Info request.
 /// `WorkerInfo::validate` checks internal consistency; launch values such as
 /// placement and queue depth are the engine's and are not reported.
+/// One image shape the worker prepared its flow runtime for: a request of
+/// `height` by `width` pixels at the guidance scales that realize one of its
+/// captured branch counts.
+table ImageWarmup {
+  height:uint;
+  width:uint;
+  cfg_text_scale:float;
+  cfg_img_scale:float;
+  /// Token ids of the alternative guidance prefix the worker encodes for an
+  /// empty negative prompt, which the request carries as its negative prompt.
+  negative_token_ids:[uint];
+}
+
 table WorkerInfo {
   endpoint:WorkerEndpoint;
   /// Whether this rank's device exports a fabric handle. A descriptor handle
@@ -251,6 +271,12 @@ table WorkerInfo {
   /// engine's window of calls that move bytes is the narrowest rank's.
   transfer_tickets:uint;
   video_denoiser:VideoDenoiserInfo;
+  /// Image shapes the worker's flow runtime is prepared for, which the engine
+  /// runs one request batch of at startup.
+  image_warmups:[ImageWarmup];
+  /// Canvas rows one sampler chunk of the worker's token denoiser covers;
+  /// zero when it generates no canvases.
+  canvas_step_rows:uint;
 }
 
 // Request identities and call records.
@@ -320,12 +346,11 @@ table Readout {
 
 /// The coordinates a call carries so a rank does not derive them from the
 /// calls that preceded it. The engine holds the request state they come
-/// from; the rank asserts its own ledger agrees.
+/// from.
 table CallCoordinates {
   logical_position:uint;
   kv_visible_len:uint;
   kv_computed_len:uint;
-  flow_step:uint;
 }
 
 /// One image block of a context prefill, decoded into `VisionInput`: the
@@ -415,8 +440,6 @@ table LatentParams {
   latent_units:uint;
   height:uint;
   width:uint;
-  start_step:uint;
-  step_count:uint;
 }
 
 table DecodeRange {
@@ -472,9 +495,9 @@ struct TokenLogprob {
 table PositionLogprobs { entries:[TokenLogprob]; }
 
 /// The completion a worker emits once for every call, checked by
-/// `RequestOutput::validate`. `finish_flags` and `timing_counters` are
+/// `CallOutput::validate`. `finish_flags` and `timing_counters` are
 /// required by the decoder.
-table RequestOutput {
+table CallOutput {
   request_key:RequestKey;
   call_id:CallId;
   status:CallStatus;
@@ -483,7 +506,7 @@ table RequestOutput {
   timing_counters:TimingCounters;
   kv_visible_len:uint;
   kv_computed_len:uint;
-  num_completed_steps:uint;
+  step_index:uint;
   committed_tokens:[uint];
   sampled_logprob:float = null;
   top_logprobs:[TokenLogprob];
@@ -727,7 +750,7 @@ table LatentTransfer {
   height:uint;
   width:uint;
   latent_units:uint;
-  step:uint;
+  step_index:uint;
   tensor:TensorTransfer;
 }
 
@@ -743,7 +766,7 @@ table TensorPublication {
 /// The payload of a Result response, checked by `BatchOutput::validate`.
 table BatchOutput {
   batch_id:ulong;
-  completions:[RequestOutput];
+  completions:[CallOutput];
   products:[TensorPublication];
   worker_exec_us:ulong = null;
   forward_stats:ForwardStats;

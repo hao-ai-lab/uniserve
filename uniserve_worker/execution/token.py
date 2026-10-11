@@ -768,7 +768,6 @@ def prepare_context(
         or any(
             inputs.request_pool_indices[descriptor] != slot
             or inputs.query_lens[descriptor] != row.query_tokens
-            or inputs.seq_lens[descriptor] != row.seq_len + row.query_tokens
             for descriptor, row in zip(descriptors, rows, strict=True)
         )
     ):
@@ -1157,7 +1156,6 @@ def token_task(
     positions: tuple[int, ...] | torch.Tensor | None,
     selection: TokenSelection,
     *,
-    seq_len: int | None = None,
     request_indexed_decode: bool = False,
     request_tables: BlockTables | None,
 ) -> TokenRow:
@@ -1166,8 +1164,7 @@ def token_task(
     With ``request_indexed_decode``, ``token_ids`` and ``positions`` must be
     None because the row borrows both from ``DecodeState``. Otherwise they
     must be non-empty and equally long; a single tensor token keeps its
-    device view. ``seq_len``, when given, must equal the request's accepted
-    visible KV length.
+    device view.
 
     Raises:
         WorkerError: ``invalid_descriptor`` when any of these checks fails,
@@ -1212,11 +1209,7 @@ def token_task(
 
     # (request slot, accepted visible length, capacity).
     cache = calls.cache_coordinates(request, tables=request_tables)
-    visible = cache[1] if seq_len is None else int(seq_len)
-    if visible != cache[1]:
-        raise invalid_descriptor(
-            "token row visibility disagrees with call metadata"
-        )
+    visible = cache[1]
     return TokenRow(
         forward_mode=cast(ForwardMode, call.kind),
         token_ids=token_values,

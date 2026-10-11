@@ -84,7 +84,6 @@ fn coordinates<'a>(
             logical_position: v.logical_position,
             kv_visible_len: v.kv_visible_len,
             kv_computed_len: v.kv_computed_len,
-            flow_step: v.flow_step,
         },
     )
 }
@@ -145,7 +144,6 @@ fn sampling<'a>(
         .allowed_token_ids
         .as_deref()
         .map(|ids| b.create_vector(ids));
-    let logprob_token_ids = Some(b.create_vector(&v.logprob_token_ids));
     let forced_token_ids = Some(b.create_vector(&v.forced_token_ids));
     fbs::SamplingParams::create(
         b,
@@ -169,7 +167,6 @@ fn sampling<'a>(
             return_logprobs: v.return_logprobs,
             return_prompt_logprobs: v.return_prompt_logprobs,
             n_prompt_logprobs: v.n_prompt_logprobs,
-            logprob_token_ids,
             typical_p: v.typical_p,
             forced_token_ids,
         },
@@ -417,8 +414,6 @@ fn latent_params<'a>(
             latent_units: v.latent_units,
             height: v.height,
             width: v.width,
-            start_step: v.start_step,
-            step_count: v.step_count,
         },
     )
 }
@@ -601,15 +596,12 @@ fn endpoint<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &WorkerEndpoint,
 ) -> WIPOffset<fbs::WorkerEndpoint<'a>> {
-    let worker_id = Some(b.create_string(&v.worker_id));
     let node = Some(b.create_string(&v.node));
     let address_space = Some(b.create_string(&v.address_space));
     let incarnation = Some(b.create_string(&v.incarnation));
     fbs::WorkerEndpoint::create(
         b,
         &fbs::WorkerEndpointArgs {
-            worker_id,
-            rank: v.rank,
             node,
             address_space,
             incarnation,
@@ -805,7 +797,7 @@ fn transfer_handle<'a>(
             height,
             width,
             latent_units,
-            step,
+            step_index,
             tensor,
         } => {
             let tensor = Some(tensor_transfer(b, tensor));
@@ -817,7 +809,7 @@ fn transfer_handle<'a>(
                         height: *height,
                         width: *width,
                         latent_units: *latent_units,
-                        step: *step,
+                        step_index: *step_index,
                         tensor,
                     },
                 )
@@ -1055,10 +1047,7 @@ fn media_output<'a>(
     )
 }
 
-fn completion<'a>(
-    b: &mut FlatBufferBuilder<'a>,
-    v: &RequestOutput,
-) -> WIPOffset<fbs::RequestOutput<'a>> {
+fn completion<'a>(b: &mut FlatBufferBuilder<'a>, v: &CallOutput) -> WIPOffset<fbs::CallOutput<'a>> {
     let request_key = Some(request_key(b, &v.request_key));
     let call_id = fbs::CallId::new(v.call_id.batch_id, v.call_id.request_index);
     let status = call_status_to_fb(v.status);
@@ -1085,9 +1074,9 @@ fn completion<'a>(
     let media_output = v.media_output.as_ref().map(|value| media_output(b, value));
     let kv_output = v.kv_output.as_ref().map(|value| kv_transfer(b, value));
     let candidate_logprobs = Some(b.create_vector(&v.candidate_logprobs));
-    fbs::RequestOutput::create(
+    fbs::CallOutput::create(
         b,
-        &fbs::RequestOutputArgs {
+        &fbs::CallOutputArgs {
             request_key,
             call_id: Some(&call_id),
             status,
@@ -1096,7 +1085,7 @@ fn completion<'a>(
             timing_counters,
             kv_visible_len: v.kv_visible_len,
             kv_computed_len: v.kv_computed_len,
-            num_completed_steps: v.num_completed_steps,
+            step_index: v.step_index,
             committed_tokens,
             sampled_logprob: v.sampled_logprob,
             top_logprobs,
@@ -1363,6 +1352,15 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 total: value.references.total,
             },
         ));
+        let frames = Some(fbs::FrameChunks::create(
+            b,
+            &fbs::FrameChunksArgs {
+                min_frames: value.frames.min_frames,
+                chunk_frames: value.frames.chunk_frames,
+                chunk_latent_frames: value.frames.chunk_latent_frames,
+                tail_latent_frames: value.frames.tail_latent_frames,
+            },
+        ));
         fbs::VideoDenoiserInfo::create(
             b,
             &fbs::VideoDenoiserInfoArgs {
@@ -1372,11 +1370,32 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 audio_shift: value.audio_shift,
                 frame_rate: value.frame_rate,
                 audio_sample_rate: value.audio_sample_rate,
+                frames,
                 canvases,
                 references,
             },
         )
     });
+    let image_warmups = {
+        let values = v
+            .image_warmups
+            .iter()
+            .map(|shape| {
+                let negative_token_ids = Some(b.create_vector(&shape.negative_token_ids));
+                fbs::ImageWarmup::create(
+                    b,
+                    &fbs::ImageWarmupArgs {
+                        height: shape.height,
+                        width: shape.width,
+                        cfg_text_scale: shape.cfg_text_scale,
+                        cfg_img_scale: shape.cfg_img_scale,
+                        negative_token_ids,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        Some(b.create_vector(&values))
+    };
     fbs::WorkerInfo::create(
         b,
         &fbs::WorkerInfoArgs {
@@ -1398,6 +1417,8 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             host_lane_capacity: v.host_lane_capacity,
             transfer_tickets: v.transfer_tickets,
             video_denoiser,
+            image_warmups,
+            canvas_step_rows: v.canvas_step_rows,
         },
     )
 }

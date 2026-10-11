@@ -36,7 +36,7 @@ use uniserve_worker_ipc::{
 
 mod batch;
 
-pub use batch::{ExecutionBatch, RequestPlacement};
+pub use batch::{ExecutionBatch, RankBuffer, RequestPlacement};
 
 /// What the engine launched one pool with.
 ///
@@ -61,27 +61,27 @@ pub struct ExecutorInfo {
     /// the map is placed with no components and a queue depth of one.
     ///
     /// `WorkerExecutor::try_new` and `SimExecutor` fill this from their
-    /// launch; `single` and `from_workers` leave it empty.
+    /// launch; `from_workers` leaves it empty.
     pub placements: BTreeMap<WorkerId, PoolPlacement>,
+    /// For each pool, the persistent buffer bytes each rank backs, in rank
+    /// order, as the ranks reported them. A pool absent from the map is one
+    /// rank backing its reported `buffer_pool_bytes`.
+    ///
+    /// Each rank has its own buffer pool, sized to the products of the
+    /// components it executes and the components that read them, so the
+    /// engine places a pool's buffers rank by rank.
+    pub rank_buffer_bytes: BTreeMap<WorkerId, Vec<u64>>,
     /// For each worker that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
     ///
-    /// `WorkerExecutor::try_new` fills this from the placement; `single` and
-    /// `from_workers` leave it empty. Scheduler admission restricts a video
+    /// `WorkerExecutor::try_new` fills this from the placement;
+    /// `from_workers` leaves it empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the worker chosen to decode.
     pub video_codecs: BTreeMap<WorkerId, BTreeSet<WorkerId>>,
 }
 
 impl ExecutorInfo {
-    /// Constructs capability information for one physical pool.
-    pub fn single(id: WorkerId, info: WorkerInfo) -> Self {
-        Self {
-            workers: vec![(id, info)],
-            ..Self::default()
-        }
-    }
-
     /// Constructs capability information for multiple pools.
     ///
     /// Fails when `pools` is empty, repeats a pool id, or holds replicas of
@@ -117,6 +117,28 @@ impl ExecutorInfo {
     /// `worker`, or `None` when the pool launched no such component.
     pub fn component_config(&self, worker: &WorkerId, name: &str) -> Option<&ComponentConfig> {
         self.placements.get(worker)?.components.get(name)
+    }
+
+    /// Returns the persistent buffer bytes each rank of `worker` backs, in
+    /// rank order; empty for a pool this info does not hold.
+    pub fn rank_buffer_bytes(&self, worker: &WorkerId) -> Vec<u64> {
+        if let Some(bytes) = self.rank_buffer_bytes.get(worker) {
+            return bytes.clone();
+        }
+        self.workers
+            .iter()
+            .find(|(id, _)| id == worker)
+            .map(|(_, info)| vec![info.buffer_pool_bytes])
+            .unwrap_or_default()
+    }
+
+    /// Returns the number of ranks `worker` launched; one for a pool this
+    /// info does not hold.
+    pub fn rank_count(&self, worker: &WorkerId) -> usize {
+        self.rank_buffer_bytes
+            .get(worker)
+            .map_or(1, Vec::len)
+            .max(1)
     }
 
     /// Returns the batches the pools admit in flight together: the sum of
@@ -238,9 +260,8 @@ impl ExecutorInfo {
     ///
     /// Fails when there are no pools. With several pools, it also fails when
     /// media routing conflicts or is incomplete, when a deployment that muxes
-    /// video reports no video denoiser, when pools describe the denoiser
-    /// differently, when KV pools disagree on cache layout or a routed KV pool
-    /// has no cache, when summed capacities overflow `u32`, or when the merged
+    /// video reports no video denoiser, when KV pools disagree on cache
+    /// layout or a routed KV pool has no cache, when summed capacities overflow `u32`, or when the merged
     /// record fails `WorkerInfo::validate`.
     pub fn runtime_info(&self) -> anyhow::Result<WorkerInfo> {
         anyhow::ensure!(
@@ -284,8 +305,8 @@ impl ExecutorInfo {
         let mut merged = self.workers[seed_index].1.clone();
         merged.media_components = self.media_routing()?;
         let denoising = routed(CallKind::Media(MediaCall::Denoising));
-        // Every worker describes the deployment's placed denoiser alike; the
-        // denoising worker's description is the deployment's.
+        // The denoising worker owns the denoiser: its description is the
+        // deployment's.
         merged.video_denoiser = denoising.and_then(|info| info.video_denoiser.clone());
         // A deployment that assembles video denoises over the fixed schedule
         // the denoising worker describes.
@@ -293,13 +314,6 @@ impl ExecutorInfo {
             !merged.media_components.contains_key(&MediaCall::Muxing)
                 || merged.video_denoiser.is_some(),
             "a deployment that muxes video reports no video denoiser"
-        );
-        anyhow::ensure!(
-            self.workers
-                .iter()
-                .all(|(_, info)| info.video_denoiser.is_none()
-                    || info.video_denoiser == merged.video_denoiser),
-            "workers disagree on the deployment's video denoiser"
         );
         // Every KV stage must agree on its groups' retention policies and page
         // shapes. Capacity is the narrowest pool because a request may
@@ -405,6 +419,15 @@ impl ExecutorInfo {
         let flow = routed(CallKind::Media(MediaCall::Denoising));
         merged.latent_page_units = flow.map_or(0, |info| info.latent_page_units);
         merged.latent_pages = flow.map_or(0, |info| info.latent_pages);
+        // The flow runtime's captured shapes are the denoising pool's, and a
+        // canvas chunk is the widest any worker's token denoiser steps.
+        merged.image_warmups = flow.map_or_else(Vec::new, |info| info.image_warmups.clone());
+        merged.canvas_step_rows = self
+            .workers
+            .iter()
+            .map(|(_, info)| info.canvas_step_rows)
+            .max()
+            .unwrap_or(0);
         merged.buffer_pool_bytes = self
             .workers
             .iter()
@@ -465,7 +488,7 @@ fn check_video_tasks(info: &WorkerInfo) -> anyhow::Result<()> {
 #[derive(Debug, Clone)]
 pub struct CallResult {
     /// Validated completion values; media storage is carried by `media` below.
-    pub output: uniserve_worker_ipc::RequestOutput,
+    pub output: uniserve_worker_ipc::CallOutput,
     /// Claimed immutable output storage, or its request-local acquisition error.
     pub media: Result<Option<Arc<uniserve_core::SharedMedia>>, String>,
 }
@@ -1037,7 +1060,10 @@ impl TransferConfig {
     /// `destination`: a location survives when the first edge matching its
     /// source and `destination` carries the mechanism it was published on, or,
     /// with no matching edge, when it is a local location on `destination`
-    /// itself. `WorkerGroup` calls this for each rank's projected batch.
+    /// itself. An endpoint's worker and rank are the ones `incarnations` holds for
+    /// its incarnation; a location whose source is not a live incarnation
+    /// matches no edge. `WorkerGroup` calls this for each rank's projected
+    /// batch.
     ///
     /// # Errors
     ///
@@ -1048,16 +1074,18 @@ impl TransferConfig {
     /// tensor keeps its filtered locations.
     pub(crate) fn bind_inputs(
         &self,
+        incarnations: &crate::worker::IncarnationRegistry,
         products: &mut [uniserve_worker_ipc::TensorPublication],
         kv_inputs: &mut [uniserve_worker_ipc::KvTransfer],
         destination: &uniserve_worker_ipc::WorkerEndpoint,
     ) -> Result<(), UnroutableInputs> {
+        let position = incarnations.position(destination);
         let mut unroutable = Vec::new();
         for payload in products.iter_mut() {
             let buffer = payload.product.buffer_id();
             let mut bound = true;
             for tensor in payload.value.tensors_mut() {
-                bound &= self.bind_locations(tensor, destination);
+                bound &= self.bind_locations(incarnations, tensor, destination, position.as_ref());
             }
             if !bound {
                 unroutable.push(buffer);
@@ -1066,7 +1094,7 @@ impl TransferConfig {
         for publication in kv_inputs.iter_mut() {
             let mut bound = true;
             for tensor in publication.tensors_mut() {
-                bound &= self.bind_locations(tensor, destination);
+                bound &= self.bind_locations(incarnations, tensor, destination, position.as_ref());
             }
             if !bound {
                 unroutable.push(publication.source);
@@ -1076,7 +1104,10 @@ impl TransferConfig {
             return Ok(());
         }
         Err(UnroutableInputs {
-            destination: format!("{}:{}", destination.worker_id, destination.rank),
+            destination: position.map_or_else(
+                || destination.incarnation.clone(),
+                |(worker, rank)| format!("{}:{rank}", worker.0),
+            ),
             buffers: unroutable,
         })
     }
@@ -1085,8 +1116,10 @@ impl TransferConfig {
     /// `bind_inputs` selects them, and reports whether any remain.
     fn bind_locations(
         &self,
+        incarnations: &crate::worker::IncarnationRegistry,
         tensor: &mut uniserve_worker_ipc::TensorTransfer,
         destination: &uniserve_worker_ipc::WorkerEndpoint,
+        destination_position: Option<&(WorkerId, u32)>,
     ) -> bool {
         use uniserve_worker_ipc::TransferTransport;
 
@@ -1100,17 +1133,23 @@ impl TransferConfig {
                 TransferTransport::CudaVmm { .. } => TransferBackend::CudaVmm,
                 TransferTransport::Channel { .. } => TransferBackend::Channel,
             };
+            let source = incarnations.position(&location.source);
             self.edges
                 .iter()
                 .find(|edge| {
-                    edge.source_worker.0 == location.source.worker_id
+                    let (Some((source_worker, source_rank)), Some((worker, rank))) =
+                        (&source, destination_position)
+                    else {
+                        return false;
+                    };
+                    edge.source_worker == *source_worker
                         && edge
                             .source_rank
-                            .is_none_or(|rank| rank == location.source.rank)
-                        && edge.destination_worker.0 == destination.worker_id
+                            .is_none_or(|expected| expected == *source_rank)
+                        && edge.destination_worker == *worker
                         && edge
                             .destination_rank
-                            .is_none_or(|rank| rank == destination.rank)
+                            .is_none_or(|expected| expected == *rank)
                 })
                 .map_or_else(
                     || &location.source == destination && published == TransferBackend::Local,
@@ -1371,6 +1410,12 @@ mod tests {
                 audio_shift: 3.0,
                 frame_rate: 24,
                 audio_sample_rate: 32_000,
+                frames: uniserve_worker_ipc::FrameChunks {
+                    min_frames: 22,
+                    chunk_frames: 17,
+                    chunk_latent_frames: 5,
+                    tail_latent_frames: 2,
+                },
                 canvases: Vec::new(),
                 references: Default::default(),
             }),
@@ -1384,7 +1429,6 @@ mod tests {
         request_slots: u32,
     ) -> (WorkerId, WorkerInfo) {
         let mut info = media_info(routes);
-        info.endpoint.worker_id = id.to_owned();
         info.request_slots = request_slots;
         info.components = routes
             .iter()
@@ -1599,6 +1643,12 @@ mod tests {
                 audio_shift: 3.0,
                 frame_rate: 24,
                 audio_sample_rate: 32_000,
+                frames: uniserve_worker_ipc::FrameChunks {
+                    min_frames: 22,
+                    chunk_frames: 17,
+                    chunk_latent_frames: 5,
+                    tail_latent_frames: 2,
+                },
                 canvases: Vec::new(),
                 references: Default::default(),
             });
@@ -1744,8 +1794,6 @@ mod tests {
         // edge that carries only CUDA VMM takes neither to the decoder.
         let transfer = TransferConfig::parse("denoiser->decoder=cuda_vmm").unwrap();
         let endpoint = |worker: &str| Endpoint {
-            worker_id: worker.to_owned(),
-            rank: 0,
             node: "host".to_owned(),
             address_space: format!("{worker}-process"),
             incarnation: format!("{worker}-incarnation"),
@@ -1792,11 +1840,101 @@ mod tests {
             },
         }];
 
+        let ranks = crate::worker::IncarnationRegistry::default();
+        let decoder = endpoint("decoder");
+        ranks.assign(&WorkerId("denoiser".to_owned()), [&producer]);
+        ranks.assign(&WorkerId("decoder".to_owned()), [&decoder]);
+
         let refusal = transfer
-            .bind_inputs(&mut products, &mut [], &endpoint("decoder"))
+            .bind_inputs(&ranks, &mut products, &mut [], &decoder)
             .unwrap_err();
         assert_eq!(refusal.buffers, vec![product.buffer_id()]);
         assert_eq!(refusal.destination, "decoder:0");
+    }
+
+    #[test]
+    fn a_replaced_rank_incarnation_no_longer_binds_to_its_edge() {
+        use uniserve_worker_ipc::{
+            CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorPublication, TensorRef,
+            TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
+        };
+
+        // Rank 1 of the denoiser sends to the decoder over shared storage,
+        // and no other rank of the denoiser has an edge.
+        let transfer = TransferConfig::parse("denoiser:1->decoder=posix_shm").unwrap();
+        let endpoint = |incarnation: &str| Endpoint {
+            node: "host".to_owned(),
+            address_space: format!("{incarnation}-process"),
+            incarnation: incarnation.to_owned(),
+        };
+        let denoiser = [endpoint("denoiser-0"), endpoint("denoiser-1")];
+        let decoder = endpoint("decoder-0");
+        let ranks = crate::worker::IncarnationRegistry::default();
+        ranks.assign(&WorkerId("denoiser".to_owned()), &denoiser);
+        ranks.assign(&WorkerId("decoder".to_owned()), [&decoder]);
+
+        let product = TensorRef {
+            request_key: RequestKey::new(1, uniserve_core::RequestId(7), 1),
+            producer_call_id: CallId::new(1, 0),
+            output_index: 0,
+            generation: 1,
+            dtype: DType::F32,
+            shape_bound: ShapeBound {
+                dims: vec![DimBound::Static(1)],
+            },
+        };
+        let published_by = |source: &Endpoint| TensorPublication {
+            product: product.clone(),
+            value: TransferHandle::DeviceProduct {
+                height: 0,
+                width: 0,
+                value_range: String::new(),
+                tensor: TensorTransfer {
+                    shape: vec![1],
+                    locations: vec![Locator {
+                        source: source.clone(),
+                        transport: TransferTransport::PosixShm {
+                            endpoint: source.incarnation.clone(),
+                            name: "segment".to_owned(),
+                        },
+                        nbytes: 4,
+                        dtype: "float32".to_owned(),
+                        shape: vec![1],
+                        offset: vec![0],
+                        device: "cpu".to_owned(),
+                    }],
+                },
+            },
+        };
+
+        let mut live = vec![published_by(&denoiser[1])];
+        transfer
+            .bind_inputs(&ranks, &mut live, &mut [], &decoder)
+            .unwrap();
+
+        // Rank 0 holds no edge to the decoder.
+        let mut unbound = vec![published_by(&denoiser[0])];
+        assert!(
+            transfer
+                .bind_inputs(&ranks, &mut unbound, &mut [], &decoder)
+                .is_err()
+        );
+
+        // The denoiser replaces both of its ranks. The old rank 1 incarnation
+        // is retired, and its replacement takes the same edge.
+        let replacement = [endpoint("denoiser-0b"), endpoint("denoiser-1b")];
+        ranks.assign(&WorkerId("denoiser".to_owned()), &replacement);
+
+        let mut retired = vec![published_by(&denoiser[1])];
+        assert!(
+            transfer
+                .bind_inputs(&ranks, &mut retired, &mut [], &decoder)
+                .is_err()
+        );
+        let mut replaced = vec![published_by(&replacement[1])];
+        transfer
+            .bind_inputs(&ranks, &mut replaced, &mut [], &decoder)
+            .unwrap();
     }
 
     #[test]

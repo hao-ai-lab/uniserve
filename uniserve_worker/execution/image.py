@@ -16,7 +16,6 @@ the ``*_outcome`` helpers stage a call's successful ``PendingOutput``.
 from __future__ import annotations
 
 import math
-from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, cast
 
@@ -349,8 +348,8 @@ def materialization_latent(
     """Gather a completed latent trajectory for the image decoder.
 
     Returns the request's current latent, gathered from its ``LatentPool``
-    pages into the call's staging. The trajectory must be at the admitted
-    image's final step.
+    pages into the call's staging. The pool refuses a trajectory that is not
+    at the admitted image's final step.
     """
     request = state.pending_output(call.request_key.request_id)
     latent_input = call.latent_input
@@ -373,15 +372,11 @@ def materialization_latent(
     staging = row.latent.staging
     if params is None or staging is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
-    if int(params.start_step) != int(image_params.steps):
-        raise invalid_descriptor(
-            "image materialization requires a completed latent trajectory"
-        )
 
     current = latent_pool.gather_current(
         row.request.request_pool_idx,
         staging,
-        step=int(params.start_step),
+        step_index=int(image_params.steps),
         generation=int(latent_input.generation),
         latent_units=int(params.latent_units),
         height=int(params.height),
@@ -413,6 +408,11 @@ def publish_image(
     latent_input = call.latent_input
     if latent_input is None:
         raise invalid_descriptor("image publication lost its latent input")
+    image_params = request.request.image
+    if image_params is None:
+        raise invalid_descriptor(
+            "image publication has no admitted image parameters"
+        )
 
     resident_output = call.image_output
     if resident_output is not None:
@@ -444,10 +444,9 @@ def publish_image(
         max_bytes=int(call.bounds.max_completion_bytes),
         state=state,
     )
-    request.progress = replace(calls.require_progress(request), flow_step=0)
     request.latent.update.params = params
     request.latent.update.generation = int(latent_input.generation)
-    request.latent.update.step = int(params.start_step)
+    request.latent.update.step_index = int(image_params.steps)
     request.latent.update.release = True
     return non_state_outcome(call, completion_tasks=(image_task,), state=state)
 

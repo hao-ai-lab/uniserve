@@ -10,8 +10,8 @@ from uniserve_worker.errors import ErrorCode
 from uniserve_worker.protocol.call import CallStatus
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.output import (
+    CallOutput,
     FinishFlags,
-    RequestOutput,
     TimingCounters,
 )
 
@@ -21,7 +21,7 @@ REASON = "media input exceeds the worker's condition capacity"
 
 
 def _completion(error_code, error_message):
-    return RequestOutput(
+    return CallOutput(
         request_key=RequestKey(engine_id=0, request_id=7, request_epoch=1),
         call_id=CallId(3, 0),
         status=CallStatus.ERROR,
@@ -30,7 +30,7 @@ def _completion(error_code, error_message):
         timing_counters=TimingCounters(),
         kv_visible_len=0,
         kv_computed_len=0,
-        num_completed_steps=0,
+        step_index=0,
         committed_tokens=(),
         finish_flags=FinishFlags(),
     )

@@ -491,12 +491,13 @@ pub struct GenerationLimits {
     pub max_latent_units: u64,
     /// Pixel-to-latent spatial downsample factor.
     pub latent_downsample: u32,
-    /// Maximum VAE grid tokens for a worker-selected length. It is also the
-    /// divisor that turns `max_latent_feature_bytes` into bytes per latent
-    /// unit in [`GenerationRequest::image_latent_bytes`].
+    /// Maximum VAE grid tokens for a worker-selected length.
     pub max_vae_grid_tokens: u32,
     /// Maximum vision grid tokens for a worker-selected length.
     pub max_vit_grid_tokens: u32,
+    /// Bytes of one latent unit of a generated image, as the model's VAE
+    /// states them ([`GenerationRequest::image_latent_bytes`]).
+    pub latent_bytes_per_unit: u64,
     /// Maximum VAE feature product size in bytes.
     pub max_latent_feature_bytes: u64,
     /// Maximum vision feature product size in bytes.
@@ -665,16 +666,13 @@ impl GenerationRequest {
         Ok(units)
     }
 
-    /// Allocation bytes for one image latent using the loaded model's byte density.
-    ///
-    /// The density is `max_latent_feature_bytes / max_vae_grid_tokens`,
-    /// rounded up to whole bytes per latent unit.
+    /// Allocation bytes for one image latent: its units at the loaded
+    /// model's `latent_bytes_per_unit`.
     ///
     /// # Errors
     ///
     /// Returns every [`GenerationRequest::image_latent_units`] error, and
-    /// `MissingRuntimeBound` naming `max_latent_feature_bytes` when either
-    /// `max_latent_feature_bytes` or `max_vae_grid_tokens` is zero.
+    /// `MissingRuntimeBound` naming `latent_bytes_per_unit` when it is zero.
     pub fn image_latent_bytes(
         &self,
         limits: &GenerationLimits,
@@ -683,15 +681,12 @@ impl GenerationRequest {
             return Ok(0);
         }
         let units = self.image_latent_units(limits)?;
-        if limits.max_vae_grid_tokens == 0 || limits.max_latent_feature_bytes == 0 {
+        if limits.latent_bytes_per_unit == 0 {
             return Err(GenerationResourceError::MissingRuntimeBound {
-                resource: "max_latent_feature_bytes",
+                resource: "latent_bytes_per_unit",
             });
         }
-        let bytes_per_unit = limits
-            .max_latent_feature_bytes
-            .div_ceil(u64::from(limits.max_vae_grid_tokens));
-        Ok(units.saturating_mul(bytes_per_unit))
+        Ok(units.saturating_mul(limits.latent_bytes_per_unit))
     }
 
     /// Checks reachable encoder work, image geometry, and guidance against loaded capacity.
@@ -1294,6 +1289,7 @@ mod tests {
             latent_downsample: 16,
             max_vae_grid_tokens: 64,
             max_vit_grid_tokens: 64,
+            latent_bytes_per_unit: (1 << 20) / 64,
             max_latent_feature_bytes: 1 << 20,
             max_vision_feature_bytes: 1 << 20,
             commit_marker_tokens: 2,

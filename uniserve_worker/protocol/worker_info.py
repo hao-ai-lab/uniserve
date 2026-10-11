@@ -164,6 +164,30 @@ class ServedCanvas:
 
 
 @dataclass(frozen=True, slots=True)
+class FrameChunks:
+    """How the video VAE divides a video's frames into chunks.
+
+    Mirrors the Rust ``FrameChunks``. A video has ``min_frames + n *
+    chunk_frames`` frames, one decode unit per chunk, so ``n + 1`` units. The
+    VAE encodes each chunk to ``chunk_latent_frames`` latent frames and the
+    final window past the whole chunks to ``tail_latent_frames``.
+    """
+
+    min_frames: int
+    chunk_frames: int
+    chunk_latent_frames: int
+    tail_latent_frames: int
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "min_frames": self.min_frames,
+            "chunk_frames": self.chunk_frames,
+            "chunk_latent_frames": self.chunk_latent_frames,
+            "tail_latent_frames": self.tail_latent_frames,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class VideoDenoiserInfo:
     """What the video denoiser a deployment places serves.
 
@@ -172,9 +196,9 @@ class VideoDenoiserInfo:
     ``frame_rate`` is the frame rate of every video, the clock durations and
     reference videos are counted on; ``audio_sample_rate`` is the rate of the
     audio generated with each video, zero when the model generates none;
-    ``canvases`` lists the only canvases the
-    deployment serves, those it prepares; ``references`` states the
-    references one request may carry.
+    ``frames`` states how the VAE chunks a video's frames; ``canvases`` lists
+    the only canvases the deployment serves, those it prepares;
+    ``references`` states the references one request may carry.
     """
 
     tasks: tuple[str, ...]
@@ -183,6 +207,7 @@ class VideoDenoiserInfo:
     audio_shift: float
     frame_rate: int
     audio_sample_rate: int
+    frames: FrameChunks
     canvases: tuple[ServedCanvas, ...] = ()
     references: ReferenceLimits = ReferenceLimits()
 
@@ -194,6 +219,7 @@ class VideoDenoiserInfo:
             "audio_shift": self.audio_shift,
             "frame_rate": self.frame_rate,
             "audio_sample_rate": self.audio_sample_rate,
+            "frames": self.frames.to_mapping(),
             "canvases": [canvas.to_mapping() for canvas in self.canvases],
             "references": {
                 "images": self.references.images,
@@ -201,6 +227,35 @@ class VideoDenoiserInfo:
                 "audios": self.references.audios,
                 "total": self.references.total,
             },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ImageWarmup:
+    """One image shape this rank's flow runtime is prepared for.
+
+    Mirrors the Rust ``ImageWarmup``. The engine runs one request of
+    ``height`` by ``width`` pixels at these guidance scales through its
+    scheduler before it serves, so each captured guidance-branch count has
+    run through the serving path. ``negative_token_ids`` are the tokens of the
+    alternative guidance prefix the worker encodes for an empty negative
+    prompt, which the request carries as its negative prompt tokens; they are
+    empty when no branch has an alternative prefix.
+    """
+
+    height: int
+    width: int
+    cfg_text_scale: float
+    cfg_img_scale: float
+    negative_token_ids: tuple[int, ...] = ()
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "height": self.height,
+            "width": self.width,
+            "cfg_text_scale": self.cfg_text_scale,
+            "cfg_img_scale": self.cfg_img_scale,
+            "negative_token_ids": list(self.negative_token_ids),
         }
 
 
@@ -215,12 +270,18 @@ class WorkerInfo:
         latent_page_units: Model-defined units stored in one latent page.
         latent_pages: Physical latent pages, including the reserved sentinel
             page that `latent_capacity_units` excludes.
-        buffer_pool_bytes: Persistent buffer-pool capacity in bytes.
+        buffer_pool_bytes: Bytes of the persistent buffer pool this rank
+            backs, which the engine places this rank's buffers in.
         max_unresolved_calls: Maximum unresolved calls per request.
         host_lane_capacity: Concurrent host-lane tasks this rank admits.
         transfer_tickets: Transfer entries this rank's transport holds in
             flight at once; the engine keeps no more transfer calls reserved
             than the narrowest rank holds.
+        image_warmups: Image shapes this rank's flow runtime is prepared for,
+            each of which the engine warms with a real request.
+        canvas_step_rows: Canvas rows one sampler chunk of this rank's token
+            denoiser covers, every row count of which the engine warms; zero
+            when it generates no canvases.
     """
 
     endpoint: WorkerEndpoint
@@ -246,6 +307,8 @@ class WorkerInfo:
     media_components: dict[MediaCall, str] = field(default_factory=dict)
     # What the deployment's video denoiser serves; ``None`` without one.
     video_denoiser: VideoDenoiserInfo | None = None
+    image_warmups: tuple[ImageWarmup, ...] = ()
+    canvas_step_rows: int = 0
 
     @property
     def latent_capacity_units(self) -> int:
@@ -287,6 +350,10 @@ class WorkerInfo:
             "max_unresolved_calls": self.max_unresolved_calls,
             "host_lane_capacity": self.host_lane_capacity,
             "transfer_tickets": self.transfer_tickets,
+            "image_warmups": [
+                shape.to_mapping() for shape in self.image_warmups
+            ],
+            "canvas_step_rows": self.canvas_step_rows,
         }
 
 

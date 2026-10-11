@@ -244,6 +244,34 @@ impl MediaCall {
             Self::Muxing => "muxing",
         }
     }
+
+    /// Returns the calls that read this call's products in a video request's
+    /// graph.
+    ///
+    /// A producing call's readers are the calls whose inputs it declares, in
+    /// the order the graph consumes them. The engine plans consumption from
+    /// this table and the worker sizes persistent product storage from it
+    /// ([`Self::reads_resident_state`] separates the readers of resident
+    /// state).
+    pub const fn readers(self) -> &'static [Self] {
+        match self {
+            Self::MediaReading => &[Self::VisionEncoding, Self::LatentEncoding],
+            Self::VisionEncoding => &[Self::TextEncoding],
+            Self::TextEncoding | Self::LatentEncoding => &[Self::LatentPreparation],
+            Self::LatentPreparation => &[Self::Denoising],
+            Self::Denoising => &[Self::Denoising, Self::VideoDecoding, Self::AudioDecoding],
+            Self::VideoDecoding => &[Self::VideoEncoding],
+            Self::VideoEncoding => &[Self::Muxing],
+            Self::AudioDecoding => &[Self::AudioEncoding],
+            Self::ImageDecoding | Self::AudioEncoding | Self::Muxing => &[],
+        }
+    }
+
+    /// Returns whether this call reads its predecessor's trajectory from the
+    /// denoiser's resident state instead of a persistent product.
+    pub const fn reads_resident_state(self) -> bool {
+        matches!(self, Self::Denoising)
+    }
 }
 
 /// Understanding and generation branches of a multimodal model.
@@ -427,9 +455,6 @@ pub struct SamplingParams {
     /// How many highest-probability alternatives to return per scored prompt position.
     #[serde(default)]
     pub n_prompt_logprobs: u32,
-    /// Token IDs whose log probabilities are returned at every scored position.
-    #[serde(default)]
-    pub logprob_token_ids: Vec<u32>,
     /// Bad-word token sequences: generation may not complete any of these.
     /// Enforced host-side by masking the completing token.
     #[serde(default)]
@@ -511,7 +536,7 @@ pub enum SamplingParamsError {
 impl SamplingParams {
     /// Returns whether generated-token logprobs are enabled.
     pub fn generated_logprobs_requested(&self) -> bool {
-        self.return_logprobs || self.n_logprobs > 0 || !self.logprob_token_ids.is_empty()
+        self.return_logprobs || self.n_logprobs > 0
     }
 
     /// Returns whether prompt-token logprobs are enabled.
@@ -613,7 +638,6 @@ impl Default for SamplingParams {
             n_logprobs: 0,
             return_prompt_logprobs: false,
             n_prompt_logprobs: 0,
-            logprob_token_ids: Vec::new(),
             bad_words_ids: Vec::new(),
             allowed_token_ids: None,
             typical_p: 1.0,
@@ -685,47 +709,32 @@ fn default_timestep_shift() -> f32 {
 /// caller can report a precise input error before scheduling diffusion work.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ImageParamsError {
-    /// Denoising step count lies outside its supported range.
-    #[error("steps must be in 1..={max}, got {got}")]
-    Steps {
-        /// Supplied step count.
-        got: u16,
-        /// Maximum supported step count.
-        max: u16,
-    },
-    /// Image height violates range or alignment requirements.
-    #[error("height must be a non-zero multiple of {multiple} in {min}..={max}, got {got}")]
+    /// Denoising step count is zero.
+    #[error("steps must be positive")]
+    Steps,
+    /// Image height is zero or not a multiple of the grid.
+    #[error("height must be a non-zero multiple of {multiple}, got {got}")]
     Height {
         /// Supplied height.
         got: u32,
-        /// Minimum supported height.
-        min: u32,
-        /// Maximum supported height.
-        max: u32,
         /// Required height alignment.
         multiple: u32,
     },
-    /// Image width violates range or alignment requirements.
-    #[error("width must be a non-zero multiple of {multiple} in {min}..={max}, got {got}")]
+    /// Image width is zero or not a multiple of the grid.
+    #[error("width must be a non-zero multiple of {multiple}, got {got}")]
     Width {
         /// Supplied width.
         got: u32,
-        /// Minimum supported width.
-        min: u32,
-        /// Maximum supported width.
-        max: u32,
         /// Required width alignment.
         multiple: u32,
     },
-    /// A guidance scale is non-finite or exceeds its supported range.
-    #[error("{field} must be finite and in 0.0..={max}, got {got}")]
+    /// A guidance scale is non-finite or negative.
+    #[error("{field} must be finite and non-negative, got {got}")]
     CfgScale {
         /// Name of the invalid scale.
         field: &'static str,
         /// Supplied scale.
         got: f32,
-        /// Maximum supported scale.
-        max: f32,
     },
     /// A floating-point parameter is NaN or infinite.
     #[error("{field} must be finite, got {got}")]
@@ -796,69 +805,43 @@ impl std::fmt::Display for CfgRenorm {
 pub struct CfgRenormParseError(String);
 
 impl ImageParams {
-    /// Upper bound on diffusion steps.
-    pub const MAX_STEPS: u16 = 1000;
-    /// Minimum supported image dimension in pixels.
-    pub const MIN_DIM: u32 = 16;
-    /// Maximum supported image dimension in pixels.
-    pub const MAX_DIM: u32 = 4096;
     /// Required divisibility for each image dimension.
     pub const DIM_MULTIPLE: u32 = 16;
-    /// Upper bound on any single CFG scale.
-    pub const MAX_CFG_SCALE: f32 = 100.0;
 
     /// Validates diffusion parameters before they reach the worker.
     ///
     /// Callers include `GenerationRequest::validate` and the worker IPC
-    /// `NewRequest::validate`. `height` and `width` must each be non-zero,
-    /// within `MIN_DIM..=MAX_DIM`, and a multiple of `DIM_MULTIPLE`. The
-    /// first violation found is returned.
+    /// `NewRequest::validate`. `height` and `width` must each be non-zero
+    /// and a multiple of `DIM_MULTIPLE`. The model's own limits bound the
+    /// image's extent and the schedule's length at admission. The first
+    /// violation found is returned.
     pub fn validate(&self) -> Result<(), ImageParamsError> {
-        // Bound discrete work before validating shape- and guidance-dependent
-        // values.
-        if self.steps == 0 || self.steps > Self::MAX_STEPS {
-            return Err(ImageParamsError::Steps {
-                got: self.steps,
-                max: Self::MAX_STEPS,
-            });
+        if self.steps == 0 {
+            return Err(ImageParamsError::Steps);
         }
 
-        // Both dimensions obey the same positive, bounded, aligned grid
-        // contract.
-        let check_dim = |got: u32| -> bool {
-            got != 0
-                && (Self::MIN_DIM..=Self::MAX_DIM).contains(&got)
-                && got.is_multiple_of(Self::DIM_MULTIPLE)
-        };
+        // Both dimensions obey the same positive, aligned grid contract.
+        let check_dim = |got: u32| -> bool { got != 0 && got.is_multiple_of(Self::DIM_MULTIPLE) };
         if !check_dim(self.height) {
             return Err(ImageParamsError::Height {
                 got: self.height,
-                min: Self::MIN_DIM,
-                max: Self::MAX_DIM,
                 multiple: Self::DIM_MULTIPLE,
             });
         }
         if !check_dim(self.width) {
             return Err(ImageParamsError::Width {
                 got: self.width,
-                min: Self::MIN_DIM,
-                max: Self::MAX_DIM,
                 multiple: Self::DIM_MULTIPLE,
             });
         }
 
-        // Each guidance axis accepts finite non-negative scaling up to the
-        // runtime-independent request bound.
+        // Each guidance axis accepts finite non-negative scaling.
         for (field, scale) in [
             ("cfg_text_scale", self.cfg_text_scale),
             ("cfg_img_scale", self.cfg_img_scale),
         ] {
-            if !scale.is_finite() || !(0.0..=Self::MAX_CFG_SCALE).contains(&scale) {
-                return Err(ImageParamsError::CfgScale {
-                    field,
-                    got: scale,
-                    max: Self::MAX_CFG_SCALE,
-                });
+            if !scale.is_finite() || scale < 0.0 {
+                return Err(ImageParamsError::CfgScale { field, got: scale });
             }
         }
 
@@ -1023,19 +1006,7 @@ mod tests {
             steps: 0,
             ..Default::default()
         };
-        assert!(matches!(
-            bad_steps.validate(),
-            Err(ImageParamsError::Steps { .. })
-        ));
-
-        let too_many_steps = ImageParams {
-            steps: ImageParams::MAX_STEPS + 1,
-            ..Default::default()
-        };
-        assert!(matches!(
-            too_many_steps.validate(),
-            Err(ImageParamsError::Steps { .. })
-        ));
+        assert!(matches!(bad_steps.validate(), Err(ImageParamsError::Steps)));
 
         let zero_height = ImageParams {
             height: 0,
@@ -1052,15 +1023,6 @@ mod tests {
         };
         assert!(matches!(
             unaligned_width.validate(),
-            Err(ImageParamsError::Width { .. })
-        ));
-
-        let huge_dim = ImageParams {
-            width: ImageParams::MAX_DIM + ImageParams::DIM_MULTIPLE,
-            ..Default::default()
-        };
-        assert!(matches!(
-            huge_dim.validate(),
             Err(ImageParamsError::Width { .. })
         ));
 

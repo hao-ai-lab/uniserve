@@ -12,8 +12,8 @@
 //!   `uniserve_worker.protocol.batch.Batch`. Python classes and enum members
 //!   are resolved once per process (`RequestTypes`); outside `kv_inputs`,
 //!   each distinct request key, call id, and shape bound is constructed once
-//!   per batch (`RequestConversion`); and `batch_from_validated` assembles the
-//!   batch without running `Batch.__post_init__`.
+//!   per batch (`RequestConversion`). The decoder validated the frame, so
+//!   the records carry no second validation.
 //! - Outbound, [`try_completion_response_from_py`] decodes the mappings the
 //!   worker's `to_mapping` methods emit. That encoding differs from the serde
 //!   form: for example `Locator.to_mapping` writes a plain `transport` string
@@ -22,7 +22,7 @@
 //!
 //! The encoder constructs many records positionally, so its argument order is
 //! coupled to the field order of the Python dataclasses in
-//! `uniserve_worker.protocol` and to the parameters of `batch_from_validated`.
+//! `uniserve_worker.protocol`.
 //! The round-trip test at the bottom of this file reads the fields of each
 //! native batch back by name.
 //!
@@ -41,14 +41,14 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString, PyTuple};
 use uniserve_core::{
     AudioClip, Canvas, ConditionMedia, ConditionRole, ImageParams, SamplingParams, TokenLogprob,
-    VideoCondition,
+    VideoCondition, VideoTask,
 };
 use uniserve_worker_ipc::{
     ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, BufferAllocation, BufferId,
-    CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType, DecodeRange,
+    CacheUnitAllocation, Call, CallId, CallKind, CallOutput, CallStatus, DType, DecodeRange,
     DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags,
     ForwardStats, GenerationParams, KvGroupTransfer, KvTransfer, LatentParams, Locator,
-    MediaOutput, NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication,
+    MediaOutput, NewRequest, RequestKey, RequestKind, ResponseKind, ShapeBound, TensorPublication,
     TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
     WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
@@ -106,7 +106,7 @@ struct RequestTypes {
     start: Py<PyAny>,
     finish: Py<PyAny>,
     free: Py<PyAny>,
-    batch_from_validated: Py<PyAny>,
+    batch: Py<PyAny>,
     dtypes: [Py<PyAny>; 7],
     forward_modes: [Py<PyAny>; ForwardMode::ALL.len()],
     media_calls: [Py<PyAny>; MediaCall::ALL.len()],
@@ -120,13 +120,21 @@ static REQUEST_TYPES: std::sync::OnceLock<RequestTypes> = std::sync::OnceLock::n
 ///
 /// Members are looked up by value (`Enum(value)`), so each spelling must be a
 /// value of the Python enum `name`, and the array order is the order of
-/// `values`.
+/// `values`. The Python enum has exactly these members: a member the schema
+/// does not spell fails the lookup, and an extra Python member is refused here
+/// instead of reaching the wire.
 fn enum_members<const N: usize>(
     module: &Bound<'_, PyModule>,
     name: &str,
     values: [&str; N],
 ) -> PyResult<[Py<PyAny>; N]> {
     let class = module.getattr(name)?;
+    if class.len()? != N {
+        return Err(PyValueError::new_err(format!(
+            "the Python enum {name} has {} members and the schema spells {N}",
+            class.len()?
+        )));
+    }
     let mut members: Vec<Py<PyAny>> = Vec::with_capacity(N);
     for value in values {
         members.push(class.call1((value,))?.unbind());
@@ -202,6 +210,23 @@ impl RequestTypes {
         records.insert("TensorTransfer", class(&module, "TensorTransfer")?);
         records.insert("KvGroupTransfer", class(&module, "KvGroupTransfer")?);
         records.insert("KvTransfer", class(&module, "KvTransfer")?);
+
+        // These members travel as their spelling and are never indexed; a
+        // member the schema does not spell is refused here.
+        enum_members(&call, "CallStatus", CallStatus::ALL.map(CallStatus::as_str))?;
+        let info = py.import("uniserve_worker.protocol.worker_info")?;
+        enum_members(
+            &info,
+            "RequestKind",
+            RequestKind::ALL.map(RequestKind::as_str),
+        )?;
+        enum_members(
+            &info,
+            "ResponseKind",
+            ResponseKind::ALL.map(ResponseKind::as_str),
+        )?;
+        let video = py.import("uniserve_worker.protocol.video")?;
+        enum_members(&video, "VideoTask", VideoTask::ALL.map(VideoTask::as_str))?;
         Ok(Self {
             records,
             call: class(&call, "Call")?,
@@ -223,20 +248,11 @@ impl RequestTypes {
             start: class(&batch, "Start")?,
             finish: class(&batch, "Finish")?,
             free: class(&batch, "Free")?,
-            batch_from_validated: class(
-                &py.import("uniserve_worker.protocol.construction")?,
-                "batch_from_validated",
-            )?,
+            batch: class(&batch, "Batch")?,
 
-            // The `dtypes` spellings sit at the indices that `dtype` hardcodes
-            // (the Rust discriminant values). `kind` indexes the other three
-            // with `as usize`, which relies on each `ALL` array listing
-            // variants in declaration order.
-            dtypes: enum_members(
-                &tensor,
-                "DType",
-                ["u8", "i32", "i64", "f16", "bf16", "f32", "i16"],
-            )?,
+            // Every table is indexed with `as usize`, which relies on each
+            // `ALL` array listing variants in declaration order.
+            dtypes: enum_members(&tensor, "DType", DType::ALL.map(DType::as_str))?,
             forward_modes: enum_members(
                 &call,
                 "ForwardMode",
@@ -278,16 +294,7 @@ impl RequestTypes {
 
     /// Returns the Python enum member for an element type.
     fn dtype<'py>(&self, py: Python<'py>, dtype: DType) -> Bound<'py, PyAny> {
-        let index = match dtype {
-            DType::U8 => 0,
-            DType::I32 => 1,
-            DType::I64 => 2,
-            DType::F16 => 3,
-            DType::BF16 => 4,
-            DType::F32 => 5,
-            DType::I16 => 6,
-        };
-        self.dtypes[index].bind(py).clone()
+        self.dtypes[dtype as usize].bind(py).clone()
     }
 }
 
@@ -426,7 +433,6 @@ impl<'py> RequestConversion<'py> {
             call.coordinates.logical_position,
             call.coordinates.kv_visible_len,
             call.coordinates.kv_computed_len,
-            call.coordinates.flow_step,
         ))?;
         let bounds = self.types.bounds.bind(self.py).call1((
             call.bounds.max_tokens,
@@ -680,52 +686,72 @@ fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyAny
         tensor_publication_to_py(py, payload, &mut native)
     })?;
 
-    // `batch_from_validated` sets these fields on a bare `Batch` without
-    // running `Batch.__post_init__`, because the frame was validated when it
-    // was decoded. Arguments are positional and follow its parameter order;
-    // the forward tuple is unpacked by index into `forward_call_indices`,
-    // `request_pool_indices`, `seq_lens`, `query_lens`, and `write_kv`.
-    let arguments = pyo3::types::PyTuple::new(
-        py,
-        [
-            batch.batch_id.into_pyobject(py)?.into_any(),
-            batch.collective_seq.into_pyobject(py)?.into_any(),
-            pyo3::types::PyTuple::new(py, calls)?.into_any(),
-            pyo3::types::PyTuple::new(py, block_tables)?.into_any(),
-            pyo3::types::PyTuple::new(py, new_cache_units)?.into_any(),
-            (
-                pyo3::types::PyTuple::new(py, &batch.forward.call_indices)?,
-                pyo3::types::PyTuple::new(py, &batch.forward.request_pool_indices)?,
-                pyo3::types::PyTuple::new(py, &batch.forward.seq_lens)?,
-                pyo3::types::PyTuple::new(py, &batch.forward.query_lens)?,
-                pyo3::types::PyTuple::new(py, &batch.forward.write_kv)?,
-            )
-                .into_pyobject(py)?
-                .into_any(),
-            record_tuple(py, &batch.latent_params, |params| {
-                latent_params_to_py(py, params, &mut native)
-            })?
-            .into_any(),
-            record_tuple(py, &batch.decode_ranges, |params| {
-                decode_range_to_py(py, params, &mut native)
-            })?
-            .into_any(),
-            record_tuple(py, &batch.buffer_allocations, |params| {
-                buffer_allocation_to_py(py, params, &mut native)
-            })?
-            .into_any(),
-            pyo3::types::PyTuple::new(py, commands)?.into_any(),
-            input_products.into_any(),
-            record_tuple(py, &batch.kv_inputs, |transfer| {
-                kv_transfer_to_py(py, transfer)
-            })?
-            .into_any(),
-        ],
+    // The batch's fields are passed by name.
+    let fields = PyDict::new(py);
+    fields.set_item(intern!(py, "batch_id"), batch.batch_id)?;
+    fields.set_item(intern!(py, "collective_seq"), batch.collective_seq)?;
+    fields.set_item(intern!(py, "calls"), pyo3::types::PyTuple::new(py, calls)?)?;
+    fields.set_item(
+        intern!(py, "block_tables"),
+        pyo3::types::PyTuple::new(py, block_tables)?,
     )?;
-    native.types.batch_from_validated.bind(py).call1(arguments)
+    fields.set_item(
+        intern!(py, "new_cache_units"),
+        pyo3::types::PyTuple::new(py, new_cache_units)?,
+    )?;
+    fields.set_item(
+        intern!(py, "forward_call_indices"),
+        pyo3::types::PyTuple::new(py, &batch.forward.call_indices)?,
+    )?;
+    fields.set_item(
+        intern!(py, "request_pool_indices"),
+        pyo3::types::PyTuple::new(py, &batch.forward.request_pool_indices)?,
+    )?;
+    fields.set_item(
+        intern!(py, "seq_lens"),
+        pyo3::types::PyTuple::new(py, &batch.forward.seq_lens)?,
+    )?;
+    fields.set_item(
+        intern!(py, "query_lens"),
+        pyo3::types::PyTuple::new(py, &batch.forward.query_lens)?,
+    )?;
+    fields.set_item(
+        intern!(py, "write_kv"),
+        pyo3::types::PyTuple::new(py, &batch.forward.write_kv)?,
+    )?;
+    fields.set_item(
+        intern!(py, "latent_params"),
+        record_tuple(py, &batch.latent_params, |params| {
+            latent_params_to_py(py, params, &mut native)
+        })?,
+    )?;
+    fields.set_item(
+        intern!(py, "decode_ranges"),
+        record_tuple(py, &batch.decode_ranges, |params| {
+            decode_range_to_py(py, params, &mut native)
+        })?,
+    )?;
+    fields.set_item(
+        intern!(py, "buffer_allocations"),
+        record_tuple(py, &batch.buffer_allocations, |params| {
+            buffer_allocation_to_py(py, params, &mut native)
+        })?,
+    )?;
+    fields.set_item(
+        intern!(py, "commands"),
+        pyo3::types::PyTuple::new(py, commands)?,
+    )?;
+    fields.set_item(intern!(py, "input_products"), input_products)?;
+    fields.set_item(
+        intern!(py, "kv_inputs"),
+        record_tuple(py, &batch.kv_inputs, |transfer| {
+            kv_transfer_to_py(py, transfer)
+        })?,
+    )?;
+    native.types.batch.bind(py).call((), Some(&fields))
 }
 
-/// Converts one trajectory's solver-step range and latent page table into a
+/// Converts one trajectory's raster geometry and latent page table into a
 /// Python `LatentParams` record.
 fn latent_params_to_py<'py>(
     py: Python<'py>,
@@ -745,8 +771,6 @@ fn latent_params_to_py<'py>(
     dict.set_item(intern!(py, "latent_units"), params.latent_units)?;
     dict.set_item(intern!(py, "height"), params.height)?;
     dict.set_item(intern!(py, "width"), params.width)?;
-    dict.set_item(intern!(py, "start_step"), params.start_step)?;
-    dict.set_item(intern!(py, "step_count"), params.step_count)?;
     construct(py, "LatentParams", &dict)
 }
 
@@ -1046,10 +1070,6 @@ fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<B
         sampling.return_prompt_logprobs,
     )?;
     dict.set_item(intern!(py, "n_prompt_logprobs"), sampling.n_prompt_logprobs)?;
-    dict.set_item(
-        intern!(py, "logprob_token_ids"),
-        u32_tuple(py, &sampling.logprob_token_ids)?,
-    )?;
 
     let bad_words = sampling
         .bad_words_ids
@@ -1126,8 +1146,6 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
     // Tensor metadata is common to every transport family.
     let dict = PyDict::new(py);
     let source = PyDict::new(py);
-    source.set_item("worker_id", &locator.source.worker_id)?;
-    source.set_item("rank", locator.source.rank)?;
     source.set_item("node", &locator.source.node)?;
     source.set_item("address_space", &locator.source.address_space)?;
     source.set_item("incarnation", &locator.source.incarnation)?;
@@ -1245,13 +1263,13 @@ fn transfer_handle_to_py<'py>(
             height,
             width,
             latent_units,
-            step,
+            step_index,
             tensor,
         } => {
             value.set_item(intern!(py, "height"), height)?;
             value.set_item(intern!(py, "width"), width)?;
             value.set_item(intern!(py, "latent_units"), latent_units)?;
-            value.set_item(intern!(py, "step"), step)?;
+            value.set_item(intern!(py, "step_index"), step_index)?;
             value.set_item(intern!(py, "tensor"), tensor_transfer_to_py(py, tensor)?)?;
             "LatentTransferValue"
         }
@@ -1511,19 +1529,17 @@ fn token_logprobs_from_py(value: &Bound<'_, PyAny>) -> Option<Vec<TokenLogprob>>
 }
 
 /// Decodes one completion with its accepted progress and output fields.
-fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> {
+fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<CallOutput> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
     // The status is a closed string enum; an unknown spelling rejects the
     // record.
     let status = str_field(dict, intern!(py, "status"))?;
-    let status = match status.to_str().ok()? {
-        "ok" => CallStatus::Ok,
-        "predicated" => CallStatus::Predicated,
-        "error" => CallStatus::Error,
-        _ => return None,
-    };
+    let status = status.to_str().ok()?;
+    let status = CallStatus::ALL
+        .into_iter()
+        .find(|candidate| candidate.as_str() == status)?;
     let error_code = match get(dict, intern!(py, "error_code"))? {
         value if value.is_none() => None,
         value => Some(error_code_of(&value)?),
@@ -1567,7 +1583,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
             bytes: u64_of(&get(output, intern!(py, "bytes"))?)?,
         })
     };
-    Some(RequestOutput {
+    Some(CallOutput {
         sampled_logprob: {
             let value = get(dict, intern!(py, "sampled_logprob"))?;
             if value.is_none() {
@@ -1598,7 +1614,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
         timing_counters,
         kv_visible_len: u32_of(&get(dict, intern!(py, "kv_visible_len"))?)?,
         kv_computed_len: u32_of(&get(dict, intern!(py, "kv_computed_len"))?)?,
-        num_completed_steps: u32_of(&get(dict, intern!(py, "num_completed_steps"))?)?,
+        step_index: u32_of(&get(dict, intern!(py, "step_index"))?)?,
         committed_tokens: u32_vec(&get(dict, intern!(py, "committed_tokens"))?)?,
         finish_flags,
         media_output,
@@ -1639,7 +1655,7 @@ fn tensor_publication_from_py(value: &Bound<'_, PyAny>) -> Option<TensorPublicat
             height: u32_of(&get(payload, intern!(py, "height"))?)?,
             width: u32_of(&get(payload, intern!(py, "width"))?)?,
             latent_units: u32_of(&get(payload, intern!(py, "latent_units"))?)?,
-            step: u32_of(&get(payload, intern!(py, "step"))?)?,
+            step_index: u32_of(&get(payload, intern!(py, "step_index"))?)?,
             tensor: tensor_transfer_from_py(&get(payload, intern!(py, "tensor"))?)?,
         },
         _ => return None,
@@ -1695,8 +1711,6 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
     let source = source_value.cast::<PyDict>().ok()?;
     Some(Locator {
         source: WorkerEndpoint {
-            worker_id: string_of(&get(source, intern!(py, "worker_id"))?)?,
-            rank: u32_of(&get(source, intern!(py, "rank"))?)?,
             node: string_of(&get(source, intern!(py, "node"))?)?,
             address_space: string_of(&get(source, intern!(py, "address_space"))?)?,
             incarnation: string_of(&get(source, intern!(py, "incarnation"))?)?,
@@ -1728,16 +1742,10 @@ fn tensor_ref_from_py(value: &Bound<'_, PyAny>) -> Option<TensorRef> {
     let dict = value.cast::<PyDict>().ok()?;
 
     let dtype = str_field(dict, intern!(py, "dtype"))?;
-    let dtype = match dtype.to_str().ok()? {
-        "u8" => DType::U8,
-        "i32" => DType::I32,
-        "i64" => DType::I64,
-        "f16" => DType::F16,
-        "bf16" => DType::BF16,
-        "f32" => DType::F32,
-        "i16" => DType::I16,
-        _ => return None,
-    };
+    let dtype = dtype.to_str().ok()?;
+    let dtype = DType::ALL
+        .into_iter()
+        .find(|candidate| candidate.as_str() == dtype)?;
 
     // Each dimension is `{"kind": "static", "value": extent}` or
     // `{"kind": "device", "value": {"max": bound}}`.
@@ -2075,7 +2083,7 @@ fn kv_group_transfer_to_py<'py>(
 /// Decodes the KV publication a completion reports in `kv_output`.
 ///
 /// Each tensor is checked by `tensor_transfer_from_py`. `KvTransfer::validate`
-/// runs later, through `RequestOutput::validate`, when the result is
+/// runs later, through `CallOutput::validate`, when the result is
 /// published.
 fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer> {
     let py = value.py();
@@ -2291,7 +2299,14 @@ mod tests {
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
-            latent_output: None,
+            latent_output: Some(TensorRef {
+                request_key: media_key,
+                producer_call_id: CallId::new(12, 0),
+                output_index: 0,
+                generation: 6,
+                dtype: DType::F32,
+                shape_bound: ShapeBound::default(),
+            }),
             image_input: None,
             image_output: None,
             completion_output: None,
@@ -2323,8 +2338,6 @@ mod tests {
             latent_units: 64,
             height: 768,
             width: 1344,
-            start_step: 0,
-            step_count: 0,
         }];
         let kv_key = RequestKey::new(1, RequestId(4), 1);
         let kv_source = BufferId {
@@ -2434,13 +2447,13 @@ mod tests {
     ///
     /// It holds a decode completion with sampled, top, and prompt logprobs,
     /// and a KV-publish completion whose publication is owned by that
-    /// completion's own request and call, as `RequestOutput::validate`
+    /// completion's own request and call, as `CallOutput::validate`
     /// requires.
     fn result_response() -> WorkerResponse {
         let request_key = RequestKey::new(1, RequestId(2), 1);
         let mut response = WorkerResponse::result(BatchOutput {
             batch_id: 13,
-            completions: vec![RequestOutput {
+            completions: vec![CallOutput {
                 sampled_logprob: Some(-0.25),
                 top_logprobs: vec![TokenLogprob {
                     token_id: 42,
@@ -2459,7 +2472,7 @@ mod tests {
                 error_message: None,
                 timing_counters: TimingCounters::default(),
                 kv_visible_len: 2,
-                num_completed_steps: 0,
+                step_index: 0,
                 kv_computed_len: 2,
                 committed_tokens: vec![42],
                 candidate_logprobs: Vec::new(),
@@ -2823,11 +2836,9 @@ mod tests {
                                     "latent_params.0.latent_units",
                                     "latent_params.0.height",
                                     "latent_params.0.width",
-                                    "latent_params.0.start_step",
-                                    "latent_params.0.step_count",
                                 ],
                             ),
-                            [12, 1, 64, 768, 1344, 0, 0]
+                            [12, 1, 64, 768, 1344]
                         );
                         server
                             .respond(py, &acknowledgement(py, batch.batch_id))

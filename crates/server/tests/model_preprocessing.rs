@@ -70,6 +70,12 @@ fn base_denoiser() -> VideoDenoiserInfo {
         audio_shift: 3.0,
         frame_rate: 24,
         audio_sample_rate: 32_000,
+        frames: uniserve_engine::FrameChunks {
+            min_frames: 22,
+            chunk_frames: 17,
+            chunk_latent_frames: 5,
+            tail_latent_frames: 2,
+        },
         canvases: [
             ("21:9", 1536, 672),
             ("16:9", 1344, 768),
@@ -274,6 +280,7 @@ fn runtime_limits() -> GenerationLimits {
         latent_downsample: 16,
         max_vae_grid_tokens: 1_000_000,
         max_vit_grid_tokens: 1_000_000,
+        latent_bytes_per_unit: u64::MAX.div_ceil(1_000_000),
         max_latent_feature_bytes: u64::MAX,
         max_vision_feature_bytes: u64::MAX,
         commit_marker_tokens: 2,
@@ -739,6 +746,12 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         audio_shift: 3.0,
         frame_rate: 24,
         audio_sample_rate: 32_000,
+        frames: uniserve_engine::FrameChunks {
+            min_frames: 22,
+            chunk_frames: 17,
+            chunk_latent_frames: 5,
+            tail_latent_frames: 2,
+        },
         canvases: vec![
             served(768, "16:9", 1344, 768),
             served(480, "21:9", 992, 416),

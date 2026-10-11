@@ -20,14 +20,14 @@
 //! locally or through the host launchers in `launcher`, before any group
 //! waits for its ranks' endpoint reports and startup capabilities.
 
-use crate::executor::{CallResult, WorkerResult};
+use crate::executor::{CallResult, RankBuffer, WorkerResult};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::registration::RankRegistry;
-use super::{BatchSubmitError, PendingRank, RankProcess};
+use super::{BatchSubmitError, IncarnationRegistry, PendingRank, RankProcess};
 use crate::executor::{WorkerExecError, WorkerFailure};
 use anyhow::Context;
 use uniserve_worker_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
@@ -248,6 +248,10 @@ pub struct WorkerGroup {
     /// Which component serves each media call across every worker of the
     /// deployment; the executor states it once all workers have reported.
     media_routing: BTreeMap<uniserve_worker_ipc::MediaCall, String>,
+    /// The worker and rank each live rank incarnation of the deployment
+    /// serves. The group registers its own ranks and retires them when it
+    /// loses them; the executor makes it the deployment's one table.
+    incarnations: IncarnationRegistry,
     /// Requests that may hold state on the ranks: added by a submitted call
     /// or `Start` command, removed when a batch carrying their `Finish`
     /// command is joined as done. Recovery reports them as lost.
@@ -502,11 +506,10 @@ impl WorkerGroup {
 
     /// Checks that the ranks' startup reports describe one group and builds it.
     ///
-    /// Every rank must agree with rank 0 apart from rank-specific fields.
-    /// The muxer must run on
-    /// the head's host, and the ranks' KV regions must cover every layer's KV
-    /// heads without a gap. Once all checks pass, no rank's startup may be
-    /// cancelled and every rank this process started must still be running.
+    /// The group takes rank 0's report. The muxer must run on the head's host,
+    /// and the ranks' KV regions must cover every layer's KV heads without a
+    /// gap. Once all checks pass, no rank's startup may be cancelled and every
+    /// rank this process started must still be running.
     fn from_ranks(
         process_args: WorkerProcessArgs,
         mut workers: Vec<RankProcess>,
@@ -515,46 +518,25 @@ impl WorkerGroup {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
 
-        // `info` starts as rank 0's report and becomes the group's; `canonical`
-        // is the reference every rank is compared with.
+        // Rank 0's report becomes the group's. The ranks derive every shared
+        // capacity collectively before they report, so the reports differ
+        // only in the fields reconciled below.
         let mut info = workers[0].info().clone();
-        let mut canonical = info.clone();
 
         // A rank's product storage follows the components it holds, which an
-        // asymmetric placement makes rank-specific: a rank that imports a
-        // component's product reserves the whole logical allocation for it,
-        // and a rank that neither produces nor consumes it reserves nothing.
-        // The group reports the smallest, because the engine places work
-        // against one pool per group and must not place more than the
-        // smallest rank can hold.
-        let product_storage = workers
+        // asymmetric placement makes rank-specific: a rank that executes or
+        // reads a component reserves the whole allocation of its products,
+        // and a rank that does neither reserves nothing. The executor
+        // places media buffers rank by rank from each rank's own report
+        // (`ExecutorInfo::rank_buffer_bytes`). The runtime's shared pool is
+        // one layout every rank holds, so the group reports the smallest
+        // nonzero pool, which no rank that holds products falls short of.
+        info.buffer_pool_bytes = workers
             .iter()
             .map(|worker| worker.info().buffer_pool_bytes)
+            .filter(|bytes| *bytes > 0)
             .min()
-            .unwrap_or(info.buffer_pool_bytes);
-        info.buffer_pool_bytes = product_storage;
-        canonical.buffer_pool_bytes = product_storage;
-
-        for (rank, worker) in workers.iter().enumerate() {
-            let mut normalized = worker.info().clone();
-            // Rank-specific fields take the reference's values before the
-            // comparison: the endpoint, product storage, and each KV group's
-            // layers and head offset.
-            normalized.endpoint = canonical.endpoint.clone();
-            normalized.buffer_pool_bytes = canonical.buffer_pool_bytes;
-            if let (Some(local), Some(reference)) = (&mut normalized.kv_cache, &canonical.kv_cache)
-                && local.groups.len() == reference.groups.len()
-            {
-                for (group, canonical) in local.groups.iter_mut().zip(&reference.groups) {
-                    group.layer_ids.clone_from(&canonical.layer_ids);
-                    group.kv_head_offset = canonical.kv_head_offset;
-                }
-            }
-            anyhow::ensure!(
-                normalized == canonical,
-                "physical rank {rank} worker info disagree with rank 0"
-            );
-        }
+            .unwrap_or(0);
 
         refuse_shared_storage_off_head(
             &process_args.host,
@@ -625,6 +607,11 @@ impl WorkerGroup {
 
         let depth = process_args.queue_depth.max(1);
         let buffers = (0..n).map(|_| VecDeque::new()).collect();
+        let incarnations = IncarnationRegistry::default();
+        incarnations.assign(
+            &crate::WorkerId(process_args.worker_id.clone()),
+            workers.iter().map(|worker| &worker.info().endpoint),
+        );
         Ok(Self {
             launchers,
             workers,
@@ -634,6 +621,7 @@ impl WorkerGroup {
             last_progress: Instant::now(),
             pending_batches: BTreeMap::new(),
             media_routing: info.media_components.clone(),
+            incarnations,
             info,
             process_args,
             resident_requests: HashSet::new(),
@@ -774,6 +762,10 @@ impl WorkerGroup {
             worker.terminate();
         }
         self.workers.clear();
+        // The lost incarnations stop resolving at once, so a publication they
+        // made is never bound as an input while the group is relaunched.
+        self.incarnations
+            .assign(&crate::WorkerId(self.process_args.worker_id.clone()), []);
         self.clear_execution();
 
         let recovery = (|| -> anyhow::Result<()> {
@@ -834,6 +826,10 @@ impl WorkerGroup {
         // match its predecessor apart from the endpoint, so the group's agreed
         // info keeps everything but rank 0's new endpoint.
         self.info.endpoint = workers[0].info().endpoint.clone();
+        self.incarnations.assign(
+            &crate::WorkerId(self.process_args.worker_id.clone()),
+            workers.iter().map(|worker| &worker.info().endpoint),
+        );
         self.workers = workers;
         self.last_progress = Instant::now();
         let ranks = self.process_args.ranks.len();
@@ -1297,6 +1293,16 @@ impl WorkerGroup {
         (&self.process_args.ranks, &self.process_args.components)
     }
 
+    /// Joins this group's ranks to the deployment's registry of live rank
+    /// incarnations, which every group of the deployment then shares.
+    pub(crate) fn share_incarnations(&mut self, incarnations: IncarnationRegistry) {
+        incarnations.assign(
+            &crate::WorkerId(self.process_args.worker_id.clone()),
+            self.workers.iter().map(|worker| &worker.info().endpoint),
+        );
+        self.incarnations = incarnations;
+    }
+
     /// States the deployment-wide media routing once every worker reported.
     pub fn set_media_routing(&mut self, routing: BTreeMap<uniserve_worker_ipc::MediaCall, String>) {
         self.media_routing = routing;
@@ -1306,12 +1312,20 @@ impl WorkerGroup {
 /// Restrict a physical invocation to each component's actual members. Request and
 /// storage commands retain group-wide visibility, including on otherwise idle
 /// ranks; they do not create synthetic call completions.
+///
+/// `placed` holds the persistent spans of each rank's own buffer pool; a
+/// rank's projection keeps those of the buffers its calls read and write.
 fn rank_projection(
     batch: &Batch,
     components: &BTreeMap<String, crate::ComponentConfig>,
     rank_count: usize,
+    placed: &[RankBuffer],
     consumer_slots: impl Fn(&uniserve_worker_ipc::Call, &[usize], usize) -> Vec<u32>,
 ) -> anyhow::Result<Vec<(usize, Batch)>> {
+    anyhow::ensure!(
+        batch.buffer_allocations.is_empty(),
+        "a group batch carries no buffer spans; each rank's spans arrive beside it"
+    );
     let members = batch
         .calls
         .iter()
@@ -1428,9 +1442,11 @@ fn rank_projection(
             )
             .map(|product| product.buffer_id())
             .collect::<HashSet<_>>();
-        projection
-            .buffer_allocations
-            .retain(|allocation| buffers.contains(&allocation.buffer));
+        projection.buffer_allocations = placed
+            .iter()
+            .filter(|span| span.rank as usize == rank && buffers.contains(&span.allocation.buffer))
+            .map(|span| span.allocation)
+            .collect();
         if projection.calls.is_empty() && projection.commands.is_empty() {
             continue;
         }
@@ -1691,7 +1707,7 @@ fn merge_completion_record(
             && canonical.output.status == rank_completion.output.status
             && canonical.output.kv_visible_len == rank_completion.output.kv_visible_len
             && canonical.output.kv_computed_len == rank_completion.output.kv_computed_len
-            && canonical.output.num_completed_steps == rank_completion.output.num_completed_steps
+            && canonical.output.step_index == rank_completion.output.step_index
             && canonical.output.finish_flags == rank_completion.output.finish_flags,
         "completion result fields diverged"
     );
@@ -1828,10 +1844,15 @@ impl WorkerGroup {
     /// `readers` names, for the batch's routed media calls, the worker each
     /// consuming component was routed to; each call's products then name
     /// only those workers' reading ranks (see `media_consumer_slots`).
+    ///
+    /// `buffers` places the batch's persistent buffers in each rank's own
+    /// pool; a rank receives the spans of the buffers its calls read and
+    /// write. The batch itself carries no spans.
     pub fn submit_batch(
         &mut self,
         batch: Batch,
         readers: &CallReaders,
+        buffers: &[RankBuffer],
     ) -> Result<(), BatchSubmitError> {
         if self.closed {
             return Err(BatchSubmitError::Failed(anyhow::anyhow!(
@@ -1856,6 +1877,7 @@ impl WorkerGroup {
             &batch,
             &self.process_args.components,
             self.workers.len(),
+            buffers,
             |call, members, rank| {
                 let routed = readers.get(&(call.request_key, call.call_id));
                 self.consumer_slots(call, routed, members, rank)
@@ -1866,6 +1888,7 @@ impl WorkerGroup {
                 .into_iter()
                 .map(|(rank, mut batch)| {
                     self.process_args.transfer.bind_inputs(
+                        &self.incarnations,
                         &mut batch.input_products,
                         &mut batch.kv_inputs,
                         &self.workers[rank].info().endpoint,

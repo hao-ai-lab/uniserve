@@ -488,7 +488,7 @@ def _serve_unusable_cuda_handle(channel) -> None:
     # A handle of the right length that names no allocation: the consumer
     # imports from the publication, so this is what an unusable handle is.
     locator = Locator(
-        source=WorkerEndpoint.local("publisher"),
+        source=WorkerEndpoint.local(),
         transport=CudaVmmTransfer(
             endpoint=f"uniserve-test-read-{uuid.uuid4().hex}",
             publication_id=uuid.uuid4().hex,
@@ -1032,7 +1032,7 @@ def test_read_refuses_a_publication_addressed_elsewhere(
     """
     device = torch.device("cuda:0")
     events = EventPool()
-    endpoint = WorkerEndpoint.local("encoder-0", rank=2)
+    endpoint = WorkerEndpoint.local()
     transport = make_transport(
         backend,
         byte_capacity=16384,
@@ -1074,14 +1074,14 @@ def test_local_delivery_between_workers_retains_the_publisher_until_consumption(
         byte_capacity=128,
         ticket_capacity=1,
         event_pool=producer_events,
-        source=WorkerEndpoint.local("encoder"),
+        source=WorkerEndpoint.local(),
     )
     consumer = make_transport(
         "local",
         byte_capacity=128,
         ticket_capacity=1,
         event_pool=consumer_events,
-        source=WorkerEndpoint.local("denoiser"),
+        source=WorkerEndpoint.local(),
     )
     source = torch.arange(32, dtype=torch.float32, device=device)
     locator = producer.publish(source)

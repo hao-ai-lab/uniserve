@@ -15,10 +15,12 @@ from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import media_builder, video_denoiser
 from uniserve_worker.bootstrap.report import (
     build_worker_layout,
+    frame_chunks,
     video_denoiser_info,
 )
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.protocol.call import MediaCall
+from uniserve_worker.protocol.worker_info import FrameChunks
 
 pytestmark = pytest.mark.unit
 
@@ -73,10 +75,20 @@ def test_the_placed_denoiser_receives_the_video_calls(base, placed):
 
 
 def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
+    denoiser = video_denoiser(base, _config("transformer"))
     info = video_denoiser_info(
-        video_denoiser(base, _config("transformer")),
+        denoiser,
         frame_rate=base.video_postprocessor.frame_rate,
         audio_sample_rate=base.audio_decoder.sample_rate,
+        frames=frame_chunks(denoiser, base.video_encoder),
+    )
+    # A video is `17n + 5` frames of `n + 1` encoder windows: five latent
+    # frames per chunk and two in the final window.
+    assert info.frames == FrameChunks(
+        min_frames=22,
+        chunk_frames=17,
+        chunk_latent_frames=5,
+        tail_latent_frames=2,
     )
     # The worker executes both tasks of the t2va/fl2va DiT on the released
     # schedule: 50 sigma points, video shift 12, audio shift 3, the canvas
@@ -91,10 +103,12 @@ def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
     # The reference DiT serves ref2va alone, with the references the
     # checkpoint documents: nine images, three videos and three audio tracks,
     # twelve in all.
+    reference_denoiser = video_denoiser(base, _config("transformer_ref"))
     reference = video_denoiser_info(
-        video_denoiser(base, _config("transformer_ref")),
+        reference_denoiser,
         frame_rate=base.video_postprocessor.frame_rate,
         audio_sample_rate=base.audio_decoder.sample_rate,
+        frames=frame_chunks(reference_denoiser, base.video_encoder),
     )
     assert reference.tasks == ("ref2va",)
     assert reference.references == ReferenceLimits(
@@ -113,10 +127,12 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
         model = Model(fasth3_config())
     # One candidate needs no deployment to name it.
     denoiser = video_denoiser(model, cpu_worker_config(device="cpu"))
+    frames = frame_chunks(denoiser, model.video_encoder)
     info = video_denoiser_info(
         denoiser,
         frame_rate=model.video_postprocessor.frame_rate,
         audio_sample_rate=model.audio_decoder.sample_rate,
+        frames=frames,
     )
     assert info.tasks == ("t2va",)
     assert info.schedule_points == 5
@@ -131,6 +147,7 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
         denoiser,
         frame_rate=model.video_postprocessor.frame_rate,
         audio_sample_rate=model.audio_decoder.sample_rate,
+        frames=frames,
         canvases=tuple(chosen.values()),
     )
     assert _declared(declared) == _trained(chosen)

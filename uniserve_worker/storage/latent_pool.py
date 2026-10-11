@@ -60,11 +60,11 @@ class LatentUpdate:
             means the call changes no trajectory, and the pool skips it.
         expected_generation: Generation of the committed trajectory a
             publication advances; zero initializes an empty slot.
-        expected_step: Committed step a publication advances.
+        expected_step_index: Committed step a publication advances.
         generation: The successor's generation for a publication, or the
             committed generation being released for a release.
-        step: The successor's step for a publication, or the committed step
-            being released for a release.
+        step_index: The successor's step index for a publication, or the
+            committed step index being released for a release.
         release: Release the slot's committed trajectory and pages instead of
             publishing a successor.
     """
@@ -72,9 +72,9 @@ class LatentUpdate:
     request_pool_idx: int
     params: LatentParams | None = None
     expected_generation: int = 0
-    expected_step: int = 0
+    expected_step_index: int = 0
     generation: int = 0
-    step: int = 0
+    step_index: int = 0
     release: bool = False
 
 
@@ -471,6 +471,16 @@ class LatentPool:
             -1, self.latent_width
         )
 
+    def committed_step_index(self, request_pool_idx: int) -> int:
+        """Return the solver step of the slot's committed trajectory.
+
+        The pool is the worker's ledger of completed steps: a publication
+        advances it at its batch commit and an adopted import sets it, so a
+        call reads the step it advances here. An empty slot is at step zero.
+        """
+        slot = self._validate_slot(int(request_pool_idx))
+        return int(self._steps[slot].item())
+
     def initial_bank(
         self,
         request_pool_idx: int,
@@ -498,7 +508,7 @@ class LatentPool:
         request_pool_idx: int,
         page_table: Sequence[int],
         *,
-        step: int,
+        step_index: int,
         generation: int,
         latent_units: int,
         height: int,
@@ -516,7 +526,7 @@ class LatentPool:
         pages = self._validate_page_table(page_table, int(latent_units))
         self._require_current(
             slot,
-            step=int(step),
+            step_index=int(step_index),
             generation=int(generation),
             latent_units=int(latent_units),
             height=int(height),
@@ -534,7 +544,7 @@ class LatentPool:
         request_pool_idx: int,
         staging: LatentStaging,
         *,
-        step: int,
+        step_index: int,
         generation: int,
         latent_units: int,
         height: int,
@@ -551,7 +561,7 @@ class LatentPool:
         pages = self._validate_staging(staging, int(latent_units))
         self._require_current(
             slot,
-            step=int(step),
+            step_index=int(step_index),
             generation=int(generation),
             latent_units=int(latent_units),
             height=int(height),
@@ -576,7 +586,7 @@ class LatentPool:
         request_pool_idx: int,
         staging: LatentStaging,
         *,
-        expected_step: int,
+        expected_step_index: int,
         expected_generation: int,
         latent_units: int,
         height: int,
@@ -593,7 +603,7 @@ class LatentPool:
         pages = self._validate_staging(staging, int(latent_units))
         self._require_current(
             slot,
-            step=int(expected_step),
+            step_index=int(expected_step_index),
             generation=int(expected_generation),
             latent_units=int(latent_units),
             height=int(height),
@@ -641,7 +651,7 @@ class LatentPool:
         request_pool_idx: int,
         page_table: Sequence[int],
         generation: int,
-        step: int,
+        step_index: int,
         latent_units: int,
         height: int,
         width: int,
@@ -663,7 +673,7 @@ class LatentPool:
         self._require_current(
             slot,
             generation=generation,
-            step=step,
+            step_index=step_index,
             latent_units=latent_units,
             height=height,
             width=width,
@@ -850,7 +860,7 @@ class LatentPool:
             )
             self._validate_metadata(
                 generation=int(publication.generation),
-                step=int(publication.step),
+                step_index=int(publication.step_index),
                 latent_units=int(params.latent_units),
                 height=int(params.height),
                 width=int(params.width),
@@ -864,8 +874,8 @@ class LatentPool:
             expected = int(publication.expected_generation)
             if expected == 0:
                 if (
-                    int(publication.expected_step) != 0
-                    or int(publication.step) != 0
+                    int(publication.expected_step_index) != 0
+                    or int(publication.step_index) != 0
                 ):
                     raise invalid_descriptor(
                         "latent initialization must publish step zero"
@@ -875,7 +885,7 @@ class LatentPool:
             else:
                 self._require_current(
                     slot,
-                    step=int(publication.expected_step),
+                    step_index=int(publication.expected_step_index),
                     generation=expected,
                     latent_units=int(params.latent_units),
                     height=int(params.height),
@@ -883,7 +893,9 @@ class LatentPool:
                 )
                 self._require_slot_pages(slot, pages)
                 self._require_page_owners(pages, slot)
-                if int(publication.step) <= int(publication.expected_step):
+                if int(publication.step_index) <= int(
+                    publication.expected_step_index
+                ):
                     raise invalid_descriptor(
                         "latent successor does not advance its step"
                     )
@@ -906,7 +918,7 @@ class LatentPool:
             )
             self._require_current(
                 slot,
-                step=int(release.step),
+                step_index=int(release.step_index),
                 generation=int(release.generation),
                 latent_units=int(params.latent_units),
                 height=int(params.height),
@@ -949,7 +961,7 @@ class LatentPool:
             # The successor was written to the inactive bank; flip it active.
             bank = 1 - int(self._active[slot].item())
             self._active[slot] = bank
-            self._steps[slot] = int(publication.step)
+            self._steps[slot] = int(publication.step_index)
             self._generations[slot] = int(publication.generation)
             self._units[slot] = int(params.latent_units)
             self._heights[slot] = int(params.height)
@@ -1023,7 +1035,7 @@ class LatentPool:
         write: LatentImport,
         *,
         generation: int,
-        step: int,
+        step_index: int,
         height: int,
         width: int,
     ) -> None:
@@ -1047,7 +1059,7 @@ class LatentPool:
         units = sum(int(span.shape[0]) for span in write.spans)
         self._validate_metadata(
             generation=generation,
-            step=step,
+            step_index=step_index,
             latent_units=units,
             height=height,
             width=width,
@@ -1062,7 +1074,7 @@ class LatentPool:
         slot = write.request_pool_idx
         self._slot_pages[slot] = write.page_table
         self._active[slot] = 0
-        self._steps[slot] = step
+        self._steps[slot] = step_index
         self._generations[slot] = generation
         self._units[slot] = units
         self._heights[slot] = height
@@ -1316,7 +1328,7 @@ class LatentPool:
         self,
         slot: int,
         *,
-        step: int,
+        step_index: int,
         generation: int,
         latent_units: int,
         height: int,
@@ -1335,7 +1347,7 @@ class LatentPool:
             int(self._widths[slot].item()),
         )
         expected = (
-            int(step),
+            int(step_index),
             int(generation),
             int(latent_units),
             int(height),
@@ -1371,7 +1383,7 @@ class LatentPool:
         self,
         *,
         generation: int,
-        step: int,
+        step_index: int,
         latent_units: int,
         height: int,
         width: int,
@@ -1379,7 +1391,7 @@ class LatentPool:
         """Validate generation, step, unit count, and raster dimensions."""
         if (
             min(int(generation), int(latent_units), int(height), int(width)) < 1
-            or int(step) < 0
+            or int(step_index) < 0
         ):
             raise invalid_descriptor("latent publication metadata is invalid")
         if int(latent_units) > self.capacity_units:

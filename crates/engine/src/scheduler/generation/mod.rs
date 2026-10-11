@@ -18,23 +18,20 @@
 //! Token semantics (stop conditions, image-branch triggers, public events)
 //! are resolved afterwards in `output`.
 
-use super::{EncoderCachePin, FlowPrefixState, Phase, RequestAllocations, TerminalIntent};
+use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, TerminalIntent};
 use crate::kv::{BlockTable, KvAllocation};
 
-use std::collections::HashSet;
 use uniserve_worker_ipc::{
-    CallCoordinates, DEFAULT_COMPONENT, ForwardMode, LatentParams, MediaCall, TransferMode,
+    CallCoordinates, DEFAULT_COMPONENT, ForwardMode, MediaCall, TransferMode,
 };
 
 use uniserve_core::{
     CanvasSampling, GenerationRequest, ImageEncoderInput, ImageInput, RequestId, SamplingParams,
 };
 use uniserve_worker_ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, Readout,
-    RequestKey, RequestOutput, SamplingState, ShapeBound, TensorRef, VisionInput,
+    Bounds, BufferId, Call, CallId, CallKind, CallOutput, CallStatus, CanvasStep, DType, DimBound,
+    Readout, RequestKey, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
-
-use crate::scheduler::image_artifact::png_artifact_dims_b64;
 
 /// Builds an unstamped product reference for a planned call output.
 ///
@@ -82,7 +79,7 @@ fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, Plannin
 /// The raw size counts three bytes per pixel plus one byte per row. The bound
 /// doubles it, adds 1 MiB, and applies base64's expansion of three bytes to
 /// four characters. It reaches the worker as part of `max_completion_bytes`,
-/// and `validate_generation_result` rejects a larger artifact.
+/// and the worker's encoder refuses a larger artifact.
 fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
     let raw = u64::from(height)
         .checked_mul(u64::from(width).saturating_mul(3).saturating_add(1))
@@ -102,12 +99,10 @@ const RANKED_LOGPROB_BYTES: u64 = 12;
 ///
 /// Returns `None` when neither generated nor prompt logprobs are requested.
 /// Each reported row costs 4 bytes plus `RANKED_LOGPROB_BYTES` per entry; a
-/// row's entries are its own token, the requested top-k candidates
-/// (`n_logprobs` or `n_prompt_logprobs`), and the distinct ids of
-/// `logprob_token_ids`. A call reports at most one generated row and
-/// `prompt_positions` prompt rows. The worker
-/// (`uniserve_worker.execution.commit`) costs its actual payload the same way
-/// and rejects one above `max_completion_bytes`.
+/// row's entries are its own token and the requested top-k candidates
+/// (`n_logprobs` or `n_prompt_logprobs`). A call reports at most one
+/// generated row and `prompt_positions` prompt rows. The worker sizes its pinned completion
+/// storage from the sum of these bounds over a batch.
 fn logprob_result_bytes(
     sampling: &SamplingParams,
     prompt_positions: u32,
@@ -117,22 +112,14 @@ fn logprob_result_bytes(
     if !generated && !prompt {
         return Ok(None);
     }
-    let requested_ids = sampling
-        .logprob_token_ids
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>()
-        .len() as u64;
     let generated_entries = generated.then_some(
         1_u64
             .checked_add(u64::from(sampling.n_logprobs))
-            .and_then(|value| value.checked_add(requested_ids))
             .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?,
     );
     let prompt_entries = prompt.then_some(
         1_u64
             .checked_add(u64::from(sampling.n_prompt_logprobs))
-            .and_then(|value| value.checked_add(requested_ids))
             .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?,
     );
     let generated_bytes = generated_entries
@@ -180,14 +167,14 @@ pub(crate) enum GenerationPhase {
     /// Publish the visible KV range as diffusion conditioning.
     PublishKv,
     /// Prepare the initial latent of the image.
-    PrepareGen,
+    LatentPreparation,
     /// Run the image's denoising steps.
-    DenoiseGen,
+    Denoising,
     /// Decode the final latent into the image. Never stored in
     /// `RequestState::phase`: `Scheduler::next_generation_phase` projects it
     /// once every denoising step is scheduled, while the accepted phase stays
-    /// `DenoiseGen`.
-    CommitGen,
+    /// `Denoising`.
+    ImageDecoding,
     /// Encode the generated image with the next feedback encoder.
     FeedbackEncode,
     /// Write the feedback encoder's feature into KV.
@@ -275,13 +262,12 @@ impl RequestState {
     ///
     /// Returns an error, before changing any state, for a call id with batch
     /// zero, a latent call without a latent product, or a denoising result
-    /// that has no submitted interval or that `Denoising::accept` rejects. The
-    /// caller then finishes the request with an error.
+    /// that `Denoising::accept` rejects. The caller then finishes the request
+    /// with an error.
     pub(crate) fn process_generation_result(
         &mut self,
         call: &Call,
-        latent: Option<&LatentParams>,
-        record: &RequestOutput,
+        record: &CallOutput,
     ) -> Result<(), GenerationResultError> {
         if call.call_id.batch_id == 0 {
             return Err(GenerationResultError::MissingCallId);
@@ -408,7 +394,7 @@ impl RequestState {
             }
             CallKind::Transfer(TransferMode::KvPublish) => {
                 self.image_conditioning = call.kv_output;
-                self.phase = GenerationPhase::PrepareGen;
+                self.phase = GenerationPhase::LatentPreparation;
             }
             CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::Denoising) => {
@@ -417,15 +403,11 @@ impl RequestState {
                 }
                 if call.kind == CallKind::Media(MediaCall::LatentPreparation) {
                     self.denoising.open(call.latent_output.clone());
-                    self.phase = GenerationPhase::DenoiseGen;
+                    self.phase = GenerationPhase::Denoising;
                 } else {
-                    let accepted = latent.is_some_and(|interval| {
-                        self.denoising.accept(
-                            interval,
-                            record.num_completed_steps,
-                            call.latent_output.clone(),
-                        )
-                    });
+                    let accepted = self
+                        .denoising
+                        .accept(record.step_index, call.latent_output.clone());
                     if !accepted {
                         return Err(GenerationResultError::Progress {
                             detail: "denoise_step_mismatch",
@@ -1033,20 +1015,17 @@ pub(super) fn register_call(
 
 /// Validates a result against submitted inputs and immutable request limits.
 ///
-/// `image_kv` and `latent` are the inputs frozen when the call was submitted
-/// (`InflightInput::Generation`); `media` is the artifact payload delivered
-/// with the result. A predicated result is valid only when the call carried a
-/// predicate and the result reports no tokens and no products. `canvas` is
-/// the deployment's block-diffusion sampling, which bounds a canvas step's
-/// block. Returns the first violation found; the caller finishes the request
-/// with an error on any `Err`.
+/// `image_kv` is the input frozen when the call was submitted
+/// (`InflightInput::Generation`). A predicated result is valid only when the
+/// call carried a predicate and the result reports no tokens and no products.
+/// `canvas` is the deployment's block-diffusion sampling, which bounds a
+/// canvas step's block. Returns the first violation found; the caller
+/// finishes the request with an error on any `Err`.
 pub(crate) fn validate_generation_result(
     call: &Call,
     image_kv: Option<(u32, Option<u32>)>,
-    latent: Option<&LatentParams>,
     state: &RequestState,
-    record: &RequestOutput,
-    media: Option<&uniserve_core::SharedMedia>,
+    record: &CallOutput,
     canvas: Option<&CanvasSampling>,
 ) -> Result<(), GenerationResultError> {
     let request = &state.req;
@@ -1076,40 +1055,6 @@ pub(crate) fn validate_generation_result(
         return Err(GenerationResultError::Status {
             detail: "call_failed",
         });
-    }
-
-    // Denoising must end exactly at the end of its submitted interval.
-    if call.kind == CallKind::Media(MediaCall::Denoising) {
-        let interval = latent.ok_or(GenerationResultError::Progress {
-            detail: "denoise_input_step_missing",
-        })?;
-        if !super::Denoising::completes(interval, record.num_completed_steps) {
-            return Err(GenerationResultError::Progress {
-                detail: "denoise_step_mismatch",
-            });
-        }
-    }
-
-    // Read the PNG header to check the requested dimensions. The output path
-    // (`image_done_event`) decodes the full image later.
-    let image_png = media.and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
-    if call_variant == CallKind::Media(MediaCall::ImageDecoding) {
-        if media.is_some_and(|value| value.len() as u64 > call.bounds.max_completion_bytes) {
-            return Err(GenerationResultError::Product {
-                detail: "image_capacity_exceeded",
-            });
-        }
-        let actual =
-            image_png
-                .and_then(png_artifact_dims_b64)
-                .ok_or(GenerationResultError::Product {
-                    detail: "missing_image_dimensions",
-                })?;
-        if actual != (request.image.height, request.image.width) {
-            return Err(GenerationResultError::Product {
-                detail: "image_dimensions_mismatch",
-            });
-        }
     }
 
     // A readout reports one finite log-probability per declared candidate,
@@ -1434,8 +1379,6 @@ pub(crate) enum GenerationResultError {
     Identity { detail: &'static str },
     #[error("worker progress invalid: {detail}")]
     Progress { detail: &'static str },
-    #[error("worker product invalid: {detail}")]
-    Product { detail: &'static str },
     #[error("worker token result invalid: {detail}")]
     Token { detail: &'static str },
     #[error("worker logprob result invalid: {detail}")]
@@ -1458,7 +1401,7 @@ pub(crate) struct RequestState {
     /// Negative-prompt KV prefix for multi-branch guidance, allocated for the
     /// first denoising call and freed once every denoising step completes or
     /// the request finishes.
-    pub(super) flow_prefix: Option<FlowPrefixState>,
+    pub(super) guidance_prefix: Option<GuidancePrefixState>,
     /// Admission generation used to reject results from prior request lifetimes.
     pub(crate) request_epoch: u64,
     /// Most recent accepted state-producing call.

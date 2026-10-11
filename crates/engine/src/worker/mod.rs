@@ -6,7 +6,8 @@
 //! their agreeing results into `WorkerResult`s, and replaces the whole group
 //! when a rank is lost. `WorkerExecutor` (in `executor`) submits explicitly
 //! targeted work to the groups of a deployment. `process` owns one rank's
-//! process and IPC channel, `registration` the addresses ranks rendezvous and
+//! process and IPC channel, `incarnations` the worker and rank each live incarnation
+//! serves, `registration` the addresses ranks rendezvous and
 //! report their endpoints at, `launcher` the per-host launchers that start
 //! ranks placed on other hosts, and `death_watch` the Linux watcher that
 //! fires a rank channel's death wake when a rank process this engine spawned
@@ -15,12 +16,14 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod death_watch;
 mod executor;
+mod incarnations;
 mod instance;
 mod launcher;
 mod process;
 mod registration;
 
 pub use executor::WorkerExecutor;
+pub(crate) use incarnations::IncarnationRegistry;
 pub use instance::{CallReaders, WorkerGroup};
 pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig};
 use process::{PendingRank, RankProcess};

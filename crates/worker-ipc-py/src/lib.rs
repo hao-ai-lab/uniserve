@@ -532,6 +532,51 @@ fn service_name(id: &str) -> String {
     uniserve_worker_ipc::service_name(id)
 }
 
+#[pyfunction]
+/// Returns the spelling of every call kind in the schema's order, the order
+/// of a worker report's supported calls.
+fn call_kinds() -> Vec<&'static str> {
+    uniserve_worker_ipc::CallKind::ALL
+        .into_iter()
+        .map(uniserve_worker_ipc::CallKind::as_str)
+        .collect()
+}
+
+#[pyfunction]
+/// Returns the spelling of every call kind whose successful completion
+/// advances its request's state.
+fn state_advancing_calls() -> Vec<&'static str> {
+    uniserve_worker_ipc::CallKind::ALL
+        .into_iter()
+        .filter(|kind| kind.advances_state())
+        .map(uniserve_worker_ipc::CallKind::as_str)
+        .collect()
+}
+
+#[pyfunction]
+/// Returns the bytes one request slot's lane holds of a call's relayed
+/// scalar outputs, from which a worker sizes its relay arenas.
+fn relay_row_bytes() -> u64 {
+    uniserve_worker_ipc::Call::relay_row_bytes()
+}
+
+#[pyfunction]
+/// Returns each `(producer, reader)` pair of media calls whose products travel
+/// through persistent tensor storage: a reader's inputs the producer declares,
+/// excluding the readers of resident denoiser state.
+fn product_edges() -> Vec<(&'static str, &'static str)> {
+    uniserve_worker_ipc::MediaCall::ALL
+        .into_iter()
+        .flat_map(|producer| {
+            producer
+                .readers()
+                .iter()
+                .filter(|reader| !reader.reads_resident_state())
+                .map(move |reader| (producer.as_str(), reader.as_str()))
+        })
+        .collect()
+}
+
 /// Resolves one aligned 32-bit word inside a writable buffer.
 ///
 /// A shared-storage segment's header words are read and written by different
@@ -587,7 +632,12 @@ fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServer>()?;
     m.add_class::<PyStreamSignal>()?;
     m.add_class::<PyErrorCode>()?;
+    m.add("SOCKET_CHANNEL", uniserve_worker_ipc::SOCKET_CHANNEL)?;
     m.add_function(wrap_pyfunction!(service_name, m)?)?;
+    m.add_function(wrap_pyfunction!(call_kinds, m)?)?;
+    m.add_function(wrap_pyfunction!(state_advancing_calls, m)?)?;
+    m.add_function(wrap_pyfunction!(product_edges, m)?)?;
+    m.add_function(wrap_pyfunction!(relay_row_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_store_u32, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_load_u32, m)?)?;
     Ok(())

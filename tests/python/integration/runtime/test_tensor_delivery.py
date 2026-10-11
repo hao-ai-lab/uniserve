@@ -58,9 +58,7 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
     backend: str, device: str, shard_axis: int
 ) -> None:
     events = [EventPool() for _ in range(3)]
-    endpoints = [
-        WorkerEndpoint.local("encoder", rank=rank) for rank in range(2)
-    ]
+    endpoints = [WorkerEndpoint.local() for rank in range(2)]
     producers = [
         make_transport(
             backend,
@@ -76,7 +74,7 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
         byte_capacity=16384,
         ticket_capacity=4,
         event_pool=events[2],
-        source=WorkerEndpoint.local("denoiser"),
+        source=WorkerEndpoint.local(),
     )
     expected = torch.arange(48, dtype=torch.float32, device=device).reshape(
         6, 8
@@ -232,14 +230,14 @@ def test_explicit_replica_binding_can_use_an_independent_live_publication() -> (
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
-        source=WorkerEndpoint.local("encoder", rank=0),
+        source=WorkerEndpoint.local(),
     )
     second = make_transport(
         "posix_shm",
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
-        source=WorkerEndpoint.local("encoder", rank=1),
+        source=WorkerEndpoint.local(),
     )
     expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     unavailable, available = first.publish(expected), second.publish(expected)
@@ -331,7 +329,7 @@ def _receive_non_peer_cuda_product(channel, destination_device: str) -> None:
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
-        source=WorkerEndpoint.local("consumer"),
+        source=WorkerEndpoint.local(),
     )
     try:
         tensor = channel.recv()
@@ -358,7 +356,7 @@ def _receive_cuda_products(channel, count: int) -> None:
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
-        source=WorkerEndpoint.local("consumer"),
+        source=WorkerEndpoint.local(),
     )
     try:
         for _ in range(count):
@@ -399,7 +397,7 @@ def test_cuda_vmm_rereads_rewritten_storage_with_its_current_values() -> None:
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
-        source=WorkerEndpoint.local("producer"),
+        source=WorkerEndpoint.local(),
     )
     storage = empty((6, 8), dtype=torch.float32, device=torch.device("cuda:0"))
     process = context.Process(target=_receive_cuda_products, args=(child, 2))
@@ -450,7 +448,7 @@ def test_cuda_vmm_stages_between_devices_without_peer_access() -> None:
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
-        source=WorkerEndpoint.local("producer"),
+        source=WorkerEndpoint.local(),
     )
     expected = torch.arange(
         48, dtype=torch.float32, device=f"cuda:{source_device}"
@@ -762,7 +760,7 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
         byte_capacity=4096,
         ticket_capacity=4,
         event_pool=events,
-        source=WorkerEndpoint.local("denoiser", rank=1),
+        source=WorkerEndpoint.local(),
     )
     expected = torch.arange(48, dtype=torch.float32, device=device).reshape(
         6, 8

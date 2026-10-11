@@ -1,34 +1,29 @@
-"""Scheduler-to-worker execution records and their validation.
+"""Scheduler-to-worker execution records.
 
 A `Batch` is one numerical call on one component together with everything a
 rank needs to run it: the per-request `Call` descriptors, the lifecycle
 commands (`Start`, `Finish`, `Free`) applied with it, the KV unit tables and
 latent, decode, and persistent-buffer allocations the scheduler chose, and
 host-supplied input tensors (`TensorPublication`). The records mirror the
-Rust `Batch` in `uniserve_worker_ipc`, whose `Batch::validate` is the
-authoritative check; `Batch.validate` here re-implements part of it.
+Rust `Batch` in `uniserve_worker_ipc`, whose decoder validates every frame
+(`Batch::validate`); these records hold what it accepted and check nothing
+again.
 
-The PyO3 transport (`crates/worker-ipc-py`) decodes and validates a frame in
-Rust, builds each member record through its constructor, and assembles the
-`Batch` with `construction.batch_from_validated`, which skips
-`Batch.validate`. It calls `BlockTable`, `CacheUnitAllocation`, `Start`,
-`Finish`, and `Free` positionally, so their field order is part of that
-contract, and the other records by keyword, so their field names are. Python
-callers build a `Batch` through its constructor, which runs `Batch.validate`.
+The PyO3 transport (`crates/worker-ipc-py`) builds each member record
+through its constructor. It calls `BlockTable`, `CacheUnitAllocation`,
+`Start`, `Finish`, and `Free` positionally, so their field order is part of
+that contract, and the other records by keyword, so their field names are.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TypeAlias
 
 from uniserve import sampling
 from uniserve.media import image
-from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import call, identity, tensor, transfer
-from uniserve_worker.protocol.validation import _nonnegative
 from uniserve_worker.protocol.video import VideoAdmission
 
 
@@ -52,25 +47,11 @@ class Finish:
     unretained exports once their readers finish (`Executor` handles this
     in ``_release_commands`` and ``_retire_commands``). Each buffer in
     ``retained_buffers`` stays readable until a `Free` command names it.
-    `__post_init__` requires every retained buffer to be owned by
-    ``request_key`` and listed once.
+    Every retained buffer is owned by ``request_key`` and listed once.
     """
 
     request_key: identity.RequestKey
     retained_buffers: tuple[identity.BufferId, ...] = ()
-
-    def __post_init__(self) -> None:
-        _validate_retained_buffers(self.request_key, self.retained_buffers)
-
-
-def _validate_retained_buffers(
-    request: identity.RequestKey, retained: tuple[identity.BufferId, ...]
-) -> None:
-    """Require each retained buffer to be owned by ``request``, listed once."""
-    if any(buffer.owner != request for buffer in retained):
-        raise invalid_descriptor("retained buffer belongs to another request")
-    if len(set(retained)) != len(retained):
-        raise invalid_descriptor("request retirement repeats a retained buffer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,19 +67,6 @@ class Free:
 
 
 BatchCommand: TypeAlias = Start | Finish | Free
-
-
-def _command_variant_index(command: BatchCommand) -> int:
-    """Return the variant discriminant used in a command's identity.
-
-    `Batch.validate` keys repeated-command detection on it. The values match
-    the Rust `BatchCommand::variant_index`.
-    """
-    if isinstance(command, Start):
-        return 0
-    if isinstance(command, Finish):
-        return 1
-    return 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,24 +85,6 @@ class GenerationParams:
     # many tokens visible and computed.
     initial_position: int = 0
 
-    def __post_init__(self) -> None:
-        """Require a nonnegative initial position and canonical stop tokens.
-
-        `SamplingParams` checks its own invariants when constructed.
-        """
-        _nonnegative(self.initial_position, "autoregressive initial position")
-        if any(
-            left >= right
-            for left, right in zip(
-                self.finish_token_ids,
-                self.finish_token_ids[1:],
-                strict=False,
-            )
-        ):
-            raise invalid_descriptor(
-                "autoregressive finish token ids are not canonical"
-            )
-
 
 @dataclass(frozen=True, slots=True)
 class DiffusionSamplingParams:
@@ -152,18 +102,6 @@ class DiffusionSamplingParams:
     # Output raster in pixels: the request's canvas.
     width: int
     height: int
-
-    def __post_init__(self) -> None:
-        """Require positive work bounds and a nonnegative deterministic seed."""
-        for name in (
-            "num_frames",
-            "video_units",
-            "width",
-            "height",
-        ):
-            if getattr(self, name) < 1:
-                raise invalid_descriptor(f"diffusion {name} must be positive")
-        _nonnegative(self.seed, "diffusion seed")
 
     @property
     def canvas(self) -> image.Config:
@@ -198,38 +136,6 @@ class NewRequest:
     # exactly with ``diffusion``.
     video: VideoAdmission | None = None
 
-    def __post_init__(self) -> None:
-        """Require a positive slot and at least one family parameter set.
-
-        Diffusion requests also need non-empty prompt tokens, each with its
-        presentation tag. Each family's own parameters are validated by its
-        record.
-        """
-        if self.diffusion is not None and not self.prompt_token_ids:
-            raise invalid_descriptor(
-                "diffusion prompt tokens must not be empty"
-            )
-        if (self.video is None) != (self.diffusion is None):
-            raise invalid_descriptor(
-                "a video admission carries both its sampling and its inputs"
-            )
-        if self.video is not None and len(self.video.text_tags) != len(
-            self.prompt_token_ids
-        ):
-            raise invalid_descriptor(
-                "every video prompt token requires one tag"
-            )
-        if self.request_pool_idx < 1:
-            raise invalid_descriptor("request-pool index must be positive")
-        if (
-            self.generation is None
-            and self.image is None
-            and self.diffusion is None
-        ):
-            raise invalid_descriptor(
-                "request start must declare one runtime-family parameter set"
-            )
-
 
 @dataclass(frozen=True, slots=True)
 class BlockTable:
@@ -253,25 +159,13 @@ class BlockTable:
     # Absolute token extent the table covers.
     allocated_tokens: int
 
-    def __post_init__(self) -> None:
-        """Validate the slot, group, start page and units."""
-        if (
-            self.request_pool_idx < 1
-            or self.group_id < 0
-            or self.start_page < 0
-            or self.allocated_tokens < 0
-            or any(unit < 1 for unit in self.unit_ids)
-            or len(set(self.unit_ids)) != len(self.unit_ids)
-        ):
-            raise invalid_descriptor("block table is invalid")
-
 
 @dataclass(frozen=True, slots=True)
 class CacheUnitAllocation:
     """Physical KV units newly assigned to a request slot and KV group.
 
     The units are a subset of the batch's `BlockTable` for the same slot and
-    group; the Rust `Batch::validate` checks this, `Batch.validate` does not.
+    group; the Rust `Batch::validate` checks this.
     The worker resets every listed unit before a call uses it.
     """
 
@@ -281,60 +175,15 @@ class CacheUnitAllocation:
     # Newly assigned physical units; non-empty, unique, unit 0 rejected.
     unit_ids: tuple[int, ...]
 
-    def __post_init__(self) -> None:
-        """Validate the slot, group, and newly assigned units."""
-        if (
-            self.request_pool_idx < 1
-            or self.group_id < 0
-            or not self.unit_ids
-            or any(unit < 1 for unit in self.unit_ids)
-            or len(set(self.unit_ids)) != len(self.unit_ids)
-        ):
-            raise invalid_descriptor("cache-unit allocation is invalid")
-
-
-def _validate_forward_inputs(
-    call_count: int,
-    call_indices: tuple[int, ...],
-    request_pool_indices: tuple[int, ...],
-    seq_lens: tuple[int, ...],
-    query_lens: tuple[int, ...],
-    write_kv: tuple[bool, ...],
-) -> None:
-    """Validate the columnar forward inputs before lanes index them.
-
-    Every column must have one entry per row, each call index must address
-    a call of the batch, no row may use slot 0, and each row needs a
-    positive query length no longer than its sequence length.
-
-    Raises:
-        WorkerError: From `invalid_descriptor` on the first violated rule.
-    """
-    rows = len(call_indices)
-    if any(
-        len(column) != rows
-        for column in (request_pool_indices, seq_lens, query_lens, write_kv)
-    ):
-        raise invalid_descriptor("forward input columns have different lengths")
-    if any(index < 0 or index >= call_count for index in call_indices):
-        raise invalid_descriptor("forward call index is outside its batch")
-    if any(slot < 1 for slot in request_pool_indices):
-        raise invalid_descriptor(
-            "forward input carries the reserved request slot"
-        )
-    if any(
-        total < query for total, query in zip(seq_lens, query_lens, strict=True)
-    ) or any(length < 1 for length in query_lens):
-        raise invalid_descriptor("forward input has invalid token lengths")
-
 
 @dataclass(frozen=True, slots=True)
 class LatentParams:
-    """Solver-step range and optional paged storage of one trajectory.
+    """Paged storage and raster of one image trajectory.
 
-    For a paged trajectory, `LatentPool` records the pages, units, and raster
-    when the trajectory's slot is initialized and checks later calls against
-    them.
+    The scheduler's allocator assigns the pages. `LatentPool` records the
+    pages, units, and raster when the trajectory's slot is initialized and
+    checks later calls against them. A standalone denoiser's request slot
+    fixes its own pages, so its calls carry no parameters.
     """
 
     request_key: identity.RequestKey
@@ -349,32 +198,6 @@ class LatentParams:
     # Output height and width in pixels.
     height: int
     width: int
-    # The call runs solver steps [start_step, start_step + step_count).
-    start_step: int
-    step_count: int
-
-    def __post_init__(self) -> None:
-        """Validate the call identity, raster, and page-table/unit agreement.
-
-        Raises:
-            WorkerError: From `invalid_descriptor` when the call id's batch
-                is not positive, the raster is empty, ``latent_units`` is
-                negative, or the page table disagrees with the units,
-                repeats a page, or carries page 0.
-        """
-        if self.call_id.batch_id < 1:
-            raise invalid_descriptor("latent params call id must be positive")
-        if min(self.height, self.width) < 1 or self.latent_units < 0:
-            raise invalid_descriptor("latent dimensions must be positive")
-        if (
-            bool(self.page_table) != (self.latent_units > 0)
-            or any(page < 1 for page in self.page_table)
-            or len(set(self.page_table)) != len(self.page_table)
-        ):
-            raise invalid_descriptor(
-                "latent params page table disagrees with its units, repeats "
-                "a page, or carries page zero"
-            )
 
 
 class MediaTrack(StrEnum):
@@ -404,16 +227,6 @@ class DecodeRange:
     # order.
     ranks: tuple[int, ...] = ()
 
-    def __post_init__(self) -> None:
-        """Validate the call identity, cursor, unit bound, and ranks."""
-        if self.call_id.batch_id < 1 or self.max_units < 1:
-            raise invalid_descriptor(
-                "decode params identity and unit bound must be positive"
-            )
-        _nonnegative(self.cursor, "decode params cursor")
-        if len(set(self.ranks)) != len(self.ranks):
-            raise invalid_descriptor("decode params name each rank once")
-
 
 @dataclass(frozen=True, slots=True)
 class BufferAllocation:
@@ -426,63 +239,13 @@ class BufferAllocation:
     offset: int
     bytes: int
 
-    def __post_init__(self) -> None:
-        """Require a non-empty span whose end fits in u64."""
-        if self.offset < 0 or self.bytes < 1:
-            raise invalid_descriptor("buffer params span is invalid")
-        if self.offset + self.bytes > (1 << 64) - 1:
-            raise invalid_descriptor("buffer params span overflows")
-
-
-def _validate_buffer_allocations(
-    calls: Sequence[call.Call],
-    parameters: Sequence[BufferAllocation],
-    where: str,
-) -> None:
-    """Validate persistent-buffer spans against each other and the calls.
-
-    Buffer ids must be unique and spans must not overlap. Every buffer output
-    of every call needs an allocation of at least its declared
-    ``max_bytes``.
-
-    Raises:
-        WorkerError: From `invalid_descriptor` on the first violated rule.
-    """
-    by_id: dict[identity.BufferId, BufferAllocation] = {}
-    spans: list[tuple[int, int]] = []
-    for params in parameters:
-        if params.buffer in by_id:
-            raise invalid_descriptor(
-                f"{where} repeats a buffer params identity"
-            )
-        by_id[params.buffer] = params
-        spans.append((params.offset, params.offset + params.bytes))
-
-    # Sorted half-open spans overlap only if one ends past the next start.
-    spans.sort()
-    if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
-        raise invalid_descriptor(f"{where} buffer parameters overlap")
-
-    for scheduled in calls:
-        for output in scheduled.buffer_outputs():
-            output_allocation = by_id.get(output.buffer_id)
-            if output_allocation is None:
-                raise invalid_descriptor(
-                    "persistent call output has no buffer params"
-                )
-            if output_allocation.bytes < output.max_bytes:
-                raise invalid_descriptor(
-                    "buffer params is smaller than its declared output"
-                )
-
 
 @dataclass(frozen=True, slots=True)
 class Batch:
     """One numerical call on one component, with every request in it.
 
-    ``__post_init__`` runs `validate`, so every constructed batch has passed
-    it, except those `construction.batch_from_validated` assembles from
-    frames the Rust decoder validated.
+    The Rust decoder validates a frame's batch (`Batch::validate`) before the
+    transport builds this record from it.
     """
 
     # Strictly increasing in each worker's submission order; `Executor.submit`
@@ -515,10 +278,6 @@ class Batch:
     input_products: tuple[TensorPublication, ...] = ()
     kv_inputs: tuple[transfer.KvTransfer, ...] = ()
 
-    def __post_init__(self) -> None:
-        """Run `validate`."""
-        self.validate()
-
     @property
     def admissions(self) -> tuple[NewRequest, ...]:
         """The `NewRequest` of every `Start` command, in command order."""
@@ -526,144 +285,6 @@ class Batch:
             command.request
             for command in self.commands
             if isinstance(command, Start)
-        )
-
-    def validate(self) -> None:
-        """Check the cross-record rules of a batch.
-
-        The batch carries a call or a command, a positive collective
-        sequence, and valid forward inputs. Its calls belong to
-        ``batch_id``, have unique ids, cover each request at most once, and
-        share one kind and component. Admissions are unique, repeated
-        commands are identical, each input product is declared by a call and
-        supplied once, each KV input has one ``KV_INSTALL`` consumer within
-        its byte bound, and buffer allocations cover the buffer outputs.
-
-        It covers part of the Rust `Batch::validate`. Among other rules, it
-        does not validate each call, require unique block tables or
-        cache-page allocations inside their tables, match latent params and
-        decode ranges to the calls, or check latent page overlap.
-
-        Raises:
-            WorkerError: From `invalid_descriptor` on the first violated rule.
-        """
-        if not self.calls and not self.commands:
-            raise invalid_descriptor(
-                "a submission batch must carry at least one call or command"
-            )
-        if self.collective_seq < 1:
-            raise invalid_descriptor(
-                "batch collective sequence must be positive"
-            )
-        _validate_forward_inputs(
-            len(self.calls),
-            self.forward_call_indices,
-            self.request_pool_indices,
-            self.seq_lens,
-            self.query_lens,
-            self.write_kv,
-        )
-        # Every call belongs to this logical batch, with unique
-        # call identities and at most one call per request.
-        call_ids = [call.call_id for call in self.calls]
-        if any(identity.batch_id != self.batch_id for identity in call_ids):
-            raise invalid_descriptor(
-                "call identity belongs to another logical batch"
-            )
-        if len(set(call_ids)) != len(call_ids):
-            raise invalid_descriptor(
-                "a submission batch repeats a call identity"
-            )
-        request_keys = [call.request_key for call in self.calls]
-        if len(set(request_keys)) != len(request_keys):
-            raise invalid_descriptor(
-                "a submission batch carries multiple calls for one request"
-            )
-        # A batch is one numerical call on one component: every call in it
-        # performs the same computation through the same component, so the rank
-        # executes it as a single homogeneous group and returns one result.
-        calls = {(call.kind, call.component) for call in self.calls}
-        if len(calls) > 1:
-            raise invalid_descriptor(
-                "a submission batch mixes call kinds or components"
-            )
-        admitted = [admission.request_key for admission in self.admissions]
-        if len(set(admitted)) != len(admitted):
-            raise invalid_descriptor(
-                "a submission batch carries a duplicate admission"
-            )
-
-        # Lifecycle commands may repeat identically but not conflict. A
-        # command's identity is its request, variant, and freed buffer.
-        identities: dict[
-            tuple[identity.RequestKey, int, identity.BufferId | None],
-            BatchCommand,
-        ] = {}
-        for command in self.commands:
-            buffer = command.buffer if isinstance(command, Free) else None
-            command_key = (
-                command.request_key,
-                _command_variant_index(command),
-                buffer,
-            )
-            existing = identities.get(command_key)
-            if existing is not None and existing != command:
-                raise invalid_descriptor(
-                    "a submission batch reuses a command identity with "
-                    "different content"
-                )
-            identities[command_key] = command
-
-        # Every input product payload must feed a declared call input or
-        # predicate, exactly once.
-        declared_inputs = {
-            product
-            for call in self.calls
-            for product in (*call.tensor_inputs(), call.predicate)
-            if product is not None
-        }
-        supplied_inputs: set[tensor.TensorRef] = set()
-        for payload in self.input_products:
-            product = payload.product
-            if product not in declared_inputs:
-                raise invalid_descriptor(
-                    "an input product payload is not declared by any call"
-                )
-            if product in supplied_inputs:
-                raise invalid_descriptor(
-                    "a submission batch repeats an input product payload"
-                )
-            supplied_inputs.add(product)
-
-        # Each KV transfer's source must be unique. It installs into exactly
-        # one ``KV_INSTALL`` call whose transfer-byte bound covers its
-        # tensors.
-        sources: set[identity.BufferId] = set()
-        for publication in self.kv_inputs:
-            if publication.source in sources:
-                raise invalid_descriptor("batch repeats a KV input")
-            sources.add(publication.source)
-            consumers = tuple(
-                call
-                for call in self.calls
-                if call.kv_input == publication.source
-            )
-            if (
-                len(consumers) != 1
-                or consumers[0].kind is not call.TransferMode.KV_INSTALL
-            ):
-                raise invalid_descriptor(
-                    "KV transfer requires one installation consumer"
-                )
-            if (
-                sum(tensor.nbytes for tensor in publication.tensors)
-                > consumers[0].bounds.max_transfer_bytes
-            ):
-                raise invalid_descriptor(
-                    "KV input exceeds its installation transfer-byte bound"
-                )
-        _validate_buffer_allocations(
-            self.calls, self.buffer_allocations, "batch"
         )
 
 
@@ -695,7 +316,7 @@ class TensorPublication:
         else:
             kind = "latent"
             value["latent_units"] = typed.latent_units
-            value["step"] = typed.step
+            value["step_index"] = typed.step_index
         return {
             "product": self.product.to_mapping(),
             "value": {"kind": kind, "value": value},

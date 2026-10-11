@@ -79,9 +79,7 @@ def prepare_rows(
         not descriptors
         or sum(lengths) != len(call.input_token_ids)
         or any(
-            inputs.write_kv[index]
-            or inputs.request_pool_indices[index] != slot
-            or inputs.seq_lens[index] - inputs.query_lens[index] != visible
+            inputs.write_kv[index] or inputs.request_pool_indices[index] != slot
             for index in descriptors
         )
     ):
@@ -226,7 +224,6 @@ def prepare_step(
             inputs.write_kv[index]
             or inputs.request_pool_indices[index] != slot
             or inputs.query_lens[index] != length
-            or inputs.seq_lens[index] - length != visible
             for index in descriptors
         )
     ):

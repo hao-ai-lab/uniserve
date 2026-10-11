@@ -26,7 +26,7 @@ def serve_pending_publication(channel, shape=(1024,)) -> None:
     )
     try:
         locator = Locator(
-            source=WorkerEndpoint.local("publisher"),
+            source=WorkerEndpoint.local(),
             transport=PosixShmTransfer(
                 endpoint="uniserve-test-pending", name=storage.name
             ),

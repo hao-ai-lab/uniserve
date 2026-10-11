@@ -525,7 +525,7 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         ),
     )
     assert failed.completions[0].status is CallStatus.ERROR
-    assert failed.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
+    assert failed.completions[0].error_code is ErrorCode.RESOURCE_ERROR
 
     continued = token_call(
         admission.request_key,

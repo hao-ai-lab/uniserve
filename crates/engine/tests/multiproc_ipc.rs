@@ -33,13 +33,14 @@ use uniserve_core::{
     SamplingParams, UnitId,
 };
 use uniserve_engine::{
-    CallReaders, EngineConfig, EngineCore, Executor, WorkerConfig, WorkerFailure, WorkerGroup,
-    WorkerProcessArgs,
+    CallReaders, EngineConfig, EngineCore, Executor, RankBuffer, WorkerConfig, WorkerFailure,
+    WorkerGroup, WorkerProcessArgs,
 };
 use uniserve_worker_ipc::{
-    Batch, BatchCommand, BlockTable, Bounds, CacheUnitAllocation, Call, CallId, CallKind,
-    CallStatus, DType, DimBound, ErrorCode, ForwardBatch, GenerationParams, Locator, NewRequest,
-    RequestKey, ShapeBound, TensorPublication, TensorRef, TransferHandle, TransferTransport,
+    Batch, BatchCommand, BlockTable, Bounds, BufferAllocation, CacheUnitAllocation, Call, CallId,
+    CallKind, CallStatus, DType, DimBound, ErrorCode, ForwardBatch, GenerationParams, Locator,
+    NewRequest, RequestKey, ShapeBound, TensorPublication, TensorRef, TransferHandle,
+    TransferTransport,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -191,7 +192,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
     assert_eq!(encode_report.results[0].output.status, CallStatus::Ok);
 
     // Closing a request releases every participating rank's physical storage.
-    worker.submit_batch(
+    worker.submit_placed(
         Batch::new(4, vec![], vec![]).with_commands(
             [first_key, second_key]
                 .into_iter()
@@ -201,7 +202,6 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
                 })
                 .collect(),
         ),
-        &CallReaders::new(),
     )?;
     let report = worker
         .poll_batch(Duration::from_secs(5))?
@@ -541,7 +541,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
                         forward: batch.forward,
                         latent: batch.latent_params.into_iter().next(),
                         decode: batch.decode_ranges.into_iter().next(),
-                        buffers: batch.buffer_allocations,
+                        buffers: on_every_rank(batch.buffer_allocations),
                         readers: Default::default(),
                     },
                 )],
@@ -771,7 +771,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         logical_position: 3,
         kv_visible_len: 3,
         kv_computed_len: 5,
-        flow_step: 0,
     };
     for mut batch in [first, successor, verifier, resumed] {
         let batch_id = batch.batch_id;
@@ -785,7 +784,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
             forward: batch.forward,
             latent: None,
             decode: None,
-            buffers: batch.buffer_allocations,
+            buffers: on_every_rank(batch.buffer_allocations),
             readers: Default::default(),
         };
         executor.submit(ExecutionBatch::new(
@@ -887,7 +886,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                     forward: batch.forward,
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
-                    buffers: batch.buffer_allocations,
+                    buffers: on_every_rank(batch.buffer_allocations),
                     readers: Default::default(),
                 },
             )],
@@ -1145,7 +1144,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
                     forward: batch.forward,
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
-                    buffers: batch.buffer_allocations,
+                    buffers: on_every_rank(batch.buffer_allocations),
                     readers: Default::default(),
                 },
             )],
@@ -1340,7 +1339,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
             UnitId(1),
             0,
         );
-        worker.submit_batch(batch, &CallReaders::new())?;
+        worker.submit_placed(batch)?;
 
         // A correlation or rank-ownership failure may fail the poll and must
         // deliver no result. A short extent still delivers the call's result,
@@ -1726,7 +1725,6 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
 fn check_rank_ipc() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
     let info = executor.info();
-    assert_eq!(info.endpoint.rank, 0);
     assert_eq!(info.max_batch_calls, 256);
     assert_eq!(info.max_batch_tokens, 256);
 
@@ -1771,7 +1769,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
 
     // `WorkerGroup::submit_batch` refuses a batch id that does not exceed the
     // last one submitted, whether the batch repeats it or conflicts with it.
-    assert!(executor.submit_batch(initial, &CallReaders::new()).is_err());
+    assert!(executor.submit_placed(initial).is_err());
 
     let conflicting = token_batch(
         1,
@@ -1784,11 +1782,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         UnitId(1),
         0,
     );
-    assert!(
-        executor
-            .submit_batch(conflicting, &CallReaders::new())
-            .is_err()
-    );
+    assert!(executor.submit_placed(conflicting).is_err());
 
     // A Finish for another epoch of the same request id leaves the resident
     // epoch in place: the continuation below still runs.
@@ -1848,7 +1842,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         0,
     );
     close_batch.commands.push(close.clone());
-    executor.submit_batch(close_batch.clone(), &CallReaders::new())?;
+    executor.submit_placed(close_batch.clone())?;
     // A batch returns one result: the call's completion and the retirement
     // it carries arrive together.
     let result = executor
@@ -1858,7 +1852,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert_eq!(result.results[0].output.status, CallStatus::Ok);
     assert!(executor.poll_batch(Duration::from_millis(50))?.is_none());
     assert!(matches!(
-        executor.submit_batch(close_batch, &CallReaders::new()),
+        executor.submit_placed(close_batch),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
     let descendant = token_batch(
@@ -1885,16 +1879,13 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert!(!executor.is_ready());
     assert!(executor.poll_batch(Duration::ZERO)?.is_none());
     assert!(matches!(
-        executor.submit_batch(
-            command_batch(
-                100,
-                BatchCommand::Finish {
-                    request_key: admission.request_key,
-                    retained_buffers: Vec::new(),
-                }
-            ),
-            &CallReaders::new()
-        ),
+        executor.submit_placed(command_batch(
+            100,
+            BatchCommand::Finish {
+                request_key: admission.request_key,
+                retained_buffers: Vec::new(),
+            }
+        )),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
     executor.close()?;
@@ -1977,12 +1968,13 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         .context("KV publication has no physical locations")?;
     assert_eq!(publication.source, buffer);
     for tensor in publication.tensors() {
-        let ranks = tensor
+        // Each rank publishes its own location, from its own incarnation.
+        let sources = tensor
             .locations
             .iter()
-            .map(|location| location.source.rank)
+            .map(|location| location.source.incarnation.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(ranks, (0..WORLD_SIZE as u32).collect());
+        assert_eq!(sources.len(), WORLD_SIZE);
     }
     // A repeated batch id is refused.
     assert!(execute(executor, publish).is_err());
@@ -2068,20 +2060,17 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     let lost_admission = text_admission(22, 1, 2)?;
     // Keep this rank from completing the batch before the test terminates it.
     let paused = PausedProcess::new(victim.try_into()?)?;
-    executor.submit_batch(
-        token_batch(
-            3,
-            3,
-            lost_admission.request_key,
-            Some(lost_admission),
-            CallId::new(3, 0),
-            CallKind::Forward(ForwardMode::Prefill),
-            &[4],
-            UnitId(2),
-            0,
-        ),
-        &CallReaders::new(),
-    )?;
+    executor.submit_placed(token_batch(
+        3,
+        3,
+        lost_admission.request_key,
+        Some(lost_admission),
+        CallId::new(3, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[4],
+        UnitId(2),
+        0,
+    ))?;
     paused.terminate()?;
     let loss = executor
         .poll_batch(Duration::from_secs(30))
@@ -2089,7 +2078,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     let loss = loss
         .downcast_ref::<WorkerFailure>()
         .context("expected scoped WorkerGroup loss")?;
-    assert_eq!(loss.worker_id.0, initial_endpoint.worker_id);
+    assert_eq!(loss.worker_id.0, "worker");
     assert_eq!(loss.endpoints.len(), WORLD_SIZE);
     assert!(loss.endpoints.contains(&initial_endpoint));
     let requests = loss
@@ -2126,10 +2115,6 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         ),
     )?;
     assert_eq!(recovered.results[0].output.status, CallStatus::Ok);
-    assert_eq!(
-        executor.info().endpoint.worker_id,
-        initial_endpoint.worker_id
-    );
     assert_ne!(
         executor.info().endpoint.incarnation,
         initial_endpoint.incarnation
@@ -2189,11 +2174,12 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         max_batch_calls: 256,
         max_batch_tokens: 256,
         attention_backend: "torch".into(),
-        // `publisher` is the worker id `SlowShmPublication` names as the
-        // source of its segment.
-        transfer: uniserve_engine::TransferConfig::parse("publisher->worker=posix_shm")?,
+        // The segment stands in for a product that rank 0 of this worker
+        // published over shared storage.
+        transfer: uniserve_engine::TransferConfig::parse("worker->worker=posix_shm")?,
         ..config
     })?;
+    let publisher = executor.info().endpoint.clone();
 
     let slow_admission = text_admission(31, 1, 1)?;
     let mut slow = token_batch(
@@ -2221,7 +2207,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     slow.calls[0].predicate = Some(predicate.clone());
     slow.input_products.push(TensorPublication {
         product: predicate,
-        value: publication.descriptor()?,
+        value: publication.descriptor(&publisher)?,
     });
 
     let fast_admission = text_admission(32, 1, 2)?;
@@ -2239,12 +2225,12 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
 
     // Resubmitting batch 1 is refused because batch ids must increase; the
     // original submission stays in flight.
-    executor.submit_batch(slow.clone(), &CallReaders::new())?;
+    executor.submit_placed(slow.clone())?;
     assert!(matches!(
-        executor.submit_batch(slow, &CallReaders::new()),
+        executor.submit_placed(slow),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
-    executor.submit_batch(fast, &CallReaders::new())?;
+    executor.submit_placed(fast)?;
     // This worker's component spans both ranks, so its ranks stay inside the
     // same collective and hold one batch in flight. The blocked batch is at the
     // head of the channel, so nothing behind it runs until its dependency is
@@ -2331,9 +2317,9 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         .collect();
     batch.input_products.push(TensorPublication {
         product: input,
-        value: publication.descriptor()?,
+        value: publication.descriptor(&publisher)?,
     });
-    executor.submit_batch(batch, &CallReaders::new())?;
+    executor.submit_placed(batch)?;
     let transferred = executor
         .poll_batch(Duration::from_secs(30))?
         .context("tensor input did not reach its component")?;
@@ -2427,7 +2413,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
                     forward: batch.forward,
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
-                    buffers: batch.buffer_allocations,
+                    buffers: on_every_rank(batch.buffer_allocations),
                     readers: Default::default(),
                 },
             )],
@@ -2920,14 +2906,6 @@ impl SlowShmPublication {
         Ok(publication)
     }
 
-    fn address_space(&self) -> String {
-        format!("rust:{}", std::process::id())
-    }
-
-    fn node(&self) -> anyhow::Result<String> {
-        Ok(std::fs::read_to_string("/etc/hostname")?.trim().to_owned())
-    }
-
     fn publish(&self) -> anyhow::Result<()> {
         let file = OpenOptions::new().write(true).open(&self.path)?;
         // The payload lands before the readiness word; each write is a system
@@ -2938,7 +2916,12 @@ impl SlowShmPublication {
         Ok(())
     }
 
-    fn descriptor(&self) -> anyhow::Result<TransferHandle> {
+    /// Describes the segment as a product published by `source`, a rank the
+    /// engine launched.
+    fn descriptor(
+        &self,
+        source: &uniserve_worker_ipc::WorkerEndpoint,
+    ) -> anyhow::Result<TransferHandle> {
         Ok(TransferHandle::DeviceProduct {
             height: 0,
             width: 0,
@@ -2946,13 +2929,7 @@ impl SlowShmPublication {
             tensor: uniserve_worker_ipc::TensorTransfer {
                 shape: vec![1],
                 locations: vec![Locator {
-                    source: uniserve_worker_ipc::WorkerEndpoint {
-                        worker_id: "publisher".into(),
-                        rank: 0,
-                        node: self.node()?,
-                        address_space: self.address_space(),
-                        incarnation: self.endpoint.clone(),
-                    },
+                    source: source.clone(),
                     transport: TransferTransport::PosixShm {
                         endpoint: self.endpoint.clone(),
                         name: self.name.clone(),
@@ -3051,7 +3028,6 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "acknowledgment_slot": 0,
     "host_slots": [0],
     "products_cross_hosts": false,
-    "worker_id": "worker",
     "queue_depth": 8,
     "model": "",
     "device": "cpu",
@@ -3131,12 +3107,31 @@ fn worker_python() -> PathBuf {
         })
 }
 
+/// Places a batch's buffer spans at the same offsets on every rank of the
+/// groups these tests launch, which share one layout of their pools.
+fn on_every_rank(allocations: Vec<BufferAllocation>) -> Vec<RankBuffer> {
+    RankBuffer::on_every_rank(&allocations, WORLD_SIZE as u32)
+}
+
+/// Submission of a batch that carries its buffer spans, which a group takes
+/// beside the batch as a rank-by-rank placement.
+trait SubmitPlaced {
+    fn submit_placed(&mut self, batch: Batch) -> Result<(), uniserve_engine::BatchSubmitError>;
+}
+
+impl SubmitPlaced for WorkerGroup {
+    fn submit_placed(&mut self, mut batch: Batch) -> Result<(), uniserve_engine::BatchSubmitError> {
+        let spans = on_every_rank(std::mem::take(&mut batch.buffer_allocations));
+        self.submit_batch(batch, &CallReaders::new(), &spans)
+    }
+}
+
 /// Submits one batch and waits up to 30 seconds for its result.
 fn execute(
     executor: &mut WorkerGroup,
     batch: Batch,
 ) -> anyhow::Result<uniserve_engine::WorkerResult> {
-    executor.submit_batch(batch, &CallReaders::new())?;
+    executor.submit_placed(batch)?;
     executor
         .poll_batch(Duration::from_secs(30))?
         .ok_or_else(|| anyhow::anyhow!("submission did not complete"))
@@ -3181,12 +3176,11 @@ fn text_admission(
 
 /// The coordinates a call entering after `output` executes at, for a request
 /// whose completions advance its logical position with its visible KV.
-fn coordinates_after(output: &uniserve_worker_ipc::RequestOutput) -> CallCoordinates {
+fn coordinates_after(output: &uniserve_worker_ipc::CallOutput) -> CallCoordinates {
     CallCoordinates {
         logical_position: output.kv_visible_len,
         kv_visible_len: output.kv_visible_len,
         kv_computed_len: output.kv_computed_len,
-        flow_step: output.num_completed_steps,
     }
 }
 
@@ -3231,7 +3225,6 @@ fn token_batch(
             logical_position: prefix_length,
             kv_visible_len: prefix_length,
             kv_computed_len: prefix_length,
-            flow_step: 0,
         },
         token_input: None,
         token_output: Some(token_output),

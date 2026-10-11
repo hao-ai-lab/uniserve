@@ -9,6 +9,8 @@
 //! flight until the scheduler blocks for a completion, and the record of
 //! submissions and resolutions is a function of scheduling decisions alone.
 
+mod support;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::thread;
@@ -21,8 +23,7 @@ use uniserve_core::{
 };
 use uniserve_engine::{
     BatchEvent, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch,
-    RequestPlacement, Scheduler, SimEngine, SimExecutor, SpecialTokenIds, VideoDenoiserInfo,
-    WorkerId,
+    RequestPlacement, SchedulerConfig, SimEngine, SimExecutor, VideoDenoiserInfo, WorkerId,
 };
 use uniserve_worker_ipc::{
     Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes, ShapeBound,
@@ -221,6 +222,12 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         audio_shift: 3.0,
         frame_rate: 24,
         audio_sample_rate: 32_000,
+        frames: uniserve_worker_ipc::FrameChunks {
+            min_frames: 22,
+            chunk_frames: 17,
+            chunk_latent_frames: 5,
+            tail_latent_frames: 2,
+        },
         canvases: Vec::new(),
         references: Default::default(),
     });
@@ -381,7 +388,8 @@ impl Served {
 fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     let mut executor = SimExecutor::new(video_worker(1, 1));
     let boundary = executor.observe();
-    let scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32).unwrap();
+    let scheduler =
+        support::scheduler(Box::new(executor), SimEngine::special_tokens(), 32).unwrap();
     let (tx, commands) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let mut stream = handle
@@ -481,10 +489,16 @@ fn serve(sim: SimEngine, requests: Vec<Request>) -> Served {
 fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option<usize>) -> Served {
     let mut executor = SimExecutor::new(sim);
     let boundary = executor.observe();
-    let mut scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32).unwrap();
-    if let Some(bound) = max_num_waiting {
-        scheduler.set_max_num_waiting(bound);
-    }
+    let scheduler = support::scheduler_with(
+        Box::new(executor),
+        SimEngine::special_tokens(),
+        SchedulerConfig {
+            max_batch: 32,
+            max_num_waiting,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
 
@@ -1227,5 +1241,63 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
             "{message}"
         ),
         events => panic!("the oversized canvas was not refused: {events:?}"),
+    }
+}
+
+/// A video worker's ranks each back only the results of the components they
+/// execute and of the components that read them, and the engine places
+/// buffers in each rank's own pool: a rank that holds fewer results packs
+/// them from its own offset zero rather than at the offsets another rank's
+/// larger set implies.
+#[test]
+fn media_buffers_are_placed_in_the_pool_of_each_rank_that_backs_them() {
+    use std::collections::BTreeSet;
+
+    let served = serve(video_worker(3, 1), vec![video_request(1, 4)]);
+    served.assert_completed(RequestId(1));
+
+    // The ranks holding a span of what a call of this kind produces.
+    let ranks = |media_call: MediaCall| {
+        served
+            .calls
+            .iter()
+            .filter(|(call, _)| call.kind == CallKind::Media(media_call))
+            .flat_map(|(call, placement)| {
+                let outputs = call
+                    .buffer_outputs()
+                    .map(|product| product.buffer_id())
+                    .collect::<Vec<_>>();
+                placement
+                    .buffers
+                    .iter()
+                    .filter(move |span| outputs.contains(&span.allocation.buffer))
+            })
+            .map(|span| span.rank)
+            .collect::<BTreeSet<_>>()
+    };
+
+    // The text encoder and its reader, the denoiser, are placed on rank 0
+    // alone, so no other rank backs the encoder's conditioning.
+    assert_eq!(ranks(MediaCall::TextEncoding), BTreeSet::from([0]));
+    // The decoder and the video codec that reads its units run on three ranks.
+    assert_eq!(ranks(MediaCall::VideoDecoding), BTreeSet::from([0, 1, 2]));
+    // The audio decoder and the muxer's audio encoding run on rank 0 alone.
+    assert_eq!(ranks(MediaCall::AudioDecoding), BTreeSet::from([0]));
+
+    // A rank that backs fewer results starts its own pool at zero: rank 2
+    // holds only the decoder's, the codec's and the denoiser's products.
+    for rank in 0..3 {
+        let lowest = served
+            .calls
+            .iter()
+            .flat_map(|(_, placement)| placement.buffers.iter())
+            .filter(|span| span.rank == rank)
+            .map(|span| span.allocation.offset)
+            .min();
+        assert_eq!(
+            lowest,
+            Some(0),
+            "rank {rank} packs from its own offset zero"
+        );
     }
 }

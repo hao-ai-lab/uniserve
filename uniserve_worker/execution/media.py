@@ -45,6 +45,7 @@ from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.media.mux import AvMuxConfig
 from uniserve_worker.protocol.batch import (
     DecodeRange,
+    LatentParams,
     MediaTrack,
     NewRequest,
     TensorPublication,
@@ -73,9 +74,8 @@ def video_shape(runner: ModelExecutor, admission: NewRequest):
     its presented vision spans; it is not rounded up to the layout it
     occupies. Raises ``invalid_descriptor`` when the admission is not a
     video request's, when the rank lacks a media builder or video decoder,
-    when the builder or decoder rejects the frame count, prompt length or
-    conditions (a size beyond the worker's capacity included), or when the
-    admission's media unit count or step count disagrees with the model.
+    or when the builder rejects the frame count, prompt length or
+    conditions (a size beyond the worker's capacity included).
     """
     from uniserve_worker.execution.conditions import library_conditions
 
@@ -97,12 +97,8 @@ def video_shape(runner: ModelExecutor, admission: NewRequest):
             conditions=library_conditions(video),
             vision_spans=video.vision_spans(),
         )
-        windows = decoder.frame_slices(size.num_frames)
     except ValueError as error:
         raise invalid_descriptor(str(error)) from error
-
-    if media.video_units != len(windows):
-        raise invalid_descriptor("video request has invalid call bounds")
     return size
 
 
@@ -653,18 +649,18 @@ def mux_config(runner: ModelExecutor, media) -> AvMuxConfig:
     )
 
 
-def sample_generation(step: int) -> int:
+def sample_generation(step_index: int) -> int:
     """Return the pool generation of a trajectory at an accepted step.
 
     A standalone denoiser's samples are never published from the pool, and
     one request slot holds one trajectory, so its accepted step count
     versions it; zero stays the empty slot's generation.
     """
-    return int(step) + 1
+    return int(step_index) + 1
 
 
 def sample_update(
-    slot: int, params, *, step: int, previous: int | None
+    slot: int, params, *, step_index: int, previous: int | None
 ) -> LatentUpdate:
     """Describe the pool publication of a trajectory's successor.
 
@@ -677,25 +673,33 @@ def sample_update(
         expected_generation=0
         if previous is None
         else sample_generation(previous),
-        expected_step=0 if previous is None else int(previous),
-        generation=sample_generation(step),
-        step=int(step),
+        expected_step_index=0 if previous is None else int(previous),
+        generation=sample_generation(step_index),
+        step_index=int(step_index),
     )
 
 
-def trajectory_params(call: Call, *, state: BatchState):
-    """Return the unique latent trajectory params assigned to a call."""
-    selected = tuple(
-        params
-        for params in state.batch.latent_params
-        if params.request_key == call.request_key
-        and params.call_id == call.call_id
+def trajectory_params(
+    call: Call, request: PendingOutput, *, model_runner: ModelExecutor
+) -> LatentParams:
+    """Return the pool parameters of a video request's trajectory.
+
+    A standalone denoiser's pool gives every request slot the same run of
+    consecutive pages, which its sample layout sizes, so the worker names the
+    pages of the request's slot itself; the raster is the admitted canvas.
+    """
+    builder = model_runner.media_builder
+    media = request.request.admission.diffusion
+    if builder is None or media is None:
+        raise invalid_descriptor("video call has no admitted media dimensions")
+    return LatentParams(
+        request_key=call.request_key,
+        call_id=call.call_id,
+        page_table=builder.slot_pages(request.request.request_pool_idx),
+        latent_units=builder.sample_pages.units,
+        height=media.height,
+        width=media.width,
     )
-    if len(selected) != 1:
-        raise invalid_descriptor(
-            "video trajectory call has no exact latent params"
-        )
-    return selected[0]
 
 
 def decode_range(call: Call, *, state: BatchState) -> DecodeRange:
@@ -847,8 +851,7 @@ def execute(
     slot_index = request.request.request_pool_idx
     products: tuple[TensorPublication, ...] = ()
     if call.kind is MediaCall.LATENT_PREPARATION:
-        # Batch preparation validated the call's pages and interval.
-        params = trajectory_params(call, state=state)
+        params = trajectory_params(call, request, model_runner=model_runner)
         assert pool is not None
         # The text features, then a conditioned request's condition latents:
         # every visual round's rows, then every audio track's
@@ -937,29 +940,22 @@ def execute(
                     ),
                 )
         request.latent.update = sample_update(
-            slot_index, params, step=0, previous=None
+            slot_index, params, step_index=0, previous=None
         )
 
     elif call.kind is MediaCall.DENOISING:
-        params = trajectory_params(call, state=state)
-        start_step, step_count = int(params.start_step), int(params.step_count)
-        if start_step != calls.require_progress(request).flow_step:
-            raise invalid_descriptor(
-                "denoising does not begin at the selected request step"
-            )
-        if step_count != 1:
-            raise invalid_descriptor(
-                "video denoising requires one selected numerical step"
-            )
+        params = trajectory_params(call, request, model_runner=model_runner)
 
-        # ``step_banks`` checks the slot's committed trajectory against
-        # ``start_step``, its generation and the call's parameters, and names
-        # the bank holding it; the runner writes the successor to the other.
+        # Each call advances the slot's committed trajectory by one step.
+        # ``step_banks`` checks the trajectory's generation and the call's
+        # parameters against the pool's record, and names the bank holding
+        # it; the runner writes the successor to the other.
         assert pool is not None
+        start_step = pool.committed_step_index(slot_index)
         source, _ = pool.step_banks(
             slot_index,
             params.page_table,
-            step=start_step,
+            step_index=start_step,
             generation=sample_generation(start_step),
             latent_units=params.latent_units,
             height=params.height,
@@ -1000,18 +996,14 @@ def execute(
         request.latent.update = sample_update(
             slot_index,
             params,
-            step=start_step + step_count,
+            step_index=start_step + 1,
             previous=start_step,
-        )
-        request.progress = replace(
-            calls.require_progress(request),
-            flow_step=start_step + step_count,
         )
 
         # Only the call that completes denoising may declare products, and
         # it publishes the step's result, the final samples.
         if call.outputs:
-            if calls.require_progress(request).flow_step != builder.num_steps:
+            if start_step + 1 != builder.num_steps:
                 raise invalid_descriptor(
                     "final latent products require completed denoising"
                 )
@@ -1024,7 +1016,7 @@ def execute(
             )
 
     elif call.kind in {MediaCall.VIDEO_DECODING, MediaCall.AUDIO_DECODING}:
-        params = decode_range(call, state=state)
+        units = decode_range(call, state=state)
         inputs = call.inputs
         if len(inputs) != 1:
             raise invalid_descriptor(
@@ -1041,7 +1033,7 @@ def execute(
                 "media reconstruction requires complete input coverage"
             )
 
-        cursor, count = params.cursor, params.max_units
+        cursor, count = units.cursor, units.max_units
         track = (
             MediaTrack.AUDIO
             if call.kind is MediaCall.AUDIO_DECODING
@@ -1131,8 +1123,7 @@ def execute(
 
     request.status = CallStatus.OK
     # Without cache coordinates the projection copies the output's progress
-    # unchanged: reconstruction and preparation leave it as staged, and a
-    # denoising step keeps the ``flow_step`` it advanced above.
+    # unchanged.
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
     request.products = products

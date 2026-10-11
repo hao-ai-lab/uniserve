@@ -260,7 +260,8 @@ impl Default for WorkerProcessArgs {
             // The engine's default running-request limit plus the largest
             // row reserve a runtime keeps outside it.
             max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
-                + crate::scheduler::MAX_FLOW_PREFIX_ROWS) as u32,
+                + crate::scheduler::MAX_GUIDANCE_PREFIX_ROWS)
+                as u32,
             attention_backend: Self::DEFAULT_ATTENTION_BACKEND.into(),
             transfer: Default::default(),
             load_format: Self::DEFAULT_LOAD_FORMAT.to_string(),
@@ -374,7 +375,6 @@ impl WorkerProcessArgs {
         };
 
         let mut fields = serde_json::Map::new();
-        fields.insert("worker_id".into(), json!(self.worker_id));
         fields.insert("registration_address".into(), json!(registration));
         // The placement decides the mechanism and the rank names the endpoint:
         // a rank on the head's host can offer shared storage, a rank elsewhere

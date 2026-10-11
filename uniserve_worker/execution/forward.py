@@ -1,15 +1,15 @@
 """Build homogeneous model calls and publish their results.
 
 ``schedule`` drives one batch's calls through dependency rounds; this module
-holds the stages of a round that contains numerical work. Per diffusion step
-offset, ``prepare_diffusion_step`` stages each open trajectory's guidance
+holds the stages of a round that contains numerical work. In a round,
+``prepare_diffusion_step`` stages each open trajectory's guidance
 branches (running any missing branch prefixes first),
 ``prepare_forward_rows`` builds the round's token, canvas, encoder, denoiser
 and image-decoder rows, ``forward_values`` runs them through
 ``ModelExecutor.forward``, ``publish_forward_values`` turns the values into
 samples, readouts, features, images or retained denoiser predictions, and
-``integrate_predictions`` advances each solver and finishes a trajectory at
-its last step.
+``integrate_predictions`` advances each solver and finishes the call's
+trajectory.
 
 Shared conventions: a call is named by its ``index`` into ``scheduled``, and
 ``outcomes`` maps an index to the ``PendingOutput`` that finished it in this
@@ -79,7 +79,6 @@ def forward_values(
     inputs: tuple[tuple[InputRow, Call], ...],
     *,
     state: BatchState,
-    retain_sampling: bool = False,
     cache: KVCacheManager | None,
     tables: BlockTables | None,
     states: DecodeState | None,
@@ -95,11 +94,6 @@ def forward_values(
     are materialized first (waiting on the forward's output event and
     gathering vocabulary shards). Each group's ``ForwardStats`` is appended
     to ``state.forward_stats``.
-
-    With ``retain_sampling``, the graph's greedy output is cloned before it
-    is bound. A batch of single-token last-logits decode rows borrows the
-    graph's output storage, which the next replay overwrites; ``schedule``
-    sets the flag while later step offsets remain in the batch.
 
     Raises:
         BaseException: The error that failed any output group, re-raised as
@@ -140,9 +134,7 @@ def forward_values(
                 for index in indexes
             ),
             tuple(inputs[index][0] for index in indexes),
-            output.greedy.clone()
-            if retain_sampling and output.greedy is not None
-            else output.greedy,
+            output.greedy,
             sampling_group=sampling_group,
             request_pool_indices=output.request_pool_indices,
         )
@@ -264,14 +256,11 @@ def initialize_trajectories(
     latent_pool: LatentPool,
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
-) -> tuple[dict[int, DiffusionState], int]:
-    """Open diffusion trajectories and return the longest declared interval.
+) -> dict[int, DiffusionState]:
+    """Open diffusion trajectories for the live denoising calls.
 
     Opens a ``DiffusionState`` for every live denoising call in
-    ``numerical`` and returns them by index together with the largest
-    ``step_count`` among their staged latent parameters (1 when none is
-    open). The caller runs that many step offsets; a shorter trajectory drops
-    out once its own interval ends.
+    ``numerical`` and returns them by index. Each call covers one solver step.
     """
     from uniserve_worker.execution import diffusion
 
@@ -290,22 +279,10 @@ def initialize_trajectories(
             state=state,
         )
 
-    step_count = 1
-    for index in trajectories:
-        call = scheduled[index]
-        request = state.pending_output(call.request_key.request_id)
-        params = request.latent.input_params
-        if params is None:
-            raise invalid_descriptor(
-                "diffusion call has no staged latent parameters"
-            )
-        step_count = max(step_count, int(params.step_count))
-
-    return trajectories, step_count
+    return trajectories
 
 
 def prepare_diffusion_step(
-    offset: int,
     trajectories: dict[int, DiffusionState],
     scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
@@ -321,8 +298,8 @@ def prepare_diffusion_step(
 ) -> dict[int, tuple[tuple[Branch, ...], torch.Tensor]]:
     """Prepare one solver step and materialize any missing guidance prefixes.
 
-    For each live trajectory whose interval covers ``offset``, stages the
-    step's guidance branches and timestep, returned by index. A branch whose
+    For each live trajectory, stages the step's guidance branches and
+    timestep, returned by index. A branch whose
     KV prefix is not yet materialized comes back from
     ``diffusion.prepare_step`` as a prefix row; those rows run through one
     ``forward_values`` call here, before the denoiser rows that read them.
@@ -344,13 +321,11 @@ def prepare_diffusion_step(
             raise invalid_descriptor(
                 "trajectory call has no staged latent inputs"
             )
-        if offset >= int(params.step_count):
-            continue
 
         guide, timestep, prefix_rows = diffusion.prepare_step(
             call,
             trajectory,
-            int(params.start_step) + offset,
+            latent_pool.committed_step_index(row.request.request_pool_idx),
             request_tables=request_tables,
             model_runner=model_runner,
             latent_pool=latent_pool,
@@ -411,7 +386,6 @@ def prepare_diffusion_step(
 
 def prepare_forward_rows(
     numerical: tuple[int, ...],
-    offset: int,
     step_inputs: Mapping[int, tuple[tuple[Branch, ...], torch.Tensor]],
     trajectories: Mapping[int, DiffusionState],
     scheduled: tuple[Call, ...],
@@ -427,10 +401,9 @@ def prepare_forward_rows(
     """Build homogeneous numerical rows for the current dependency frontier.
 
     Returns ``(index, row)`` pairs for the forward and the prepared encoder
-    images by index. Only open trajectories run after the first step offset;
-    every other call builds its row at offset 0. A trajectory contributes one
-    denoiser row per guidance branch and a token-denoising call one row per
-    canvas, so an index can appear more than once.
+    images by index. A trajectory contributes one denoiser row per guidance
+    branch and a token-denoising call one row per canvas, so an index can
+    appear more than once.
     An image-decoding call without a latent input finishes here without a
     forward (``image.diffusion_finalize_frames``), and rows whose call
     finished during preparation are dropped from the result.
@@ -442,7 +415,7 @@ def prepare_forward_rows(
 
     for index in numerical:
         call = scheduled[index]
-        if index in outcomes or (offset > 0 and index not in step_inputs):
+        if index in outcomes:
             continue
 
         if index in trajectories:
@@ -751,7 +724,6 @@ def integrate_predictions(
     predictions: Mapping[int, list[torch.Tensor]],
     step_inputs: Mapping[int, tuple[tuple[Branch, ...], torch.Tensor]],
     trajectories: Mapping[int, DiffusionState],
-    offset: int,
     scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
     *,
@@ -766,8 +738,8 @@ def integrate_predictions(
 
     ``predictions`` holds one denoiser output per guidance branch, in the
     branch order ``prepare_diffusion_step`` staged. The solver integrates them
-    into the call's latent staging in place; when ``offset`` is the
-    trajectory's last step, ``diffusion.finish`` stages its outcome.
+    into the call's latent staging in place, and ``diffusion.finish`` stages
+    the call's outcome.
     """
     from uniserve_worker.execution import diffusion
 
@@ -792,16 +764,15 @@ def integrate_predictions(
             staging.value[: int(params.latent_units)],
             timestep,
             tuple(values),
-            int(params.start_step) + offset,
+            latent_pool.committed_step_index(row.request.request_pool_idx),
         )
-        if offset + 1 == int(params.step_count):
-            outcomes[index] = diffusion.finish(
-                call,
-                trajectories[index],
-                latent_pool=latent_pool,
-                model_runner=model_runner,
-                publication_transports=publication_transports,
-                request_tables=request_tables,
-                config=config,
-                state=state,
-            )
+        outcomes[index] = diffusion.finish(
+            call,
+            trajectories[index],
+            latent_pool=latent_pool,
+            model_runner=model_runner,
+            publication_transports=publication_transports,
+            request_tables=request_tables,
+            config=config,
+            state=state,
+        )

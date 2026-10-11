@@ -42,14 +42,14 @@ use uniserve_core::{KvCacheGroup, KvGroupKind, RequestId, SamplingParams, TokenL
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
     ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds, BufferAllocation,
-    BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallStatus, CanvasStep,
-    DType, DecodeRange, DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode,
-    FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats, GenerationParams,
+    BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallOutput, CallStatus,
+    CanvasStep, DType, DecodeRange, DiffusionSamplingParams, DimBound, ErrorCallIdentity,
+    ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats, GenerationParams,
     KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall, MediaOutput,
-    NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind, SamplingState,
-    ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle,
-    TransferMode, TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint, WorkerInfo,
-    WorkerRequest, WorkerResponse, WorkerResponseError,
+    NewRequest, Readout, RequestKey, RequestKind, ResponseKind, SamplingState, ShapeBound,
+    TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferMode,
+    TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint, WorkerInfo, WorkerRequest,
+    WorkerResponse, WorkerResponseError,
 };
 use uniserve_core::{
     AudioClip, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator, VideoClip,
@@ -145,15 +145,12 @@ macro_rules! codec_ensure {
     };
 }
 
-/// Validates a worker request and encodes it as a FlatBuffers payload.
+/// Encodes a worker request as a FlatBuffers payload.
 ///
-/// Only a `Submit` request carries a payload to validate; `Batch::validate`
-/// failures return [`CodecError::Validation`]. The returned bytes are the
-/// frame payload without the transport `Header`.
+/// The sender validates a batch where it builds it, and the receiver's
+/// [`decode_request`] validates every frame, so encoding checks nothing. The
+/// returned bytes are the frame payload without the transport `Header`.
 pub fn encode_request(request: &WorkerRequest) -> CodecResult<Vec<u8>> {
-    if let Some(batch) = request.batch() {
-        batch.validate()?;
-    }
     let mut builder = FlatBufferBuilder::new();
     let root = encode::request(&mut builder, request);
     builder.finish(root, None);
@@ -596,6 +593,12 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
         audio_shift: table.audio_shift(),
         frame_rate: table.frame_rate(),
         audio_sample_rate: table.audio_sample_rate(),
+        frames: crate::FrameChunks {
+            min_frames: table.frames().min_frames(),
+            chunk_frames: table.frames().chunk_frames(),
+            chunk_latent_frames: table.frames().chunk_latent_frames(),
+            tail_latent_frames: table.frames().tail_latent_frames(),
+        },
         canvases: table
             .canvases()
             .map(|canvases| {
@@ -679,8 +682,6 @@ fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<Latent
         latent_units: params.latent_units(),
         height: params.height(),
         width: params.width(),
-        start_step: params.start_step(),
-        step_count: params.step_count(),
     })
 }
 
@@ -726,7 +727,6 @@ fn coordinates_from_table(table: Option<fbs::CallCoordinates<'_>>) -> CodecResul
         logical_position: value.logical_position(),
         kv_visible_len: value.kv_visible_len(),
         kv_computed_len: value.kv_computed_len(),
-        flow_step: value.flow_step(),
     })
 }
 
@@ -1019,7 +1019,7 @@ fn batch_output_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOut
 }
 
 /// Decodes one call completion; `BatchOutput::validate` checks it.
-fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<RequestOutput> {
+fn completion_record_from_table(record: fbs::CallOutput<'_>) -> CodecResult<CallOutput> {
     let finish_flags = record
         .finish_flags()
         .context("completion result has no finish flags")?;
@@ -1051,7 +1051,7 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
         .timing_counters()
         .context("completion record has no timing counters")?;
 
-    let record = RequestOutput {
+    let record = CallOutput {
         sampled_logprob: record.sampled_logprob(),
         top_logprobs: record
             .top_logprobs()
@@ -1088,7 +1088,7 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
         },
         kv_visible_len: record.kv_visible_len(),
         kv_computed_len: record.kv_computed_len(),
-        num_completed_steps: record.num_completed_steps(),
+        step_index: record.step_index(),
         committed_tokens: record
             .committed_tokens()
             .map(|items| items.iter().collect())
@@ -1210,6 +1210,25 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             components
         },
         video_denoiser: info.video_denoiser().map(video_denoiser_from_table),
+        image_warmups: info
+            .image_warmups()
+            .map(|shapes| {
+                shapes
+                    .iter()
+                    .map(|shape| crate::ImageWarmup {
+                        height: shape.height(),
+                        width: shape.width(),
+                        cfg_text_scale: shape.cfg_text_scale(),
+                        cfg_img_scale: shape.cfg_img_scale(),
+                        negative_token_ids: shape
+                            .negative_token_ids()
+                            .map(|ids| ids.iter().collect())
+                            .unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        canvas_step_rows: info.canvas_step_rows(),
     };
     info.validate()?;
     Ok(info)
@@ -1266,10 +1285,6 @@ fn sampling_from_table(sampling: fbs::SamplingParams<'_>) -> CodecResult<Samplin
         return_logprobs: sampling.return_logprobs(),
         return_prompt_logprobs: sampling.return_prompt_logprobs(),
         n_prompt_logprobs: sampling.n_prompt_logprobs(),
-        logprob_token_ids: sampling
-            .logprob_token_ids()
-            .map(|items| items.iter().collect())
-            .unwrap_or_default(),
         typical_p: sampling.typical_p(),
         forced_token_ids: sampling
             .forced_token_ids()
@@ -1394,8 +1409,6 @@ fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
 /// Decodes the loaded rank identity used by startup and physical products.
 fn endpoint_from_table(endpoint: fbs::WorkerEndpoint<'_>) -> CodecResult<WorkerEndpoint> {
     let value = WorkerEndpoint {
-        worker_id: required_str(endpoint.worker_id(), "endpoint.worker_id")?,
-        rank: endpoint.rank(),
         node: required_str(endpoint.node(), "endpoint.node")?,
         address_space: required_str(endpoint.address_space(), "endpoint.address_space")?,
         incarnation: required_str(endpoint.incarnation(), "endpoint.incarnation")?,
@@ -1763,7 +1776,7 @@ fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<Tra
                 height: transfer.height(),
                 width: transfer.width(),
                 latent_units: transfer.latent_units(),
-                step: transfer.step(),
+                step_index: transfer.step_index(),
                 tensor: tensor_transfer_from_table(
                     transfer
                         .tensor()
@@ -1908,7 +1921,7 @@ fn response_kind_from_fb(kind: fbs::RespKind) -> CodecResult<ResponseKind> {
 ///
 /// Its buffer identities and tensor transfers are validated as they are
 /// decoded; the descriptor as a whole is validated by its container:
-/// `Batch::validate` for `kv_inputs` and `RequestOutput::validate` for a
+/// `Batch::validate` for `kv_inputs` and `CallOutput::validate` for a
 /// completion's `kv_output`.
 fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransfer> {
     Ok(KvTransfer {

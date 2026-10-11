@@ -37,8 +37,8 @@ pub const SHARED_STORAGE_CHANNEL: &str = "iceoryx2";
 /// The mechanism name of a channel over a TCP stream, served by a rank off the
 /// head's host.
 ///
-/// `uniserve_worker.bootstrap.launch` defines its own `SOCKET_CHANNEL` with
-/// this value; the two must stay equal.
+/// The Python extension exposes it as `SOCKET_CHANNEL`, which the worker's
+/// launch compares with the descriptor's `channel_transport`.
 pub const SOCKET_CHANNEL: &str = "tcp";
 
 /// A wake raised inside one process for that process's own service loop,

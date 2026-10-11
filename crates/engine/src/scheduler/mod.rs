@@ -31,7 +31,7 @@
 //! - `allocation` and `placement`: storage ownership and worker placement.
 //! - `control`: cancellation and frontend lifecycle commands.
 //! - `config`, `stats`, and `stats_report`: limits and statistics.
-//! - `image_artifact`: validation of worker-produced PNG artifacts.
+//! - `image_artifact`: metadata of worker-produced PNG artifacts.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -44,7 +44,7 @@ pub use config::{
     DEFAULT_MAX_NUM_SEQS, SchedulerConfig, SchedulingPolicy,
 };
 pub(crate) use execution::generation_consuming_calls;
-pub(crate) use run::{MAX_FLOW_PREFIX_ROWS, flow_prefix_rows};
+pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,
@@ -70,7 +70,7 @@ pub(crate) use crate::executor::{
     BatchResult, ExecutionBatch, Executor, ExecutorSubmitError, RequestPlacement,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -96,12 +96,12 @@ use uniserve_core::{RejectionKind, UnitId, encoder_cache_key};
 use uniserve_worker_ipc::{
     BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
-    DimBound, ForwardBatch, ForwardStats, GenerationParams, LatentParams, NewRequest, RequestKey,
-    SamplingState, ShapeBound, TensorRef, TimingCounters, WorkerInfo,
+    DimBound, ForwardBatch, ForwardStats, GenerationParams, NewRequest, RequestKey, SamplingState,
+    ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
 
-use crate::executor::WorkerFailure;
-use crate::scheduler::image_artifact::validate_png_artifact;
+use crate::executor::{RankBuffer, WorkerFailure};
+use crate::scheduler::image_artifact::png_artifact_info;
 use allocation::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
     UnknownMediaWorker,
@@ -135,13 +135,12 @@ const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
 /// (`Scheduler::select_batch_kind`).
 const PREFILL_WINDOW_CREDITS: usize = 2;
 
-/// Builds a validated image-completion event from a base64 PNG payload.
+/// Builds an image-completion event from a base64 PNG payload.
 ///
-/// Fully decodes the PNG through `validate_png_artifact`; returns `None` when
-/// the payload is not valid base64 or not a fully decodable PNG with nonzero
-/// dimensions.
+/// Reads the dimensions and size through `png_artifact_info`; returns `None`
+/// when the payload has no PNG header with nonzero dimensions.
 fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<EngineCoreOutput> {
-    let metadata = validate_png_artifact(&pixels_png_b64, None)?;
+    let metadata = png_artifact_info(&pixels_png_b64)?;
     Some(EngineCoreOutput::ImageDone {
         image_id,
         height: metadata.height,
@@ -155,8 +154,7 @@ fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<EngineCoreO
 /// Model token identifiers used for sequence and image-content boundaries.
 ///
 /// Serving resolves these from the loaded model's configuration in the server
-/// crate (`special_token_ids`); the `Default` values serve schedulers that
-/// tests and examples construct directly.
+/// crate (`special_token_ids`).
 pub struct SpecialTokenIds {
     /// Beginning-of-sequence token identifier.
     pub bos: u32,
@@ -166,16 +164,6 @@ pub struct SpecialTokenIds {
     pub eos: Vec<u32>,
     /// Token identifier that terminates encoded image content.
     pub end_of_image: u32,
-}
-
-impl Default for SpecialTokenIds {
-    fn default() -> Self {
-        Self {
-            bos: 151644,
-            eos: vec![151645, 151643],
-            end_of_image: 151653,
-        }
-    }
 }
 
 /// Request-held reference to a reusable encoder-cache entry.
@@ -213,13 +201,13 @@ impl TerminalIntent {
 }
 
 /// Negative-prompt KV prefix of a token request whose image generation uses
-/// more than one guidance branch (`Scheduler::ensure_flow_prefix`).
+/// more than one guidance branch (`Scheduler::ensure_guidance_prefix`).
 ///
 /// The prefix holds its own request-pool slot and KV allocation, separate
 /// from the request's main `RequestAllocations`, until
-/// `Scheduler::free_flow_prefix` releases them after the last denoising step
+/// `Scheduler::free_guidance_prefix` releases them after the last denoising step
 /// or the request finishes.
-struct FlowPrefixState {
+struct GuidancePrefixState {
     allocations: RequestAllocations,
     /// Units per KV group, as `(group_id, unit_ids)`, not yet declared to the
     /// worker; the next denoising call drains them as fresh-unit allocations.
@@ -230,7 +218,7 @@ struct FlowPrefixState {
     diffusion_finalized: bool,
 }
 
-impl FlowPrefixState {
+impl GuidancePrefixState {
     /// Returns the request-pool index.
     fn request_pool_idx(&self) -> u32 {
         self.allocations.request_slot()
@@ -337,32 +325,6 @@ struct PendingMedia {
     event_tx: EventTx,
     /// Unix timestamp at which the request entered the waiting queue.
     queued_at: f64,
-}
-
-/// Permissive unified-multimodal limits for a scheduler built without
-/// model-derived limits.
-///
-/// `Scheduler::with_config` uses them for workers with media capabilities, and
-/// `EngineConfig::sim` uses them as its default. Construction intersects them
-/// with worker-reported capacities (`resolve_generation_limits` in `run`), so
-/// the effective bounds come from the loaded workers. A serving deployment
-/// supplies model limits through `EngineConfig`.
-pub(crate) fn unbounded_umm_generation_limits() -> uniserve_core::GenerationLimits {
-    uniserve_core::GenerationLimits {
-        features: uniserve_core::GenerationFeatures::UNDERSTANDING
-            | uniserve_core::GenerationFeatures::VISION_ENCODE
-            | uniserve_core::GenerationFeatures::LATENT_ENCODE
-            | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
-        max_latent_units: u64::MAX,
-        latent_downsample: 16,
-        max_vae_grid_tokens: u32::MAX,
-        max_vit_grid_tokens: u32::MAX,
-        max_latent_feature_bytes: 256 << 20,
-        max_vision_feature_bytes: 256 << 20,
-        commit_marker_tokens: 2,
-        max_cfg_branches: 3,
-        encoder_cache_entries: 256,
-    }
 }
 
 /// Single-threaded owner of scheduling, storage, execution, and request state.

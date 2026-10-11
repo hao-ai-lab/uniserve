@@ -192,15 +192,10 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     parent_completion = parent_report.completions[0]
     assert completion.kv_visible_len == parent_completion.kv_visible_len
     assert completion.kv_computed_len == parent_completion.kv_computed_len
-    assert (
-        completion.num_completed_steps == parent_completion.num_completed_steps
-    )
+    assert completion.step_index == parent_completion.step_index
     assert descendant_completion.kv_visible_len == completion.kv_visible_len
     assert descendant_completion.kv_computed_len == completion.kv_computed_len
-    assert (
-        descendant_completion.num_completed_steps
-        == completion.num_completed_steps
-    )
+    assert descendant_completion.step_index == completion.step_index
 
     selected = predecessor.call_id
 
@@ -321,10 +316,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         candidate_completion.kv_computed_len
         == parent_completion.kv_computed_len
     )
-    assert (
-        candidate_completion.num_completed_steps
-        == parent_completion.num_completed_steps
-    )
+    assert candidate_completion.step_index == parent_completion.step_index
 
     parent_observation = record_completion(predecessor, parent_report)
     _release_relay_outputs(worker, initial, predecessor, candidate)

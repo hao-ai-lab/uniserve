@@ -218,11 +218,41 @@ class StreamSignal:
         """
         ...
 
+SOCKET_CHANNEL: str
+"""The channel mechanism name of a rank off the head's host: a TCP stream."""
+
 def service_name(id: str) -> str:
     """Return the shared-storage service name for one endpoint identifier.
 
     A rank names its own channel endpoint and reports it to the head, so both
     sides must spell the name the same way; this function is that spelling.
+    """
+    ...
+
+def call_kinds() -> list[str]:
+    """Return the spelling of every call kind in the schema's order.
+
+    A worker report lists its supported calls in this order.
+    """
+    ...
+
+def state_advancing_calls() -> list[str]:
+    """Return the spelling of every call kind that advances request state."""
+    ...
+
+def relay_row_bytes() -> int:
+    """Return the bytes one request slot's lane holds of relayed scalars.
+
+    A worker sizes its request-relay arenas per (request slot, lane) row
+    from this value.
+    """
+    ...
+
+def product_edges() -> list[tuple[str, str]]:
+    """Return the persistent-product edges of the video graph.
+
+    Each ``(producer, reader)`` pair names media calls whose products travel
+    through persistent tensor storage, as the schema's graph states them.
     """
     ...
 

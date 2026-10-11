@@ -26,11 +26,12 @@ use crate::executor::{
     BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, PoolPlacement,
     WorkerFailure, WorkerId, logical_result,
 };
+use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use uniserve_core::{CommandWaker, ImageParams, RequestId, SamplingParams, TokenLogprob};
 use uniserve_worker_ipc::{
-    BatchOutput, Call, CallKind, CallStatus, ErrorCode, FinishFlags, NewRequest, RequestOutput,
+    BatchOutput, Call, CallKind, CallOutput, CallStatus, ErrorCode, FinishFlags, NewRequest,
     SamplingState, TensorRef, TimingCounters, WorkerInfo,
 };
 
@@ -102,6 +103,7 @@ impl SimExecutor {
     /// Panics if the simulator thread cannot be spawned.
     pub fn new(mut engine: SimEngine) -> Self {
         let info = engine.info().clone();
+        let info_buffer_bytes = info.buffer_pool_bytes;
         let results_on_wait = engine.results_on_wait;
         let depth = engine.queue_depth;
         let placement = PoolPlacement {
@@ -143,7 +145,20 @@ impl SimExecutor {
             })
             .expect("spawn sim executor thread");
         let id = WorkerId("sim".to_owned());
-        let mut executor_info = ExecutorInfo::single(id.clone(), info);
+        let mut executor_info = ExecutorInfo {
+            workers: vec![(id.clone(), info)],
+            ..ExecutorInfo::default()
+        };
+        // Every rank the components name backs the simulated pool.
+        let ranks = placement
+            .components
+            .values()
+            .flat_map(|config| config.ranks.iter().copied())
+            .max()
+            .map_or(1, |rank| rank + 1);
+        executor_info
+            .rank_buffer_bytes
+            .insert(id.clone(), vec![info_buffer_bytes; ranks]);
         executor_info.placements.insert(id, placement);
         Self {
             executor_info,
@@ -734,14 +749,9 @@ fn select_token(
             .collect();
         // Stable, so tied candidates keep ascending vocabulary order.
         order.sort_by(|&a, &b| logprob_of(b).total_cmp(&logprob_of(a)));
-        let requested = sampling.logprob_token_ids.iter().map(|&id| id as usize);
-        for index in order
-            .into_iter()
-            .take(sampling.n_logprobs as usize)
-            .chain(requested)
-        {
+        for index in order.into_iter().take(sampling.n_logprobs as usize) {
             let token_id = index as u32;
-            if index < vocabulary && !top.iter().any(|&(existing, ..)| existing == token_id) {
+            if !top.iter().any(|&(existing, ..)| existing == token_id) {
                 let value = logprob_of(index);
                 top.push((token_id, value, rank_of(value)));
             }
@@ -756,6 +766,42 @@ fn select_token(
 }
 
 impl SimEngine {
+    /// Control tokens consistent with the simulator's synthetic text: its fake
+    /// EOS id terminates a request.
+    pub fn special_tokens() -> SpecialTokenIds {
+        SpecialTokenIds {
+            bos: 151_644,
+            eos: vec![FAKE_EOS_TOKEN, 151_643],
+            end_of_image: 151_653,
+        }
+    }
+
+    /// Model limits of a deployment that serves every call kind the
+    /// simulator implements without a model-imposed bound.
+    ///
+    /// The scheduler intersects them with the capacities and call kinds the
+    /// simulated worker reports.
+    pub fn generation_limits() -> uniserve_core::GenerationLimits {
+        uniserve_core::GenerationLimits {
+            features: uniserve_core::GenerationFeatures::UNDERSTANDING
+                | uniserve_core::GenerationFeatures::VISION_ENCODE
+                | uniserve_core::GenerationFeatures::LATENT_ENCODE
+                | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
+            max_latent_units: u64::MAX,
+            latent_downsample: 16,
+            max_vae_grid_tokens: u32::MAX,
+            max_vit_grid_tokens: u32::MAX,
+            // One latent unit of the simulated image: 256 MiB over the
+            // simulated worker's 65,536 latent units.
+            latent_bytes_per_unit: 4096,
+            max_latent_feature_bytes: 256 << 20,
+            max_vision_feature_bytes: 256 << 20,
+            commit_marker_tokens: 2,
+            max_cfg_branches: 3,
+            encoder_cache_entries: 256,
+        }
+    }
+
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
         // Unset fields, including the KV cache, come from `WorkerInfo::default`.
@@ -906,7 +952,7 @@ impl SimEngine {
         }
     }
 
-    /// Executes one call against its request and returns its [`RequestOutput`].
+    /// Executes one call against its request and returns its [`CallOutput`].
     ///
     /// Advances the request's positions, KV extent, synthetic text index,
     /// penalty counts, and denoising step as the call kind requires, and
@@ -924,7 +970,7 @@ impl SimEngine {
         canvas_sampling: Option<uniserve_core::CanvasSampling>,
         call: &Call,
         request: &mut SimRequestState,
-    ) -> anyhow::Result<RequestOutput> {
+    ) -> anyhow::Result<CallOutput> {
         // A call states the coordinates it executes at. The simulator holds the
         // same request state a rank does, so a disagreement is a scheduling
         // failure and not a condition it can execute through. A media branch
@@ -938,7 +984,6 @@ impl SimEngine {
                 logical_position: request.logical_position,
                 kv_visible_len: request.kv_visible_len,
                 kv_computed_len: request.kv_visible_len,
-                flow_step: u32::from(request.flow_step),
             };
             anyhow::ensure!(
                 stated == held,
@@ -946,7 +991,7 @@ impl SimEngine {
                 call.call_id
             );
         }
-        let mut record = RequestOutput {
+        let mut record = CallOutput {
             sampled_logprob: None,
             top_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
@@ -958,7 +1003,7 @@ impl SimEngine {
             timing_counters: TimingCounters::default(),
             kv_visible_len: 0,
             kv_computed_len: 0,
-            num_completed_steps: 0,
+            step_index: 0,
             committed_tokens: Vec::new(),
             candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
@@ -1180,7 +1225,7 @@ impl SimEngine {
                     .image()
                     .map(|image| image.steps)
                     .unwrap_or(DEFAULT_DENOISE_STEPS);
-                record.num_completed_steps = u32::from(request.flow_step);
+                record.step_index = u32::from(request.flow_step);
                 // Denoise completion surfaces as a length finish once the flow has
                 // advanced through every scheduled step.
                 record.finish_flags.length = request.flow_step >= total;
@@ -1242,8 +1287,8 @@ impl SimEngine {
     ///
     /// The completion carries no product generations and reports the
     /// request's unchanged progress.
-    fn predicated_completion(call: &Call, request: &SimRequestState) -> RequestOutput {
-        RequestOutput {
+    fn predicated_completion(call: &Call, request: &SimRequestState) -> CallOutput {
+        CallOutput {
             sampled_logprob: None,
             top_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
@@ -1255,7 +1300,7 @@ impl SimEngine {
             timing_counters: TimingCounters::default(),
             kv_visible_len: request.kv_visible_len,
             kv_computed_len: request.kv_visible_len,
-            num_completed_steps: u32::from(request.flow_step),
+            step_index: u32::from(request.flow_step),
             committed_tokens: Vec::new(),
             candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
@@ -1412,7 +1457,7 @@ pub fn sim_candidate_logprob(request_id: RequestId, token: u32) -> f32 {
     -1.0 - ((request_id.0.wrapping_add(u64::from(token))) % 7) as f32
 }
 
-fn set_kv_lengths(lengths: &mut RequestOutput, visible: u32) {
+fn set_kv_lengths(lengths: &mut CallOutput, visible: u32) {
     lengths.kv_visible_len = visible;
     lengths.kv_computed_len = visible;
 }
@@ -1766,7 +1811,6 @@ mod tests {
             logical_position: 2,
             kv_visible_len: 2,
             kv_computed_len: 2,
-            flow_step: 0,
         };
         selected.requests.push(successor);
 

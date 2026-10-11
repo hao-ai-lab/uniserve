@@ -484,6 +484,62 @@ def test_product_capacity_backs_produced_and_consumed_products_whole(
     ) == expected.get(rank, 0)
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_product_capacity_backs_products_on_every_member_of_a_tensor_group(
+    rank,
+):
+    from uniserve.distributed.mesh import DeviceMesh
+    from uniserve_worker.bootstrap.capacity import local_product_storage_bytes
+    from uniserve_worker.config.deployment import (
+        ComponentConfig,
+        ParallelConfig,
+    )
+    from uniserve_worker.model_executor.component_binding import (
+        ComponentBinding,
+    )
+    from uniserve_worker.protocol.call import MediaCall
+    from uniserve_worker.protocol.tensor import (
+        DType,
+        OutputInfo,
+        ShapeBound,
+        StaticDim,
+    )
+
+    # Both members of a tensor-parallel component execute each of its calls,
+    # and the engine hands each of them a span for the call's persistent
+    # outputs, so each backs the products although one replica publishes.
+    config = ComponentConfig(
+        (0, 1), parallel_config=ParallelConfig(tensor_parallel_size=2)
+    )
+    group = Communicator((0, 1), rank)
+    binding = ComponentBinding(
+        "encode",
+        config,
+        group,
+        DeviceMesh(
+            ranks=config.ranks,
+            rank=rank,
+            shape=tuple(size for _, size in config.parallel_config.dimensions),
+            axes=tuple(axis for axis, _ in config.parallel_config.dimensions),
+        ),
+        group.device,
+    )
+    outputs = {
+        "encode": (
+            OutputInfo("embedding", DType.F32, ShapeBound((StaticDim(128),))),
+        )
+    }
+
+    assert (
+        local_product_storage_bytes(
+            outputs,
+            bindings={"encode": binding},
+            media_components={MediaCall.TEXT_ENCODING: "encode"},
+        )
+        == 512
+    )
+
+
 @pytest.mark.parametrize("start,stop", [(2, 5), (5, 5)])
 def test_tensor_output_preserves_global_slice_and_borrows_storage(start, stop):
     from uniserve.tensors import OutputLayout, TensorOutput

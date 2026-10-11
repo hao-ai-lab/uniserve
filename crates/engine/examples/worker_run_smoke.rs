@@ -18,12 +18,12 @@ use std::time::{Duration, Instant};
 
 use uniserve_core::EngineCoreOutput;
 use uniserve_core::{
-    GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, RequestId,
-    SamplingParams,
+    GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, ModelDtype,
+    RequestId, SamplingParams,
 };
 use uniserve_engine::{
-    Command, EngineHandle, Scheduler, SpecialTokenIds, WorkerExecutor, WorkerGroup, WorkerId,
-    WorkerProcessArgs,
+    Command, EngineHandle, Scheduler, SchedulerConfig, SimEngine, WorkerExecutor, WorkerGroup,
+    WorkerId, WorkerProcessArgs,
 };
 
 type Rxs = HashMap<RequestId, uniserve_engine::EventRx>;
@@ -122,7 +122,17 @@ fn main() -> anyhow::Result<()> {
     // Commands sent through a handle built with this waker interrupt the
     // executor's idle park, which round 2 exercises.
     let waker = engine.command_waker();
-    let sched = Scheduler::new(Box::new(engine), SpecialTokenIds::default(), 32)?;
+    let sched = Scheduler::new(
+        Box::new(engine),
+        // The stub model's end-of-text id is the simulator's.
+        SimEngine::special_tokens(),
+        SchedulerConfig {
+            max_batch: 32,
+            ..Default::default()
+        },
+        ModelDtype::BFloat16,
+        SimEngine::generation_limits(),
+    )?;
 
     let (tx, rx) = crossbeam_channel::unbounded::<Command>();
     let handle = EngineHandle::with_waker(tx, waker);

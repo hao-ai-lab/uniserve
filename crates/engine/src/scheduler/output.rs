@@ -241,7 +241,7 @@ impl Scheduler {
     pub(super) fn resolve_decode_text(
         &mut self,
         id: RequestId,
-        mut record: uniserve_worker_ipc::RequestOutput,
+        mut record: uniserve_worker_ipc::CallOutput,
     ) {
         self.activate_request_tables(id);
 
@@ -361,7 +361,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         call: Call,
-        mut record: uniserve_worker_ipc::RequestOutput,
+        mut record: uniserve_worker_ipc::CallOutput,
         media: Option<&SharedMedia>,
     ) {
         let call_variant = call.kind;
@@ -688,10 +688,7 @@ impl Scheduler {
                     return;
                 };
                 let (image_id, h, w, steps, prev_sd) = {
-                    let prev = record
-                        .num_completed_steps
-                        .saturating_sub(1)
-                        .min(u32::from(u16::MAX)) as u16;
+                    let prev = record.step_index.saturating_sub(1).min(u32::from(u16::MAX)) as u16;
                     (
                         st.image_id,
                         st.req.image.height,
@@ -1483,7 +1480,7 @@ impl Scheduler {
         // acknowledges the ordered close command.
         let mut awaits_close = false;
         let mut allocations = None;
-        let mut flow_prefix = None;
+        let mut guidance_prefix = None;
         if let Some(mut st) = self.running.remove(&id) {
             let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
             if st.worker_registered {
@@ -1494,7 +1491,7 @@ impl Scheduler {
                 };
                 self.inflight.pending_commands.push_back(command);
                 let mut allocations: Vec<RequestAllocations> = st
-                    .flow_prefix
+                    .guidance_prefix
                     .take()
                     .into_iter()
                     .map(|prefix| prefix.allocations)
@@ -1519,7 +1516,7 @@ impl Scheduler {
                 awaits_close = true;
             } else {
                 allocations = st.allocations.take();
-                flow_prefix = st.flow_prefix.take();
+                guidance_prefix = st.guidance_prefix.take();
             }
 
             // Remove admission reservations before exposing terminal output so
@@ -1563,7 +1560,7 @@ impl Scheduler {
         // Unregistered requests have no outstanding worker reference, so their
         // allocations can return to the scheduler immediately.
         if !awaits_close {
-            if let Some(prefix) = flow_prefix {
+            if let Some(prefix) = guidance_prefix {
                 prefix.allocations.free(&mut self.storage);
             }
             if let Some(allocations) = allocations {

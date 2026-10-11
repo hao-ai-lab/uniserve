@@ -71,7 +71,6 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (
     snapshots = []
     for grant in (None, 1 << 40):
         worker = execution_worker(
-            worker_id="encoder-0",
             execution=cpu_worker_config(
                 graph_policy="off",
                 prefill_cuda_graph=False,
@@ -85,12 +84,6 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (
         finally:
             worker.close()
     first, second = snapshots
-    assert (
-        first["endpoint"]["worker_id"]
-        == second["endpoint"]["worker_id"]
-        == "encoder-0"
-    )
-    assert first["endpoint"]["rank"] == second["endpoint"]["rank"] == 0
     assert first["endpoint"]["node"] == second["endpoint"]["node"]
     assert (
         first["endpoint"]["address_space"]

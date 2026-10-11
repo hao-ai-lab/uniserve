@@ -422,7 +422,7 @@ def _execute_calls(
         if images:
             # An image worker always holds its latent pool.
             assert latent_pool is not None
-            trajectories, step_count = initialize_trajectories(
+            trajectories = initialize_trajectories(
                 numerical,
                 scheduled,
                 outcomes,
@@ -433,94 +433,86 @@ def _execute_calls(
                 model_runner=model_runner,
             )
         else:
-            trajectories, step_count = {}, 1
+            trajectories = {}
 
-        # step_count is the longest declared solver interval among the opened
-        # trajectories; a trajectory with fewer steps drops out once its
-        # interval ends.
-        for offset in range(step_count):
-            # The numerical schedule is local to this loop. Accepted request
-            # progress is published only after the complete declared interval.
-            if trajectories:
-                assert latent_pool is not None
-                step_inputs = prepare_diffusion_step(
-                    offset,
-                    trajectories,
-                    scheduled,
-                    outcomes,
-                    state=state,
-                    kv_cache=kv_cache,
-                    latent_pool=latent_pool,
-                    request_tables=request_tables,
-                    model_runner=model_runner,
-                    decode_state=decode_state,
-                    sampling_group=sampling_group,
-                    tokenizer=tokenizer,
-                )
-            else:
-                step_inputs = {}
+        # The numerical schedule is local to this round. Accepted request
+        # progress is published with the batch commit.
+        if trajectories:
+            assert latent_pool is not None
+            step_inputs = prepare_diffusion_step(
+                trajectories,
+                scheduled,
+                outcomes,
+                state=state,
+                kv_cache=kv_cache,
+                latent_pool=latent_pool,
+                request_tables=request_tables,
+                model_runner=model_runner,
+                decode_state=decode_state,
+                sampling_group=sampling_group,
+                tokenizer=tokenizer,
+            )
+        else:
+            step_inputs = {}
 
-            forward, prepared_images = prepare_forward_rows(
-                numerical,
-                offset,
+        forward, prepared_images = prepare_forward_rows(
+            numerical,
+            step_inputs,
+            trajectories,
+            scheduled,
+            outcomes,
+            state=state,
+            tensor_store=tensor_store,
+            latent_pool=latent_pool,
+            request_tables=request_tables,
+            model_runner=model_runner,
+            decode_state=decode_state,
+        )
+
+        values = (
+            forward_values(
+                model_runner,
+                tuple((task, scheduled[index]) for index, task in forward),
+                cache=kv_cache,
+                tables=request_tables,
+                states=decode_state,
+                sampling_group=sampling_group,
+                state=state,
+            )
+            if forward
+            else ()
+        )
+
+        predictions = publish_forward_values(
+            forward,
+            values,
+            prepared_images,
+            trajectories,
+            scheduled,
+            outcomes,
+            state=state,
+            tensor_store=tensor_store,
+            publication_transports=publication_transports,
+            model_runner=model_runner,
+            request_tables=request_tables,
+            decode_state=decode_state,
+            sampling_group=sampling_group,
+            config=config,
+        )
+
+        if predictions:
+            assert latent_pool is not None
+            integrate_predictions(
+                predictions,
                 step_inputs,
                 trajectories,
                 scheduled,
                 outcomes,
                 state=state,
-                tensor_store=tensor_store,
                 latent_pool=latent_pool,
-                request_tables=request_tables,
-                model_runner=model_runner,
-                decode_state=decode_state,
-            )
-
-            values = (
-                forward_values(
-                    model_runner,
-                    tuple((task, scheduled[index]) for index, task in forward),
-                    cache=kv_cache,
-                    tables=request_tables,
-                    states=decode_state,
-                    sampling_group=sampling_group,
-                    state=state,
-                    retain_sampling=offset + 1 < step_count,
-                )
-                if forward
-                else ()
-            )
-
-            predictions = publish_forward_values(
-                forward,
-                values,
-                prepared_images,
-                trajectories,
-                scheduled,
-                outcomes,
-                state=state,
-                tensor_store=tensor_store,
                 publication_transports=publication_transports,
-                model_runner=model_runner,
                 request_tables=request_tables,
-                decode_state=decode_state,
-                sampling_group=sampling_group,
+                model_runner=model_runner,
                 config=config,
             )
-
-            if predictions:
-                assert latent_pool is not None
-                integrate_predictions(
-                    predictions,
-                    step_inputs,
-                    trajectories,
-                    offset,
-                    scheduled,
-                    outcomes,
-                    state=state,
-                    latent_pool=latent_pool,
-                    publication_transports=publication_transports,
-                    request_tables=request_tables,
-                    model_runner=model_runner,
-                    config=config,
-                )
     return outcomes

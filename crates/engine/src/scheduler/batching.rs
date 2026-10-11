@@ -84,21 +84,21 @@ impl Scheduler {
     /// Reserves persistent buffers, latent pages, and transfer capacity for one call.
     ///
     /// Returns the call's output buffer spans, in `Call::buffer_outputs`
-    /// order, or `None` when the call cannot run now: the flow prefix of a
+    /// order, or `None` when the call cannot run now: the guidance prefix of a
     /// denoising call cannot be allocated, transfer capacity is exhausted,
     /// the request is not running, `Placement::worker_target` finds no worker,
     /// a buffer or latent-page allocation fails, or (after latching
     /// engine-fatal) the request holds no allocations.
     ///
     /// Buffer spans reserved before a failure are returned to the pool, but a
-    /// failure is not free of side effects: a flow prefix already allocated
+    /// failure is not free of side effects: a guidance prefix already allocated
     /// stays with the request, and a failed buffer allocation evicts one
     /// unpinned encoder-cache product, if any, and queues a `Free` for its
     /// buffer. Only a successful reservation counts against the transfer
     /// capacity.
     fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<BufferSpan>> {
         let id = call.request_key.request_id;
-        if call.kind == CallKind::Media(MediaCall::Denoising) && !self.ensure_flow_prefix(id) {
+        if call.kind == CallKind::Media(MediaCall::Denoising) && !self.ensure_guidance_prefix(id) {
             return None;
         }
         let uses_transfer = call.bounds.max_transfer_bytes > 0;
@@ -247,7 +247,7 @@ impl Scheduler {
             // Between two steps of one request, another request may take it.
             if next_type == Some(CallKind::Media(MediaCall::Denoising))
                 && (self.inflight.denoiser_lane_held_by_other(id)
-                    || !self.flow_prefix_is_schedulable(id))
+                    || !self.guidance_prefix_is_schedulable(id))
             {
                 continue;
             }
@@ -296,7 +296,7 @@ impl Scheduler {
 
                 // Only a call that obtains its storage is charged to the
                 // pass. A call that cannot run now leaves the budget to later
-                // requests; in particular, requests waiting for the flow-prefix
+                // requests; in particular, requests waiting for the guidance-prefix
                 // row must not spend the pass before the request that holds
                 // the row, which is the one whose steps release it.
                 let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
@@ -606,12 +606,12 @@ impl Scheduler {
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::CloseKv => CallKind::Forward(ForwardMode::Prefill),
             Phase::PublishKv => CallKind::Transfer(TransferMode::KvPublish),
-            Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
-            Phase::DenoiseGen if st.denoising.is_complete() => {
+            Phase::LatentPreparation => CallKind::Media(MediaCall::LatentPreparation),
+            Phase::Denoising if st.denoising.is_complete() => {
                 CallKind::Media(MediaCall::ImageDecoding)
             }
-            Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
-            Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),
+            Phase::Denoising => CallKind::Media(MediaCall::Denoising),
+            Phase::ImageDecoding => CallKind::Media(MediaCall::ImageDecoding),
             Phase::FeedbackEncode => {
                 let feedback = &st.req.image_generation;
                 feedback.feedback_source.as_ref()?;
@@ -753,18 +753,6 @@ impl Scheduler {
             | CallKind::Transfer(TransferMode::KvPublish)
             | CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::Denoising) => Some(KvLengths { visible, input: 0 }),
-            _ => None,
-        };
-        // Latent preparation opens the trajectory at step zero, a denoising
-        // call starts after the steps already scheduled, and image decoding
-        // sits at the end of the schedule.
-        let start_step = match call.kind {
-            CallKind::Media(MediaCall::LatentPreparation) => Some(0),
-            CallKind::Media(MediaCall::Denoising) => self.num_scheduled_denoise_steps(request_id),
-            CallKind::Media(MediaCall::ImageDecoding) => self
-                .running
-                .get(&request_id)
-                .map(|state| u32::from(state.req.image.steps)),
             _ => None,
         };
         // An image-feature extension declares the KV tokens of the encoder
@@ -988,7 +976,7 @@ impl Scheduler {
         // A denoising call adds one query row per guidance branch; its query
         // is the latent grid plus the commit marker tokens and writes no KV.
         // Branch 0 attends to the request's own conditioning KV. Every other
-        // branch attends to the flow prefix (the negative-prompt KV in its own
+        // branch attends to the guidance prefix (the negative-prompt KV in its own
         // request row) when the request holds one, and to the request's own
         // KV otherwise. Until a denoising call completes successfully and
         // finalizes the prefix, the call also prefills a non-empty negative
@@ -1020,7 +1008,7 @@ impl Scheduler {
                 return None;
             };
             let mut alternative = None;
-            if let Some(prefix) = state.flow_prefix.as_mut() {
+            if let Some(prefix) = state.guidance_prefix.as_mut() {
                 if !prefix.diffusion_finalized || !prefix.new_units.is_empty() {
                     for table in prefix.block_tables() {
                         call_block_tables.push(IpcBlockTable {
@@ -1060,8 +1048,8 @@ impl Scheduler {
 
         let mut latent = None;
 
-        // Latent allocations describe the request-owned page table and the
-        // exact denoising interval executed by this call.
+        // Latent allocations describe the request-owned page table this call
+        // addresses.
         if matches!(
             call.kind,
             CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
@@ -1088,24 +1076,10 @@ impl Scheduler {
                 height: state.req.image.height,
                 width: state.req.image.width,
             };
-            let Some(start_step) = start_step else {
-                tracing::error!(
-                    request_id = request_id.0,
-                    call = call.kind.as_str(),
-                    "latent call has no submitted step"
-                );
-                self.fatal = true;
-                return None;
-            };
-            // A denoising call covers one step; latent preparation and
-            // image decoding cover none.
-            let step_count = u32::from(call.kind == CallKind::Media(MediaCall::Denoising));
             latent = Some(Denoising::params(
                 call.request_key,
                 call.call_id,
                 &placement,
-                start_step,
-                step_count,
             ));
         }
 
@@ -1140,11 +1114,14 @@ impl Scheduler {
         let submitted_us = uniserve_core::now_monotonic_us();
         self.register_inflight(
             call.clone(),
-            InflightInput::Generation {
-                image_kv,
-                latent: latent.clone(),
-            },
+            InflightInput::Generation { image_kv },
             submitted_us.saturating_sub(planned_us),
+        );
+        // The runtime's buffer pool is one address space, so every rank of
+        // the worker holds each span at the same offset.
+        let buffers = RankBuffer::on_every_rank(
+            &call_buffers,
+            self.executor.info().rank_count(&worker) as u32,
         );
         batch.requests.push((
             call,
@@ -1156,7 +1133,7 @@ impl Scheduler {
                 forward: call_forward,
                 latent,
                 decode: None,
-                buffers: call_buffers,
+                buffers,
                 readers: Default::default(),
             },
         ));
@@ -1452,7 +1429,7 @@ impl Scheduler {
                     request,
                 )
             }),
-            Phase::PrepareGen => {
+            Phase::LatentPreparation => {
                 let conditioning = self.kv_conditioning(id)?;
                 self.plan_call(id, |scheduler, request| {
                     generation::plan_diffusion_prepare(
@@ -1464,7 +1441,7 @@ impl Scheduler {
                     )
                 })
             }
-            Phase::DenoiseGen => {
+            Phase::Denoising => {
                 // Each call covers the next step of the schedule, and none
                 // is planned once every step is submitted. Accepted
                 // completion remains separately tracked on the request.
@@ -1487,7 +1464,7 @@ impl Scheduler {
                     )
                 })
             }
-            Phase::CommitGen => {
+            Phase::ImageDecoding => {
                 let latent = self
                     .pending_output(id, |call| call.latent_output.as_ref())
                     .or(self.running.get(&id)?.denoising.latent())

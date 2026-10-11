@@ -9,6 +9,8 @@
 //! candidate, so the expected answer is known exactly. Tests observe calls at
 //! the executor boundary, the protocol the worker consumes.
 
+mod support;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -21,8 +23,8 @@ use uniserve_core::{
     ReadoutRow, ReadoutSlot, RejectionKind, RequestId, SamplingParams,
 };
 use uniserve_engine::{
-    BatchEvent, ComponentConfig, EngineHandle, EventRx, ExecutionBatch, Scheduler, SchedulerConfig,
-    SchedulerStats, SimEngine, SimExecutor, SpecialTokenIds, sim_candidate_logprob,
+    BatchEvent, ComponentConfig, EngineHandle, EventRx, ExecutionBatch, SchedulerConfig,
+    SchedulerStats, SimEngine, SimExecutor, sim_candidate_logprob,
 };
 use uniserve_worker_ipc::{Call, CallKind, ComponentInfo, ForwardMode, MediaCall};
 
@@ -116,7 +118,8 @@ impl Running {
         let mut executor = SimExecutor::new(sim);
         let batches = executor.observe();
         let scheduler =
-            Scheduler::with_config(Box::new(executor), SpecialTokenIds::default(), config).unwrap();
+            support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config)
+                .unwrap();
         let stats = scheduler.stats_handle();
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
@@ -779,7 +782,7 @@ fn a_ready_canvas_pass_runs_before_waiting_prefill() {
     let mut executor = SimExecutor::new(sim);
     let batches = executor.observe();
     let scheduler =
-        Scheduler::with_config(Box::new(executor), SpecialTokenIds::default(), config).unwrap();
+        support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let short = readout_request(7, prompt(16, 1000), vec![row(32, &[(1, &[60])])]);

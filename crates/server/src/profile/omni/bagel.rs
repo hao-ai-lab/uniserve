@@ -113,16 +113,14 @@ impl BagelProfile {
         let dtype_bytes = model_dtype_bytes(model_dtype);
         let vae_tokens = Self::max_grid_tokens(Self::VAE_RESIZE);
         let vit_tokens = Self::max_grid_tokens(Self::VIT_RESIZE);
-        // `GenerationRequest::image_latent_bytes` divides the latent feature
-        // bytes by `max_vae_grid_tokens` to get the bytes per latent unit.
+        let latent_bytes_per_unit = Self::LATENT_UNIT_ELEMENTS * dtype_bytes;
         GenerationLimits {
             max_latent_units: u64::MAX,
             latent_downsample: Self::LATENT_DOWNSAMPLE,
             max_vae_grid_tokens: vae_tokens,
             max_vit_grid_tokens: vit_tokens,
-            max_latent_feature_bytes: u64::from(vae_tokens)
-                * Self::LATENT_UNIT_ELEMENTS
-                * dtype_bytes,
+            latent_bytes_per_unit,
+            max_latent_feature_bytes: u64::from(vae_tokens) * latent_bytes_per_unit,
             max_vision_feature_bytes: u64::MAX,
             commit_marker_tokens: Self::MARKER_TOKENS,
             max_cfg_branches: 3,

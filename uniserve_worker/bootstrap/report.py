@@ -31,6 +31,7 @@ from uniserve.model import (
     CausalLM,
     PatchEncoder,
     VideoDenoiser,
+    VideoEncoder,
     VideoPostprocessor,
 )
 from uniserve.processing import ImageProcessor
@@ -89,6 +90,7 @@ from uniserve_worker.protocol.call import CALL_KINDS
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import (
     ComponentInfo,
+    FrameChunks,
     ServedCanvas,
     VideoDenoiserInfo,
     WorkerInfo,
@@ -122,10 +124,6 @@ class WorkerLayout:
             worker. With a KV cache, the primary device's entry is already
             charged against the KV grant; ``Worker.__init__`` checks each
             other CUDA device against its own grant.
-        physical_buffer_pool_bytes: Bytes this rank's ``BufferPool`` backs.
-            On a request-tensor rank that backs only some products it is
-            smaller than ``info.buffer_pool_bytes``, and the worker builds a
-            compact pool.
         planes: The K/V unit pool plan the worker allocates its pool from
             with ``info.kv_cache.num_units`` units; ``None`` without a
             ``CausalLM``.
@@ -139,7 +137,6 @@ class WorkerLayout:
     arena: ArenaCapacity
     input_config: TokenBufferConfig | None
     fixed_device_bytes: tuple[tuple[str, int], ...]
-    physical_buffer_pool_bytes: int
     planes: Planes | None
     latent_pool: LatentPoolPlan | None
 
@@ -199,7 +196,7 @@ def build_worker_layout(
         else supported_calls(model, (name for name, _ in components))
     )
 
-    endpoint = endpoint or WorkerEndpoint.local(rank=int(worker_config.rank))
+    endpoint = endpoint or WorkerEndpoint.local()
 
     if state_buffers is None:
         state_buffers = media_state_buffers(
@@ -614,9 +611,33 @@ def _token_worker_layout(
         arena=arena,
         input_config=input_config,
         fixed_device_bytes=tuple(fixed_bytes.items()),
-        physical_buffer_pool_bytes=buffer_pool_bytes,
         planes=planes,
         latent_pool=plan,
+    )
+
+
+def frame_chunks(
+    denoiser: VideoDenoiser, encoder: VideoEncoder | None
+) -> FrameChunks:
+    """State how the video VAE chunks the frames a denoiser generates.
+
+    The denoiser's legal frame counts form the progression ``min_frames + n *
+    chunk_frames``. The encoder's latent windows of the fewest frames are one
+    whole chunk followed by the final window.
+
+    Raises:
+        ValueError: The model has no video encoder to state its latent frames.
+    """
+    if encoder is None:
+        raise ValueError("a video model must declare its video encoder")
+    minimum = denoiser.legal_frame_count(1)
+    chunk = denoiser.legal_frame_count(minimum + 1) - minimum
+    whole, *_, final = encoder.latent_slices(minimum)
+    return FrameChunks(
+        min_frames=minimum,
+        chunk_frames=chunk,
+        chunk_latent_frames=whole.stop - whole.start,
+        tail_latent_frames=final.stop - final.start,
     )
 
 
@@ -625,6 +646,7 @@ def video_denoiser_info(
     *,
     frame_rate: int,
     audio_sample_rate: int,
+    frames: FrameChunks,
     canvases: tuple[image.Config, ...] = (),
 ) -> VideoDenoiserInfo:
     """Describe what the deployment's video denoiser serves.
@@ -638,7 +660,8 @@ def video_denoiser_info(
     ``frame_rate`` is the model's output frame rate
     (``VideoPostprocessor.frame_rate``) and ``audio_sample_rate`` its audio
     rate (``AudioDecoder.sample_rate``), zero for a model without an audio
-    decoder.
+    decoder; ``frames`` is how its VAE chunks a video's frames
+    (``frame_chunks``).
     """
     # The denoiser names each of its canvases once.
     names = {size: name for name, size in denoiser.canvases.items()}
@@ -651,6 +674,7 @@ def video_denoiser_info(
         audio_shift=float(shifts["audio"]),
         frame_rate=frame_rate,
         audio_sample_rate=audio_sample_rate,
+        frames=frames,
         canvases=tuple(
             ServedCanvas(*names[canvas], canvas.width, canvas.height)
             for canvas in served
@@ -670,10 +694,10 @@ def _request_tensor_worker_layout(
 ) -> WorkerLayout:
     """Describe request tensors, products, and persistent capacity.
 
-    ``info.buffer_pool_bytes`` covers every product of every resident request
-    and is the logical pool the engine assigns buffer offsets in; the physical
-    pool backs only the products this rank produces or holds a consumer of
-    (``local_product_storage_bytes``).
+    ``info.buffer_pool_bytes`` is the pool this rank backs: the products of
+    every resident request that this rank's components produce or that
+    components it holds read (``local_product_storage_bytes``). The engine
+    places each rank's buffers in that rank's own pool.
     """
     slots = int(worker_config.max_request_pool_size)
     depth = int(queue_depth)
@@ -715,7 +739,13 @@ def _request_tensor_worker_layout(
         latent_page_units=0 if plan is None else plan.page_units,
         latent_pages=0 if plan is None else plan.num_pages,
         buffer_pool_bytes=slots
-        * product_storage_bytes(resolve_outputs(model, worker_config)),
+        * local_product_storage_bytes(
+            resolve_outputs(model, worker_config),
+            bindings=bindings or {},
+            media_components=media_components(
+                model, worker_config.deployment_components
+            ),
+        ),
         max_unresolved_calls=unresolved_window,
         media_components=dict(
             media_components(model, worker_config.deployment_components)
@@ -724,6 +754,9 @@ def _request_tensor_worker_layout(
             builder.denoiser,
             frame_rate=output.frame_rate,
             audio_sample_rate=0 if audio is None else audio.sample_rate,
+            frames=frame_chunks(
+                builder.denoiser, capability(model, VideoEncoder)
+            ),
             canvases=builder.canvases,
         ),
         host_lane_capacity=1 if host else int(arena.host_lane_inflight),
@@ -736,14 +769,6 @@ def _request_tensor_worker_layout(
         fixed_device_bytes=(),
         planes=None,
         latent_pool=plan,
-        physical_buffer_pool_bytes=slots
-        * local_product_storage_bytes(
-            resolve_outputs(model, worker_config),
-            bindings=bindings or {},
-            media_components=media_components(
-                model, worker_config.deployment_components
-            ),
-        ),
     )
 
 

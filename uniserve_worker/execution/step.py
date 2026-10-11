@@ -33,9 +33,9 @@ from uniserve_worker.execution.schedule import dispatch_batch
 from uniserve_worker.profiling import _forward_stats
 from uniserve_worker.protocol.call import CallStatus
 from uniserve_worker.protocol.output import (
+    CallOutput,
     FinishFlags,
     ForwardStats,
-    RequestOutput,
     TimingCounters,
 )
 from uniserve_worker.protocol.tensor import DType
@@ -387,7 +387,7 @@ def _error_outputs(
     coordinates when the call has no predecessor or the request pool no
     longer holds the call's exact request key.
     """
-    records: list[RequestOutput] = []
+    records: list[CallOutput] = []
     for call in state.batch.calls:
         # Report accepted coordinates only for the matching admitted epoch;
         # a stale descriptor cannot observe a replacement request slot.
@@ -401,7 +401,7 @@ def _error_outputs(
         else:
             runtime = request.accepted_progress
 
-        placeholder = RequestOutput(
+        placeholder = CallOutput(
             request_key=call.request_key,
             call_id=call.call_id,
             status=CallStatus.ERROR,
@@ -413,9 +413,7 @@ def _error_outputs(
             kv_computed_len=(
                 0 if runtime is None else int(runtime.kv_computed_len)
             ),
-            num_completed_steps=(
-                0 if runtime is None else int(runtime.flow_step)
-            ),
+            step_index=0,
             committed_tokens=(),
             finish_flags=FinishFlags(),
         )

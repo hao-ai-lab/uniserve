@@ -89,8 +89,7 @@ impl SenseNovaProfile {
             .max()
             .unwrap_or(0);
         let max_vision_units = Self::MAX_IMAGE_PIXELS / u64::from(Self::VISION_STRIDE).pow(2);
-        // `GenerationRequest::image_latent_bytes` divides the latent feature
-        // bytes by `max_vae_grid_tokens` to get the bytes per latent unit.
+        let latent_bytes_per_unit = Self::LATENT_UNIT_ELEMENTS * dtype_bytes;
         GenerationLimits {
             max_latent_units: u64::MAX,
             latent_downsample: Self::LATENT_DOWNSAMPLE,
@@ -98,7 +97,8 @@ impl SenseNovaProfile {
             max_vit_grid_tokens: u32::try_from(max_vision_units)
                 .unwrap_or(u32::MAX)
                 .saturating_add(Self::FEEDBACK_MARKER_TOKENS),
-            max_latent_feature_bytes: max_latent_units * Self::LATENT_UNIT_ELEMENTS * dtype_bytes,
+            latent_bytes_per_unit,
+            max_latent_feature_bytes: max_latent_units * latent_bytes_per_unit,
             max_vision_feature_bytes: u64::MAX,
             commit_marker_tokens: 0,
             max_cfg_branches: 3,
