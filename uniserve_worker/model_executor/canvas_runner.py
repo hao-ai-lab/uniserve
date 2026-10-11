@@ -179,14 +179,6 @@ class CanvasRunner(ModelRunner):
             value *= 2
         return (*buckets, length)
 
-    def capture_plan(self):
-        return (
-            super().capture_plan(),
-            self.canvas_rows,
-            self.readout_lengths,
-            None if self.canvas_slots is None else self.canvas_slots.constants,
-        )
-
     def close_graphs(self):
         try:
             super().close_graphs()

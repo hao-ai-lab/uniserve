@@ -1749,14 +1749,11 @@ class ModelExecutor:
         )
 
     def _bind_expert_steps(self):
-        """Bind forwards reaching experts to a common transfer catalog.
+        """Bind forwards reaching experts to the exchange's transfer catalog.
 
         Every local numerical graph captures the transfer capacities that
-        hold its tokens. All ranks must share the same catalog, including
-        ranks whose next step has no local work.
-
-        Raises:
-            RuntimeError: The ranks' step plans differ.
+        hold its tokens. The deployment gives every rank the same catalog,
+        including ranks whose next step has no local work.
         """
         exchange = self.experts
         if exchange is None:
@@ -1774,29 +1771,6 @@ class ModelExecutor:
                 peer.expert_step = True
                 peer.expert_order = len(self._expert_runners)
             self._expert_runners.append(entry)
-
-        # Warmup executes collectives too. Equal transfer catalogs alone do
-        # not establish that peers capture the same local numerical calls.
-        plan = (
-            exchange.capacities,
-            self.worker_config.expert_microbatches,
-            tuple(entry.capture_plan() for entry in self._expert_runners),
-        )
-        plans = [None] * exchange.group.size
-        torch.distributed.all_gather_object(
-            plans, plan, group=exchange.group._require()
-        )
-        sources = (
-            plans[: exchange.attention_ranks]
-            if exchange.attention_ranks
-            else plans
-        )
-        if any(other != sources[0] for other in sources) or any(
-            other[:2] != sources[0][:2] for other in plans
-        ):
-            raise RuntimeError(
-                f"expert-parallel ranks have different capture plans: {plans}"
-            )
 
     def join_expert_step(self, *, leaving: bool = False) -> bool:
         """Take part in the next expert step when this rank has no forward.

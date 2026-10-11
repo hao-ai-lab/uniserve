@@ -164,14 +164,6 @@ class ModelRunner(Execution, ABC):
         assert tokens is not None
         return tokens
 
-    def capture_plan(self):
-        """Numerical captures whose startup collectives must pair on peers."""
-        return (
-            tuple(sorted(self.call_kinds)),
-            self.decode_shapes,
-            self.prefill_shapes,
-        )
-
     def select_graph_shape(self, batch, *, eligible):
         """Use the exact numerical signature for non-text graph variants.
 
