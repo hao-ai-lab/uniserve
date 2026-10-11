@@ -412,6 +412,15 @@ impl ExecutorInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
+        // A transfer call may be placed on any pool, so the narrowest
+        // transport binds the engine's window of reserved transfers.
+        merged.transfer_tickets = self
+            .workers
+            .iter()
+            .map(|(_, info)| info.transfer_tickets)
+            .filter(|limit| *limit > 0)
+            .min()
+            .unwrap_or(0);
         // Latent page geometry is the denoising pool's, zero without one.
         let flow = routed(CallKind::Media(MediaCall::Denoising));
         merged.latent_page_units = flow.map_or(0, |info| info.latent_page_units);

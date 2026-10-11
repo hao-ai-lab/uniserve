@@ -222,11 +222,9 @@ impl Scheduler {
         // Queue and batch limits cannot exceed the physical executor envelope.
         let max_batch_calls = info.max_batch_calls as usize;
         let max_batch_tokens = info.max_batch_tokens as usize;
-        let transfer_capacity = executor
-            .info()
-            .queue_depth()
-            .saturating_mul(max_batch_calls)
-            .clamp(1, MAX_INFLIGHT_TRANSFERS);
+        // Each worker reports the transfer entries its transport holds in
+        // flight; the merged record carries the narrowest.
+        let transfer_capacity = info.transfer_tickets as usize;
 
         config.max_num_waiting = config.max_num_waiting.map(|bound| bound.max(1));
 

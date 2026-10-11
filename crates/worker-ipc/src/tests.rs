@@ -1910,6 +1910,7 @@ fn full_caps() -> WorkerInfo {
         max_decode_calls: 48,
         request_slots: 96,
         max_unresolved_calls: 3,
+        transfer_tickets: 192,
         latent_page_units: 64,
         latent_pages: 17,
         ..WorkerInfo::default()

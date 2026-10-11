@@ -631,6 +631,14 @@ def _token_worker_layout(
             code for code in CALL_KINDS if code in supported_calls(model)
         )
     )
+    arena = model_arena_capacity(
+        model,
+        worker_config,
+        bindings=None,
+        state_buffers=None,
+        num_units=0 if capacity is None else capacity.num_units,
+        **arena_args,
+    )
     info = WorkerInfo(
         endpoint=endpoint,
         supported_calls=supported,
@@ -647,7 +655,10 @@ def _token_worker_layout(
         media_components={}
         if worker_config.role == "experts"
         else dict(media_components(model, worker_config.deployment_components)),
-        host_lane_capacity=1,
+        # The rank's host executor and transfer capacity are the ones the
+        # arena reserved.
+        host_lane_capacity=int(arena.host_lane_inflight),
+        transfer_tickets=int(arena.transfer_tickets),
         encoder_cache_entries=encoder_cache_entries,
         encoder_entry_bytes=max(
             max_latent_feature_bytes, max_vision_feature_bytes
@@ -655,18 +666,8 @@ def _token_worker_layout(
         if encoder_cache_entries
         else 0,
     )
-    arena = model_arena_capacity(
-        model,
-        worker_config,
-        bindings=None,
-        state_buffers=None,
-        num_units=0 if capacity is None else capacity.num_units,
-        **arena_args,
-    )
     return WorkerLayout(
-        # The rank's host executor owns the host lane, so its advertised
-        # capacity is the one the arena reserved.
-        info=replace(info, host_lane_capacity=int(arena.host_lane_inflight)),
+        info=info,
         arena=arena,
         input_config=input_config,
         fixed_device_bytes=tuple(fixed_bytes.items()),
@@ -722,6 +723,23 @@ def _request_tensor_worker_layout(
     plan = latent_pool_plan(model, worker_config)
     builder = media_builder(model, worker_config)
 
+    arena = model_arena_capacity(
+        model,
+        worker_config,
+        bindings=bindings,
+        state_buffers=state_buffers,
+        queue_depth=depth,
+        num_units=0,
+        max_latent_feature_bytes=0,
+        max_vision_feature_bytes=0,
+        unit_bytes=0,
+    )
+
+    # A host rank is one codec slot, the same on each of a host worker's
+    # ranks, so the engine's ledger admits one host task per rank. Any other
+    # worker's host lane is the arena's executor. ``Worker.__init__`` sizes
+    # its ``HostLane`` by the same rule, so the two must change together.
+    host = bindings is not None and holds_host_components(bindings)
     info = WorkerInfo(
         endpoint=endpoint,
         supported_calls=tuple(
@@ -742,30 +760,11 @@ def _request_tensor_worker_layout(
         video_denoiser=video_denoiser_info(
             builder.denoiser, canvases=builder.canvases
         ),
-        host_lane_capacity=1,
+        host_lane_capacity=1 if host else int(arena.host_lane_inflight),
+        transfer_tickets=int(arena.transfer_tickets),
     )
-    arena = model_arena_capacity(
-        model,
-        worker_config,
-        bindings=bindings,
-        state_buffers=state_buffers,
-        queue_depth=depth,
-        num_units=0,
-        max_latent_feature_bytes=0,
-        max_vision_feature_bytes=0,
-        unit_bytes=0,
-    )
-
-    # A host rank is one codec slot, the same on each of a host worker's
-    # ranks, so the engine's ledger admits one host task per rank. Any other
-    # worker's host lane is the arena's executor. ``Worker.__init__`` sizes
-    # its ``HostLane`` by the same rule, so the two must change together.
-    host = bindings is not None and holds_host_components(bindings)
     return WorkerLayout(
-        info=replace(
-            info,
-            host_lane_capacity=1 if host else int(arena.host_lane_inflight),
-        ),
+        info=info,
         arena=arena,
         input_config=None,
         fixed_device_bytes=(),

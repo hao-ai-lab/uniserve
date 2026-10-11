@@ -387,6 +387,10 @@ pub struct WorkerInfo {
     /// The scheduler treats zero as one.
     #[serde(default)]
     pub host_lane_capacity: u32,
+    /// Transfer entries this rank's transport holds in flight at once. The
+    /// scheduler keeps no more transfer calls reserved than the narrowest
+    /// rank holds.
+    pub transfer_tickets: u32,
 }
 
 impl WorkerInfo {
@@ -465,7 +469,8 @@ impl WorkerInfo {
             self.max_batch_calls > 0
                 && self.max_batch_tokens > 0
                 && self.request_slots > 0
-                && self.max_unresolved_calls > 0,
+                && self.max_unresolved_calls > 0
+                && self.transfer_tickets > 0,
             "worker info declare a zero scheduling bound"
         );
         ensure_valid!(
@@ -550,6 +555,7 @@ impl Default for WorkerInfo {
             encoder_entry_bytes: 0,
             max_unresolved_calls: 1,
             host_lane_capacity: 1,
+            transfer_tickets: 1,
         }
     }
 }

@@ -1182,6 +1182,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
         encoder_entry_bytes: info.encoder_entry_bytes(),
         max_unresolved_calls: info.max_unresolved_calls(),
         host_lane_capacity: info.host_lane_capacity(),
+        transfer_tickets: info.transfer_tickets(),
         media_components: {
             let mut components = std::collections::BTreeMap::new();
             if let Some(bindings) = info.media_components() {

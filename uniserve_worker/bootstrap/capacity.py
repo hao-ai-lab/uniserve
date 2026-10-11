@@ -73,12 +73,6 @@ from uniserve_worker.storage.tensor_store import (
     TensorStore,
 )
 
-# Upper bound on the reads ``ArenaCapacity.transfer_tickets`` lets a rank
-# keep in flight for its queued calls; see ``request_tensor_arena_capacity``
-# for the floor a request-tensor rank keeps above it.
-_MAX_TRANSFER_ENTRIES = 256
-# A token worker's host-lane bound; request-tensor workers derive theirs.
-_HOST_LANE_INFLIGHT = 256
 # Relay-arena bytes budgeted per (request slot, relay lane) row across one
 # device's ``TensorStore`` relay arenas.
 # FIXME: A relay arena exists per (dtype, field) of the scalar outputs the
@@ -600,9 +594,7 @@ def request_tensor_arena_capacity(
         # the group producing it, so the rank keeps at least its own group's
         # world size: the products it reads in several regions come from its
         # own group's sequence-parallel or distributed components.
-        transfer_tickets=max(
-            int(worker_config.world_size), min(slots, _MAX_TRANSFER_ENTRIES)
-        ),
+        transfer_tickets=max(int(worker_config.world_size), slots),
         host_lane_inflight=state_slots * (unresolved_window + 1),
     )
 
@@ -683,7 +675,10 @@ def model_arena_capacity(
             ),
         )
 
-    transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
+    # One ticket per queued call: ``queue_depth`` batches of up to
+    # ``max_batch_calls`` calls are in flight at once, and a call holds at
+    # most one transfer entry and one host-lane task.
+    transfer_tickets = slots
 
     # Every ticket is budgeted for the largest single transfer: the whole KV
     # pool, or one latent (an image's whole trajectory) or vision feature.
@@ -715,7 +710,7 @@ def model_arena_capacity(
         device_product_bytes=device_product_bytes,
         transfer_bytes=max_transfer_bytes * transfer_tickets,
         transfer_tickets=transfer_tickets,
-        host_lane_inflight=_HOST_LANE_INFLIGHT,
+        host_lane_inflight=slots,
     )
 
 

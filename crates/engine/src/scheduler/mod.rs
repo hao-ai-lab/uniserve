@@ -112,11 +112,6 @@ use graph::{VideoGraph, product};
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
 use output::RequestOutput;
 
-/// Upper bound on concurrently reserved transfer calls. Construction clamps
-/// the executor's `queue_depth * max_batch_calls` to between one and this
-/// value to form `Scheduler::transfer_capacity`.
-const MAX_INFLIGHT_TRANSFERS: usize = 256;
-
 /// Execution lane a call kind is batched in (see `batch_kind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatchKind {

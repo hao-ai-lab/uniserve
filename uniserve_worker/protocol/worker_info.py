@@ -191,6 +191,9 @@ class WorkerInfo:
         buffer_pool_bytes: Persistent buffer-pool capacity in bytes.
         max_unresolved_calls: Maximum unresolved calls per request.
         host_lane_capacity: Concurrent host-lane tasks this rank admits.
+        transfer_tickets: Transfer entries this rank's transport holds in
+            flight at once; the engine keeps no more transfer calls reserved
+            than the narrowest rank holds.
     """
 
     endpoint: WorkerEndpoint
@@ -204,6 +207,7 @@ class WorkerInfo:
     buffer_pool_bytes: int
     max_unresolved_calls: int
     host_lane_capacity: int
+    transfer_tickets: int
     encoder_cache_entries: int = 0
     encoder_entry_bytes: int = 0
     max_prefill_calls: int = 0
@@ -259,6 +263,7 @@ class WorkerInfo:
             "encoder_entry_bytes": self.encoder_entry_bytes,
             "max_unresolved_calls": self.max_unresolved_calls,
             "host_lane_capacity": self.host_lane_capacity,
+            "transfer_tickets": self.transfer_tickets,
         }
 
 
