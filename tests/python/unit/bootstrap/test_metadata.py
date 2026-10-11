@@ -384,7 +384,10 @@ def test_h3_media_units_follow_each_request_canvas():
     from uniserve_worker.model_executor.component_binding import (
         ComponentBinding,
     )
-    from uniserve_worker.protocol.batch import DecodeRange, DiffusionSamplingParams
+    from uniserve_worker.protocol.batch import (
+        DecodeRange,
+        DiffusionSamplingParams,
+    )
     from uniserve_worker.protocol.identity import CallId, RequestKey
     from uniserve_worker.protocol.tensor import StaticDim
 
@@ -435,7 +438,9 @@ def test_h3_media_units_follow_each_request_canvas():
             RequestKey(1, 0, 0), CallId(1, 0), cursor=0, max_units=1
         )
         for width, height in ((1536, 672), (1344, 768), (768, 1344)):
-            media = DiffusionSamplingParams(124, 7, 1, width=width, height=height)
+            media = DiffusionSamplingParams(
+                124, 7, 1, width=width, height=height
+            )
             assert runner.output_layout(
                 "video_decoder", 0, media, round_, 10
             ).shape == (1, 22, height, width, 3)
