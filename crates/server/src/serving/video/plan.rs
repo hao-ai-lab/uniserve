@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use uniserve_core::{
     Canvas, ConditionMedia, ConditionVision, ImageFit, MediaLocator, VideoCondition, VideoTask,
 };
-use uniserve_engine::{FrameChunks, ReferenceLimits, ServedCanvas};
+use uniserve_engine::{FrameClips, ReferenceLimits, ServedCanvas};
 
 use super::probe::{AudioFacts, ImageFacts, MediaFacts, VideoFacts};
 use super::{RequestField, VideoInputError};
@@ -271,9 +271,9 @@ pub struct PlanLimits {
     /// Frame rate of every generated video, in frames per second, as the
     /// denoiser declares it; reference videos are resampled to it.
     pub frame_rate: u32,
-    /// How the VAE chunks a video's frames, as the denoiser declares it: the
-    /// rule that counts generated and reference frames.
-    pub frames: FrameChunks,
+    /// How the VAE divides a video's frames into clips, as the denoiser
+    /// declares it: the rule that counts generated and reference frames.
+    pub frames: FrameClips,
     /// The only canvases the deployment serves, as its workers declare them
     /// in their handshake: each with the `target.short_edge` and
     /// `target.aspect_ratio` that select it.
@@ -580,9 +580,10 @@ pub struct VideoClip {
     pub vae_frames: u32,
     /// The soundtrack, when the video has one.
     pub soundtrack: Option<AudioClip>,
-    /// How the VAE chunks `vae_frames`, as the workers declare it.
+    /// How the VAE divides `vae_frames` into clips, as the workers declare
+    /// it.
     #[serde(skip)]
-    pub chunks: FrameChunks,
+    pub vae_clips: FrameClips,
 }
 
 /// The conditioner's view of one image.
@@ -654,10 +655,10 @@ impl ConditionPlan {
     /// in order: with `g` patch rows, band `b` holds rows `b * g / bands` to
     /// `(b + 1) * g / bands`, rounded down, which is the video encoder's
     /// `row_bands` partition. `image_bands` is clamped to one through `g`.
-    /// A video's encoded frames are one unit per chunk and one for the final
-    /// window: each chunk yields `chunk_latent_frames` latent frames of rows
-    /// and the final window `tail_latent_frames` ([`FrameChunks`]). An audio
-    /// reference has none.
+    /// A video's encoded frames are one unit per clip and one for the tail:
+    /// each clip yields `clip_latent_frames` latent frames of rows and the
+    /// tail `tail_latent_frames` ([`FrameClips`]). An audio reference has
+    /// none.
     pub fn latent_units(&self, canvas: Canvas, image_bands: u32) -> Vec<u32> {
         match &self.prepared {
             Prepared::Keyframe(_) => vec![rows_per_frame(canvas)],
@@ -675,12 +676,12 @@ impl ConditionPlan {
             }
             Prepared::Video(clip) => {
                 let rows_per_frame = rows_per_frame(clip.canvas);
-                let chunks = clip.chunks;
+                let clips = clip.vae_clips;
                 let mut units = vec![
-                    chunks.chunk_latent_frames * rows_per_frame;
-                    chunks.units(clip.vae_frames) as usize
+                    clips.clip_latent_frames * rows_per_frame;
+                    clips.units(clip.vae_frames) as usize
                 ];
-                units.push(chunks.tail_latent_frames * rows_per_frame);
+                units.push(clips.tail_latent_frames * rows_per_frame);
                 units
             }
             Prepared::Audio(_) => Vec::new(),
@@ -1002,14 +1003,14 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// # Errors
 ///
 /// Returns a message when the display aspect lies outside 1:4 to 4:1, fewer
-/// than `chunks.min_frames` frames remain after the offset, or the offset lies
+/// than `clips.min_frames` frames remain after the offset, or the offset lies
 /// past the end of the soundtrack.
 pub fn video_reference(
     media: &VideoFacts,
     start_seconds: f64,
     frames: u32,
     frame_rate: u32,
-    chunks: &FrameChunks,
+    clips: &FrameClips,
     vision: &ProcessorConfig,
     config: &ReferenceConfig,
 ) -> Result<(VideoClip, VideoVision), String> {
@@ -1034,16 +1035,16 @@ pub fn video_reference(
     };
     let start_frame = start_offset(start_seconds, fps);
     let available = timeline.saturating_sub(start_frame);
-    if available < u64::from(chunks.min_frames) {
+    if available < u64::from(clips.min_frames) {
         return Err(format!(
             "a reference video needs at least {} frames at {frame_rate} fps \
              after start_time_seconds, got {available}",
-            chunks.min_frames
+            clips.min_frames
         ));
     }
     let kept = u32::try_from(available).map_or(frames, |available| available.min(frames));
-    // The VAE encodes the leading complete chunks of the kept frames.
-    let vae_frames = chunks.align_down(kept).unwrap_or(chunks.min_frames);
+    // The VAE encodes the leading complete clips of the kept frames.
+    let vae_frames = clips.align_down(kept).unwrap_or(clips.min_frames);
     let soundtrack = media
         .soundtrack
         .as_ref()
@@ -1061,7 +1062,7 @@ pub fn video_reference(
         frames: kept,
         vae_frames,
         soundtrack,
-        chunks: *chunks,
+        vae_clips: *clips,
     };
     let seen = VideoVision {
         grid,
@@ -1493,7 +1494,7 @@ fn plan_reference(
     vision: &ProcessorConfig,
     limits: &PlanLimits,
 ) -> Result<ConditionPlan, VideoInputError> {
-    let (frame_rate, chunks, config) = (limits.frame_rate, &limits.frames, &limits.references);
+    let (frame_rate, clips, config) = (limits.frame_rate, &limits.frames, &limits.references);
     let reject = |error: String| VideoInputError::condition(index, error);
     let plan = |prepared, seen, audio_rows| ConditionPlan {
         index,
@@ -1518,7 +1519,7 @@ fn plan_reference(
         MediaFacts::Video(video) => {
             let start = condition.start_seconds.unwrap_or(0.0);
             let (clip, seen) =
-                video_reference(video, start, frames, frame_rate, chunks, vision, config)
+                video_reference(video, start, frames, frame_rate, clips, vision, config)
                     .map_err(reject)?;
             let audio_rows = clip.soundtrack.map_or(0, |track| track.rows());
             Ok(plan(
@@ -1665,12 +1666,12 @@ pub(super) mod tests {
     pub(in crate::serving::video) const FRAME_RATE: u32 = 24;
 
     /// The frame rule of the reference pipeline's video VAE: `17n + 5`
-    /// frames, five latent frames per chunk and two in the final window.
-    pub(in crate::serving::video) const FRAMES: uniserve_engine::FrameChunks =
-        uniserve_engine::FrameChunks {
+    /// frames, five latent frames per clip and two in the tail.
+    pub(in crate::serving::video) const FRAMES: uniserve_engine::FrameClips =
+        uniserve_engine::FrameClips {
             min_frames: 22,
-            chunk_frames: 17,
-            chunk_latent_frames: 5,
+            clip_frames: 17,
+            clip_latent_frames: 5,
             tail_latent_frames: 2,
         };
 
@@ -1972,7 +1973,7 @@ pub(super) mod tests {
                 frames: 124,
                 vae_frames: 124,
                 soundtrack: None,
-                chunks: FRAMES,
+                vae_clips: FRAMES,
             }),
             vision: None,
             audio_rows: 0,
@@ -2120,7 +2121,7 @@ pub(super) mod tests {
     }
 
     /// Reference videos resample to the output rate, honour the start offset, keep a
-    /// whole VAE window, and sample the reference's 2 fps vision blocks.
+    /// whole VAE clip, and sample the reference's 2 fps vision blocks.
     #[test]
     fn reference_videos_match_the_reference() {
         let fixture = fixture();

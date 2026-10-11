@@ -187,9 +187,9 @@ def test_unit_encoding_assembles_the_native_whole_video_conditioning(
         video.Config(num_frames, image.Config(272, 20))
     )["video"]
     assembled = torch.full(layout.shape, torch.nan)
-    for unit in reversed(model.frame_slices(num_frames)):
+    for clip in reversed(model.clips(num_frames)):
         (result,) = model.encode(
-            (pixels[unit],), frames=(unit,), num_frames=(num_frames,)
+            (pixels[clip],), clips=(clip,), num_frames=(num_frames,)
         )
         assembled[result.layout.local_slice] = result.tensor
     torch.testing.assert_close(

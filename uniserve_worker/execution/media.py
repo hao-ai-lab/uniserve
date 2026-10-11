@@ -235,8 +235,8 @@ def prepare_call(
     resources whose constants and workspace it uses: the ``"denoising"``
     views and the request layout's ``LayoutEntry`` for preparation and
     denoising, the ``"video_overlap"`` views and the post-processor's context
-    for a video decode round, whose decoder context the round's segment
-    selects when it decodes (``decode_video_unit``), and no views for an
+    for a video decode round, whose decoder context the round's clip output
+    selects when it decodes (``decode_video_clip``), and no views for an
     audio decode round. Other kinds return ``({}, None)``. Slot views
     are taken from ``storage`` on first use and kept in the trajectory.
     Raises ``invalid_descriptor`` when the trajectory has no slot state, and
@@ -438,34 +438,34 @@ def prepare_denoising(
         ) from error
 
 
-def decode_video_unit(
+def decode_video_clip(
     runner: ModelExecutor,
     entry: str,
     latent: torch.Tensor,
-    frames: slice,
+    clip: slice,
     size: video.Config,
 ):
-    """Reconstruct one media unit of a video's complete packed latent.
+    """Reconstruct one clip of a video's complete packed latent.
 
-    The unit's window is unpacked eagerly on the caller's stream, which
-    depends on the video's frame count, and decoded at its segment, whose
+    The clip's input is unpacked eagerly on the caller's stream, which
+    depends on the video's frame count, and decoded at its clip output, whose
     prepared context and captured graph every video of that raster shares.
 
     Returns:
-        The decoder call's ``ExecutionOutput``: one native segment, leading
-        with a unit axis of one, and the call's statistics.
+        The decoder call's ``ExecutionOutput``: one native clip output,
+        leading with a unit axis of one, and the call's statistics.
     """
     decoder = runner.video_decoder
-    segment = decoder.segment(size, frames)
-    config = decoder.window_input(segment)
-    window = torch.empty(config.shape, dtype=config.dtype, device=latent.device)
-    decoder.unpack_latents(latent, frames, size, out=window)
+    output = decoder.clip_output(size, clip)
+    config = decoder.clip_input(output)
+    values = torch.empty(config.shape, dtype=config.dtype, device=latent.device)
+    decoder.unpack_latents(latent, clip, size, out=values)
     return runner.run_module(
         entry,
-        (window,),
+        (values,),
         method="decode",
-        size=segment,
-        segments=(segment,),
+        size=output,
+        clip_outputs=(output,),
     )
 
 
@@ -473,13 +473,13 @@ def decode_video_unit(
 def warmup_decoders(runner: ModelExecutor) -> None:
     """Prepare and capture reconstruction at every admitted size.
 
-    A video window's decode depends on its segment alone, so the video
-    decoder prepares and captures each segment its admitted videos decode
-    to once: the frame count only changes how a window is unpacked, which
-    runs eagerly. The audio decoder's prepared context and graph follow the
-    track's latent frames, so it warms every admitted duration and the units
-    its ranks decode together. Every size's context is prepared before the
-    first capture into the decoder's shared graph pool
+    A video clip's decode depends on its clip output alone, so the video
+    decoder prepares and captures each clip output its admitted videos
+    decode to once: the frame count only changes how a clip's input is
+    unpacked, which runs eagerly. The audio decoder's prepared context and
+    graph follow the track's latent frames, so it warms every admitted
+    duration and the units its ranks decode together. Every size's context
+    is prepared before the first capture into the decoder's shared graph pool
     (``ModelExecutor.prepare_module``), the largest first.
 
     Raises:
@@ -490,16 +490,16 @@ def warmup_decoders(runner: ModelExecutor) -> None:
     frames = tuple(reversed(builder.frame_counts))
     decoder = runner.video_decoder
     # Canvases come in decreasing generated rows and frame counts in
-    # decreasing order, so the first segments are the largest.
-    segments = (
+    # decreasing order, so the first clip outputs are the largest.
+    clip_outputs = (
         ()
         if decoder is None
         else tuple(
             dict.fromkeys(
-                decoder.segment(video.Config(num_frames, canvas), window)
+                decoder.clip_output(video.Config(num_frames, canvas), clip)
                 for canvas in builder.canvases
                 for num_frames in frames
-                for window in decoder.frame_slices(num_frames)
+                for clip in decoder.clips(num_frames)
             )
         )
     )
@@ -509,19 +509,19 @@ def warmup_decoders(runner: ModelExecutor) -> None:
                 continue
             module = call.module
             if isinstance(module, VideoDecoder):
-                for segment in segments:
-                    runner.prepare_module(name, segment, method="decode")
-                for segment in segments:
-                    config = module.window_input(segment)
-                    window = torch.zeros(
+                for output in clip_outputs:
+                    runner.prepare_module(name, output, method="decode")
+                for output in clip_outputs:
+                    config = module.clip_input(output)
+                    values = torch.zeros(
                         config.shape, dtype=config.dtype, device=binding.device
                     )
                     runner.run_module(
                         name,
-                        (window,),
+                        (values,),
                         method="decode",
-                        size=segment,
-                        segments=(segment,),
+                        size=output,
+                        clip_outputs=(output,),
                     )
             elif isinstance(module, AudioDecoder):
                 # The audio track does not depend on the canvas.
@@ -553,8 +553,8 @@ def warmup_decoders(runner: ModelExecutor) -> None:
                     )
     except (CUDAGraphError, torch.OutOfMemoryError) as error:
         raise RuntimeError(
-            f"the decoders ({len(segments)} video segments, {len(frames)} "
-            "audio durations) do not fit this device: lower "
+            f"the decoders ({len(clip_outputs)} video clip outputs, "
+            f"{len(frames)} audio durations) do not fit this device: lower "
             "--max-video-seconds, raise --mem-fraction-static, or serve with "
             f"--graph-policy off ({error})"
         ) from error
@@ -564,7 +564,7 @@ def warmup_decoders(runner: ModelExecutor) -> None:
 def warmup_postprocess(
     runner: ModelExecutor, storage: tuple[TensorBuffers, ...]
 ) -> None:
-    """Exercise real output windows through the public numerical interface.
+    """Exercise real output clips through the public numerical interface.
 
     One post-processing call converts the media unit this rank reconstructed,
     so its prepared context follows the frame count and canvas, and every
@@ -596,12 +596,12 @@ def warmup_postprocess(
     for output in sizes:
         frames = output.num_frames
         runner.prepare_module(name, output, method="forward")
-        windows = decoder.frame_slices(frames)
+        clips = decoder.clips(frames)
         layout = decoder.output_layout(output)["video"]
         state = storage[0].view(call.module.state_buffers(output))
         cursor = 0
-        while cursor < len(windows):
-            count = min(units_per_round, len(windows) - cursor)
+        while cursor < len(clips):
+            count = min(units_per_round, len(clips) - cursor)
             if position < count:
                 unit = cursor + position
                 unit_outputs = (
@@ -625,7 +625,7 @@ def warmup_postprocess(
                     unit_outputs,
                     method="forward",
                     size=output,
-                    frames=(windows[unit],),
+                    clips=(clips[unit],),
                     sizes=(output,),
                     state=state,
                     unit_count=count,
@@ -636,16 +636,14 @@ def warmup_postprocess(
 def mux_config(runner: ModelExecutor, media) -> AvMuxConfig:
     """Return the container settings one request's media units encode under."""
     decoder = runner.video_decoder
-    windows = decoder.frame_slices(media.num_frames)
+    clips = decoder.clips(media.num_frames)
     return AvMuxConfig(
         width=media.width,
         height=media.height,
         frame_count=media.num_frames,
         frame_rate=runner.video_postprocessor.frame_rate,
         audio_rate=runner.audio_decoder.sample_rate,
-        video_unit_frames=tuple(
-            window.stop - window.start for window in windows
-        ),
+        video_unit_frames=tuple(clip.stop - clip.start for clip in clips),
     )
 
 
@@ -1043,16 +1041,16 @@ def execute(
         # contiguous run of the declared range's media units, on either
         # track (``ComponentBinding.media_units``).
         if track is MediaTrack.VIDEO:
-            windows = model_runner.video_decoder.frame_slices(media.num_frames)
-            # A video decoder places one native unit per rank
+            clips = model_runner.video_decoder.clips(media.num_frames)
+            # A video decoder places one native clip per rank
             # (``validate_components``), so its run is a single unit.
             unit = assigned_units(
-                model_runner, call.component, cursor, count, len(windows)
+                model_runner, call.component, cursor, count, len(clips)
             ).start
-            window = windows[unit]
+            clip = clips[unit]
             output = video.Config(media.num_frames, media.canvas)
-            decoded = decode_video_unit(
-                model_runner, call.component, read.tensor, window, output
+            decoded = decode_video_clip(
+                model_runner, call.component, read.tensor, clip, output
             )
             if decoded.stats is None:
                 raise RuntimeError("module output has no execution statistics")
@@ -1062,17 +1060,17 @@ def execute(
                     "video decoding reconstructs exactly one media unit"
                 )
 
-            # The decoded window becomes an RGB media unit on this rank,
+            # The decoded clip becomes an RGB media unit on this rank,
             # cross-faded with the neighbouring unit's tail, and that unit
             # is the product a host rank encodes.
             decoder = model_runner.video_decoder
-            unit_outputs = (decoder.place(decoded.values[0], window, output),)
+            unit_outputs = (decoder.place(decoded.values[0], clip, output),)
             processed = model_runner.run_module(
                 call.component,
                 unit_outputs,
                 method="forward",
                 size=output,
-                frames=(window,),
+                clips=(clip,),
                 sizes=(output,),
                 state=slot,
                 unit_count=count,
@@ -1081,13 +1079,13 @@ def execute(
             # Concatenation borrows one flat byte span; the product row is
             # the unit's frames at the output raster, and a unit shorter than
             # the longest fills its row's leading frames.
-            frames = window.stop - window.start
+            frames = clip.stop - clip.start
             value = concatenate_views(processed.values).view(
                 1, frames, media.height, media.width, 3
             )
             longest = max(
                 span.stop - span.start
-                for span in decoder.frame_slices(media.num_frames)
+                for span in decoder.clips(media.num_frames)
             )
             if frames < longest:
                 row = value.new_zeros((1, longest, *value.shape[2:]))

@@ -1352,12 +1352,12 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 total: value.references.total,
             },
         ));
-        let frames = Some(fbs::FrameChunks::create(
+        let frames = Some(fbs::FrameClips::create(
             b,
-            &fbs::FrameChunksArgs {
+            &fbs::FrameClipsArgs {
                 min_frames: value.frames.min_frames,
-                chunk_frames: value.frames.chunk_frames,
-                chunk_latent_frames: value.frames.chunk_latent_frames,
+                clip_frames: value.frames.clip_frames,
+                clip_latent_frames: value.frames.clip_latent_frames,
                 tail_latent_frames: value.frames.tail_latent_frames,
             },
         ));

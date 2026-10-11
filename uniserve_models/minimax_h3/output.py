@@ -1,10 +1,10 @@
 """H3 RGB reconstruction.
 
-A video of ``17 * n + 5`` frames is decoded as ``n`` media units. Each unit
-decodes to 25 frames: a 17-frame body, three VAE padding frames, and a
-five-frame tail. The next unit cross-fades that tail into its leading
-frames; the last unit's tail ends the video. ``VideoPostprocessor`` supplies
-these slices and blend weights.
+A video of ``17 * n + 5`` frames is decoded as ``n`` clips. Each clip decodes
+to 25 frames: a 17-frame body, three VAE padding frames, and a five-frame
+tail. The next clip cross-fades that tail into its leading frames; the last
+clip's tail ends the video. ``VideoPostprocessor`` supplies these slices and
+blend weights.
 """
 
 from collections.abc import Mapping
@@ -15,12 +15,12 @@ from uniserve.media import video
 from uniserve.model import VideoPostprocessor as BaseVideoPostprocessor
 from uniserve.tensors import BufferConfig, OutputLayout
 
-from .packing import VAE_FRAMES_PER_CHUNK, VAE_LATENTS_PER_CHUNK
+from .packing import CLIP_FRAMES, CLIP_LATENTS
 
 
-def frame_slices(num_frames: int) -> tuple[slice, ...]:
+def video_clips(num_frames: int) -> tuple[slice, ...]:
     """Partition a complete H3 timeline into 17-frame bodies and its final overlap."""  # noqa: E501
-    body, tail = VAE_FRAMES_PER_CHUNK, VAE_LATENTS_PER_CHUNK
+    body, tail = CLIP_FRAMES, CLIP_LATENTS
     if (
         type(num_frames) is not int
         or num_frames < body + tail
@@ -30,7 +30,7 @@ def frame_slices(num_frames: int) -> tuple[slice, ...]:
             "H3 frame count must have the form 17 * n + 5 with n positive"
         )
     count = (num_frames - tail) // body
-    # Every unit covers a 17-frame body; the last unit adds the 5-frame tail.
+    # Every clip covers a 17-frame body; the last clip adds the 5-frame tail.
     return tuple(
         slice(
             index * body,
@@ -44,26 +44,26 @@ class VideoPostprocessor(BaseVideoPostprocessor):
     """Remove H3's three-frame decoder padding and cross-fade five-frame overlaps."""  # noqa: E501
 
     def __init__(self, *, frame_rate: int):
-        # Weight of the current unit across the five overlap frames: 0, 0.2,
+        # Weight of the current clip across the five overlap frames: 0, 0.2,
         # ..., 0.8, so the first blended frame is entirely the predecessor's.
         weights = torch.arange(5, device="cpu", dtype=torch.float16) / 5
         super().__init__(weights, frame_rate=frame_rate)
 
     def reconstruction_slices(
-        self, frames: slice, num_frames: int
+        self, clip: slice, num_frames: int
     ) -> tuple[slice, slice]:
-        if frames not in frame_slices(num_frames):
+        if clip not in video_clips(num_frames):
             raise ValueError(
-                "H3 RGB reconstruction requires a complete legal frame slice"
+                "H3 RGB reconstruction requires one of the video's clips"
             )
-        # Each decoded unit is 25 frames: a 17-frame body to keep, three
+        # Each decoded clip is 25 frames: a 17-frame body to keep, three
         # VAE padding frames to drop, and a five-frame tail overlapping the
-        # next unit.
+        # next clip.
         return slice(0, 17), slice(20, 25)
 
     def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
         num_frames = size.num_frames
-        frame_slices(num_frames)
+        video_clips(num_frames)
         height, width = size.frame.height, size.frame.width
         return {
             "video": OutputLayout(
@@ -81,7 +81,7 @@ class VideoPostprocessor(BaseVideoPostprocessor):
         }
 
     def state_buffers(self, size: video.Config) -> Mapping[str, BufferConfig]:
-        frame_slices(size.num_frames)
+        video_clips(size.num_frames)
         return {
             "video_overlap": BufferConfig(
                 (1, 3, 5, size.frame.height, size.frame.width), torch.float16
@@ -92,16 +92,17 @@ class VideoPostprocessor(BaseVideoPostprocessor):
         self, size: video.Config
     ) -> Mapping[str, BufferConfig]:
         layout = self.output_layout(size)["video"]
-        # One call reconstructs one media unit, so the RGB workspace holds the
-        # longest unit rather than the whole timeline; the last unit is the
+        # One call reconstructs one clip, so the RGB workspace holds the
+        # longest clip rather than the whole timeline; the last clip is the
         # longest because it keeps its own overlap tail.
-        unit = max(
-            window.stop - window.start
-            for window in frame_slices(size.num_frames)
+        longest = max(
+            clip.stop - clip.start for clip in video_clips(size.num_frames)
         )
         return {
-            "rgb_frames": BufferConfig((unit, *layout.shape[1:]), layout.dtype),
-            # Receives the predecessor media unit's overlap from the ring.
+            "rgb_frames": BufferConfig(
+                (longest, *layout.shape[1:]), layout.dtype
+            ),
+            # Receives the predecessor clip's overlap from the ring.
             "overlap_exchange": BufferConfig(
                 (1, 3, 5, size.frame.height, size.frame.width), torch.float16
             ),
@@ -110,7 +111,7 @@ class VideoPostprocessor(BaseVideoPostprocessor):
     def constant_buffers(
         self, size: video.Config
     ) -> Mapping[str, BufferConfig]:
-        frame_slices(size.num_frames)
+        video_clips(size.num_frames)
         return {
             name: BufferConfig((1, 3, 1, 1, 1), torch.float32)
             for name in ("pixel_mean", "pixel_std")

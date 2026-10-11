@@ -270,7 +270,7 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
     A request is sized by its output frame count, canvas, prompt length and
     condition rows. The network's fixed grids set its step count
     (``num_steps``) and trained shifts; it rounds a requested duration to its
-    native windows and describes the request state and outputs that the
+    native clips and describes the request state and outputs that the
     caller's storage holds; the caller advances the fixed schedule and
     supplies each step's borrowed tensors to ``bind_inputs``.
     """

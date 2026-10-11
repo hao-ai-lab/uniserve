@@ -42,8 +42,8 @@ __all__ = [
     "Segment",
     "SegmentKind",
     "TEXT_TAG",
-    "VAE_FRAMES_PER_CHUNK",
-    "VAE_LATENTS_PER_CHUNK",
+    "CLIP_FRAMES",
+    "CLIP_LATENTS",
     "VIDEO_TAG",
     "align_num_frames",
     "audio_latent_frames",
@@ -67,13 +67,13 @@ AUDIO_CHANNELS = 2
 
 # The H3 timeline: request planning, packing, encoding and reconstruction
 # all count frames, samples and latents on it. Video runs at FPS. The video
-# VAE encodes chunks of VAE_FRAMES_PER_CHUNK frames (its ``clip_length``)
-# into VAE_LATENTS_PER_CHUNK latent frames, so H3 generates
-# ``VAE_FRAMES_PER_CHUNK * n + VAE_LATENTS_PER_CHUNK`` frames, ``n``
+# VAE encodes clips of CLIP_FRAMES frames (its ``clip_length``)
+# into CLIP_LATENTS latent frames, so H3 generates
+# ``CLIP_FRAMES * n + CLIP_LATENTS`` frames, ``n``
 # positive. The audio VAE hops AUDIO_HOP samples at AUDIO_SAMPLE_RATE.
 FPS = 24
-VAE_FRAMES_PER_CHUNK = 17
-VAE_LATENTS_PER_CHUNK = 5
+CLIP_FRAMES = 17
+CLIP_LATENTS = 5
 AUDIO_SAMPLE_RATE = 32_000
 AUDIO_LATENTS_PER_SECOND = 40
 AUDIO_HOP = AUDIO_SAMPLE_RATE // AUDIO_LATENTS_PER_SECOND
@@ -225,16 +225,15 @@ def align_num_frames(num_frames: int) -> int:
     22.
     """
     return max(
-        VAE_FRAMES_PER_CHUNK + VAE_LATENTS_PER_CHUNK,
-        num_frames
-        + (VAE_LATENTS_PER_CHUNK - num_frames) % VAE_FRAMES_PER_CHUNK,
+        CLIP_FRAMES + CLIP_LATENTS,
+        num_frames + (CLIP_LATENTS - num_frames) % CLIP_FRAMES,
     )
 
 
 def video_latent_frames(num_frames: int) -> int:
     """Convert a valid H3 output-frame count into temporal video-VAE latents.
 
-    Each 17-frame unit contributes five latent frames and the trailing
+    Each 17-frame clip contributes five latent frames and the trailing
     5-frame overlap two more.
 
     Raises:
@@ -243,12 +242,12 @@ def video_latent_frames(num_frames: int) -> int:
     """
     if (
         type(num_frames) is not int
-        or num_frames < VAE_FRAMES_PER_CHUNK + VAE_LATENTS_PER_CHUNK
-        or num_frames % VAE_FRAMES_PER_CHUNK != VAE_LATENTS_PER_CHUNK
+        or num_frames < CLIP_FRAMES + CLIP_LATENTS
+        or num_frames % CLIP_FRAMES != CLIP_LATENTS
     ):
         raise ValueError("H3 frame count must have the form 17 * n + 5")
-    chunks = (num_frames - VAE_LATENTS_PER_CHUNK) // VAE_FRAMES_PER_CHUNK
-    return chunks * VAE_LATENTS_PER_CHUNK + 2
+    clips = (num_frames - CLIP_LATENTS) // CLIP_FRAMES
+    return clips * CLIP_LATENTS + 2
 
 
 def audio_latent_frames(num_frames: int) -> int:

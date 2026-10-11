@@ -44,8 +44,8 @@ from .packing import (
     AUDIO_HOP,
     AUDIO_SAMPLE_RATE,
     CANVAS_MULTIPLE,
-    VAE_FRAMES_PER_CHUNK,
-    VAE_LATENTS_PER_CHUNK,
+    CLIP_FRAMES,
+    CLIP_LATENTS,
     VIDEO_TILE_SHAPES,
 )
 
@@ -631,7 +631,7 @@ def _video_vae(values: Mapping[str, Any]) -> video_vae.Config:
         config.spatial_compression,
         config.temporal_compression,
     )
-    if clip != (VAE_FRAMES_PER_CHUNK, VAE_LATENTS_PER_CHUNK, 2, 16, 4):
+    if clip != (CLIP_FRAMES, CLIP_LATENTS, 2, 16, 4):
         raise ValueError(
             "MiniMax-H3 video_vae must encode 17-frame clips to 5 latent "
             "frames, dropping 3 of them from the final clip, at 16x spatial "

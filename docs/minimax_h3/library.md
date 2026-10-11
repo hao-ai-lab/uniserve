@@ -48,7 +48,7 @@ result = generate(
 )
 ```
 
-`result.frames` contains `[frames, height, width, 3]` uint8 RGB; `result.audio` contains stereo int16 PCM at 32 kHz. Frame counts follow the model's temporal windows, so this four-second request produces 107 frames. `generate` supports text conditioning; keyframe and reference computation uses the encoders and denoiser's public calls directly.
+`result.frames` contains `[frames, height, width, 3]` uint8 RGB; `result.audio` contains stereo int16 PCM at 32 kHz. Frame counts follow the video VAE's 17-frame clips, so this four-second request produces 107 frames. `generate` supports text conditioning; keyframe and reference computation uses the encoders and denoiser's public calls directly.
 
 ## Layouts and conditions
 

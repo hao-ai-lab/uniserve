@@ -1672,10 +1672,10 @@ fn kv_free_worker_info_round_trips() {
             audio_shift: 3.0,
             frame_rate: 24,
             audio_sample_rate: 32_000,
-            frames: crate::FrameChunks {
+            frames: crate::FrameClips {
                 min_frames: 22,
-                chunk_frames: 17,
-                chunk_latent_frames: 5,
+                clip_frames: 17,
+                clip_latent_frames: 5,
                 tail_latent_frames: 2,
             },
             canvases: vec![
@@ -2222,13 +2222,13 @@ fn ipc_decode_rejects_malformed_frames() {
 }
 
 #[test]
-fn frame_chunks_count_decode_units_and_align_requested_frames() {
-    // 17-frame chunks past a final 5-frame window: `17n + 5` frames in `n`
-    // units, five latent frames per chunk and two in the final window.
-    let frames = FrameChunks {
+fn frame_clips_count_decode_units_and_align_requested_frames() {
+    // 17-frame clips past a final 5-frame tail: `17n + 5` frames in `n`
+    // units, five latent frames per clip and two in the tail.
+    let frames = FrameClips {
         min_frames: 22,
-        chunk_frames: 17,
-        chunk_latent_frames: 5,
+        clip_frames: 17,
+        clip_latent_frames: 5,
         tail_latent_frames: 2,
     };
     frames.validate().unwrap();
@@ -2245,7 +2245,7 @@ fn frame_chunks_count_decode_units_and_align_requested_frames() {
         [22, 22, 39, 107, 362]
     );
 
-    // Available frames round down to a whole number of chunks.
+    // Available frames round down to a whole number of clips.
     assert_eq!(frames.align_down(21), None);
     assert_eq!(
         [22, 38, 39, 130].map(|count| frames.align_down(count)),
@@ -2253,8 +2253,8 @@ fn frame_chunks_count_decode_units_and_align_requested_frames() {
     );
 
     assert!(
-        FrameChunks {
-            chunk_frames: 0,
+        FrameClips {
+            clip_frames: 0,
             ..frames
         }
         .validate()

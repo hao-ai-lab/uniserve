@@ -145,9 +145,9 @@ def decoded_units_layout(
     its row's leading frames, and the unit division names how many. The rows
     are host products a host rank's encoder reads in place.
     """
-    windows = decoder.frame_slices(size.num_frames)
-    frames = max(window.stop - window.start for window in windows)
-    shape = (len(windows), frames, size.frame.height, size.frame.width, 3)
+    clips = decoder.clips(size.num_frames)
+    frames = max(clip.stop - clip.start for clip in clips)
+    shape = (len(clips), frames, size.frame.height, size.frame.width, 3)
     return OutputLayout(
         shape,
         torch.uint8,
@@ -167,16 +167,16 @@ def encoded_units_layout(
     """
     from uniserve_worker.media.mux import encoded_unit_bytes
 
-    windows = decoder.frame_slices(size.num_frames)
+    clips = decoder.clips(size.num_frames)
     row = encoded_unit_bytes(
-        max(window.stop - window.start for window in windows),
+        max(clip.stop - clip.start for clip in clips),
         size.frame.height,
         size.frame.width,
     )
     return OutputLayout(
-        (len(windows), row),
+        (len(clips), row),
         torch.uint8,
-        (slice(0, len(windows)), slice(0, row)),
+        (slice(0, len(clips)), slice(0, row)),
         variable_axes=(0,),
     )
 

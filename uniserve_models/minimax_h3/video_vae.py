@@ -5,8 +5,8 @@ The decoder is a non-causal ViT: ``Transformer`` turns every latent voxel into
 one token, appends learned register tokens and one zero token, and expands
 each latent token into an RGB patch. ``Decoder`` adds the 1x1x1
 ``post_quant_conv`` and overlapping spatial tiles; ``Model`` denormalizes one
-native temporal window of latents. ``decoding.VideoDecoder`` owns ``Model``,
-and ``output.VideoPostprocessor`` stitches the decoded windows.
+clip's native latents. ``decoding.VideoDecoder`` owns ``Model``, and
+``output.VideoPostprocessor`` stitches the decoded clips.
 
 With quantized projection weights, projections return their bias separately
 so the consuming fused kernel (residual update, Q/K normalization and RoPE,
@@ -664,7 +664,7 @@ class Decoder(SpatialDecoder):
 
 
 class Model(LatentDecoder):
-    """Denormalize one native temporal segment, decode tiles, and crop its pad.
+    """Denormalize one clip's native latents, decode tiles, and crop its pad.
 
     The latent raster is the request's canvas divided by the spatial
     compression; spatial tiling covers any raster on that grid.
@@ -674,7 +674,7 @@ class Model(LatentDecoder):
 
     def __init__(self, config: Config):
         # A clip covers `span` latent frames; cropping `token_drop` frames
-        # per clip leaves consecutive native windows sharing `overlap`
+        # per clip leaves consecutive clips' native latents sharing `overlap`
         # latent frames.
         span = config.clip_latents
         overlap = (-config.token_drop) % span
@@ -712,8 +712,8 @@ class Model(LatentDecoder):
             decoded = super().forward(latents)
         # The VAE left-pads each clip to a multiple of its temporal compression;
         # crop those leading frames from the decoded timeline.
-        # output.VideoPostprocessor drops the window's remaining padding
-        # frames and cross-fades its overlap tail with the next window. FP16
+        # output.VideoPostprocessor drops the clip's remaining padding
+        # frames and cross-fades its overlap tail with the next clip. FP16
         # matches the output layout that decoding.VideoDecoder declares.
         padding = (
             -self.decoder.config.clip_length

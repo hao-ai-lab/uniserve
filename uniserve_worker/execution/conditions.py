@@ -15,8 +15,8 @@ admission with the request's exact leading extents:
   ``condition_video_latents`` in rounds of encoding units, each round
   covering the next units its component's ranks encode together, and the
   PCM into ``condition_audio_latents`` in one call. A video's units are its
-  encoder windows; a still frame is one unit or, as planned, several bands
-  of its latent rows (``VideoEncoder.row_bands``).
+  clips; a still frame is one unit or, as planned, several bands of its
+  latent rows (``VideoEncoder.row_bands``).
 
 Every product concatenates its conditions in request order. The server
 presents the vision blocks in request order too, so the vision features are
@@ -502,7 +502,7 @@ def encode_units(
         MediaCall.LATENT_ENCODING, capability_type=VideoEncoder
     )
     units = condition_units(video)
-    values, frames, counts, bands, planned = [], [], [], [], []
+    values, spans, counts, bands, planned = [], [], [], [], []
     for index, unit in (units[position] for position in run):
         condition = video.conditions[index]
         size = condition.pixels
@@ -510,30 +510,29 @@ def encode_units(
             raise invalid_descriptor("a visual unit belongs to no pixels")
         # A still frame planned as several units is encoded in bands of its
         # latent rows, one band per unit, each reading the whole frame; any
-        # other condition's units are its encoder windows. A unit's frames
-        # are whole [height, width, 3] rasters of its condition's pixels,
-        # frame-major.
+        # other condition's units are its clips. A unit's frames are whole
+        # [height, width, 3] rasters of its condition's pixels, frame-major.
         if size.num_frames == 1 and len(condition.latent_units) > 1:
-            window = slice(0, 1)
+            clip = slice(0, 1)
             band = encoder.row_bands(size.frame, len(condition.latent_units))[
                 unit
             ]
         else:
-            window = encoder.frame_slices(size.num_frames)[unit]
+            clip = encoder.clips(size.num_frames)[unit]
             band = None
         area = size.frame.height * size.frame.width
         values.append(
             pixels[
-                offsets[index] + window.start * area : offsets[index]
-                + window.stop * area
+                offsets[index] + clip.start * area : offsets[index]
+                + clip.stop * area
             ].view(
-                window.stop - window.start,
+                clip.stop - clip.start,
                 size.frame.height,
                 size.frame.width,
                 3,
             )
         )
-        frames.append(window)
+        spans.append(clip)
         counts.append(size.num_frames)
         bands.append(band)
         planned.append(condition.latent_units[unit])
@@ -541,7 +540,7 @@ def encode_units(
     result = model_runner.run_encoder(
         "video_condition",
         *values,
-        frames=tuple(frames),
+        clips=tuple(spans),
         num_frames=tuple(counts),
         rows=tuple(bands),
     )

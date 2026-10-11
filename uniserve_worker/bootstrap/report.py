@@ -90,7 +90,7 @@ from uniserve_worker.protocol.call import CALL_KINDS
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import (
     ComponentInfo,
-    FrameChunks,
+    FrameClips,
     ServedCanvas,
     VideoDenoiserInfo,
     WorkerInfo,
@@ -616,14 +616,14 @@ def _token_worker_layout(
     )
 
 
-def frame_chunks(
+def frame_clips(
     denoiser: VideoDenoiser, encoder: VideoEncoder | None
-) -> FrameChunks:
-    """State how the video VAE chunks the frames a denoiser generates.
+) -> FrameClips:
+    """State how the video VAE divides the frames a denoiser generates.
 
     The denoiser's legal frame counts form the progression ``min_frames + n *
-    chunk_frames``. The encoder's latent windows of the fewest frames are one
-    whole chunk followed by the final window.
+    clip_frames``. The encoder's latent slices of the fewest frames are one
+    whole clip followed by the tail.
 
     Raises:
         ValueError: The model has no video encoder to state its latent frames.
@@ -631,12 +631,12 @@ def frame_chunks(
     if encoder is None:
         raise ValueError("a video model must declare its video encoder")
     minimum = denoiser.legal_frame_count(1)
-    chunk = denoiser.legal_frame_count(minimum + 1) - minimum
+    clip = denoiser.legal_frame_count(minimum + 1) - minimum
     whole, *_, final = encoder.latent_slices(minimum)
-    return FrameChunks(
+    return FrameClips(
         min_frames=minimum,
-        chunk_frames=chunk,
-        chunk_latent_frames=whole.stop - whole.start,
+        clip_frames=clip,
+        clip_latent_frames=whole.stop - whole.start,
         tail_latent_frames=final.stop - final.start,
     )
 
@@ -646,7 +646,7 @@ def video_denoiser_info(
     *,
     frame_rate: int,
     audio_sample_rate: int,
-    frames: FrameChunks,
+    frames: FrameClips,
     canvases: tuple[image.Config, ...] = (),
 ) -> VideoDenoiserInfo:
     """Describe what the deployment's video denoiser serves.
@@ -660,8 +660,8 @@ def video_denoiser_info(
     ``frame_rate`` is the model's output frame rate
     (``VideoPostprocessor.frame_rate``) and ``audio_sample_rate`` its audio
     rate (``AudioDecoder.sample_rate``), zero for a model without an audio
-    decoder; ``frames`` is how its VAE chunks a video's frames
-    (``frame_chunks``).
+    decoder; ``frames`` is how its VAE divides a video's frames into clips
+    (``frame_clips``).
     """
     # The denoiser names each of its canvases once.
     names = {size: name for name, size in denoiser.canvases.items()}
@@ -754,7 +754,7 @@ def _request_tensor_worker_layout(
             builder.denoiser,
             frame_rate=output.frame_rate,
             audio_sample_rate=0 if audio is None else audio.sample_rate,
-            frames=frame_chunks(
+            frames=frame_clips(
                 builder.denoiser, capability(model, VideoEncoder)
             ),
             canvases=builder.canvases,

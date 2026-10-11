@@ -15,12 +15,12 @@ from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import media_builder, video_denoiser
 from uniserve_worker.bootstrap.report import (
     build_worker_layout,
-    frame_chunks,
+    frame_clips,
     video_denoiser_info,
 )
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.protocol.call import MediaCall
-from uniserve_worker.protocol.worker_info import FrameChunks
+from uniserve_worker.protocol.worker_info import FrameClips
 
 pytestmark = pytest.mark.unit
 
@@ -80,14 +80,14 @@ def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
         denoiser,
         frame_rate=base.video_postprocessor.frame_rate,
         audio_sample_rate=base.audio_decoder.sample_rate,
-        frames=frame_chunks(denoiser, base.video_encoder),
+        frames=frame_clips(denoiser, base.video_encoder),
     )
-    # A video is `17n + 5` frames of `n + 1` encoder windows: five latent
-    # frames per chunk and two in the final window.
-    assert info.frames == FrameChunks(
+    # A video is `17n + 5` frames of `n + 1` encoder clips: five latent
+    # frames per clip and two in the tail.
+    assert info.frames == FrameClips(
         min_frames=22,
-        chunk_frames=17,
-        chunk_latent_frames=5,
+        clip_frames=17,
+        clip_latent_frames=5,
         tail_latent_frames=2,
     )
     # The worker executes both tasks of the t2va/fl2va DiT on the released
@@ -108,7 +108,7 @@ def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
         reference_denoiser,
         frame_rate=base.video_postprocessor.frame_rate,
         audio_sample_rate=base.audio_decoder.sample_rate,
-        frames=frame_chunks(reference_denoiser, base.video_encoder),
+        frames=frame_clips(reference_denoiser, base.video_encoder),
     )
     assert reference.tasks == ("ref2va",)
     assert reference.references == ReferenceLimits(
@@ -127,7 +127,7 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
         model = Model(fasth3_config())
     # One candidate needs no deployment to name it.
     denoiser = video_denoiser(model, cpu_worker_config(device="cpu"))
-    frames = frame_chunks(denoiser, model.video_encoder)
+    frames = frame_clips(denoiser, model.video_encoder)
     info = video_denoiser_info(
         denoiser,
         frame_rate=model.video_postprocessor.frame_rate,

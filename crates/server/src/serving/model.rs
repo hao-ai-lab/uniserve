@@ -682,7 +682,7 @@ pub fn video_frame_count(
     seconds: f64,
     max_video_seconds: f64,
     frame_rate: u32,
-    frames: &uniserve_engine::FrameChunks,
+    frames: &uniserve_engine::FrameClips,
 ) -> std::result::Result<u32, String> {
     if !seconds.is_finite() || !(MIN_VIDEO_SECONDS..=max_video_seconds).contains(&seconds) {
         return Err(format!(

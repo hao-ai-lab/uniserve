@@ -331,57 +331,57 @@ pub struct ReferenceLimits {
     pub total: u32,
 }
 
-/// How the video VAE divides a video's frames into chunks.
+/// How the video VAE divides a video's frames into clips.
 ///
-/// A video has `min_frames + n * chunk_frames` frames: one decode unit per
-/// chunk, so `n + 1` units. The VAE encodes each such chunk of a video to
-/// `chunk_latent_frames` latent frames and the final window past the whole
-/// chunks to `tail_latent_frames`. The model states the rule; every count a
+/// A video has `min_frames + n * clip_frames` frames: one decode unit per
+/// clip, so `n + 1` units. The VAE encodes each such clip of a video to
+/// `clip_latent_frames` latent frames and the tail past the whole clips to
+/// `tail_latent_frames`. The model states the rule; every count a
 /// request derives from it, the generated frames, the decode units and a
 /// reference video's encoded frames, follows from these four values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FrameChunks {
-    /// Fewest frames of a video: one chunk and the final window.
+pub struct FrameClips {
+    /// Fewest frames of a video: one clip and the tail.
     pub min_frames: u32,
-    /// Frames each further chunk adds.
-    pub chunk_frames: u32,
-    /// Latent frames one chunk encodes to.
-    pub chunk_latent_frames: u32,
-    /// Latent frames of the final window past the chunks.
+    /// Frames each further clip adds.
+    pub clip_frames: u32,
+    /// Latent frames one clip encodes to.
+    pub clip_latent_frames: u32,
+    /// Latent frames of the tail past the clips.
     pub tail_latent_frames: u32,
 }
 
-impl FrameChunks {
+impl FrameClips {
     /// Returns the decode units of a video of `frames` legal frames.
     pub fn units(&self, frames: u32) -> u32 {
-        frames.saturating_sub(self.min_frames) / self.chunk_frames + 1
+        frames.saturating_sub(self.min_frames) / self.clip_frames + 1
     }
 
     /// Returns the fewest legal frame count that is at least `requested`.
     pub fn align_up(&self, requested: u32) -> u32 {
         let beyond = requested.saturating_sub(self.min_frames);
-        self.min_frames + beyond.div_ceil(self.chunk_frames) * self.chunk_frames
+        self.min_frames + beyond.div_ceil(self.clip_frames) * self.clip_frames
     }
 
     /// Returns the most legal frames of at most `available`, or `None` below
     /// the fewest.
     pub fn align_down(&self, available: u32) -> Option<u32> {
         let beyond = available.checked_sub(self.min_frames)?;
-        Some(self.min_frames + beyond / self.chunk_frames * self.chunk_frames)
+        Some(self.min_frames + beyond / self.clip_frames * self.clip_frames)
     }
 
     /// Returns the latent frames the VAE encodes `frames` legal frames to.
     pub fn latent_frames(&self, frames: u32) -> u32 {
-        self.units(frames) * self.chunk_latent_frames + self.tail_latent_frames
+        self.units(frames) * self.clip_latent_frames + self.tail_latent_frames
     }
 
-    /// Checks that the rule is positive and leaves a final window past the
-    /// first chunk.
+    /// Checks that the rule is positive and leaves a tail past the first
+    /// clip.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            self.chunk_frames > 0
-                && self.min_frames > self.chunk_frames
-                && self.chunk_latent_frames > 0
+            self.clip_frames > 0
+                && self.min_frames > self.clip_frames
+                && self.clip_latent_frames > 0
                 && self.tail_latent_frames > 0,
             "a video denoiser declares an empty frame rule"
         );
@@ -411,9 +411,9 @@ pub struct VideoDenoiserInfo {
     /// Sample rate, in Hz, of the audio track generated with each video; zero
     /// for a deployment that generates none.
     pub audio_sample_rate: u32,
-    /// How the VAE chunks a video's frames, which counts frames and decode
-    /// units.
-    pub frames: FrameChunks,
+    /// How the VAE divides a video's frames into clips, which counts frames
+    /// and decode units.
+    pub frames: FrameClips,
     /// The only canvases the deployment serves: those it prepares, in the
     /// order its operator selected them.
     #[serde(default)]

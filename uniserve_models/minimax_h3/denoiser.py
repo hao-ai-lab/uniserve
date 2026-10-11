@@ -65,9 +65,9 @@ from .inputs import (
 )
 from .packing import (
     AUDIO_SAMPLE_RATE,
+    CLIP_FRAMES,
+    CLIP_LATENTS,
     FPS,
-    VAE_FRAMES_PER_CHUNK,
-    VAE_LATENTS_PER_CHUNK,
     DensePacking,
     SegmentPacking,
     align_num_frames,
@@ -264,18 +264,16 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             )
             return size.condition_rows
 
-        # A reference video keeps the leading whole VAE windows of the
+        # A reference video keeps the leading whole VAE clips of the
         # generated frames, and its soundtrack the generated duration. The
         # server truncates a soundtrack to that duration at its native rate
         # and torchaudio's resampler returns ``ceil(new * length / orig)``
         # samples at 32 kHz, so the ceiling of the generated duration at
         # 32 kHz bounds the samples of every source rate.
-        windows = max(
-            1, (num_frames - VAE_LATENTS_PER_CHUNK) // VAE_FRAMES_PER_CHUNK
-        )
-        frames = windows * VAE_FRAMES_PER_CHUNK + VAE_LATENTS_PER_CHUNK
+        clips = max(1, (num_frames - CLIP_LATENTS) // CLIP_FRAMES)
+        frames = clips * CLIP_FRAMES + CLIP_LATENTS
         samples = math.ceil(num_frames * AUDIO_SAMPLE_RATE / FPS)
-        clip = max(
+        reference = max(
             (
                 Condition(
                     ConditionRole.REFERENCE,
@@ -303,7 +301,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         return (
             *keyframes,
             *(still,) * limits.images,
-            *(clip,) * limits.videos,
+            *(reference,) * limits.videos,
         )
 
     @property
@@ -318,7 +316,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         return attention.tile if isinstance(attention, SparseAttention) else 64
 
     def legal_frame_count(self, requested: int) -> int:
-        """Round a requested duration up to the next complete native window."""
+        """Round a requested duration up to the next complete clip."""
         return align_num_frames(requested)
 
     def make_size(

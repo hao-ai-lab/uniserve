@@ -281,7 +281,7 @@ def test_conditioned_request_computes_the_model_first_step(workers, root, case):
         request_pool_idx=1,
         diffusion=DiffusionSamplingParams(
             request.num_frames,
-            len(runner.video_decoder.frame_slices(request.num_frames)),
+            len(runner.video_decoder.clips(request.num_frames)),
             SEED,
             width=request.canvas.width,
             height=request.canvas.height,
