@@ -29,7 +29,7 @@ use super::{ConditionInput, VideoInputs, VideoProcessor};
 use crate::config::VideoMediaSettings;
 use crate::openai::{ApiError, VideoCondition, VideoGenerationRequest};
 use crate::profile::tokenizer::DynTokenizer;
-use crate::serving::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ServeError, ServeRequestId, VIDEO_FPS};
+use crate::serving::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ServeError, ServeRequestId};
 
 /// The fields of the video request body, in schema order.
 pub(crate) const REQUEST_FIELDS: [&str; 6] =
@@ -43,6 +43,9 @@ pub struct ProcessedVideo {
     pub request: DiffusionRequest,
     /// The requested duration in seconds, before frame alignment.
     pub duration_seconds: f64,
+    /// The duration of the generated frames, in seconds: the frame count at
+    /// the deployment's frame rate.
+    pub actual_seconds: f64,
     /// The generated canvas.
     pub canvas: Canvas,
 }
@@ -108,6 +111,7 @@ impl VideoService {
         let limits = PlanLimits {
             tasks: tasks.clone(),
             max_video_seconds,
+            frame_rate: denoiser.frame_rate,
             canvases: denoiser.canvases.clone(),
             reference_limits: denoiser.references,
             references,
@@ -192,7 +196,7 @@ impl VideoService {
                 "sizes": sizes,
                 "canvases": canvases,
             },
-            "fps": VIDEO_FPS,
+            "fps": self.denoiser.frame_rate,
             "min_seconds": MIN_VIDEO_SECONDS,
             "max_seconds": self.processor.limits().max_video_seconds,
             "model_max_seconds": MAX_VIDEO_SECONDS,
@@ -296,6 +300,7 @@ impl VideoService {
                 },
             },
             duration_seconds: plan.duration_seconds,
+            actual_seconds: f64::from(plan.num_frames) / f64::from(self.denoiser.frame_rate),
             canvas: plan.canvas,
         })
     }
@@ -343,6 +348,7 @@ mod tests {
                 schedule_points: 50,
                 video_shift: 12.0,
                 audio_shift: 3.0,
+                frame_rate: 24,
                 canvases: super::super::plan::tests::served_canvases(),
                 references: ReferenceLimits {
                     images: 9,

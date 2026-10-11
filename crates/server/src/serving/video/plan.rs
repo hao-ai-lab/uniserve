@@ -2,8 +2,8 @@
 //!
 //! [`plan_request`] resolves everything a request implies before any pixel is
 //! decoded: the generated canvas and frame counts, how every condition is
-//! prepared (keyframe fit, reference image size, 24 fps reference clip,
-//! 32 kHz soundtrack), what the Qwen3-VL conditioner sees of it (vision
+//! prepared (keyframe fit, reference image size, reference clip at the
+//! output frame rate, 32 kHz soundtrack), what the Qwen3-VL conditioner sees of it (vision
 //! grids, 2 fps samples and block timestamps), and the units the worker
 //! encodes each condition in. [`check_request`] applies the subset of rules
 //! that needs no media, so a malformed request is rejected before its media
@@ -16,11 +16,12 @@
 //! `tests/python/fixtures/minimax_h3_plan.json`, generated from that
 //! pipeline. Rules the reference leaves open are fixed here:
 //!
-//! - `start_time_seconds` skips the first `floor(s * 24 + 0.5)` frames of a
-//!   reference video's 24 fps timeline and the first `floor(s * rate + 0.5)`
-//!   samples of its soundtrack;
+//! - `start_time_seconds` skips the first `floor(s * fps + 0.5)` frames of a
+//!   reference video's timeline at the output frame rate `fps` (24 for the
+//!   released checkpoint) and the first `floor(s * rate + 0.5)` samples of
+//!   its soundtrack;
 //! - a reference video needs at least 22 frames (one `17n + 5` VAE window)
-//!   on its 24 fps timeline after the start offset;
+//!   on that timeline after the start offset;
 //! - `ref2va` keyframes are fitted to the target canvas like `fl2va` ones
 //!   (the first stretched, a second cover-cropped) and do not enter the
 //!   conditioner;
@@ -39,7 +40,7 @@ use uniserve_engine::{ReferenceLimits, ServedCanvas};
 
 use super::probe::{AudioFacts, ImageFacts, MediaFacts, VideoFacts};
 use super::{RequestField, VideoInputError};
-use crate::serving::{VIDEO_FPS, video_frame_count};
+use crate::serving::video_frame_count;
 
 /// Short edge of the adapt_shape_v1 canvas rule, in pixels.
 pub const CANVAS_SHORT_EDGE: u32 = 768;
@@ -61,7 +62,8 @@ pub const REFERENCE_IMAGE_SHORT_EDGE: u32 = 2048;
 /// Pixel frames per video VAE window, and the overlap a window carries.
 const VAE_FRAMES_PER_CHUNK: u32 = 17;
 const VAE_LATENTS_PER_CHUNK: u32 = 5;
-/// Fewest 24 fps frames a reference video must keep: one VAE window.
+/// Fewest frames at the output rate a reference video must keep: one VAE
+/// window.
 pub const MIN_REFERENCE_FRAMES: u32 = VAE_FRAMES_PER_CHUNK + VAE_LATENTS_PER_CHUNK;
 
 /// The audio VAE's sample rate and hop: 40 latents per second.
@@ -273,6 +275,9 @@ pub struct PlanLimits {
     pub tasks: Vec<VideoTask>,
     /// Longest requested duration served (`--max-video-seconds`).
     pub max_video_seconds: f64,
+    /// Frame rate of every generated video, in frames per second, as the
+    /// denoiser declares it; reference videos are resampled to it.
+    pub frame_rate: u32,
     /// The only canvases the deployment serves, as its workers declare them
     /// in their handshake: each with the `target.short_edge` and
     /// `target.aspect_ratio` that select it.
@@ -569,9 +574,9 @@ impl AudioClip {
 pub struct VideoClip {
     /// The canvas of the video's own display aspect the frames are put on.
     pub canvas: Canvas,
-    /// Frames of the 24 fps timeline skipped at the start.
+    /// Frames of the output-rate timeline skipped at the start.
     pub start_frame: u32,
-    /// 24 fps frames kept after the start offset, at most the generated
+    /// Output-rate frames kept after the start offset, at most the generated
     /// frame count; the conditioner samples these.
     pub frames: u32,
     /// The leading `17n + 5` frames the VAE encodes.
@@ -596,7 +601,7 @@ pub struct VideoVision {
     pub grid: VisionGrid,
     /// Vision tokens of each block.
     pub block_tokens: u32,
-    /// The 24 fps frames sampled at 2 fps.
+    /// The output-rate frames sampled at 2 fps.
     pub frame_indices: Vec<u32>,
     /// The timestamp label of each block, in seconds.
     pub block_timestamps: Vec<f64>,
@@ -875,11 +880,13 @@ pub fn reference_image_size(
     })
 }
 
-/// Samples a 24 fps clip at 2 fps and labels its vision blocks.
+/// Samples a clip of `frame_rate` frames per second at 2 fps and labels its
+/// vision blocks.
 ///
-/// Every twelfth frame is sampled. The conditioner merges the samples in
-/// groups of `temporal_patch`, repeating the last one to fill a group, and
-/// labels a group with the mean of its timestamps.
+/// Every `frame_rate / 2`-th frame is sampled (every twelfth at 24 fps). The
+/// conditioner merges the samples in groups of `temporal_patch`, repeating
+/// the last one to fill a group, and labels a group with the mean of its
+/// timestamps.
 ///
 /// # Errors
 ///
@@ -887,8 +894,9 @@ pub fn reference_image_size(
 pub fn sample_video_frames(
     frames: u32,
     temporal_patch: u32,
+    frame_rate: u32,
 ) -> Result<(Vec<u32>, Vec<f64>), String> {
-    let stride = f64::from(VIDEO_FPS) / VIDEO_SAMPLE_FPS;
+    let stride = f64::from(frame_rate) / VIDEO_SAMPLE_FPS;
     let mut indices: Vec<u32> = Vec::new();
     let mut cursor = 0.0_f64;
     loop {
@@ -945,6 +953,7 @@ pub fn audio_clip(
     media: &AudioFacts,
     start_seconds: f64,
     frames: u32,
+    frame_rate: u32,
 ) -> Result<AudioClip, String> {
     let rate = media.sample_rate;
     let start_sample = start_offset(start_seconds, f64::from(rate));
@@ -952,8 +961,8 @@ pub fn audio_clip(
         return Err("start_time_seconds lies past the end of the audio track".to_owned());
     }
     let available = media.samples - start_sample;
-    // The reference truncates to `int(frames / 24 * rate)` samples.
-    let limit = (f64::from(frames) / f64::from(VIDEO_FPS) * f64::from(rate)).trunc() as u64;
+    // The reference truncates to `int(frames / fps * rate)` samples.
+    let limit = (f64::from(frames) / f64::from(frame_rate) * f64::from(rate)).trunc() as u64;
     let source = available.min(limit);
     let samples = if rate == AUDIO_SAMPLE_RATE {
         source
@@ -987,9 +996,9 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
 
 /// Sizes a reference video and the conditioner's view of it.
 ///
-/// The video is resampled to 24 fps (each frame held until the slot of the
-/// next), its first `floor(s * 24 + 0.5)` frames are skipped and the rest is
-/// truncated to the generated frame count, on the canvas of its own display
+/// The video is resampled to `frame_rate` (each frame held until the slot of
+/// the next), its first `floor(s * frame_rate + 0.5)` frames are skipped and
+/// the rest is truncated to the generated frame count, on the canvas of its own display
 /// aspect. A video with fewer pixels than that canvas keeps its own size,
 /// each side rounded half to even to a multiple of 32, unless
 /// `config.enlarge` scales it up to the canvas. Its soundtrack is offset by
@@ -1004,6 +1013,7 @@ pub fn video_reference(
     media: &VideoFacts,
     start_seconds: f64,
     frames: u32,
+    frame_rate: u32,
     vision: &ProcessorConfig,
     config: &ReferenceConfig,
 ) -> Result<(VideoClip, VideoVision), String> {
@@ -1017,20 +1027,20 @@ pub fn video_reference(
             height: nearest_multiple(f64::from(media.height)),
         };
     }
-    let frame_rate =
+    let source_rate =
         f64::from(media.frame_rate.numerator) / f64::from(media.frame_rate.denominator);
-    let fps = f64::from(VIDEO_FPS);
-    let timeline = if frame_rate == fps {
+    let fps = f64::from(frame_rate);
+    let timeline = if source_rate == fps {
         media.frames
     } else {
-        // The timeline ends at the 24 fps slot the stream's end rounds to.
-        (media.frames as f64 * (fps / frame_rate) + 0.5).floor() as u64
+        // The timeline ends at the output-rate slot the stream's end rounds to.
+        (media.frames as f64 * (fps / source_rate) + 0.5).floor() as u64
     };
     let start_frame = start_offset(start_seconds, fps);
     let available = timeline.saturating_sub(start_frame);
     if available < u64::from(MIN_REFERENCE_FRAMES) {
         return Err(format!(
-            "a reference video needs at least {MIN_REFERENCE_FRAMES} frames at {VIDEO_FPS} fps \
+            "a reference video needs at least {MIN_REFERENCE_FRAMES} frames at {frame_rate} fps \
              after start_time_seconds, got {available}"
         ));
     }
@@ -1042,10 +1052,11 @@ pub fn video_reference(
     let soundtrack = media
         .soundtrack
         .as_ref()
-        .map(|track| audio_clip(track, start_seconds, frames))
+        .map(|track| audio_clip(track, start_seconds, frames, frame_rate))
         .transpose()?;
 
-    let (frame_indices, block_timestamps) = sample_video_frames(kept, vision.temporal_patch_size)?;
+    let (frame_indices, block_timestamps) =
+        sample_video_frames(kept, vision.temporal_patch_size, frame_rate)?;
     let sampled = u32::try_from(frame_indices.len()).unwrap_or(u32::MAX);
     let grid = vision.video_grid(sampled, size.height, size.width)?;
     let clip = VideoClip {
@@ -1181,7 +1192,7 @@ pub fn check_request(
 
     match target.duration_seconds {
         Some(seconds) => {
-            video_frame_count(seconds, limits.max_video_seconds)
+            video_frame_count(seconds, limits.max_video_seconds, limits.frame_rate)
                 .map_err(|error| VideoInputError::invalid(RequestField::TargetDuration, error))?;
         }
         None => {
@@ -1357,7 +1368,7 @@ fn resolve_frames(
     limits: &PlanLimits,
 ) -> Result<(f64, u32), VideoInputError> {
     if let Some(seconds) = target.duration_seconds {
-        return video_frame_count(seconds, limits.max_video_seconds)
+        return video_frame_count(seconds, limits.max_video_seconds, limits.frame_rate)
             .map(|frames| (seconds, frames))
             .map_err(|error| VideoInputError::invalid(RequestField::TargetDuration, error));
     }
@@ -1379,7 +1390,7 @@ fn resolve_frames(
         ));
     }
     let seconds = (track.samples - start_sample) as f64 / rate;
-    video_frame_count(seconds, limits.max_video_seconds)
+    video_frame_count(seconds, limits.max_video_seconds, limits.frame_rate)
         .map(|frames| (seconds, frames))
         .map_err(|error| {
             VideoInputError::condition(
@@ -1468,6 +1479,7 @@ fn plan_reference(
     condition: &ConditionSpec,
     media: &MediaFacts,
     frames: u32,
+    frame_rate: u32,
     vision: &ProcessorConfig,
     config: &ReferenceConfig,
 ) -> Result<ConditionPlan, VideoInputError> {
@@ -1489,13 +1501,13 @@ fn plan_reference(
             Ok(plan(Prepared::Image(size), Some(seen), 0))
         }
         MediaFacts::Audio(audio) => {
-            let clip = audio_clip(audio, 0.0, frames).map_err(reject)?;
+            let clip = audio_clip(audio, 0.0, frames, frame_rate).map_err(reject)?;
             Ok(plan(Prepared::Audio(clip), None, clip.rows()))
         }
         MediaFacts::Video(video) => {
             let start = condition.start_seconds.unwrap_or(0.0);
-            let (clip, seen) =
-                video_reference(video, start, frames, vision, config).map_err(reject)?;
+            let (clip, seen) = video_reference(video, start, frames, frame_rate, vision, config)
+                .map_err(reject)?;
             let audio_rows = clip.soundtrack.map_or(0, |track| track.rows());
             Ok(plan(
                 Prepared::Video(clip),
@@ -1559,9 +1571,15 @@ pub fn plan_request(
                     "a keyframe must be an image",
                 ));
             }
-            (ConditionRole::Reference, _) => {
-                plan_reference(index, condition, facts, frames, vision, &limits.references)?
-            }
+            (ConditionRole::Reference, _) => plan_reference(
+                index,
+                condition,
+                facts,
+                frames,
+                limits.frame_rate,
+                vision,
+                &limits.references,
+            )?,
         };
         plans.push(plan);
     }
@@ -1637,12 +1655,17 @@ pub(super) mod tests {
         served
     }
 
+    /// The output frame rate of the reference pipeline the vectors come
+    /// from.
+    pub(in crate::serving::video) const FRAME_RATE: u32 = 24;
+
     /// Limits that serve every task and duration the model does, at the
     /// canvases of the vectors.
     pub(in crate::serving::video) fn limits() -> PlanLimits {
         PlanLimits {
             tasks: vec![VideoTask::T2va, VideoTask::Fl2va, VideoTask::Ref2va],
             max_video_seconds: 15.0,
+            frame_rate: FRAME_RATE,
             canvases: served_canvases(),
             // The checkpoint's documented limits.
             reference_limits: ReferenceLimits {
@@ -2026,7 +2049,7 @@ pub(super) mod tests {
                 frames: 48,
                 soundtrack: None,
             };
-            video_reference(&facts, 0.0, 124, &vision, config)
+            video_reference(&facts, 0.0, 124, FRAME_RATE, &vision, config)
                 .unwrap()
                 .0
                 .canvas
@@ -2079,7 +2102,7 @@ pub(super) mod tests {
         }
     }
 
-    /// Reference videos resample to 24 fps, honour the start offset, keep a
+    /// Reference videos resample to the output rate, honour the start offset, keep a
     /// whole VAE window, and sample the reference's 2 fps vision blocks.
     #[test]
     fn reference_videos_match_the_reference() {
@@ -2089,8 +2112,14 @@ pub(super) mod tests {
             let facts = video_facts(case);
             let start = case["start_seconds"].as_f64().unwrap();
             let frames = case["num_frames"].as_u64().unwrap() as u32;
-            let planned =
-                video_reference(&facts, start, frames, &vision, &ReferenceConfig::RELEASED);
+            let planned = video_reference(
+                &facts,
+                start,
+                frames,
+                FRAME_RATE,
+                &vision,
+                &ReferenceConfig::RELEASED,
+            );
             if case.get("error").is_some() {
                 assert!(planned.is_err(), "{case}");
                 continue;
@@ -2128,6 +2157,7 @@ pub(super) mod tests {
                 &audio_facts(case),
                 case["start_seconds"].as_f64().unwrap(),
                 case["num_frames"].as_u64().unwrap() as u32,
+                FRAME_RATE,
             )
             .unwrap();
             assert_eq!(audio_json(&clip), case["clip"], "{case}");

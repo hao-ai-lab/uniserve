@@ -12,7 +12,10 @@ from uniserve.media import image
 from uniserve_models.minimax_h3 import Model
 from uniserve_models.minimax_h3.config import DMD_CANVASES, NAMED_CANVASES
 from uniserve_worker.bootstrap.inputs import media_builder
-from uniserve_worker.bootstrap.report import video_denoiser_info
+from uniserve_worker.bootstrap.report import (
+    build_worker_layout,
+    video_denoiser_info,
+)
 from uniserve_worker.config.execution import WorkerConfig
 
 pytestmark = pytest.mark.unit
@@ -78,15 +81,32 @@ def test_a_deployment_that_names_nothing_prepares_every_canvas(model):
 
 def test_the_handshake_declares_each_canvas_with_its_names(model):
     config = _config(("768p", "480p"), ("16:9",))
+    builder = media_builder(model, config)
     info = video_denoiser_info(
-        media_builder(model, config).denoiser,
-        canvases=media_builder(model, config).canvases,
+        builder.denoiser,
+        frame_rate=model.video_postprocessor.frame_rate,
+        canvases=builder.canvases,
     )
     names = [(768, "16:9"), (480, "16:9")]
     assert [
         ((c.short_edge, c.aspect_ratio), image.Config(c.height, c.width))
         for c in info.canvases
     ] == [(name, DMD_CANVASES[name]) for name in names]
+
+
+def test_a_worker_reports_its_canvases_and_frame_rate_in_its_info(model):
+    config = _config(
+        ("480p",), ("21:9", "9:16"), max_request_pool_size=2, max_batch_calls=2
+    )
+    declared = build_worker_layout(
+        model, config, queue_depth=6
+    ).info.video_denoiser
+    assert declared is not None
+    assert declared.frame_rate == 24
+    assert [
+        (c.short_edge, c.aspect_ratio, c.width, c.height)
+        for c in declared.canvases
+    ] == [(480, "21:9", 992, 416), (480, "9:16", 480, 832)]
 
 
 @pytest.mark.parametrize(

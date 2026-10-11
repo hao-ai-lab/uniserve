@@ -1380,6 +1380,7 @@ mod tests {
                 schedule_points: 5,
                 video_shift: 12.0,
                 audio_shift: 3.0,
+                frame_rate: 24,
                 canvases: Vec::new(),
                 references: Default::default(),
             }),
@@ -1606,6 +1607,7 @@ mod tests {
                 schedule_points: 5,
                 video_shift: 12.0,
                 audio_shift: 3.0,
+                frame_rate: 24,
                 canvases: Vec::new(),
                 references: Default::default(),
             });

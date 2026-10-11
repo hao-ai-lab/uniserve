@@ -678,7 +678,10 @@ def _token_worker_layout(
 
 
 def video_denoiser_info(
-    denoiser: VideoDenoiser, *, canvases: tuple[image.Config, ...] = ()
+    denoiser: VideoDenoiser,
+    *,
+    frame_rate: int,
+    canvases: tuple[image.Config, ...] = (),
 ) -> VideoDenoiserInfo:
     """Describe what the deployment's video denoiser serves.
 
@@ -687,7 +690,9 @@ def video_denoiser_info(
     ``canvases``, those the deployment prepares and admits, or without any
     every canvas the denoiser offers (``VideoDenoiser.canvases``), each with
     the short edge and aspect ratio that select it. The references are the
-    most one request may carry (``VideoDenoiser.max_references``).
+    most one request may carry (``VideoDenoiser.max_references``), and
+    ``frame_rate`` is the model's output frame rate
+    (``VideoPostprocessor.frame_rate``).
     """
     # The denoiser names each of its canvases once.
     names = {size: name for name, size in denoiser.canvases.items()}
@@ -698,6 +703,7 @@ def video_denoiser_info(
         schedule_points=denoiser.num_steps + 1,
         video_shift=float(shifts["video"]),
         audio_shift=float(shifts["audio"]),
+        frame_rate=frame_rate,
         canvases=tuple(
             ServedCanvas(*names[canvas], canvas.width, canvas.height)
             for canvas in served
@@ -730,6 +736,7 @@ def _request_tensor_worker_layout(
     # samples allocates it.
     plan = latent_pool_plan(model, worker_config)
     builder = media_builder(model, worker_config)
+    output = capability(model, VideoPostprocessor)
 
     info = WorkerInfo(
         endpoint=endpoint,
@@ -749,7 +756,9 @@ def _request_tensor_worker_layout(
             media_components(model, worker_config.deployment_components)
         ),
         video_denoiser=video_denoiser_info(
-            builder.denoiser, canvases=builder.canvases
+            builder.denoiser,
+            frame_rate=output.frame_rate,
+            canvases=builder.canvases,
         ),
         host_lane_capacity=1,
     )

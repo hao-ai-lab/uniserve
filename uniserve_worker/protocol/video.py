@@ -79,7 +79,7 @@ class ImageFit:
 
 @dataclass(frozen=True, slots=True)
 class VideoClip:
-    """A reference video's frames on the 24 fps timeline.
+    """A reference video's frames on the output-rate timeline.
 
     The first ``start_frame`` frames are skipped and the next ``frames``
     kept, scaled onto ``canvas``; the video encoder encodes the leading

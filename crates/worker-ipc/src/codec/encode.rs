@@ -1379,6 +1379,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 schedule_points: value.schedule_points,
                 video_shift: value.video_shift,
                 audio_shift: value.audio_shift,
+                frame_rate: value.frame_rate,
                 canvases,
                 references,
             },

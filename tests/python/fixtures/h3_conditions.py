@@ -26,6 +26,7 @@ from uniserve.media import image
 from uniserve.model import ConditionRole
 from uniserve_models import qwen3_vl
 from uniserve_models.minimax_h3.encoder import TextEncoderConfig
+from uniserve_models.minimax_h3.packing import AUDIO_SAMPLE_RATE, FPS
 from uniserve_worker.execution.media_reader import read_conditions
 from uniserve_worker.media.reader import SHARED_MEMORY
 from uniserve_worker.protocol.video import (
@@ -39,8 +40,7 @@ from uniserve_worker.protocol.video import (
 )
 
 # The model's audio rate, the rate every soundtrack is resampled to.
-SAMPLE_RATE = 32_000
-FPS = 24
+SAMPLE_RATE = AUDIO_SAMPLE_RATE
 
 # The 16:9 canvas of the canvas rule: 24 x 42 denoiser tokens of 32 pixels,
 # which the conditioner reads as a 48 x 84 grid of 16-pixel patches merged

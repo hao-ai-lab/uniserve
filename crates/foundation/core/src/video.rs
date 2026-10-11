@@ -62,7 +62,7 @@ pub struct ImageFit {
 
 /// The frames of a reference video the media reader produces.
 ///
-/// The video is resampled to 24 fps and scaled onto `canvas` in one decoding
+/// The video is resampled to the output frame rate and scaled onto `canvas` in one decoding
 /// pass; its first `start_frame` frames are skipped and the next `frames`
 /// kept. The conditioner samples the kept frames; the video encoder encodes
 /// their leading `vae_frames`.
@@ -70,9 +70,9 @@ pub struct ImageFit {
 pub struct VideoClip {
     /// The canvas of the video's own display aspect.
     pub canvas: Canvas,
-    /// Frames of the 24 fps timeline skipped at the start.
+    /// Frames of the output-rate timeline skipped at the start.
     pub start_frame: u32,
-    /// Frames of the 24 fps timeline kept after the start offset.
+    /// Frames of the output-rate timeline kept after the start offset.
     pub frames: u32,
     /// The leading kept frames the video encoder encodes.
     pub vae_frames: u32,

@@ -68,6 +68,7 @@ fn base_denoiser() -> VideoDenoiserInfo {
         schedule_points: 50,
         video_shift: 12.0,
         audio_shift: 3.0,
+        frame_rate: 24,
         canvases: [
             ("21:9", 1536, 672),
             ("16:9", 1344, 768),
@@ -735,6 +736,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         schedule_points: 9,
         video_shift: 10.0,
         audio_shift: 3.0,
+        frame_rate: 24,
         canvases: vec![
             served(768, "16:9", 1344, 768),
             served(480, "21:9", 992, 416),

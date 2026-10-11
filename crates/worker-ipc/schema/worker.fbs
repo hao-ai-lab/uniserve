@@ -206,13 +206,15 @@ table ReferenceLimits {
 
 /// What a deployment's video denoiser serves: its tasks, its fixed schedule
 /// (sigma points including the clean endpoint, and the per-modality shifts),
-/// the canvases it prepares and accepts, in the order the deployment
-/// selected them, and the references a request may carry.
+/// the frame rate of every video it generates, in frames per second, the
+/// canvases it prepares and accepts, in the order the deployment selected
+/// them, and the references a request may carry.
 table VideoDenoiserInfo {
   tasks:[string];
   schedule_points:uint;
   video_shift:double;
   audio_shift:double;
+  frame_rate:uint;
   canvases:[ServedCanvas];
   references:ReferenceLimits;
 }
@@ -526,7 +528,7 @@ enum ConditionRole : ubyte { FirstFrame, LastFrame, Reference }
 /// A still image resized to `resized`, then the `size` window at (`left`,
 /// `top`) kept.
 struct ImageFit { resized:Canvas; left:uint; top:uint; size:Canvas; }
-/// A reference video's frames on the 24 fps timeline.
+/// A reference video's frames on the output-rate timeline.
 struct VideoClip { canvas:Canvas; start_frame:uint; frames:uint; vae_frames:uint; }
 /// An audio track's native samples and their count at the model rate.
 struct AudioClip {

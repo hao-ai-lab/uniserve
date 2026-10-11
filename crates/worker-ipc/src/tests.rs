@@ -1614,6 +1614,7 @@ fn kv_free_worker_info_round_trips() {
             schedule_points: 5,
             video_shift: 12.0,
             audio_shift: 3.0,
+            frame_rate: 24,
             canvases: vec![
                 ServedCanvas {
                     short_edge: 768,

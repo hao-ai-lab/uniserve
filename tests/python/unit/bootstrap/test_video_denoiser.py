@@ -70,7 +70,10 @@ def test_the_placed_denoiser_receives_the_video_calls(base, placed):
 
 
 def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
-    info = video_denoiser_info(video_denoiser(base, _config("transformer")))
+    info = video_denoiser_info(
+        video_denoiser(base, _config("transformer")),
+        frame_rate=base.video_postprocessor.frame_rate,
+    )
     # The worker executes both tasks of the t2va/fl2va DiT on the released
     # schedule: 50 sigma points, video shift 12, audio shift 3, the canvas
     # rule's canvas of every named aspect ratio at 768p.
@@ -85,7 +88,8 @@ def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
     # checkpoint documents: nine images, three videos and three audio tracks,
     # twelve in all.
     reference = video_denoiser_info(
-        video_denoiser(base, _config("transformer_ref"))
+        video_denoiser(base, _config("transformer_ref")),
+        frame_rate=base.video_postprocessor.frame_rate,
     )
     assert reference.tasks == ("ref2va",)
     assert reference.references == ReferenceLimits(
@@ -104,7 +108,9 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
         model = Model(fasth3_config())
     # One candidate needs no deployment to name it.
     denoiser = video_denoiser(model, cpu_worker_config(device="cpu"))
-    info = video_denoiser_info(denoiser)
+    info = video_denoiser_info(
+        denoiser, frame_rate=model.video_postprocessor.frame_rate
+    )
     assert info.tasks == ("t2va",)
     assert info.schedule_points == 5
     # Without a deployment's selection, every training bucket: 21:9, 16:9,
@@ -114,5 +120,9 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
     chosen = {
         name: DMD_CANVASES[name] for name in ((480, "16:9"), (768, "9:16"))
     }
-    declared = video_denoiser_info(denoiser, canvases=tuple(chosen.values()))
+    declared = video_denoiser_info(
+        denoiser,
+        frame_rate=model.video_postprocessor.frame_rate,
+        canvases=tuple(chosen.values()),
+    )
     assert _declared(declared) == _trained(chosen)
