@@ -18,7 +18,7 @@ from uniserve.nn.attention import (
     VarlenInput,
     VisibleInput,
 )
-from uniserve.runtime import PrefixCache, TensorBuffers
+from uniserve.runtime import KVCache, TensorBuffers
 from uniserve.runtime.backends.attention import resolve
 from uniserve.runtime.backends.attention.torch import Backend as TorchBackend
 
@@ -73,7 +73,7 @@ def test_native_attention_matches_declared_visibility(
         for _ in range(2)
     )
     cache_layout = Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)})
-    with PrefixCache(
+    with KVCache(
         cache_layout, num_units=4, block_size=16, device=device
     ) as cache:
         state = cache.state("attention")
@@ -148,7 +148,7 @@ def test_paged_replay_reads_changed_causal_flags(provider):
         torch.randn(5, 2, 64, dtype=q.dtype, device=device, generator=generator)
         for _ in range(2)
     )
-    with PrefixCache(
+    with KVCache(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
         num_units=4,
         block_size=16,
@@ -229,7 +229,7 @@ def test_segmented_graph_keeps_nonfinite_values_within_their_sequence():
         batch.queries, batch.prefixes, batch.block_table, None, ends, True
     )
     with (
-        PrefixCache(
+        KVCache(
             Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
             num_units=2,
             block_size=16,
@@ -281,7 +281,7 @@ def test_native_paged_replay_reads_changed_block_table_and_writes_slot_zero(
         torch.randn(1, 2, 64, dtype=q.dtype, device=device, generator=generator)
         for _ in range(2)
     )
-    with PrefixCache(
+    with KVCache(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
         num_units=3,
         block_size=16,
@@ -372,7 +372,7 @@ def test_native_paged_output_views_preserve_values_on_replay(
         ].view_as(q)
     else:
         out = torch.empty_like(q)
-    with PrefixCache(
+    with KVCache(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
         num_units=2,
         block_size=16,
@@ -446,7 +446,7 @@ def test_paged_replay_preserves_masked_writes_and_live_sequence_boundaries(
         )[..., ::column_stride]
         for _ in range(2)
     )
-    with PrefixCache(
+    with KVCache(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
         num_units=4,
         block_size=16,
@@ -551,7 +551,7 @@ def test_visible_paged_replay_uses_changed_endpoints(provider, paged_keys):
         )
         for _ in range(2)
     )
-    with PrefixCache(
+    with KVCache(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
         num_units=17,
         block_size=16,
@@ -841,7 +841,7 @@ def test_native_history_window_matches_portable_reference(
         "size": TextSize(tokens, 2),
         "window": window,
     }
-    with PrefixCache(
+    with KVCache(
         layout, num_units=16, block_size=block_size, device=device
     ) as cache:
         state = cache.state("attention")

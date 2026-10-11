@@ -8,7 +8,7 @@ import torch
 from uniserve.media import image
 from uniserve.model import LatentInput, TextInput, TextSize, VisionInput
 from uniserve.nn.attention import AttentionBatch, PagedInput
-from uniserve.runtime import ExecutionContext, PrefixCache
+from uniserve.runtime import ExecutionContext, KVCache
 from uniserve_models.stub import DenoiserInput, Model
 
 pytestmark = pytest.mark.unit
@@ -29,7 +29,7 @@ def test_token_cycle_projects_selected_rows_and_writes_only_supplied_slots():
         device="cpu",
     )
     inputs = TextInput(tokens, torch.arange(10), AttentionBatch.single(batch))
-    with PrefixCache(
+    with KVCache(
         model.cache_config, num_units=1, block_size=16, device="cpu"
     ) as cache:
         state = cache.state(next(iter(model.cache_config.layers)))

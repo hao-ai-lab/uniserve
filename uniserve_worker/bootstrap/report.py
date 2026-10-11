@@ -33,7 +33,7 @@ from uniserve.model import (
     VideoPostprocessor,
 )
 from uniserve.processing import ImageProcessor
-from uniserve.runtime.prefix_cache import Planes
+from uniserve.runtime.kv_cache import Planes
 from uniserve.tensors import BufferConfig
 from uniserve_worker.bootstrap.cache import (
     cache_info,

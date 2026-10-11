@@ -28,7 +28,7 @@ from uniserve.nn.attention import (
 )
 from uniserve.runtime import (
     ExecutionContext,
-    PrefixCache,
+    KVCache,
     initialize_process_groups,
 )
 from uniserve_models import bagel, sensenova_u1
@@ -83,7 +83,7 @@ def _run(rank, rendezvous, root, architecture, config, shape, axes):
         with ExitStack() as scope:
             caches = [
                 scope.enter_context(
-                    PrefixCache(
+                    KVCache(
                         item.text.cache_config,
                         num_units=2,
                         block_size=4,

@@ -20,7 +20,7 @@ from uniserve.nn.attention import (
 from uniserve.runtime import (
     CUDAStream,
     ExecutionContext,
-    PrefixCache,
+    KVCache,
     initialize_process_groups,
 )
 
@@ -69,7 +69,7 @@ def _run(rank, rendezvous):
                     )
                 }
             )
-            with PrefixCache(
+            with KVCache(
                 config, num_units=1, block_size=16, device="cpu"
             ) as cache:
                 with ExecutionContext(
@@ -187,7 +187,7 @@ def _context(rank, rendezvous, gpu):
                 stream.wait(torch.cuda.current_stream(device))
             with (
                 stream if stream is not None else nullcontext(),
-                PrefixCache(
+                KVCache(
                     config, num_units=3, block_size=16, device=device
                 ) as cache,
             ):

@@ -22,7 +22,7 @@ from uniserve.model import CausalLM
 from uniserve.nn.attention import Attention
 from uniserve.quantization import Quantizer
 from uniserve.runtime.backends.attention import Backend, CachePages
-from uniserve.runtime.prefix_cache import Planes, plan_units
+from uniserve.runtime.kv_cache import Planes, plan_units
 from uniserve_worker.bootstrap.inputs import capability
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import unsupported_setup

@@ -8,7 +8,7 @@ import torch
 
 from uniserve.cache import Config, mha
 from uniserve.quantization import Quantizer
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve_worker.protocol.worker_info import (
     KVCacheInfo,
     KvGroup,
@@ -48,7 +48,7 @@ def mha_pool(
     quantization = (
         {name: Quantizer("fp8", axis=0) for name in layers} if encoded else None
     )
-    cache = PrefixCache(
+    cache = KVCache(
         Config(layers),
         num_units=num_pages,
         block_size=page_size,

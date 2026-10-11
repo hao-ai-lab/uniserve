@@ -44,7 +44,7 @@ from uniserve.distributed import Communicator
 from uniserve.loading import weights
 from uniserve.math import ceil_div
 from uniserve.nn.moe import FusedMoE
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve.runtime.process_groups import (
     Rendezvous,
     initialize_process_groups,
@@ -188,7 +188,7 @@ def _worker(
         else:
             runner.close()
         return
-    cache = PrefixCache(
+    cache = KVCache(
         model.text.cache_config,
         num_units=units,
         block_size=16,

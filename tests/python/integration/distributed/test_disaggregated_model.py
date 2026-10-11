@@ -23,8 +23,8 @@ from uniserve.runtime import (
     CUDAGraph,
     CUDAStream,
     ExecutionContext,
+    KVCache,
     Microbatches,
-    PrefixCache,
 )
 from uniserve.runtime.expert_exchange import ExpertExchange
 from uniserve.runtime.process_groups import initialize_process_groups
@@ -110,7 +110,7 @@ def _context(scope, model, device, exchange=None, *, moe="auto"):
     stream.wait(torch.cuda.current_stream(device))
     cache = (
         scope.enter_context(
-            PrefixCache(
+            KVCache(
                 model.cache_config,
                 num_units=2,
                 block_size=BLOCK_SIZE,

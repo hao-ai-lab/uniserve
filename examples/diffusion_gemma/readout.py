@@ -22,8 +22,8 @@ from uniserve.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve.runtime import ExecutionContext, PrefixCache
-from uniserve.runtime.prefix_cache import plan_units
+from uniserve.runtime import ExecutionContext, KVCache
+from uniserve.runtime.kv_cache import plan_units
 from uniserve_models import loading
 
 
@@ -57,7 +57,7 @@ def read_candidates(model, prompt, canvas, position, candidates):
         blocks[index] = tuple(range(next_unit, next_unit + pages))
         next_unit += pages
 
-    cache = PrefixCache(
+    cache = KVCache(
         config, num_units=next_unit, block_size=block_size, device=device
     )
     context = ExecutionContext(

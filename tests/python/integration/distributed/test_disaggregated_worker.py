@@ -14,7 +14,7 @@ from tests.python.fixtures.checkpoints import qwen_moe_checkpoint
 from tests.python.integration.runtime.test_prefill_graphs import _call
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.nn.moe import FusedMoE
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve.runtime.process_groups import (
     Rendezvous,
     initialize_process_groups,
@@ -51,7 +51,7 @@ def _worker(model, config, *, group=None, attention_ranks=1):
         if expert:
             runner.configure_experts()
         else:
-            cache = PrefixCache(
+            cache = KVCache(
                 model.cache_config,
                 num_units=32,
                 block_size=16,

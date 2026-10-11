@@ -5,7 +5,7 @@ serves a token-denoising call: each canvas row attends to the cached prompt
 and to its own tokens without writing the cache, and the call reports each
 answer slot's candidate log-probabilities under the full-vocabulary
 softmax. The reported values must equal the public model evaluated
-directly, a prompt pass that writes a prefix cache followed by a canvas pass
+directly, a prompt pass that writes a K/V cache followed by a canvas pass
 that reads it, in FP32 on the CPU with the torch attention backend. Image
 soft tokens enter the prompt between its image markers.
 """
@@ -48,8 +48,8 @@ from uniserve.nn.attention import (
 from uniserve.nn.attention import (
     BlockTable as Table,
 )
-from uniserve.runtime import ExecutionContext, PrefixCache
-from uniserve.runtime.prefix_cache import plan_units
+from uniserve.runtime import ExecutionContext, KVCache
+from uniserve.runtime.kv_cache import plan_units
 from uniserve.sampling import SamplingParams
 from uniserve_models import loading as models
 from uniserve_worker.model_executor.image_inputs import prepare_image
@@ -279,7 +279,7 @@ def _reference(root, prompt, segments, canvases, slots, features=None):
     model = load_diffusion_gemma(root)
     config = model.text.cache_config
     tables = len(plan_units(config, block_size=PAGE).tables)
-    cache = PrefixCache(
+    cache = KVCache(
         config, num_units=tables * PAGES, block_size=PAGE, device="cpu"
     )
     context = ExecutionContext(model, cache=cache, attention="torch")

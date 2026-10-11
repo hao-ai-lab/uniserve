@@ -5,7 +5,7 @@ import torch
 
 from tests.python.fixtures.checkpoints import bagel_checkpoint
 from uniserve.media import image
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve_models import bagel
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.capacity import input_buffer_config
@@ -43,7 +43,7 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
         flow_graph_batch_sizes=(1,),
     )
     runner = ModelExecutor(model, config)
-    cache = PrefixCache(
+    cache = KVCache(
         model.text.cache_config, num_units=8, block_size=16, device="cpu"
     )
     manager = KVCacheManager(

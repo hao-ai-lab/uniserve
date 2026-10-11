@@ -7,7 +7,7 @@ block; the finishing step reports the block's tokens, which the engine
 commits to the context as a prefill before the next block starts at step
 zero. The tokens and the step that finishes each block must equal the
 public model driven directly by the block-diffusion sampler of
-``uniserve.diffusion.canvas``: a prompt pass that writes a prefix cache,
+``uniserve.diffusion.canvas``: a prompt pass that writes a K/V cache,
 then per step a canvas pass that reads it with the previous step's
 self-conditioning, in FP32 on the CPU with the torch attention backend. A
 step may be queued behind the one before it, predicated on that step's
@@ -50,8 +50,8 @@ from uniserve.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve.runtime import ExecutionContext, PrefixCache
-from uniserve.runtime.prefix_cache import plan_units
+from uniserve.runtime import ExecutionContext, KVCache
+from uniserve.runtime.kv_cache import plan_units
 from uniserve.sampling import SamplingParams
 from uniserve_worker.protocol.batch import (
     Batch,
@@ -155,7 +155,7 @@ class _Reference:
         self.model = load_diffusion_gemma(root)
         config = self.model.text.cache_config
         tables = len(plan_units(config, block_size=PAGE).tables)
-        self.cache = PrefixCache(
+        self.cache = KVCache(
             config, num_units=tables * PAGES, block_size=PAGE, device="cpu"
         )
         self.context = ExecutionContext(

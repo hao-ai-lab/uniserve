@@ -37,7 +37,7 @@ from uniserve.model import CausalLM, VideoPostprocessor
 from uniserve.nn import Linear
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizedTensor, Quantizer
-from uniserve.runtime import EventPool, PrefixCache
+from uniserve.runtime import EventPool, KVCache
 from uniserve.runtime.device import canonical_device, device_storage_budget
 from uniserve.runtime.process_groups import (
     ProcessGroups,
@@ -546,7 +546,7 @@ class Worker:
                 planes = plan_cache(text, worker_config)
                 dtype, fp8 = storage(worker_config)
                 self.kv_cache = KVCacheManager(
-                    PrefixCache(
+                    KVCache(
                         cache,
                         num_units=kv_cache.num_units,
                         block_size=page_size(worker_config),

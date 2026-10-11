@@ -29,7 +29,7 @@ from uniserve.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.sampling import greedy
 from uniserve.tensors import adjacent_view
@@ -617,7 +617,7 @@ def widen_prefix(batch, widths):
     )
 
 
-def restore_writes(batch, cache: PrefixCache | None):
+def restore_writes(batch, cache: KVCache | None):
     """Snapshot the cache blocks the batch writes and return its restorer.
 
     Blocks are snapshotted only when ``cache`` is given and the attention

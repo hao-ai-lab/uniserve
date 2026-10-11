@@ -251,7 +251,7 @@ def plan_units(
     return Planes(columns, plane_bytes, tuple(groups), quantizer is not None)
 
 
-class PrefixCache:
+class KVCache:
     """Allocate a K/V unit pool; callers own unit assignment and retirement.
 
     No layer, attention method, or numerical input receives this owning

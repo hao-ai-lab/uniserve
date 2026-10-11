@@ -477,9 +477,9 @@ AttentionInput = (
 class AttentionBatch:
     """One call's numerical attention inputs, one entry per cache table.
 
-    A layer bound to a prefix cache reads the entry of the table that holds
+    A layer bound to a K/V cache reads the entry of the table that holds
     its cache; a layer without a cache table reads the batch's only entry.
-    Table IDs come from the prefix cache's layout and are not model
+    Table IDs come from the K/V cache's layout and are not model
     configuration. Every packed entry shares ``queries``: the same query
     order, length and offset tensors. Entries may differ in their prefixes,
     block tables, write addresses and key visibility. A dense input forms a

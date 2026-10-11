@@ -3,7 +3,7 @@
 The engine's scheduler assigns each request slot its KV units per cache
 group; the worker's ``BlockTables`` hold the installed group tables. A group
 whose logical page spans ``units_per_page`` units owns that many numerical
-block tables (see ``uniserve.runtime.prefix_cache``), so one call's attention
+block tables (see ``uniserve.runtime.kv_cache``), so one call's attention
 is an ``AttentionBatch`` with one entry per numerical table. Every entry
 shares the call's query and prefix lengths; entries differ in their pages,
 page size, write addresses and, for a history-windowed group, the first page

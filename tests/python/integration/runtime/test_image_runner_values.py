@@ -19,7 +19,7 @@ from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image
 from uniserve.model import TextSize
 from uniserve.nn.attention import AttentionBatch
-from uniserve.runtime import ExecutionContext, PrefixCache
+from uniserve.runtime import ExecutionContext, KVCache
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.capacity import input_buffer_config
 from uniserve_worker.config.deployment import ComponentConfig
@@ -165,7 +165,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
     size = image.Config(16, 16)
     factory = runner.image_builder
     shape = factory.denoiser.latent_shape("image", size)
-    cache = PrefixCache(
+    cache = KVCache(
         model.text.cache_config, num_units=8, block_size=16, device="cuda:0"
     )
     manager = KVCacheManager(

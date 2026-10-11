@@ -14,7 +14,7 @@ from torch import nn
 
 from uniserve.model import CausalLM, TransformerDecoder
 from uniserve.nn.attention import Attention
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve_worker.bootstrap.cache import (
     cache_info,
     group_layers,
@@ -77,7 +77,7 @@ def hybrid_pool(
     dtype, fp8 = storage(config)
     if fp8:
         raise ValueError("the hybrid fixture stores unquantized K/V")
-    cache = PrefixCache(
+    cache = KVCache(
         model.cache_config,
         num_units=num_units,
         block_size=config.block_size,

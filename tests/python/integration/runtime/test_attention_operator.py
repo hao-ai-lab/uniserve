@@ -16,7 +16,7 @@ from uniserve.nn.attention import (
     VisibleInput,
 )
 from uniserve.quantization import Quantizer
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve.runtime.backends.attention.torch import Backend
 
 pytestmark = pytest.mark.integration
@@ -122,7 +122,7 @@ def test_shared_visible_endpoint_bounds_every_query_of_its_sequence():
 @pytest.mark.parametrize("quantized", [False, True])
 def test_paged_attention_observes_updates_and_mutated_block_tables(quantized):
     config = mha.Config(1, 4, (0,), torch.float32)
-    with PrefixCache(
+    with KVCache(
         Config({"attention": config}),
         num_units=3,
         block_size=2,
@@ -162,7 +162,7 @@ def test_paged_attention_observes_updates_and_mutated_block_tables(quantized):
 def test_segmented_attention_merges_visible_current_tokens_with_prefix(
     prefix_length,
 ):
-    with PrefixCache(
+    with KVCache(
         Config({"attention": mha.Config(1, 4, (0,), torch.float32)}),
         num_units=2,
         block_size=2,
@@ -237,7 +237,7 @@ def test_paged_window_follows_each_query_position(window, causal):
     key = torch.randn(8, 1, 4, generator=generator)
     value = torch.randn(8, 1, 4, generator=generator)
     query = torch.randn(3, 2, 4, generator=generator)
-    with PrefixCache(
+    with KVCache(
         Config({"attention": mha.Config(1, 4, (0,), torch.float32)}),
         num_units=5,
         block_size=2,
@@ -302,7 +302,7 @@ def test_segmented_window_reads_one_prefix_interval(prefix_length, window):
     key = torch.randn(prefix_length + 3, 1, 4, generator=generator)
     value = torch.randn(prefix_length + 3, 1, 4, generator=generator)
     query = torch.randn(3, 2, 4, generator=generator)
-    with PrefixCache(
+    with KVCache(
         Config({"attention": mha.Config(1, 4, (0,), torch.float32)}),
         num_units=3,
         block_size=2,
@@ -359,7 +359,7 @@ def test_paged_window_reads_each_row_from_its_start_page(causal):
     ]
     query = torch.randn(5, 2, 4, generator=generator)
     layout = mha.Config(1, 4, (0,), torch.float32)
-    with PrefixCache(
+    with KVCache(
         Config({"attention": layout}), num_units=10, block_size=2, device="cpu"
     ) as cache:
         state = cache.state("attention")
@@ -414,7 +414,7 @@ def test_segmented_window_reads_its_prefix_from_the_start_page():
     value = torch.randn(10, 1, 4, generator=generator)
     query = torch.randn(3, 2, 4, generator=generator)
     layout = mha.Config(1, 4, (0,), torch.float32)
-    with PrefixCache(
+    with KVCache(
         Config({"attention": layout}), num_units=5, block_size=2, device="cpu"
     ) as cache:
         state = cache.state("attention")

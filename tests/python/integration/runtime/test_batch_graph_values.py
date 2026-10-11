@@ -9,7 +9,7 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 from uniserve import loading
 from uniserve.loading import weights
 from uniserve.model import CausalLM
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve_models import loading as models
 from uniserve_models.stub import image_processor as stub_image_processor
 from uniserve_worker.bootstrap.cache import cache_info
@@ -81,7 +81,7 @@ def _text_runner(model, provider, decode_capacity=2, image_processor=None):
         prefill_graph_token_sizes=(16,),
         decode_graph_batch_sizes=(1, decode_capacity),
     )
-    cache = PrefixCache(
+    cache = KVCache(
         model.cache_config, num_units=16, block_size=16, device="cuda:0"
     )
     manager = KVCacheManager(
@@ -405,7 +405,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
         decode_graph_batch_sizes=(1, 2),
     )
     runner = ModelExecutor(model, config)
-    cache = PrefixCache(
+    cache = KVCache(
         model.cache_config, num_units=8, block_size=16, device="cuda:0"
     )
     manager = KVCacheManager(

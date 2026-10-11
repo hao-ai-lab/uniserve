@@ -1,4 +1,4 @@
-"""Denoising passes over discrete token canvases that read a prefix cache.
+"""Denoising passes over discrete token canvases that read a K/V cache.
 
 A token denoiser refines a block of token ids, the canvas, conditioned on a
 prompt whose keys and values a causal pass of the same backbone already

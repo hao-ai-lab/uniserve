@@ -29,7 +29,7 @@ from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
 from uniserve.distributed import Communicator
 from uniserve.loading import weights
 from uniserve.math import ceil_div
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve_models import loading as models
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.capacity import (
@@ -117,7 +117,7 @@ def _diffusion_gemma_worker(
         decode_graph_batch_sizes=(1,),
     )
     processor = source.image_processor
-    cache = PrefixCache(
+    cache = KVCache(
         model.text.cache_config,
         num_units=units,
         block_size=16,

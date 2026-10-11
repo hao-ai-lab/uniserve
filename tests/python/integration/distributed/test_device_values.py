@@ -9,7 +9,7 @@ import torch
 from uniserve.cache import Config, mha
 from uniserve.nn import RotaryEmbedding
 from uniserve.quantization import Quantizer
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -33,7 +33,7 @@ def test_rotary_factors_follow_positions_on_another_device():
 def test_cache_reset_follows_backing_on_another_device(quantized):
     with (
         torch.cuda.device(0),
-        PrefixCache(
+        KVCache(
             Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
             num_units=3,
             block_size=4,
@@ -65,7 +65,7 @@ def test_cache_updates_follow_backing_and_preserve_existing_values_on_another_de
 ):
     with (
         torch.cuda.device(0),
-        PrefixCache(
+        KVCache(
             Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
             num_units=3,
             block_size=4,

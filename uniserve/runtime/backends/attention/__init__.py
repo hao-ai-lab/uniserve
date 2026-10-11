@@ -23,7 +23,7 @@ from uniserve.tensors import BufferConfig
 
 @dataclass(frozen=True, slots=True)
 class CachePages:
-    """How a layer's paged prefix cache stores its pages.
+    """How a layer's paged K/V cache stores its pages.
 
     ``page_tokens`` is the tokens of one page, ``dtype`` the element type
     the pages store and ``quantized`` whether they hold per-block FP8
@@ -203,7 +203,7 @@ class Operator:
         *,
         indices: torch_lib.Tensor,
     ) -> None:
-        """Write current K/V rows into the bound prefix cache."""
+        """Write current K/V rows into the bound K/V cache."""
         if self._closed:
             raise RuntimeError("attention operator is closed")
         if self.cache is None:
@@ -321,7 +321,7 @@ class Backend:
     ) -> bool:
         """Report whether the backend serves a cache layer on ``pages``.
 
-        A layer with a paged prefix cache receives causal and non-causal
+        A layer with a paged K/V cache receives causal and non-causal
         paged calls and segmented reads of its prefix. A backend serving
         one provider reports True and validates its own page constraints
         when a layer is prepared.

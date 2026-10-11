@@ -37,7 +37,7 @@ from uniserve.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve.runtime import PrefixCache, TensorBuffers
+from uniserve.runtime import KVCache, TensorBuffers
 from uniserve.runtime.backends.attention import resolve
 from uniserve.runtime.backends.attention.torch import Backend as TorchBackend
 
@@ -81,7 +81,7 @@ def _pool(block_size, window):
             "full": mha.Config(2, 512, (0, 1), torch.bfloat16),
         }
     )
-    with PrefixCache(
+    with KVCache(
         layers, num_units=_UNITS, block_size=block_size, device="cuda"
     ) as cache:
         yield cache

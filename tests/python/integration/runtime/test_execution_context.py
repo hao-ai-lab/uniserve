@@ -25,7 +25,7 @@ from uniserve.runtime import (
     CUDAGraph,
     CUDAStream,
     ExecutionContext,
-    PrefixCache,
+    KVCache,
     Scratch,
 )
 from uniserve.tensors import BufferConfig
@@ -75,7 +75,7 @@ def test_device_lengths_drive_current_attention_values(
     )
     with (
         stream if stream is not None else nullcontext(),
-        PrefixCache(
+        KVCache(
             Config({"attention": mha.Config(2, 64, (0, 1), dtype)}),
             num_units=2,
             block_size=16,
@@ -194,7 +194,7 @@ def test_replay_binding_still_rejects_inputs_outside_the_captured_contract():
         }
     )
     with (
-        PrefixCache(config, num_units=8, block_size=16, device=device) as cache,
+        KVCache(config, num_units=8, block_size=16, device=device) as cache,
         ExecutionContext(module, cache=cache, attention="trtllm") as context,
     ):
         context.prepare(TextSize(5, 2))
@@ -248,8 +248,8 @@ def test_nested_execution_contexts_keep_prefixes_independent():
     module.projection.weight.copy_(torch.eye(64))
     config = Config({"attention": mha.Config(1, 64, (0,), torch.float32)})
     with (
-        PrefixCache(config, num_units=1, block_size=16, device="cpu") as first,
-        PrefixCache(config, num_units=1, block_size=16, device="cpu") as second,
+        KVCache(config, num_units=1, block_size=16, device="cpu") as first,
+        KVCache(config, num_units=1, block_size=16, device="cpu") as second,
         ExecutionContext(module, cache=first, attention="torch") as a,
     ):
         a.prepare(TextSize(1, 1))
@@ -350,7 +350,7 @@ def test_eager_attention_replans_changed_sequence_boundaries():
         for _ in range(2)
     )
     with (
-        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
+        KVCache(config, num_units=2, block_size=16, device=device) as cache,
         ExecutionContext(layer, cache=cache, attention="flashinfer") as context,
     ):
         context.prepare(TextSize(5, 2))
@@ -438,7 +438,7 @@ def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
         prefixes=replace(initial.prefixes, host=None),
     )
     with (
-        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
+        KVCache(config, num_units=2, block_size=16, device=device) as cache,
         ExecutionContext(layer, cache=cache, attention=provider) as context,
     ):
         context.prepare(TextSize(5, 2))
@@ -513,7 +513,7 @@ def test_context_without_derived_lengths_plans_only_with_host_mirrors():
         ]
     )
     with (
-        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
+        KVCache(config, num_units=2, block_size=16, device=device) as cache,
         ExecutionContext(
             layer, cache=cache, attention="torch", derive_host_lengths=False
         ) as context,
@@ -700,7 +700,7 @@ def test_table_batches_plan_cached_layers_beside_cacheless_layers():
         }
     )
     with (
-        PrefixCache(config, num_units=4, block_size=2, device="cpu") as cache,
+        KVCache(config, num_units=4, block_size=2, device="cpu") as cache,
         ExecutionContext(module, cache=cache, attention="torch") as context,
     ):
         context.prepare(TextSize(3, 1))

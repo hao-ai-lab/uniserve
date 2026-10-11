@@ -1,6 +1,6 @@
 """Request unit assignment, cache publications, imports, and retirement.
 
-``KVCacheManager`` wraps one ``PrefixCache`` unit pool on a worker rank and
+``KVCacheManager`` wraps one ``KVCache`` unit pool on a worker rank and
 decides when each physical unit interval may be rewritten or reused. Unit
 allocation belongs to the engine scheduler; this manager validates the unit
 ids it assigns and owns the request block tables (``BlockTables``) that model
@@ -40,7 +40,7 @@ import torch
 
 from uniserve.cache import mha
 from uniserve.math import ceil_div
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.transfer import (
@@ -122,7 +122,7 @@ class KVCacheManager:
 
     def __init__(
         self,
-        cache: PrefixCache,
+        cache: KVCache,
         *,
         info: KVCacheInfo,
         group_layers: Sequence[Sequence[int]] | None = None,
@@ -194,7 +194,7 @@ class KVCacheManager:
                 )
             self.axes += (GroupAxis(offset, len(axis)),)
 
-        # A ``PrefixCache`` holds only MHA layers (``plan_units`` rejects any
+        # A ``KVCache`` holds only MHA layers (``plan_units`` rejects any
         # other layout).
         self.compute_dtypes = tuple(
             cast(mha.Config, cache.config.layers[group.layers[0]]).compute_dtype
@@ -734,7 +734,7 @@ class KVCacheManager:
         """Prepare newly allocated units for their new owner.
 
         Resets only the unit state a new writer reads
-        (`PrefixCache.recycle_units`); stale values stay unread.
+        (`KVCache.recycle_units`); stale values stay unread.
 
         Raises:
             WorkerError: ``invalid_descriptor`` when the units are invalid;

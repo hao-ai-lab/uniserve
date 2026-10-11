@@ -10,7 +10,7 @@ lookups such as attention input construction (`model_executor.attention`).
 
 A cache group's logical page occupies ``units_per_page`` units, and the units
 at one position of every page form one numerical block table (see
-`uniserve.runtime.prefix_cache`). A slot's table of one group therefore
+`uniserve.runtime.kv_cache`). A slot's table of one group therefore
 installs as ``units_per_page`` device rows, one per numerical table, each
 holding the slot's units of pages ``start_page..`` at that position.
 """

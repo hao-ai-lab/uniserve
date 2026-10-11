@@ -48,8 +48,8 @@ from uniserve.nn.attention import (
 )
 from uniserve.nn.functional import patchify
 from uniserve.nn.moe import FusedMoE
-from uniserve.runtime import ExecutionContext, PrefixCache
-from uniserve.runtime.prefix_cache import plan_units
+from uniserve.runtime import ExecutionContext, KVCache
+from uniserve.runtime.kv_cache import plan_units
 from uniserve_models import loading as models
 
 pytestmark = pytest.mark.integration
@@ -180,7 +180,7 @@ def _canvas(model, context, canvas, prefix, soft=None):
 def _session(model):
     config = model.text.cache_config
     tables = len(plan_units(config, block_size=BLOCK_SIZE).tables)
-    cache = PrefixCache(
+    cache = KVCache(
         config,
         num_units=tables * PAGES,
         block_size=BLOCK_SIZE,
@@ -717,7 +717,7 @@ def _native_pass(root, device, attention, tokens, calls, images, canvases):
     ).model
     config = model.text.cache_config
     tables = len(plan_units(config, block_size=NATIVE_BLOCK_SIZE).tables)
-    cache = PrefixCache(
+    cache = KVCache(
         config,
         num_units=1 + tables * NATIVE_PAGES,
         block_size=NATIVE_BLOCK_SIZE,

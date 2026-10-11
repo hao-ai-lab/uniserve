@@ -16,7 +16,7 @@ from uniserve import loading
 from uniserve.loading import weights
 from uniserve.model import EmbeddingReplacement, TextInput, TextSize
 from uniserve.nn.attention import AttentionBatch, PagedInput
-from uniserve.runtime import ExecutionContext, PrefixCache
+from uniserve.runtime import ExecutionContext, KVCache
 from uniserve_models import loading as models
 from uniserve_models import qwen3
 
@@ -37,7 +37,7 @@ def test_checkpoint_prefill_decode_and_selected_logits(tmp_path, tied, theta):
     tokens = torch.tensor([[1, 3, 9, 2]])
     with torch.no_grad():
         expected = reference(tokens).logits
-    with PrefixCache(
+    with KVCache(
         model.cache_config, num_units=2, block_size=4, device="cpu"
     ) as cache:
         with ExecutionContext(model, cache=cache, attention="torch") as context:
@@ -102,7 +102,7 @@ def test_embedding_replacement_matches_numerical_embedding_input(tmp_path):
             device="cpu",
         )
     )
-    with PrefixCache(
+    with KVCache(
         model.cache_config, num_units=1, block_size=4, device="cpu"
     ) as cache:
         with ExecutionContext(model, cache=cache, attention="torch") as context:
@@ -170,7 +170,7 @@ def _partitioned(rank, rendezvous, root, shape, axes):
         from uniserve_worker.sampling.metadata import TokenSelection
 
         expected = torch.load(root / "expected.pt", weights_only=True)
-        with PrefixCache(
+        with KVCache(
             model.cache_config, num_units=1, block_size=4, device="cpu"
         ) as cache:
             with ExecutionContext(
@@ -493,7 +493,7 @@ def _moe_logits(root, tokens, *, mesh=None):
     ).model
     count = tokens.numel()
     with (
-        PrefixCache(
+        KVCache(
             model.cache_config, num_units=1, block_size=8, device="cpu"
         ) as cache,
         ExecutionContext(model, cache=cache, attention="torch") as context,
