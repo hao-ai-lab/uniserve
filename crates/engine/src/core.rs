@@ -37,7 +37,7 @@ use uniserve_core::ComponentDistribution;
 use uniserve_core::{
     CommandWaker, ComponentConfig, GenerationLimits, ModelDtype, ParallelConfig, Request, RequestId,
 };
-use uniserve_worker_ipc::WorkerInfo;
+use uniserve_worker_ipc::{VIDEO_CODEC_COMPONENT, VIDEO_DECODER_COMPONENT, WorkerInfo};
 
 /// One cooperative member's physical execution endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +76,12 @@ pub struct WorkerConfig {
     /// the group.
     pub ranks: Vec<WorkerRank>,
     /// Components keyed by name, each listing indices into `ranks`.
+    ///
+    /// The video decoder and the video codec are always distributed by
+    /// temporal units with one unit per rank, so a deployment states neither
+    /// field for them and reading one completes them
+    /// ([`VIDEO_DECODER_COMPONENT`], [`VIDEO_CODEC_COMPONENT`]).
+    #[serde(deserialize_with = "deserialize_components")]
     pub components: BTreeMap<String, ComponentConfig>,
     /// Maximum number of physical runs in flight per rank, launched as
     /// `WorkerProcessArgs::queue_depth`.
@@ -93,6 +99,37 @@ pub struct WorkerConfig {
     /// accepts the range [`WorkerConfig::validate_mem_fraction_static`] states.
     #[serde(default)]
     pub mem_fraction_static: Option<f64>,
+}
+
+/// Reads a worker group's components and completes the placement of the video
+/// decoder and the video codec.
+///
+/// Each of them runs one local instance per member rank and takes one
+/// independent media unit per rank per round, which is the only placement
+/// the worker accepts for them. A deployment that states it is read as
+/// written; one that states another unit count is refused.
+fn deserialize_components<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, ComponentConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut components = BTreeMap::<String, ComponentConfig>::deserialize(deserializer)?;
+    for name in [VIDEO_DECODER_COMPONENT, VIDEO_CODEC_COMPONENT] {
+        let Some(component) = components.get_mut(name) else {
+            continue;
+        };
+        if component.units_per_rank != 1 {
+            return Err(serde::de::Error::custom(format!(
+                "component {name} takes one media unit per rank, not {}",
+                component.units_per_rank
+            )));
+        }
+        component
+            .distribution
+            .get_or_insert(uniserve_core::ComponentDistribution::TemporalUnits);
+    }
+    Ok(components)
 }
 
 impl WorkerConfig {
@@ -1203,5 +1240,58 @@ mod tests {
         let entry = other.components.remove(DEFAULT_COMPONENT).unwrap();
         other.components.insert("divided".into(), entry);
         assert!(WorkerConfig::validate_all(&[worker, other]).is_ok());
+    }
+
+    /// The video decoder and codec are placed over their ranks one unit per
+    /// rank without a deployment saying so, so every shipped deployment
+    /// resolves them as temporal-unit components, with or without the field.
+    #[test]
+    fn shipped_deployments_resolve_the_video_decoder_and_codec_distribution() {
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/minimax_h3");
+        let mut files = 0;
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let workers: Vec<WorkerConfig> = serde_json::from_str(&text).unwrap();
+            WorkerConfig::validate_all(&workers).unwrap();
+
+            for name in [VIDEO_DECODER_COMPONENT, VIDEO_CODEC_COMPONENT] {
+                let placed = workers
+                    .iter()
+                    .filter_map(|worker| worker.components.get(name))
+                    .collect::<Vec<_>>();
+                assert!(!placed.is_empty(), "{path:?} places no {name}");
+                for component in placed {
+                    assert_eq!(
+                        component.distribution,
+                        Some(ComponentDistribution::TemporalUnits),
+                        "{path:?} {name}"
+                    );
+                    assert_eq!(component.units_per_rank, 1, "{path:?} {name}");
+                }
+            }
+            files += 1;
+        }
+        assert!(files > 0);
+    }
+
+    /// A deployment may still state the distribution the decoder always has,
+    /// and reading it gives the same placement; a second unit per rank is
+    /// not a placement the decoder has.
+    #[test]
+    fn stating_the_decoder_distribution_changes_nothing_and_extra_units_are_refused() {
+        let components = |decoder: &str| {
+            serde_json::from_str::<WorkerConfig>(&format!(
+                r#"{{"id": "model", "queue_depth": 2,
+                    "ranks": [{{"node": "n", "device": "cuda:0"}},
+                              {{"node": "n", "device": "cuda:1"}}],
+                    "components": {{"video_decoder": {decoder}}}}}"#
+            ))
+        };
+        let omitted = components(r#"{"ranks": [0, 1]}"#).unwrap();
+        let stated = components(r#"{"ranks": [0, 1], "distribution": "temporal_units"}"#).unwrap();
+        assert_eq!(omitted, stated);
+        assert!(omitted.validate().is_ok());
+        assert!(components(r#"{"ranks": [0, 1], "units_per_rank": 2}"#).is_err());
     }
 }
