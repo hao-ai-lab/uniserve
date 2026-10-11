@@ -52,8 +52,8 @@ from .packing import (
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
-# DMD rungs are unshifted noise levels on the 1000-step training clock.
-TRAINING_CLOCK = 1000.0
+# DMD rungs are unshifted noise levels on the 1000-step training schedule.
+NUM_TRAIN_TIMESTEPS = 1000.0
 
 # The base release evaluates the released sigma grid of 50 points: 49
 # network evaluations and the clean endpoint.
@@ -473,7 +473,7 @@ def _fasth3_grids(
         grid = partial(
             RungGrid,
             tuple(contract["dmd_denoising_steps"]),
-            clock=TRAINING_CLOCK,
+            num_train_timesteps=NUM_TRAIN_TIMESTEPS,
         )
     elif "pdd_step_indices" in contract:
         grid = partial(

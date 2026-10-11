@@ -72,8 +72,12 @@ def dmd_denoiser(
     return DenoiserConfig(
         transformer=transformer or transformer_config(),
         grids={
-            "video": RungGrid(rungs, shift=video_shift, clock=1000.0),
-            "audio": RungGrid(rungs, shift=AUDIO_SHIFT, clock=1000.0),
+            "video": RungGrid(
+                rungs, shift=video_shift, num_train_timesteps=1000.0
+            ),
+            "audio": RungGrid(
+                rungs, shift=AUDIO_SHIFT, num_train_timesteps=1000.0
+            ),
         },
         attention=SparseAttention(tile=64, sparsity=sparsity),
         tasks=("t2va",),

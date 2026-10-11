@@ -7,8 +7,8 @@ from uniserve.diffusion import BlockGrid, UniformGrid, fuse_heads
 
 pytestmark = pytest.mark.unit
 
-# The OmniRef PDD contract: 32 fine intervals in blocks of four on the base
-# clock [0, 0.999], video shift 12 and audio shift 3.
+# The OmniRef PDD contract: 32 fine intervals in blocks of four over
+# [0, 0.999], video shift 12 and audio shift 3.
 NODES = (0, 4, 8, 12, 16, 20, 24, 28, 32)
 
 

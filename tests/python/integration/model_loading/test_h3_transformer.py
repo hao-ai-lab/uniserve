@@ -49,8 +49,8 @@ def _reference(hidden, source, config, step, tags, cosine, sine):
         )
         return F.linear(x.to(dtype), parameter(prefix + ".weight", dtype), bias)
 
-    # The Preview export's DMD rungs on the 1000-step clock, shifted by the
-    # video (12) and audio (3) scheduler shifts.
+    # The Preview export's DMD rungs on the 1000-step training schedule,
+    # shifted by the video (12) and audio (3) scheduler shifts.
     rung = (999, 749, 500, 250)[step] / 1000
     sigma = torch.tensor(
         [

@@ -56,8 +56,12 @@ def test_t2va_fasth3_resolves_its_trained_rungs(checkpoint):
     assert set(config.denoisers) == {"transformer"}
     denoiser = config.denoisers["transformer"]
     assert denoiser.grids == {
-        "video": RungGrid((999, 749, 500, 250), shift=12.0, clock=1000.0),
-        "audio": RungGrid((999, 749, 500, 250), shift=3.0, clock=1000.0),
+        "video": RungGrid(
+            (999, 749, 500, 250), shift=12.0, num_train_timesteps=1000.0
+        ),
+        "audio": RungGrid(
+            (999, 749, 500, 250), shift=3.0, num_train_timesteps=1000.0
+        ),
     }
     assert denoiser.attention == SparseAttention(tile=64, sparsity=0.9)
     assert denoiser.tasks == ("t2va",)
@@ -169,8 +173,8 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
     denoiser = config.denoisers["transformer"]
     rungs = (999, 874, 749, 624, 500, 375, 250, 125)
     assert denoiser.grids == {
-        "video": RungGrid(rungs, shift=10, clock=1000.0),
-        "audio": RungGrid(rungs, shift=3, clock=1000.0),
+        "video": RungGrid(rungs, shift=10, num_train_timesteps=1000.0),
+        "audio": RungGrid(rungs, shift=3, num_train_timesteps=1000.0),
     }
     assert denoiser.attention.sparsity == 0.8
     with torch.device("meta"):
@@ -278,6 +282,19 @@ def test_a_checkpoint_defines_its_own_network_dimensions(checkpoint):
     decoder = "video_decoder.decoder.decoder.decoder.layers"
     assert f"{decoder}.34.qkv" in precision.dtypes
     assert f"{decoder}.35.qkv" not in precision.dtypes
+
+
+def test_pixel_normalization_comes_from_the_checkpoint_processor(checkpoint):
+    path = checkpoint / "processor/preprocessor_config.json"
+    values = json.loads(path.read_text())
+    path.write_text(
+        json.dumps(
+            {**values, "image_mean": [0.1, 0.2, 0.3], "image_std": [1, 2, 3]}
+        )
+    )
+
+    pixels = read_config(checkpoint, IOConfig(), sources={}).text_encoder.pixels
+    assert (pixels.mean, pixels.std) == ((0.1, 0.2, 0.3), (1, 2, 3))
 
 
 def test_h3_reader_reports_missing_decoder_field(checkpoint):

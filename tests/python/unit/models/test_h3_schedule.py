@@ -21,9 +21,10 @@ def test_fixed_modality_endpoints():
     schedules = model.make_schedules(device="cpu")
     assert tuple(schedules) == ("video", "audio")
     for name, shift in (("video", 12.0), ("audio", 3.0)):
-        # Each rung is an unshifted noise level on the 1000-step clock,
-        # shifted once per modality and materialized in double precision
-        # before rounding to FP32; the clean endpoint follows the last rung.
+        # Each rung is an unshifted noise level on the 1000-step training
+        # schedule, shifted once per modality and materialized in double
+        # precision before rounding to FP32; the clean endpoint follows the
+        # last rung.
         expected = tuple(
             shift * (rung / 1000) / (1 + (shift - 1) * (rung / 1000))
             for rung in (999, 749, 500, 250, 0)
