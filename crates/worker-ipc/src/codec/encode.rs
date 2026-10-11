@@ -1380,6 +1380,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             .image_warmups
             .iter()
             .map(|shape| {
+                let negative_token_ids = Some(b.create_vector(&shape.negative_token_ids));
                 fbs::ImageWarmup::create(
                     b,
                     &fbs::ImageWarmupArgs {
@@ -1387,6 +1388,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                         width: shape.width,
                         cfg_text_scale: shape.cfg_text_scale,
                         cfg_img_scale: shape.cfg_img_scale,
+                        negative_token_ids,
                     },
                 )
             })

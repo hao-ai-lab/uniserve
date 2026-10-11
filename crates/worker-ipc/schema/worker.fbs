@@ -240,6 +240,9 @@ table ImageWarmup {
   width:uint;
   cfg_text_scale:float;
   cfg_img_scale:float;
+  /// Token ids of the alternative guidance prefix the worker encodes for an
+  /// empty negative prompt, which the request carries as its negative prompt.
+  negative_token_ids:[uint];
 }
 
 table WorkerInfo {

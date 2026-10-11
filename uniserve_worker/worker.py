@@ -773,7 +773,7 @@ class Worker:
                 layout,
                 info=replace(
                     info,
-                    image_warmups=image_warmups(runner, info),
+                    image_warmups=image_warmups(runner, info, tokenizer),
                     canvas_step_rows=canvas_step_rows(
                         runner, self.canvas_slots is not None
                     ),

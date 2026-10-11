@@ -234,13 +234,17 @@ class ImageWarmup:
     Mirrors the Rust ``ImageWarmup``. The engine runs one request of
     ``height`` by ``width`` pixels at these guidance scales through its
     scheduler before it serves, so each captured guidance-branch count has
-    run through the serving path.
+    run through the serving path. ``negative_token_ids`` are the tokens of the
+    alternative guidance prefix the worker encodes for an empty negative
+    prompt, which the request carries as its negative prompt tokens; they are
+    empty when no branch has an alternative prefix.
     """
 
     height: int
     width: int
     cfg_text_scale: float
     cfg_img_scale: float
+    negative_token_ids: tuple[int, ...] = ()
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -248,6 +252,7 @@ class ImageWarmup:
             "width": self.width,
             "cfg_text_scale": self.cfg_text_scale,
             "cfg_img_scale": self.cfg_img_scale,
+            "negative_token_ids": list(self.negative_token_ids),
         }
 
 

@@ -1219,6 +1219,10 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
                         width: shape.width(),
                         cfg_text_scale: shape.cfg_text_scale(),
                         cfg_img_scale: shape.cfg_img_scale(),
+                        negative_token_ids: shape
+                            .negative_token_ids()
+                            .map(|ids| ids.iter().collect())
+                            .unwrap_or_default(),
                     })
                     .collect()
             })

@@ -68,6 +68,7 @@ pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<(
             GenerationConstraint::UndOnly,
             tokens,
             ImageParams::default(),
+            Vec::new(),
         )
     };
     // Keeps the requests clients could submit.
@@ -129,6 +130,7 @@ pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<(
                 GenerationConstraint::GenOnly,
                 0,
                 image,
+                shape.negative_token_ids.clone(),
             )]);
             if !requests.is_empty() {
                 run(core, "image", requests)?;
@@ -146,17 +148,20 @@ pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<(
 ///
 /// `tokens` is the number of understanding tokens it generates; an image
 /// request generates none and starts its image directly after the prompt.
+/// `negative_token_ids` is the negative prompt the worker encoded for its
+/// guidance branches, whose length sizes the alternative prefix's KV.
 fn warmup_request(
     config: &EngineConfig,
     request_id: uniserve_core::RequestId,
     constraint: GenerationConstraint,
     tokens: usize,
     image: ImageParams,
+    negative_token_ids: Vec<u32>,
 ) -> GenerationRequest {
     GenerationRequest {
         request_id,
         prompt_token_ids: vec![config.bos],
-        negative_prompt_token_ids: Vec::new(),
+        negative_prompt_token_ids: negative_token_ids,
         multimodal_inputs: MultimodalInputs::default(),
         constraint,
         sampling: SamplingParams {
@@ -246,8 +251,8 @@ mod tests {
     use uniserve_worker_ipc::ImageWarmup;
 
     /// Runs `warm` on a simulated worker reported to run on a CUDA device and
-    /// returns the media call kinds of every batch the executor accepted,
-    /// with each batch's call count.
+    /// returns the kind of every batch the executor accepted with its call
+    /// count.
     fn warmed_batches(
         sim: SimEngine,
         canvas: Option<uniserve_core::CanvasSampling>,
@@ -262,6 +267,20 @@ mod tests {
         canvas: Option<uniserve_core::CanvasSampling>,
         limits: impl FnOnce(&mut uniserve_core::GenerationLimits),
     ) -> Vec<(CallKind, usize)> {
+        warmed_submissions(sim, canvas, limits)
+            .into_iter()
+            .filter_map(|batch| {
+                Some(batch.requests.first()?.0.kind).map(|kind| (kind, batch.requests.len()))
+            })
+            .collect()
+    }
+
+    /// As `warmed_batches`, returning the batches themselves.
+    fn warmed_submissions(
+        sim: SimEngine,
+        canvas: Option<uniserve_core::CanvasSampling>,
+        limits: impl FnOnce(&mut uniserve_core::GenerationLimits),
+    ) -> Vec<crate::executor::ExecutionBatch> {
         let mut executor = SimExecutor::new(sim);
         let boundary = executor.observe();
         let mut config = EngineConfig::sim("warmup");
@@ -276,9 +295,7 @@ mod tests {
         boundary
             .try_iter()
             .filter_map(|event| match event {
-                BatchEvent::Submitted(batch) => {
-                    Some(batch.requests.first()?.0.kind).map(|kind| (kind, batch.requests.len()))
-                }
+                BatchEvent::Submitted(batch) => Some(batch),
                 BatchEvent::Resolved { .. } => None,
             })
             .collect()
@@ -305,12 +322,14 @@ mod tests {
                 width: 64,
                 cfg_text_scale: 1.0,
                 cfg_img_scale: 1.0,
+                negative_token_ids: Vec::new(),
             },
             ImageWarmup {
                 height: 64,
                 width: 128,
                 cfg_text_scale: 4.0,
                 cfg_img_scale: 2.0,
+                negative_token_ids: Vec::new(),
             },
         ];
 
@@ -328,6 +347,29 @@ mod tests {
     }
 
     #[test]
+    fn a_guided_shape_carries_the_negative_prompt_the_worker_encoded() {
+        let mut sim = SimEngine::new();
+        sim.mut_info_for_test().image_warmups = vec![ImageWarmup {
+            height: 64,
+            width: 64,
+            cfg_text_scale: 4.0,
+            cfg_img_scale: 1.0,
+            negative_token_ids: vec![11, 12, 13],
+        }];
+
+        // The worker reads its alternative prefix from the admission, so the
+        // request states the tokens the worker encoded for it.
+        let admitted = warmed_submissions(sim, None, |_| {})
+            .iter()
+            .flat_map(|batch| batch.admissions().cloned().collect::<Vec<_>>())
+            .filter(|admission| admission.image.is_some())
+            .map(|admission| admission.generation.unwrap().negative_token_ids)
+            .collect::<Vec<_>>();
+
+        assert_eq!(admitted, vec![vec![11, 12, 13]]);
+    }
+
+    #[test]
     fn a_shape_the_limits_refuse_is_not_warmed() {
         let mut sim = SimEngine::new();
         sim.mut_info_for_test().image_warmups = vec![
@@ -336,12 +378,14 @@ mod tests {
                 width: 64,
                 cfg_text_scale: 1.0,
                 cfg_img_scale: 1.0,
+                negative_token_ids: Vec::new(),
             },
             ImageWarmup {
                 height: 64,
                 width: 64,
                 cfg_text_scale: 4.0,
                 cfg_img_scale: 2.0,
+                negative_token_ids: Vec::new(),
             },
         ];
 

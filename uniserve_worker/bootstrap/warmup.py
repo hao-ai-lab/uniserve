@@ -19,7 +19,10 @@ import math
 from typing import TYPE_CHECKING
 
 from uniserve_worker.model_executor.graph_inputs import DiffusionShape
-from uniserve_worker.model_executor.startup import capture_image_parameters
+from uniserve_worker.model_executor.startup import (
+    capture_branch_prefixes,
+    capture_image_parameters,
+)
 from uniserve_worker.protocol.call import MediaCall
 from uniserve_worker.protocol.worker_info import ImageWarmup
 
@@ -29,7 +32,7 @@ if TYPE_CHECKING:
 
 
 def image_warmups(
-    runner: ModelExecutor, info: WorkerInfo
+    runner: ModelExecutor, info: WorkerInfo, tokenizer: object | None = None
 ) -> tuple[ImageWarmup, ...]:
     """Return the image shapes the engine warms this rank's flow runtime with.
 
@@ -39,6 +42,11 @@ def image_warmups(
     image builder's token bound. The engine's denoiser lane runs one request
     at a time, so one request exercises the shape; a worker without a request
     slot to spare for a guided request's alternative prefix states none.
+
+    A guided shape also states the token ids of its alternative guidance
+    prefix. The worker encodes the empty negative prompt through the model's
+    flow prompt, so a request carries those ids as its negative prompt tokens,
+    which is how the engine sizes that prefix's KV the way the worker reads it.
 
     Empty without an image builder or without latent preparation and
     denoising.
@@ -72,12 +80,25 @@ def image_warmups(
         guidance = capture_image_parameters(
             branches, steps=2, height=shape.height, width=shape.width
         )
+        _, resolved = capture_branch_prefixes(
+            builder, runner.flow_prompt, tokenizer, guidance
+        )
+        alternatives = {
+            prefix
+            for prefix, reuses_conditioning in resolved
+            if not reuses_conditioning
+        }
+        if len(alternatives) > 1:
+            raise ValueError(
+                "image warmup guidance has more than one alternative prefix"
+            )
         shapes.append(
             ImageWarmup(
                 height=shape.height,
                 width=shape.width,
                 cfg_text_scale=guidance.cfg_text_scale,
                 cfg_img_scale=guidance.cfg_img_scale,
+                negative_token_ids=next(iter(alternatives), ()),
             )
         )
     return tuple(shapes)

@@ -7,20 +7,60 @@ from types import SimpleNamespace
 import pytest
 
 from uniserve_worker.bootstrap.warmup import canvas_step_rows, image_warmups
+from uniserve_worker.model_executor.diffusion_inputs import BranchSource
 from uniserve_worker.model_executor.graph_inputs import DiffusionShape
 from uniserve_worker.protocol.call import MediaCall
 
+# The guidance branches each guidance-scale pair evaluates: the conditioned
+# branch, then branches that condition on the negative prompt or the start.
+_BRANCHES = {
+    (1.0, 1.0): (BranchSource.CONDITIONING,),
+    (4.0, 1.0): (BranchSource.CONDITIONING, BranchSource.NEGATIVE_OR_START),
+    (4.0, 2.0): (
+        BranchSource.CONDITIONING,
+        BranchSource.NEGATIVE_OR_START,
+        BranchSource.NEGATIVE_OR_START,
+    ),
+}
 
-def _runner(captures, *, max_tokens=4096, framing=2, downsample=16):
+
+class _FlowPrompt:
+    """The model's template, which wraps even an empty prompt in tokens."""
+
+    def encode(self, tokenizer, *, text):
+        return (7, 8) if text == "" else (7, 8, 9)
+
+
+def _runner(
+    captures,
+    *,
+    max_tokens=4096,
+    framing=2,
+    downsample=16,
+    flow_prompt=None,
+):
+    denoiser = SimpleNamespace(
+        downsample=downsample,
+        make_schedules=lambda *args, **kwargs: {"image": None},
+        make_guidance=lambda *, text_scale, image_scale, **kwargs: (
+            SimpleNamespace(
+                branches=lambda schedule, step: _BRANCHES[
+                    (text_scale, image_scale)
+                ]
+            )
+        ),
+    )
     builder = SimpleNamespace(
         max_tokens=max_tokens,
         framing=framing,
-        denoiser=SimpleNamespace(downsample=downsample),
+        denoiser=denoiser,
+        branch_source=lambda branch: branch,
     )
     return SimpleNamespace(
         image_builder=builder,
         flow_cfg_branches=(1, 2, 3),
         flow_captures=tuple(captures),
+        flow_prompt=flow_prompt,
     )
 
 
@@ -59,6 +99,21 @@ def test_each_captured_branch_count_warms_its_last_captured_shape() -> None:
         (4.0, 1.0),
         (4.0, 2.0),
     ]
+
+
+def test_a_guided_shape_states_the_encoded_empty_negative() -> None:
+    shapes = image_warmups(_runner([], flow_prompt=_FlowPrompt()), _info())
+
+    # An unguided shape has no alternative prefix; guided ones read the
+    # template's encoding of an empty negative prompt.
+    assert [shape.negative_token_ids for shape in shapes] == [
+        (),
+        (7, 8),
+        (7, 8),
+    ]
+    # Without a flow prompt the alternative prefix is empty.
+    bare = image_warmups(_runner([]), _info())
+    assert [shape.negative_token_ids for shape in bare] == [(), (), ()]
 
 
 def test_an_uncaptured_branch_count_warms_a_square_of_the_latent_capacity() -> (

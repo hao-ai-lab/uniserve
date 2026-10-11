@@ -506,6 +506,38 @@ def capture_image_parameters(cfg_branches, *, steps, height, width):
     )
 
 
+def capture_branch_prefixes(builder, flow_prompt, tokenizer, image):
+    """Resolve the guidance branches of ``image`` at its first step.
+
+    Returns the image schedule and one ``(prefix token ids, reuses the
+    conditioning KV)`` pair per branch the parameters evaluate, for a request
+    with an empty negative prompt, in the order the guidance returns them
+    (see ``resolve_prefix``).
+    """
+    schedule = builder.denoiser.make_schedules(
+        image.steps,
+        shift=image.timestep_shift if image.timestep_shift > 0 else None,
+        device="cpu",
+    )["image"]
+    guidance = builder.denoiser.make_guidance(
+        text_scale=image.cfg_text_scale,
+        image_scale=image.cfg_img_scale,
+        interval=image.cfg_interval,
+        renorm=Renorm(image.cfg_renorm_type),
+        renorm_min=image.cfg_renorm_min,
+    )
+    return schedule, tuple(
+        resolve_prefix(
+            flow_prompt,
+            builder.branch_source(branch),
+            negative_prompt="",
+            negative_token_ids=(),
+            tokenizer=tokenizer,
+        )
+        for branch in guidance.branches(schedule, 0)
+    )
+
+
 @torch.inference_mode()
 def prepare_flow(runner, entry, latent_pool, tokenizer):
     """Warm and capture configured image shapes on real conditioning prefixes.
@@ -574,21 +606,9 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                 height=shape.height,
                 width=shape.width,
             )
-            schedule = builder.denoiser.make_schedules(
-                image.steps,
-                shift=image.timestep_shift
-                if image.timestep_shift > 0
-                else None,
-                device="cpu",
-            )["image"]
-            guidance = builder.denoiser.make_guidance(
-                text_scale=image.cfg_text_scale,
-                image_scale=image.cfg_img_scale,
-                interval=image.cfg_interval,
-                renorm=Renorm(image.cfg_renorm_type),
-                renorm_min=image.cfg_renorm_min,
+            schedule, branches = capture_branch_prefixes(
+                builder, runner.flow_prompt, tokenizer, image
             )
-            branches = guidance.branches(schedule, 0)
             if len(branches) != shape.cfg_branches:
                 raise ValueError(
                     "capture guidance does not realize its configured branch "
@@ -597,19 +617,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
 
             # One prefix per (request, branch), branch-fastest. A prefix can
             # be empty (see ``resolve_prefix``).
-            prefixes = (
-                tuple(
-                    resolve_prefix(
-                        runner.flow_prompt,
-                        builder.branch_source(branch),
-                        negative_prompt="",
-                        negative_token_ids=(),
-                        tokenizer=tokenizer,
-                    )[0]
-                    for branch in branches
-                )
-                * shape.rows
-            )
+            prefixes = tuple(prefix for prefix, _ in branches) * shape.rows
             lengths = tuple(map(len, prefixes))
 
             with (

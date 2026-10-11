@@ -276,6 +276,12 @@ pub struct ImageWarmup {
     pub cfg_text_scale: f32,
     /// Classifier-free guidance scale of the image condition.
     pub cfg_img_scale: f32,
+    /// Tokens of the alternative guidance prefix the worker encodes for an
+    /// empty negative prompt, which the request carries as its negative prompt
+    /// so the engine sizes that prefix as the worker reads it. Empty when no
+    /// guidance branch has an alternative prefix.
+    #[serde(default)]
+    pub negative_token_ids: Vec<u32>,
 }
 
 impl ImageWarmup {
