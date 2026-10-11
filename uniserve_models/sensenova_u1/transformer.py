@@ -106,12 +106,6 @@ class TransformerLayer(nn.Module):
             dim,
             cache_name=f"text.backbone.layers.{index}.attention",
         )
-        # Always None: ``TransformerConfig`` rejects sliding_attention layers.
-        self.window = (
-            config.sliding_window
-            if config.layer_types[index] == "sliding_attention"
-            else None
-        )
         self.temporal_rotary = RotaryEmbedding(
             dim // 2,
             theta=config.rope_theta,

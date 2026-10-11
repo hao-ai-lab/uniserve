@@ -210,7 +210,7 @@ def test_bagel_resize_matches_the_shared_fixture(case):
 def _sensenova_processor() -> ImageProcessor:
     """Build SenseNova U1's image processor at the published patch size."""
     config = u1.Config(
-        u1.TransformerConfig(37, 32, 48, 2, 4, 2, 8, ("full_attention",) * 2),
+        u1.TransformerConfig(37, 32, 48, 2, 4, 2, 8),
         vision.Config(16, 32, 0.5, 16, 3, 10000.0),
         flow.Config(
             flow.HeadConfig(32, 2, 1.0),

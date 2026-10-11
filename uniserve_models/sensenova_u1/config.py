@@ -49,9 +49,8 @@ class TransformerConfig:
     temporal rotary half and height and width quarters: the temporal axis
     uses ``rope_theta`` and ``max_position_embeddings``, the spatial axes
     ``rope_theta_hw`` and ``max_position_embeddings_hw``, and all three share
-    ``rope_scaling`` and ``partial_rotary_factor``. ``layer_types`` and
-    ``sliding_window`` record the checkpoint's attention kinds, but
-    ``__post_init__`` rejects any ``sliding_attention`` layer.
+    ``rope_scaling`` and ``partial_rotary_factor``. Every layer attends over
+    the whole visible sequence.
 
     Raises:
         ValueError: From ``__post_init__`` when a field has the wrong type or
@@ -65,7 +64,6 @@ class TransformerConfig:
     num_attention_heads: int
     num_key_value_heads: int
     head_dim: int
-    layer_types: tuple[str, ...]
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-6
     attention_bias: bool = False
@@ -75,7 +73,6 @@ class TransformerConfig:
     rope_theta_hw: float = 10000.0
     rope_scaling: RoPEScaling | None = None
     partial_rotary_factor: float = 1.0
-    sliding_window: int | None = None
     pad_token_id: int | None = None
     tie_word_embeddings: bool = False
 
@@ -112,35 +109,6 @@ class TransformerConfig:
         if self.partial_rotary_factor > 1:
             raise ValueError(
                 "SenseNova partial_rotary_factor must not exceed one"
-            )
-
-        if (
-            not isinstance(self.layer_types, tuple)
-            or len(self.layer_types) != self.num_hidden_layers
-        ):
-            raise ValueError(
-                "SenseNova layer_types must describe every decoder layer"
-            )
-        if any(
-            not isinstance(value, str)
-            or value not in {"full_attention", "sliding_attention"}
-            for value in self.layer_types
-        ):
-            raise ValueError(
-                "SenseNova layer_types contains an unsupported attention type"
-            )
-        if self.sliding_window is not None:
-            _positive(self.sliding_window, "sliding_window", integer=True)
-        if "sliding_attention" in self.layer_types:
-            if self.sliding_window is None:
-                raise ValueError(
-                    "SenseNova sliding_attention requires sliding_window"
-                )
-            # The multimodal mask implements full attention within image
-            # blocks and causal text visibility, without a local-window cutoff.
-            raise ValueError(
-                "SenseNova layer_types: sliding_attention is not "
-                "supported by the MoT decoder"
             )
 
         for name in ("attention_bias", "tie_word_embeddings"):
@@ -220,9 +188,9 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
     Raises:
         ValueError: For malformed metadata, including a missing
             ``llm_config``, ``vision_config`` or text dimension without a
-            default, conflicting aliases, an unsupported rotary recipe or
-            sparse MoE text model, and fields that a rotary recipe or config
-            dataclass rejects.
+            default, conflicting aliases, an unsupported rotary recipe,
+            sliding-window attention or a sparse MoE text model, and fields
+            that a rotary recipe or config dataclass rejects.
     """  # noqa: E501
     text, image = raw.get("llm_config"), raw.get("vision_config")
     if not isinstance(text, Mapping) or not isinstance(image, Mapping):
@@ -255,33 +223,24 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
             "SenseNova requires explicit head_dim for this hidden width"
         )
 
+    # Sliding-window attention changes the visible keys. The multimodal
+    # mask gives image blocks full attention and text causal visibility,
+    # without a local-window cutoff, so a windowed checkpoint is not served.
     use_window = text.get("use_sliding_window", False)
     if not isinstance(use_window, bool):
         raise ValueError("SenseNova use_sliding_window must be boolean")
-    window = text.get("sliding_window")
-    boundary = text.get("max_window_layers", 0)
-    if (
-        not isinstance(boundary, int)
-        or isinstance(boundary, bool)
-        or boundary < 0
+    layer_types = text.get("layer_types")
+    if use_window or (
+        layer_types is not None
+        and (
+            not isinstance(layer_types, list)
+            or any(kind != "full_attention" for kind in layer_types)
+        )
     ):
         raise ValueError(
-            "SenseNova llm_config.max_window_layers must be a "
-            "non-negative integer"
+            "SenseNova sliding-window attention is not supported by the "
+            "MoT decoder"
         )
-    layer_types = text.get("layer_types")
-    if layer_types is None:
-        # Without layer_types, the window fields define the per-layer
-        # attention kinds: with use_sliding_window and a sliding_window set,
-        # layers from max_window_layers onward use sliding attention.
-        layer_types = tuple(
-            "sliding_attention"
-            if use_window and window is not None and index >= boundary
-            else "full_attention"
-            for index in range(layers)
-        )
-    if not isinstance(layer_types, (list, tuple)):
-        raise ValueError("SenseNova layer_types must be a sequence")
 
     vision_ratio = _stage_scalar(
         image.get("downsample_ratio", 0.5), "downsample_ratio"
@@ -310,7 +269,6 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
                 text, "num_key_value_heads", "llm_config"
             ),
             head_dim=text.get("head_dim", hidden // heads),
-            layer_types=tuple(layer_types),
             hidden_act=text.get("hidden_act", "silu"),
             rms_norm_eps=text.get("rms_norm_eps", 1e-6),
             attention_bias=text.get("attention_bias", False),
@@ -322,7 +280,6 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
             rope_theta_hw=text.get("rope_theta_hw", 10000.0),
             rope_scaling=rotary.scaling,
             partial_rotary_factor=rotary.partial_rotary_factor,
-            sliding_window=window,
             # The text map's pad_token_id takes precedence over the root's.
             pad_token_id=text.get("pad_token_id")
             if text.get("pad_token_id") is not None
