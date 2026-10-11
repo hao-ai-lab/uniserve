@@ -130,8 +130,7 @@ def _predicated_outcome(
 
     Reuses the call's reserved `PendingOutput`: sets `CallStatus.PREDICATED`,
     keeps its progress coordinates, and clears finish flags, which a
-    predicated completion must not carry (`RequestOutput.validate` rejects
-    them).
+    predicated completion must not carry.
     """
     request = state.pending_output(call.request_key.request_id)
     request.status = CallStatus.PREDICATED

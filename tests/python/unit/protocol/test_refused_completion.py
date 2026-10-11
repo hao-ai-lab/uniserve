@@ -1,13 +1,12 @@
 """A worker that refuses a request reports why in the call's completion.
 
 The engine returns the stated reason to the client as an invalid-request
-rejection, so a refusal's completion carries it on the wire and no other
-completion does.
+rejection, so a refusal's completion carries it on the wire.
 """
 
 import pytest
 
-from uniserve_worker.errors import ErrorCode, WorkerError
+from uniserve_worker.errors import ErrorCode
 from uniserve_worker.protocol.call import CallStatus
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.output import (
@@ -39,19 +38,6 @@ def _completion(error_code, error_message):
 
 def test_a_refusal_carries_its_reason_across_the_wire():
     refused = _completion(ErrorCode.INVALID_REQUEST, REASON)
-    refused.validate()
     mapping = refused.to_mapping()
     assert mapping["error_code"] is ErrorCode.INVALID_REQUEST
     assert mapping["error_message"] == REASON
-
-
-@pytest.mark.parametrize(
-    ("error_code", "error_message"),
-    [
-        (ErrorCode.INVALID_REQUEST, None),
-        (ErrorCode.COMPUTE_ERROR, REASON),
-    ],
-)
-def test_only_a_refusal_states_a_reason(error_code, error_message):
-    with pytest.raises(WorkerError, match="states why"):
-        _completion(error_code, error_message).validate()

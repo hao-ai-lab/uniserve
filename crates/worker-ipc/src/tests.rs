@@ -644,6 +644,25 @@ fn candidate_logprobs_belong_to_a_successful_completion() {
     assert!(record.validate().is_err());
 }
 
+/// A completion states why exactly when it refuses its request, so the engine
+/// has a reason to return to the client.
+#[test]
+fn a_refusal_and_only_a_refusal_states_its_reason() {
+    let mut refusal = completion_record();
+    refusal.status = CallStatus::Error;
+    refusal.error_code = Some(ErrorCode::InvalidRequest);
+    assert!(refusal.validate().is_err());
+    refusal.error_message = Some("conditions exceed the worker's capacity".into());
+    assert!(refusal.validate().is_ok());
+
+    let mut failure = completion_record();
+    failure.status = CallStatus::Error;
+    failure.error_code = Some(ErrorCode::ComputeError);
+    assert!(failure.validate().is_ok());
+    failure.error_message = Some("unrequested reason".into());
+    assert!(failure.validate().is_err());
+}
+
 /// Constructs malformed wire input independently of the validated encoder.
 ///
 /// The frame holds one call with the given forward and media codes and no

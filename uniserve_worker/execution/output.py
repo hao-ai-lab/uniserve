@@ -500,8 +500,8 @@ class PendingOutput:
             RuntimeError: The output is not ready (which includes an
                 abandoned output), or a speculative sampling row disagrees
                 with its draft span or initialized KV extent. Errors from
-                `OutputBuffer.read_tokens`, `OutputBuffer.observe`, and
-                `RequestOutput.validate` also propagate.
+                `OutputBuffer.read_tokens` and `OutputBuffer.observe` also
+                propagate.
         """
         if self.value is not None:
             return self.value
@@ -701,7 +701,6 @@ class PendingOutput:
             else runtime
         )
 
-        concrete.validate()
         self.value = concrete
         self.host.tasks = ()
         return concrete
