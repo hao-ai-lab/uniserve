@@ -2882,9 +2882,9 @@ impl Drop for PausedProcess {
 
 /// An external shared-storage publisher the test controls.
 ///
-/// The segment carries what a consumer needs in its header: the digest of the
-/// locator that names it, and a readiness word the test writes after the
-/// payload. Until then a rank that reads it waits on that word.
+/// The segment carries what a consumer needs in its header: a readiness word
+/// the test writes after the payload. Until then a rank that reads it waits
+/// on that word.
 struct SlowShmPublication {
     name: String,
     endpoint: String,
@@ -2919,33 +2919,8 @@ impl SlowShmPublication {
         // which leaves the readiness word pending and every acknowledgment
         // word unclaimed.
         file.set_len(SEGMENT_HEADER_BYTES + 1)?;
-        // The header names the exact locator the rank will be handed, the way
-        // the worker's own publications do, so the rank accepts the segment.
-        file.write_all_at(&publication.digest()?, 0)?;
         file.write_all_at(&[0], SEGMENT_HEADER_BYTES)?;
         Ok(publication)
-    }
-
-    /// The digest the worker computes over a locator: SHA-256 of its
-    /// canonical JSON, keys sorted, no whitespace.
-    fn digest(&self) -> anyhow::Result<[u8; 32]> {
-        use sha2::Digest as _;
-
-        let canonical = format!(
-            concat!(
-                "{{\"device\":\"cpu\",\"dtype\":\"uint8\",\"endpoint\":\"{endpoint}\",",
-                "\"name\":\"{name}\",\"nbytes\":1,\"offset\":[0],\"shape\":[1],",
-                "\"source\":{{\"address_space\":\"{address_space}\",",
-                "\"incarnation\":\"{incarnation}\",\"node\":\"{node}\",\"rank\":0,",
-                "\"worker_id\":\"publisher\"}},\"transport\":\"posix_shm\"}}"
-            ),
-            endpoint = self.endpoint,
-            name = self.name,
-            address_space = self.address_space(),
-            incarnation = self.endpoint,
-            node = self.node()?,
-        );
-        Ok(sha2::Sha256::digest(canonical.as_bytes()).into())
     }
 
     fn address_space(&self) -> String {
