@@ -42,7 +42,7 @@ def _expected(module, hidden, ids, weights):
     return result
 
 
-@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("activation", ["silu", "gelu_pytorch_tanh"])
 def test_each_token_combines_its_selected_experts(activation):
     module = _module(activation)
     generator = torch.Generator().manual_seed(11)

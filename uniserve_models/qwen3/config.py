@@ -16,7 +16,6 @@ from pathlib import Path
 
 from uniserve import loading
 from uniserve.loading import checkpoint
-from uniserve.nn.moe import Activation
 from uniserve.nn.rope import RoPEScaling, YaRNScaling
 
 from ..rotary import read_rotary
@@ -158,7 +157,10 @@ class Config:
                 "half the head dimension"
             )
 
-        if self.num_experts and self.hidden_act not in _EXPERT_ACTIVATIONS:
+        if self.num_experts and self.hidden_act not in {
+            "silu",
+            "gelu_pytorch_tanh",
+        }:
             raise ValueError(
                 f"Qwen3-MoE experts do not implement {self.hidden_act!r}; "
                 "expert kernels gate with SiLU or tanh-approximated GELU"
@@ -182,13 +184,6 @@ _GATED_ACTIVATIONS: Mapping[str, str] = {
     "gelu_pytorch_tanh": "gelu_pytorch_tanh",
 }
 
-# ``FusedMoE``'s name for each ``GatedMLP`` activation the expert kernels
-# implement; they have no exact GELU.
-_EXPERT_ACTIVATIONS: Mapping[str, Activation] = {
-    "silu": "silu",
-    "gelu_pytorch_tanh": "gelu_tanh",
-}
-
 
 def gated_activation(hidden_act: object, *, owner: str) -> str:
     """Resolve a checkpoint's ``hidden_act`` to a ``GatedMLP`` activation.
@@ -199,11 +194,6 @@ def gated_activation(hidden_act: object, *, owner: str) -> str:
     if not isinstance(hidden_act, str) or hidden_act not in _GATED_ACTIVATIONS:
         raise ValueError(f"unsupported {owner} hidden_act {hidden_act!r}")
     return _GATED_ACTIVATIONS[hidden_act]
-
-
-def expert_activation(hidden_act: str) -> Activation:
-    """Name the ``FusedMoE`` gating of ``Config.hidden_act``."""
-    return _EXPERT_ACTIVATIONS[hidden_act]
 
 
 def _required_int(config: Mapping[str, object], name: str) -> int:

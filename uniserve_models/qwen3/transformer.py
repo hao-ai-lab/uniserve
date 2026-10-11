@@ -8,6 +8,8 @@ model. Traversal, pipeline exchange and the final norm belong to the shared
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import nn
 
@@ -25,11 +27,11 @@ from uniserve.nn.linear import (
     VocabParallelEmbedding,
 )
 from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.moe import FusedMoE, TopK
+from uniserve.nn.moe import Activation, FusedMoE, TopK
 from uniserve.nn.norm import RMSNorm
 from uniserve.nn.rope import MRotaryEmbedding, RotaryEmbedding
 
-from .config import Config, expert_activation
+from .config import Config
 
 
 class Attention(nn.Module):
@@ -121,7 +123,8 @@ class MoE(nn.Module):
             config.hidden_size,
             config.moe_intermediate_size,
             top_k=config.num_experts_per_tok,
-            activation=expert_activation(config.hidden_act),
+            # ``Config`` admits only the gating the expert kernels implement.
+            activation=cast("Activation", config.hidden_act),
         )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:

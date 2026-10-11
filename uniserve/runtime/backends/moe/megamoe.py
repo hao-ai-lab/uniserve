@@ -128,7 +128,10 @@ class MegaMoEBuffer:
             apply_topk_in_fc1=False,
             in_kernel_fc2_reduce=False,
             combine_dtype="bf16",
-            activation=activation,
+            # The vendored drop names tanh-approximated GELU ``gelu_tanh``.
+            activation="gelu_tanh"
+            if activation == "gelu_pytorch_tanh"
+            else activation,
         )
         # Captured launches bind both a stream and a local token extent;
         # all extents retain the same maximum-sized symmetric allocation.
