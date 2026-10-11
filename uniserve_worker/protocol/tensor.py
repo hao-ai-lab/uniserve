@@ -19,13 +19,6 @@ from typing import TypeAlias
 
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import identity
-from uniserve_worker.protocol.validation import (
-    _map,
-    _seq,
-    _str,
-    _tagged,
-    _uint,
-)
 
 
 class DType(StrEnum):
@@ -132,36 +125,6 @@ class ShapeBound:
             for extent, bound in zip(shape, self.dims, strict=True)
         )
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "shape_bound"
-    ) -> ShapeBound:
-        """Parse tagged ``static`` and ``device`` dimension variants."""
-        data = _map(value, where)
-        dims: list[DimBound] = []
-        for index, item in enumerate(
-            _seq(data.get("dims", ()), f"{where}.dims")
-        ):
-            kind, payload = _tagged(item, f"{where}.dims[{index}]")
-            if kind == "static":
-                dims.append(
-                    StaticDim(_uint(payload, f"{where}.dims[{index}].value"))
-                )
-            elif kind == "device":
-                inner = _map(payload, f"{where}.dims[{index}].value")
-                dims.append(
-                    DeviceDim(
-                        _uint(
-                            inner.get("max"), f"{where}.dims[{index}].value.max"
-                        )
-                    )
-                )
-            else:
-                raise invalid_descriptor(
-                    f"{where}.dims[{index}] has unknown variant {kind!r}"
-                )
-        return cls(tuple(dims))
-
     def to_mapping(self) -> dict[str, object]:
         """Serialize ordered dimension bounds into tagged wire variants."""
         return {"dims": [_dim_to_mapping(dim) for dim in self.dims]}
@@ -209,30 +172,6 @@ class OutputInfo:
     def max_bytes(self) -> int:
         """Maximum storage in bytes: bound element count times dtype width."""
         return self.shape_bound.max_elements * self.dtype.element_bytes
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "output_info"
-    ) -> OutputInfo:
-        """Parse a named result description with its dtype and shape bound."""
-        data = _map(value, where)
-        raster = data.get("raster_axes")
-        return cls(
-            name=_str(data.get("name"), f"{where}.name"),
-            dtype=DType(_str(data.get("dtype"), f"{where}.dtype")),
-            shape_bound=ShapeBound.from_mapping(
-                data.get("shape_bound"), f"{where}.shape_bound"
-            ),
-            raster_axes=None
-            if raster is None
-            else (
-                _uint(
-                    _map(raster, f"{where}.raster_axes").get("height"),
-                    f"{where}.raster_axes.height",
-                ),
-                _uint(raster.get("width"), f"{where}.raster_axes.width"),
-            ),
-        )
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize the result description for IPC."""

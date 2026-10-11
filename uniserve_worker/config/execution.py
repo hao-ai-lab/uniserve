@@ -24,7 +24,6 @@ from uniserve.runtime.backends.attention.flashinfer import (
     Config as FlashInferConfig,
 )
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.protocol.batch import CanvasSampling
 from uniserve_worker.protocol.call import (
     CALL_KINDS,
     CallKind,
@@ -32,8 +31,15 @@ from uniserve_worker.protocol.call import (
     MediaCall,
     TransferMode,
 )
+from uniserve_worker.protocol.validation import (
+    _float,
+    _map,
+    _nonnegative,
+    _uint,
+)
 
 __all__ = [
+    "CanvasSampling",
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
     "DEFAULT_GRAPH_STORAGE_FRACTION",
     "DEFAULT_PREFILL_GRAPH_ROW_BUCKETS",
@@ -287,6 +293,75 @@ class LaneConfig:
                 raise ValueError(
                     f"lane {name} must be positive when configured"
                 )
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasSampling:
+    """Block-diffusion sampling of the canvases a deployment generates.
+
+    A block of ``canvas_length`` tokens starts as random tokens and is
+    denoised for at most ``max_steps`` steps: each samples every position at
+    a temperature falling linearly from ``t_max`` to ``t_min``, accepts the
+    lowest-entropy samples within ``entropy_bound`` nats and renoises the
+    rest. A block stops early once its argmax canvas has held for
+    ``stability_threshold`` steps and its mean entropy is below
+    ``confidence_threshold`` nats. Draws follow the admitted sampling seed.
+    """
+
+    canvas_length: int
+    max_steps: int
+    entropy_bound: float
+    t_min: float
+    t_max: float
+    confidence_threshold: float
+    stability_threshold: int
+
+    def __post_init__(self) -> None:
+        """Require positive lengths and finite sampling values.
+
+        The sampler (``uniserve.diffusion.canvas.CanvasSampling``) checks
+        the values' domain when the worker runs the canvas.
+        """
+        if self.canvas_length < 1 or self.max_steps < 1:
+            raise invalid_descriptor(
+                "a canvas requires a positive length and step limit"
+            )
+        if not all(
+            math.isfinite(value)
+            for value in (
+                self.entropy_bound,
+                self.t_min,
+                self.t_max,
+                self.confidence_threshold,
+            )
+        ):
+            raise invalid_descriptor("canvas sampling values are not finite")
+        _nonnegative(self.stability_threshold, "canvas stability threshold")
+
+    @classmethod
+    def from_mapping(
+        cls, value: object, where: str = "canvas sampling"
+    ) -> CanvasSampling:
+        """Parse the sampling a worker's launch descriptor states."""
+        data = _map(value, where)
+        return cls(
+            canvas_length=_uint(
+                data.get("canvas_length"), f"{where}.canvas_length"
+            ),
+            max_steps=_uint(data.get("max_steps"), f"{where}.max_steps"),
+            entropy_bound=_float(
+                data.get("entropy_bound"), f"{where}.entropy_bound"
+            ),
+            t_min=_float(data.get("t_min"), f"{where}.t_min"),
+            t_max=_float(data.get("t_max"), f"{where}.t_max"),
+            confidence_threshold=_float(
+                data.get("confidence_threshold"),
+                f"{where}.confidence_threshold",
+            ),
+            stability_threshold=_uint(
+                data.get("stability_threshold"), f"{where}.stability_threshold"
+            ),
+        )
 
 
 @dataclass(frozen=True)
