@@ -1490,11 +1490,10 @@ fn plan_reference(
     condition: &ConditionSpec,
     media: &MediaFacts,
     frames: u32,
-    frame_rate: u32,
-    chunks: &FrameChunks,
     vision: &ProcessorConfig,
-    config: &ReferenceConfig,
+    limits: &PlanLimits,
 ) -> Result<ConditionPlan, VideoInputError> {
+    let (frame_rate, chunks, config) = (limits.frame_rate, &limits.frames, &limits.references);
     let reject = |error: String| VideoInputError::condition(index, error);
     let plan = |prepared, seen, audio_rows| ConditionPlan {
         index,
@@ -1584,16 +1583,9 @@ pub fn plan_request(
                     "a keyframe must be an image",
                 ));
             }
-            (ConditionRole::Reference, _) => plan_reference(
-                index,
-                condition,
-                facts,
-                frames,
-                limits.frame_rate,
-                &limits.frames,
-                vision,
-                &limits.references,
-            )?,
+            (ConditionRole::Reference, _) => {
+                plan_reference(index, condition, facts, frames, vision, limits)?
+            }
         };
         plans.push(plan);
     }
