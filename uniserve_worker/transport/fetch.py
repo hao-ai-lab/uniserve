@@ -105,10 +105,6 @@ def plan_reads(
         transport = bindings.get((location.source, location.backend))
         if transport is None:
             continue
-        if transport.name != location.backend:
-            raise invalid_descriptor(
-                "bound transport disagrees with the physical edge"
-            )
         coverage = tuple(
             slice(start, start + extent)
             for start, extent in zip(
@@ -173,19 +169,14 @@ def submit_reads(
 
     Raises:
         WorkerError: `ReadBackpressureError` when too few read tickets are
-            free now, `unsupported_setup` when the reads outnumber the
-            rank's tickets, and `invalid_descriptor` when their transports
-            do not share one capacity. An error raised while submitting, by
-            a backend's `fetch` or by `retain`, propagates after the tickets
-            already submitted are cancelled.
+            free now, and `unsupported_setup` when the reads outnumber the
+            rank's tickets. An error raised while submitting, by a backend's
+            `fetch` or by `retain`, propagates after the tickets already
+            submitted are cancelled.
     """
     if not reads:
         return ()
     capacity = reads[0].transport.capacity
-    if any(read.transport.capacity is not capacity for read in reads):
-        raise invalid_descriptor(
-            "a fetch's transports must share the rank's transfer capacity"
-        )
 
     tickets: list[TransferTicket] = []
     with ReadReservation(capacity, len(reads)) as reservation:

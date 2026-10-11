@@ -37,7 +37,6 @@ from uniserve.runtime import EventPool
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
     DESCRIPTOR_HANDLE_BYTES,
-    FABRIC_HANDLE_BYTES,
     CudaVmmTransfer,
     Locator,
     WorkerEndpoint,
@@ -631,17 +630,6 @@ class CudaVmmTransport(Transport):
         if not isinstance(locator.transport, CudaVmmTransfer):
             raise invalid_descriptor(
                 "CUDA VMM read requires a CUDA VMM locator"
-            )
-        # A device product reaches another host as a fabric handle and not as
-        # a process descriptor, which names an allocation only within the host
-        # that exported it. The head refuses an edge whose devices cannot
-        # export one, so this is the rank restating what it was given.
-        if (
-            locator.source.node != self.source.node
-            and len(locator.transport.allocation_handle) != FABRIC_HANDLE_BYTES
-        ):
-            raise invalid_descriptor(
-                "a device product crosses hosts only as a fabric handle"
             )
         if device.type != "cuda":
             raise invalid_descriptor(

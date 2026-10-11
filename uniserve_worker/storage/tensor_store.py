@@ -140,7 +140,6 @@ def _invariant(message: str) -> WorkerError:
 # the full `TensorRef` of the live record to reject stale generations.
 _ReferenceKey = tuple[int, int, int, CallId, int]
 _CallKey = tuple[RequestKey, CallId]
-_SlotStorageKey = tuple[str, tuple[int, ...], torch.dtype]
 
 
 def _reference_key(reference: TensorRef) -> _ReferenceKey:

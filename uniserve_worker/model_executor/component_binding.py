@@ -76,23 +76,6 @@ class ComponentBinding:
                 f"component {self.name} members lie outside its Worker"
             )
 
-        # Mesh agreement is checked only without a distribution: a
-        # ``temporal_units`` member's mesh is that rank alone, which differs
-        # from the configured ranks whenever there are several.
-        if self.config.distribution is None:
-            if (self.mesh is not None) != self.owns:
-                raise ValueError(
-                    f"component {self.name} requires its local mesh"
-                )
-            if self.mesh is not None and (
-                self.mesh.ranks != self.config.ranks
-                or tuple(zip(self.mesh.axes, self.mesh.shape))
-                != self.config.parallel_config.dimensions
-            ):
-                raise ValueError(
-                    f"component {self.name} mesh disagrees with configuration"
-                )
-
     @property
     def owns(self) -> bool:
         """Whether this process executes the configured component."""
