@@ -89,6 +89,7 @@ from uniserve_worker.protocol.call import CALL_KINDS
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import (
     ComponentInfo,
+    ServedCanvas,
     VideoDenoiserInfo,
     WorkerInfo,
 )
@@ -684,16 +685,22 @@ def video_denoiser_info(
     The tasks are the denoiser's, in its order. The schedule's sigma points
     include the clean endpoint the network never evaluates. The canvases are
     ``canvases``, those the deployment prepares and admits, or without any
-    every canvas the denoiser offers (``VideoDenoiser.canvases``).
+    every canvas the denoiser offers (``VideoDenoiser.canvases``), each with
+    the short edge and aspect ratio that select it.
     """
-    served = canvases or denoiser.canvases
+    # The denoiser names each of its canvases once.
+    names = {size: name for name, size in denoiser.canvases.items()}
+    served = canvases or tuple(denoiser.canvases.values())
     shifts = denoiser.schedule_shifts
     return VideoDenoiserInfo(
         tasks=denoiser.tasks,
         schedule_points=denoiser.num_steps + 1,
         video_shift=float(shifts["video"]),
         audio_shift=float(shifts["audio"]),
-        canvases=tuple((canvas.width, canvas.height) for canvas in served),
+        canvases=tuple(
+            ServedCanvas(*names[canvas], canvas.width, canvas.height)
+            for canvas in served
+        ),
     )
 
 

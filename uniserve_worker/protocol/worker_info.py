@@ -141,6 +141,28 @@ class ComponentInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class ServedCanvas:
+    """A canvas a deployment serves and the request fields that select it.
+
+    Mirrors the Rust ``ServedCanvas``: ``short_edge`` is the resolution
+    class in pixels (``target.short_edge``), ``aspect_ratio`` the display
+    ratio as ``W:H`` (``target.aspect_ratio``).
+    """
+
+    short_edge: int
+    aspect_ratio: str
+    width: int
+    height: int
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "short_edge": self.short_edge,
+            "aspect_ratio": self.aspect_ratio,
+            "canvas": {"width": self.width, "height": self.height},
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class VideoDenoiserInfo:
     """What the video denoiser a deployment places serves.
 
@@ -153,7 +175,7 @@ class VideoDenoiserInfo:
     schedule_points: int
     video_shift: float
     audio_shift: float
-    canvases: tuple[tuple[int, int], ...] = ()
+    canvases: tuple[ServedCanvas, ...] = ()
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -161,10 +183,7 @@ class VideoDenoiserInfo:
             "schedule_points": self.schedule_points,
             "video_shift": self.video_shift,
             "audio_shift": self.audio_shift,
-            "canvases": [
-                {"width": width, "height": height}
-                for width, height in self.canvases
-            ],
+            "canvases": [canvas.to_mapping() for canvas in self.canvases],
         }
 
 

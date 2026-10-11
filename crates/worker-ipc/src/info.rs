@@ -268,6 +268,17 @@ impl WorkerEndpoint {
     }
 }
 
+/// A canvas a deployment serves, with the request fields that select it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedCanvas {
+    /// `target.short_edge`: the resolution class, in pixels.
+    pub short_edge: u32,
+    /// `target.aspect_ratio`: the display ratio as `W:H`.
+    pub aspect_ratio: String,
+    /// The raster this pair selects.
+    pub canvas: uniserve_core::Canvas,
+}
+
 /// What the video denoiser a deployment places serves.
 ///
 /// The denoiser fixes its schedule; the tasks and canvases bound what
@@ -283,9 +294,10 @@ pub struct VideoDenoiserInfo {
     pub video_shift: f64,
     /// Shift of the audio schedule.
     pub audio_shift: f64,
-    /// The only canvases the deployment serves: those it prepares.
+    /// The only canvases the deployment serves: those it prepares, in the
+    /// order its operator selected them.
     #[serde(default)]
-    pub canvases: Vec<uniserve_core::Canvas>,
+    pub canvases: Vec<ServedCanvas>,
 }
 
 impl VideoDenoiserInfo {
@@ -296,7 +308,8 @@ impl VideoDenoiserInfo {
     }
 
     /// Checks that tasks are named once each, the schedule has an endpoint
-    /// and positive finite shifts, and every canvas is positive.
+    /// and positive finite shifts, and every canvas is a positive raster
+    /// selected by its own `(short_edge, aspect_ratio)` pair.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -312,10 +325,22 @@ impl VideoDenoiserInfo {
             "a video denoiser schedule needs points and positive shifts"
         );
         ensure_valid!(
+            self.canvases.iter().all(|served| {
+                served.short_edge > 0
+                    && !served.aspect_ratio.is_empty()
+                    && served.canvas.width > 0
+                    && served.canvas.height > 0
+            }),
+            "a video denoiser declares an empty canvas"
+        );
+        ensure_valid!(
             self.canvases
                 .iter()
-                .all(|canvas| canvas.width > 0 && canvas.height > 0),
-            "a video denoiser declares an empty canvas"
+                .map(|served| (served.short_edge, served.aspect_ratio.as_str()))
+                .collect::<HashSet<_>>()
+                .len()
+                == self.canvases.len(),
+            "a video denoiser declares a canvas name twice"
         );
         Ok(())
     }

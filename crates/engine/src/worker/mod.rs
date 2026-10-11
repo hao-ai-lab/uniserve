@@ -150,9 +150,16 @@ pub struct WorkerProcessArgs {
     /// Optional text capacities, in prompt tokens, of a video denoiser's
     /// layouts, as a comma-separated increasing list.
     pub video_text_capacities: Option<String>,
-    /// Optional canvases a video worker prepares and admits, as
-    /// comma-separated `HEIGHTxWIDTH`; `None` prepares the denoiser's own.
-    pub video_frame_sizes: Option<String>,
+    /// Optional resolution classes (`768p`) a video worker prepares, as a
+    /// comma-separated list. Crossed with `video_aspect_ratios`, they name
+    /// the canvases the worker prepares and admits; the model refuses a name
+    /// it does not generate. `None` takes every resolution class the
+    /// denoiser generates.
+    pub video_resolutions: Option<String>,
+    /// Optional aspect ratios (`16:9`) a video worker prepares, as a
+    /// comma-separated list; `None` takes every aspect ratio the denoiser
+    /// generates.
+    pub video_aspect_ratios: Option<String>,
     /// Block-diffusion sampling of every canvas the deployment generates, as
     /// the server resolves it; `None` when the served model generates no
     /// canvases. The scheduler plans canvas steps under it and the worker

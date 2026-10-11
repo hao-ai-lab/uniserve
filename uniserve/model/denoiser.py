@@ -1,7 +1,7 @@
 """Numerical denoiser capabilities and shared image latent transforms."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Generic, Protocol, TypeVar, cast
@@ -267,13 +267,64 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         }
 
     @property
-    def canvases(self) -> tuple[image.Config, ...]:
+    def canvases(self) -> Mapping[tuple[int, str], image.Config]:
         """Canvases a deployment may prepare layouts for before serving.
 
-        A deployment prepares a selection of them, or all of them without
-        one, and admits only the canvases it prepares.
+        Each is keyed by the pair a request selects it with: the resolution
+        class's short edge in pixels and the display aspect ratio as
+        ``W:H``, such as ``(768, "16:9")``. A deployment prepares a selection
+        of them (``select_canvases``) and admits only the canvases it
+        prepares.
         """
         raise NotImplementedError
+
+    def select_canvases(
+        self, resolutions: Sequence[str], aspect_ratios: Sequence[str]
+    ) -> tuple[image.Config, ...]:
+        """Resolve a deployment's named canvases to the rasters it prepares.
+
+        ``resolutions`` are resolution classes such as ``768p`` and
+        ``aspect_ratios`` display ratios such as ``16:9``. Every resolution
+        is crossed with every aspect ratio, resolution-major in the order
+        named. Without resolutions, or without aspect ratios, every one the
+        network offers takes their place; without either, the result is every
+        canvas it offers, in its own order.
+
+        Raises:
+            ValueError: A name that is not a resolution class, a pair the
+                network does not generate, or a repeated name.
+        """
+        offered = self.canvases
+        if not resolutions and not aspect_ratios:
+            return tuple(offered.values())
+
+        edges: list[int] = []
+        for name in resolutions:
+            if not (name.endswith("p") and name[:-1].isdecimal()):
+                raise ValueError(
+                    f"a video resolution is a class such as 768p, got {name!r}"
+                )
+            edges.append(int(name[:-1]))
+        # Without names, every one the network offers, in its own order.
+        edges = edges or list(dict.fromkeys(edge for edge, _ in offered))
+        ratios = list(aspect_ratios) or list(
+            dict.fromkeys(ratio for _, ratio in offered)
+        )
+        if len(set(edges)) != len(edges) or len(set(ratios)) != len(ratios):
+            raise ValueError("a video resolution or aspect ratio repeats")
+
+        selected = []
+        for edge in edges:
+            for ratio in ratios:
+                canvas = offered.get((edge, ratio))
+                if canvas is None:
+                    generated = ", ".join(f"{e}p {r}" for e, r in offered)
+                    raise ValueError(
+                        f"this network generates only {generated}, not "
+                        f"{edge}p {ratio}"
+                    )
+                selected.append(canvas)
+        return tuple(selected)
 
     @property
     def tasks(self) -> tuple[str, ...]:

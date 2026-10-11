@@ -1614,7 +1614,24 @@ fn kv_free_worker_info_round_trips() {
             schedule_points: 5,
             video_shift: 12.0,
             audio_shift: 3.0,
-            canvases: Vec::new(),
+            canvases: vec![
+                ServedCanvas {
+                    short_edge: 768,
+                    aspect_ratio: "16:9".into(),
+                    canvas: uniserve_core::Canvas {
+                        width: 1344,
+                        height: 768,
+                    },
+                },
+                ServedCanvas {
+                    short_edge: 480,
+                    aspect_ratio: "21:9".into(),
+                    canvas: uniserve_core::Canvas {
+                        width: 992,
+                        height: 416,
+                    },
+                },
+            ],
         }),
         supported_calls: video_components()
             .into_keys()

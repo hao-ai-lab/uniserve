@@ -182,15 +182,27 @@ table ComponentInfo {
 /// A video raster in pixels.
 struct Canvas { width:uint; height:uint; }
 
+/// A canvas a deployment serves with the request fields that select it:
+/// `target.short_edge`, the resolution class in pixels, and
+/// `target.aspect_ratio`, the display ratio as `W:H`. `width` and `height`
+/// are the raster of that pair.
+table ServedCanvas {
+  short_edge:uint;
+  aspect_ratio:string;
+  width:uint;
+  height:uint;
+}
+
 /// What a deployment's video denoiser serves: its tasks, its fixed schedule
 /// (sigma points including the clean endpoint, and the per-modality shifts)
-/// and the canvases it prepares and accepts.
+/// and the canvases it prepares and accepts, in the order the deployment
+/// selected them.
 table VideoDenoiserInfo {
   tasks:[string];
   schedule_points:uint;
   video_shift:double;
   audio_shift:double;
-  canvases:[Canvas];
+  canvases:[ServedCanvas];
 }
 
 /// Binds a media call to the component that runs it; the decoder rejects a

@@ -134,19 +134,30 @@ def rule_canvases() -> tuple[image.Config, ...]:
     return tuple(dict.fromkeys(canvas(ratio, 1.0) for ratio in probes))
 
 
+# The canvas rule's canvas of every named aspect ratio, at the 768-pixel
+# short edge, keyed as a request selects it: ``(short_edge, "W:H")``.
+NAMED_CANVASES = MappingProxyType(
+    {
+        (CANVAS_SHORT_EDGE, f"{width}:{height}"): canvas(width, height)
+        for width, height in NAMED_ASPECT_RATIOS
+    }
+)
+
 # FastH3 DMD students are trained on, and generate only, 12 buckets: the
 # named aspect ratios at the 768p and 480p resolutions. The 768p buckets are
 # the canvas rule's canvases; the 480p buckets, (height, width) below in the
 # same ratio order, are the training table's own rather than a rescaled rule
 # (21:9 is 992x416, not 960x416). A deployment prepares a subset of them.
-DMD_CANVASES = (
-    *(canvas(*ratio) for ratio in NAMED_ASPECT_RATIOS),
-    image.Config(416, 992),
-    image.Config(480, 832),
-    image.Config(480, 640),
-    image.Config(480, 480),
-    image.Config(640, 480),
-    image.Config(832, 480),
+DMD_CANVASES = MappingProxyType(
+    {
+        **NAMED_CANVASES,
+        (480, "21:9"): image.Config(416, 992),
+        (480, "16:9"): image.Config(480, 832),
+        (480, "4:3"): image.Config(480, 640),
+        (480, "1:1"): image.Config(480, 480),
+        (480, "3:4"): image.Config(640, 480),
+        (480, "9:16"): image.Config(832, 480),
+    }
 )
 
 
@@ -289,15 +300,16 @@ class DenoiserConfig:
             their shifts; requests cannot change them.
         attention: Dense or sparse attention.
         tasks: The tasks this DiT serves, in canonical order.
-        canvases: The only canvases the checkpoint generates, or None when it
-            generates every canvas of the canvas rules.
+        canvases: The only canvases the checkpoint generates, keyed by the
+            ``(short_edge, "W:H")`` a request selects them with, or None
+            when it generates every canvas of the canvas rule.
     """
 
     transformer: TransformerConfig
     grids: Mapping[str, FixedGrid]
     attention: Attention
     tasks: tuple[str, ...]
-    canvases: tuple[image.Config, ...] | None
+    canvases: Mapping[tuple[int, str], image.Config] | None
 
     def __post_init__(self) -> None:
         if (
@@ -308,13 +320,18 @@ class DenoiserConfig:
         ):
             raise ValueError("H3 denoiser tasks must name distinct H3 tasks")
         if self.canvases is not None and (
-            not isinstance(self.canvases, tuple)
+            not isinstance(self.canvases, Mapping)
             or not self.canvases
             or any(
-                not isinstance(value, image.Config) for value in self.canvases
+                not isinstance(value, image.Config)
+                for value in self.canvases.values()
             )
+            # A canvas is named once, so a raster's name is its own.
+            or len(set(self.canvases.values())) != len(self.canvases)
         ):
-            raise ValueError("H3 denoiser canvases must be image.Config values")
+            raise ValueError(
+                "H3 denoiser canvases must name distinct image.Config values"
+            )
         if (
             set(self.grids) != {"video", "audio"}
             or any(

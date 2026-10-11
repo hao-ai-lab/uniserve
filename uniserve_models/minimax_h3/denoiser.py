@@ -50,11 +50,10 @@ from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
 from .conditioning import Conditioner
 from .config import (
-    NAMED_ASPECT_RATIOS,
+    NAMED_CANVASES,
     DenoiserConfig,
     DenseAttention,
     SparseAttention,
-    canvas,
     rule_canvases,
 )
 from .inputs import (
@@ -197,18 +196,16 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         )
 
     @property
-    def canvases(self) -> tuple[image.Config, ...]:
+    def canvases(self) -> Mapping[tuple[int, str], image.Config]:
         """Canvases a deployment may prepare layouts for.
 
         A checkpoint that generates only some canvases offers those; one
         that follows the canvas rule offers every named aspect ratio's
-        canvas.
+        canvas at the rule's short edge.
         """
         if self.config.canvases is not None:
             return self.config.canvases
-        return tuple(
-            dict.fromkeys(canvas(*ratio) for ratio in NAMED_ASPECT_RATIOS)
-        )
+        return NAMED_CANVASES
 
     @property
     def tasks(self) -> tuple[str, ...]:
@@ -336,9 +333,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 rows.
         """
         canvases = self.config.canvases
-        if canvases is not None and canvas not in canvases:
+        if canvases is not None and canvas not in canvases.values():
             raise ValueError(
-                f"this H3 checkpoint generates only {canvases}, not {canvas}"
+                "this H3 checkpoint generates only "
+                f"{tuple(canvases.values())}, not {canvas}"
             )
         segments = condition_segments(tuple(conditions), canvas)
         tasks = self.config.tasks

@@ -599,9 +599,13 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
             .map(|canvases| {
                 canvases
                     .iter()
-                    .map(|canvas| uniserve_core::Canvas {
-                        width: canvas.width(),
-                        height: canvas.height(),
+                    .map(|served| crate::ServedCanvas {
+                        short_edge: served.short_edge(),
+                        aspect_ratio: served.aspect_ratio().unwrap_or_default().to_owned(),
+                        canvas: uniserve_core::Canvas {
+                            width: served.width(),
+                            height: served.height(),
+                        },
                     })
                     .collect()
             })

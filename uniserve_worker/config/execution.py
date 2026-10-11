@@ -440,9 +440,13 @@ class WorkerConfig:
     # Text capacities, in prompt tokens, of the denoiser's layouts; empty
     # selects ``MediaBuilder``'s default spacing.
     video_text_capacities: tuple[int, ...]
-    # Canvases, as (height, width) pixels, a video deployment prepares and
-    # admits; empty prepares the denoiser's own (``VideoDenoiser.canvases``).
-    video_frame_sizes: tuple[tuple[int, int], ...]
+    # Resolution classes (``768p``) and aspect ratios (``16:9``) of the
+    # canvases a video deployment prepares and admits: every resolution at
+    # every aspect ratio, resolved by the denoiser
+    # (``VideoDenoiser.select_canvases``). Empty takes everything the
+    # denoiser generates.
+    video_resolutions: tuple[str, ...]
+    video_aspect_ratios: tuple[str, ...]
     # Names of every component any worker group of the deployment places;
     # it selects which of a checkpoint's video denoisers the deployment
     # serves.
@@ -566,9 +570,8 @@ def worker_config_from_namespace(
         video_text_capacities=_parse_positive_int_csv(
             namespace.video_text_capacities, default=()
         ),
-        video_frame_sizes=_parse_image_shapes(
-            namespace.video_frame_sizes, default=(), name="video frame sizes"
-        ),
+        video_resolutions=_parse_names(namespace.video_resolutions),
+        video_aspect_ratios=_parse_names(namespace.video_aspect_ratios),
         deployment_components=tuple(
             str(name) for name in namespace.deployment_components
         ),
@@ -661,6 +664,16 @@ def _parse_positive_int_csv(
     if tuple(sorted(set(values))) != values:
         raise ValueError("integer bucket lists must be strictly increasing")
     return values
+
+
+def _parse_names(raw: object | None) -> tuple[str, ...]:
+    """Parse a comma-separated list of names; ``None`` is none."""
+    if raw is None:
+        return ()
+    names = tuple(part.strip() for part in str(raw).split(","))
+    if any(not name for name in names):
+        raise ValueError("name lists must contain only non-empty values")
+    return names
 
 
 def _parse_image_shapes(

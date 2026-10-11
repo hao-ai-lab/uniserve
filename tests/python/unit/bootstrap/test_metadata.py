@@ -120,7 +120,8 @@ def test_h3_worker_advertises_bounded_media_products():
         max_model_len=65,
         max_video_seconds=1.0,
         max_request_pool_size=2,
-        video_frame_sizes=((768, 1344), (1344, 768)),
+        video_resolutions=("768p",),
+        video_aspect_ratios=("16:9", "9:16"),
     )
     outputs = resolve_outputs(model, config)
     assert set(supported_calls(model)) == {
@@ -536,7 +537,8 @@ def test_a_deployment_without_condition_capacity_serves_the_largest_set():
         max_video_seconds=5.0,
         max_batch_calls=2,
         max_request_pool_size=2,
-        video_frame_sizes=((768, 1344),),
+        video_resolutions=("768p",),
+        video_aspect_ratios=("16:9",),
         deployment_components=("transformer_ref",),
     )
     assert config.max_condition_rows is None
@@ -573,7 +575,8 @@ def test_a_media_worker_keeps_a_request_slot_for_every_three_queue_positions():
         max_video_seconds=5.0,
         max_batch_calls=8,
         max_request_pool_size=8,
-        video_frame_sizes=((768, 1344),),
+        video_resolutions=("768p",),
+        video_aspect_ratios=("16:9",),
         deployment_components=("transformer_ref",),
     )
 

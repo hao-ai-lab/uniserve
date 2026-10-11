@@ -36,6 +36,13 @@ def _config(*placed: str) -> WorkerConfig:
     )
 
 
+def _declared(info) -> tuple[tuple[int, str, int, int], ...]:
+    """Each declared canvas as (short edge, aspect ratio, width, height)."""
+    return tuple(
+        (c.short_edge, c.aspect_ratio, c.width, c.height) for c in info.canvases
+    )
+
+
 @pytest.fixture(scope="module")
 def base():
     with torch.device("meta"):
@@ -57,16 +64,16 @@ def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
     info = video_denoiser_info(video_denoiser(base, _config("transformer")))
     # The worker executes both tasks of the t2va/fl2va DiT on the released
     # schedule: 50 sigma points, video shift 12, audio shift 3, the canvas
-    # rule's canvas of every named aspect ratio.
+    # rule's canvas of every named aspect ratio at 768p.
     assert (info.tasks, info.schedule_points) == (("t2va", "fl2va"), 50)
     assert (info.video_shift, info.audio_shift) == (12.0, 3.0)
-    assert info.canvases == (
-        (1536, 672),
-        (1344, 768),
-        (1024, 768),
-        (768, 768),
-        (768, 1024),
-        (768, 1344),
+    assert _declared(info) == (
+        (768, "21:9", 1536, 672),
+        (768, "16:9", 1344, 768),
+        (768, "4:3", 1024, 768),
+        (768, "1:1", 768, 768),
+        (768, "3:4", 768, 1024),
+        (768, "9:16", 768, 1344),
     )
 
     # The reference DiT serves ref2va alone.
@@ -88,24 +95,24 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
     info = video_denoiser_info(denoiser)
     assert info.tasks == ("t2va",)
     assert info.schedule_points == 5
-    # Without a deployment's selection, every (width, height) training
-    # bucket: 21:9, 16:9, 4:3, 1:1, 3:4 and 9:16 at 768p, then at 480p.
-    assert info.canvases == (
-        (1536, 672),
-        (1344, 768),
-        (1024, 768),
-        (768, 768),
-        (768, 1024),
-        (768, 1344),
-        (992, 416),
-        (832, 480),
-        (640, 480),
-        (480, 480),
-        (480, 640),
-        (480, 832),
+    # Without a deployment's selection, every training bucket: 21:9, 16:9,
+    # 4:3, 1:1, 3:4 and 9:16 at 768p, then at 480p.
+    assert _declared(info) == (
+        (768, "21:9", 1536, 672),
+        (768, "16:9", 1344, 768),
+        (768, "4:3", 1024, 768),
+        (768, "1:1", 768, 768),
+        (768, "3:4", 768, 1024),
+        (768, "9:16", 768, 1344),
+        (480, "21:9", 992, 416),
+        (480, "16:9", 832, 480),
+        (480, "4:3", 640, 480),
+        (480, "1:1", 480, 480),
+        (480, "3:4", 480, 640),
+        (480, "9:16", 480, 832),
     )
     served = (image.Config(480, 832), image.Config(1344, 768))
-    assert video_denoiser_info(denoiser, canvases=served).canvases == (
-        (832, 480),
-        (768, 1344),
+    assert _declared(video_denoiser_info(denoiser, canvases=served)) == (
+        (480, "16:9", 832, 480),
+        (768, "9:16", 768, 1344),
     )

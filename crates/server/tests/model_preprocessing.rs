@@ -12,8 +12,8 @@ use base64::Engine as _;
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-use uniserve_core::{GenerationLimits, GenerationRequest, MediaCall};
-use uniserve_engine::VideoDenoiserInfo;
+use uniserve_core::{Canvas, GenerationLimits, GenerationRequest, MediaCall};
+use uniserve_engine::{ServedCanvas, VideoDenoiserInfo};
 use uniserve_server::VideoMediaSettings;
 use uniserve_server::openai::VideoGenerationRequest;
 use uniserve_server::profile::assets::ResolvedModelFiles;
@@ -24,7 +24,7 @@ use uniserve_server::serving::media::{
     ImageFetchError, ImageFetchPolicy, ImageFetcher, ImageInput, ImageListError,
 };
 use uniserve_server::serving::video::VideoService;
-use uniserve_server::serving::video::plan::{NAMED_ASPECT_RATIOS, ProcessorConfig, canvas};
+use uniserve_server::serving::video::plan::ProcessorConfig;
 use uniserve_server::serving::{
     InputProcessor, RequestRenderer, ResponseOptions, ServeRequestId, chat_image_urls,
 };
@@ -51,6 +51,15 @@ const SPECIAL_TOKENS: &[&str] = &[
     "</answer>",
 ];
 
+/// A canvas a worker declares for a short edge and an aspect ratio.
+fn served(short_edge: u32, aspect_ratio: &str, width: u32, height: u32) -> ServedCanvas {
+    ServedCanvas {
+        short_edge,
+        aspect_ratio: aspect_ratio.to_owned(),
+        canvas: Canvas { width, height },
+    }
+}
+
 /// What a released base denoiser reports in its handshake: text-to-video
 /// over the canvases of the named aspect ratios, on the 50-point schedule.
 fn base_denoiser() -> VideoDenoiserInfo {
@@ -59,10 +68,17 @@ fn base_denoiser() -> VideoDenoiserInfo {
         schedule_points: 50,
         video_shift: 12.0,
         audio_shift: 3.0,
-        canvases: NAMED_ASPECT_RATIOS
-            .iter()
-            .map(|&(width, height)| canvas(f64::from(width), f64::from(height)).unwrap())
-            .collect(),
+        canvases: [
+            ("21:9", 1536, 672),
+            ("16:9", 1344, 768),
+            ("4:3", 1024, 768),
+            ("1:1", 768, 768),
+            ("3:4", 768, 1024),
+            ("9:16", 768, 1344),
+        ]
+        .into_iter()
+        .map(|(aspect_ratio, width, height)| served(768, aspect_ratio, width, height))
+        .collect(),
     }
 }
 
@@ -712,14 +728,17 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
 #[tokio::test]
 async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
-    let canvas = |width, height| uniserve_core::Canvas { width, height };
     // 768p 16:9, then 480p 21:9 and 16:9.
     let denoiser = VideoDenoiserInfo {
         tasks: vec!["t2va".to_owned()],
         schedule_points: 9,
         video_shift: 10.0,
         audio_shift: 3.0,
-        canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
+        canvases: vec![
+            served(768, "16:9", 1344, 768),
+            served(480, "21:9", 992, 416),
+            served(480, "16:9", 832, 480),
+        ],
     };
     let model = InputProcessor::new(
         loaded.config().clone(),
@@ -751,7 +770,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     );
     assert_eq!(
         capabilities["canvas"]["aspect_ratios"],
-        serde_json::json!(["21:9", "16:9"])
+        serde_json::json!(["16:9", "21:9"])
     );
     assert_eq!(
         capabilities["canvas"]["sizes"],
@@ -780,7 +799,13 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         .await
         .unwrap();
     assert_eq!(prepared.request.sampling.num_frames, 243);
-    assert_eq!(prepared.canvas, canvas(1344, 768));
+    assert_eq!(
+        prepared.canvas,
+        Canvas {
+            width: 1344,
+            height: 768
+        }
+    );
 
     // A 480 short edge names the 480p training bucket of the ratio.
     let narrow = model
@@ -792,7 +817,13 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         )
         .await
         .unwrap();
-    assert_eq!(narrow.canvas, canvas(992, 416));
+    assert_eq!(
+        narrow.canvas,
+        Canvas {
+            width: 992,
+            height: 416
+        }
+    );
     assert_eq!(
         (
             narrow.request.sampling.width,
