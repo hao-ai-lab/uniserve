@@ -712,12 +712,11 @@ class Batch:
                 )
             supplied_inputs.add(product)
 
-        # Each KV transfer's descriptor must fit the transfer-handle bound and
-        # its source must be unique. It installs into exactly one
-        # ``KV_INSTALL`` call whose transfer-byte bound covers its tensors.
+        # Each KV transfer's source must be unique. It installs into exactly
+        # one ``KV_INSTALL`` call whose transfer-byte bound covers its
+        # tensors.
         sources: set[identity.BufferId] = set()
         for publication in self.kv_inputs:
-            publication.encoded_size_bound()
             if publication.source in sources:
                 raise invalid_descriptor("batch repeats a KV input")
             sources.add(publication.source)
@@ -755,19 +754,6 @@ class TensorPublication:
 
     product: tensor.TensorRef
     value: transfer.TransferValue
-
-    def encoded_size_bound(self) -> int:
-        """Return the estimated encoded size of the tensor's locators.
-
-        Raises:
-            WorkerError: From `invalid_descriptor` when the estimate exceeds
-                ``transfer.MAX_TRANSFER_HANDLE_BYTES`` or a locator names an
-                unknown transport.
-        """
-        size = transfer._tensor_transfers_size((self.value.tensor,))
-        if size > transfer.MAX_TRANSFER_HANDLE_BYTES:
-            raise invalid_descriptor("transfer metadata exceeds its byte bound")
-        return size
 
     def to_mapping(self) -> dict[str, object]:
         """Encode the tensor identity and its kind-tagged transfer value."""

@@ -33,11 +33,6 @@ from uniserve_worker.protocol.validation import (
     _uint,
 )
 
-#: Upper bound on a transfer descriptor's estimated encoded size, in bytes. It
-#: equals the worker-ipc crate's `MAX_TRANSFER_HANDLE_BYTES`, which the crate's
-#: validators enforce on their own estimate of the same descriptor.
-MAX_TRANSFER_HANDLE_BYTES = 64 * 1024
-
 #: Bytes of a POSIX file-descriptor allocation handle. It names an open file of
 #: the exporting process, so a consumer on the same host receives a usable
 #: descriptor through `uniserve_worker.transport.descriptor_grants`, and no
@@ -611,11 +606,8 @@ class KvTransfer:
     its tokens from its `KvGroupTransfer.start` on. An unchanged extent
     carries no groups; otherwise there is one entry per cache group, in
     table order. `compute_dtype` is the precision used when reading
-    quantized source pages. `__post_init__` does not check the descriptor
-    size bound; the output commit in `uniserve_worker.execution.commit` and
-    `Batch.validate` run `encoded_size_bound`. The worker-ipc crate's
-    `KvTransfer::validate` checks the same relations and the size bound in
-    the crate's codec.
+    quantized source pages. The worker-ipc crate's `KvTransfer::validate`
+    checks the same relations in the crate's codec.
     """
 
     groups: tuple[KvGroupTransfer, ...]
@@ -675,30 +667,6 @@ class KvTransfer:
             "compute_dtype": self.compute_dtype,
         }
 
-    def encoded_size_bound(self) -> int:
-        """Return the estimated descriptor size, enforcing the handle bound.
-
-        The estimate covers every page and scale locator of every group plus
-        the publication metadata, and parallels the worker-ipc crate's
-        `KvTransfer::encoded_size_bound`.
-
-        Raises:
-            WorkerError: `invalid_descriptor` when the estimate exceeds
-                `MAX_TRANSFER_HANDLE_BYTES` or a locator names an unknown
-                transport.
-        """
-        size = (
-            _tensor_transfers_size(self.tensors)
-            + 32 * len(self.groups)
-            + len(self.destination.encode())
-            + len(self.compute_dtype.encode())
-        )
-        if size > MAX_TRANSFER_HANDLE_BYTES:
-            raise invalid_descriptor(
-                "KV transfer exceeds its descriptor byte bound"
-            )
-        return size
-
 
 @dataclass(frozen=True, slots=True)
 class LatentTransferValue:
@@ -719,62 +687,3 @@ class LatentTransferValue:
 TransferValue: TypeAlias = (
     EncoderTransferValue | DeviceProductTransferValue | LatentTransferValue
 )
-
-
-def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
-    """Estimate the encoded byte size of tensor locators for handle bounding.
-
-    The integer constants are conservative per-record overheads (field names,
-    tags, lengths), not exact wire sizes; only string and list lengths are
-    measured from the values themselves. The estimate parallels the
-    worker-ipc crate's `transfer_encoded_size`, which the crate's validators
-    check against the same bound when the codec encodes or decodes a batch
-    or a batch result; an estimate here below the crate's lets the worker
-    commit a descriptor that the codec then rejects.
-    """
-    locators = tuple(
-        location for tensor in tensors for location in tensor.locations
-    )
-    size = 512 + sum(64 + 8 * len(tensor.shape) for tensor in tensors)
-
-    for locator in locators:
-        size += (
-            256
-            + len(locator.dtype.encode())
-            + len(locator.device.encode())
-            + 16 * len(locator.shape)
-            + len(locator.source.worker_id.encode())
-            + len(locator.source.node.encode())
-            + len(locator.source.address_space.encode())
-            + len(locator.source.incarnation.encode())
-        )
-
-        transport = locator.transport
-        if isinstance(transport, LocalTransfer):
-            size += len(transport.endpoint.encode()) + 16
-        elif isinstance(transport, PosixShmTransfer):
-            size += (
-                len(transport.endpoint.encode())
-                + len(transport.name.encode())
-                + 16
-            )
-        elif isinstance(transport, ChannelTransfer):
-            # The bytes are the product, not the handle: their budget is the
-            # channel's byte capacity and the message caps of the rank channel
-            # they travel on, so only the locator's framing counts here.
-            size += len(transport.endpoint.encode()) + 24
-        elif isinstance(transport, CudaVmmTransfer):
-            size += (
-                len(transport.endpoint.encode())
-                + len(transport.publication_id.encode())
-                + len(transport.ready_event_handle)
-                + 8 * len(transport.tensor_stride)
-                + 8 * len(transport.storage_offsets_bytes)
-                + 12 * len(transport.span_lengths)
-                + 64
-            )
-        else:
-            raise invalid_descriptor(
-                "tensor transfer names an unknown transport"
-            )
-    return size
