@@ -236,7 +236,7 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
 
     // Error metadata occupies independent optional fields on the wire.
     let message = response.message().map(str::to_owned);
-    let code = response.code().map(str::to_owned);
+    let code = response.code().map(error_code_from_fb).transpose()?;
     let fatal = response.fatal();
     let phase = response.phase().map(str::to_owned);
     let route = response.route().map(str::to_owned);
@@ -291,12 +291,11 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
             let message = message
                 .filter(|value| !value.is_empty())
                 .context("error response has no message")?;
-            let code = code.filter(|value| !value.is_empty());
             WorkerResponse::Error {
                 message_id,
                 error: WorkerResponseError {
                     message,
-                    code,
+                    code: code.context("error response has no code")?,
                     fatal: fatal.context("error response has no fatal flag")?,
                     phase,
                     route,
@@ -1823,11 +1822,14 @@ fn call_status_from_fb(status: fbs::CallStatus) -> CodecResult<CallStatus> {
 /// Maps a worker error code to its stable FlatBuffers discriminant.
 fn error_code_to_fb(code: ErrorCode) -> fbs::ErrorCode {
     match code {
-        ErrorCode::InvalidCall => fbs::ErrorCode::InvalidCall,
-        ErrorCode::ResourceExhausted => fbs::ErrorCode::ResourceExhausted,
+        ErrorCode::UnsupportedCall => fbs::ErrorCode::UnsupportedCall,
+        ErrorCode::InvalidDescriptor => fbs::ErrorCode::InvalidDescriptor,
+        ErrorCode::UnsupportedSetup => fbs::ErrorCode::UnsupportedSetup,
+        ErrorCode::InputError => fbs::ErrorCode::InputError,
         ErrorCode::ComputeError => fbs::ErrorCode::ComputeError,
-        ErrorCode::Cancelled => fbs::ErrorCode::Cancelled,
-        ErrorCode::Internal => fbs::ErrorCode::Internal,
+        ErrorCode::ResourceError => fbs::ErrorCode::ResourceError,
+        ErrorCode::InvariantViolation => fbs::ErrorCode::InvariantViolation,
+        ErrorCode::FatalWorkerFailure => fbs::ErrorCode::FatalWorkerFailure,
         ErrorCode::InvalidRequest => fbs::ErrorCode::InvalidRequest,
     }
 }
@@ -1835,11 +1837,14 @@ fn error_code_to_fb(code: ErrorCode) -> fbs::ErrorCode {
 /// Decodes a supported FlatBuffers worker error code.
 fn error_code_from_fb(code: fbs::ErrorCode) -> CodecResult<ErrorCode> {
     Ok(match code {
-        fbs::ErrorCode::InvalidCall => ErrorCode::InvalidCall,
-        fbs::ErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
+        fbs::ErrorCode::UnsupportedCall => ErrorCode::UnsupportedCall,
+        fbs::ErrorCode::InvalidDescriptor => ErrorCode::InvalidDescriptor,
+        fbs::ErrorCode::UnsupportedSetup => ErrorCode::UnsupportedSetup,
+        fbs::ErrorCode::InputError => ErrorCode::InputError,
         fbs::ErrorCode::ComputeError => ErrorCode::ComputeError,
-        fbs::ErrorCode::Cancelled => ErrorCode::Cancelled,
-        fbs::ErrorCode::Internal => ErrorCode::Internal,
+        fbs::ErrorCode::ResourceError => ErrorCode::ResourceError,
+        fbs::ErrorCode::InvariantViolation => ErrorCode::InvariantViolation,
+        fbs::ErrorCode::FatalWorkerFailure => ErrorCode::FatalWorkerFailure,
         fbs::ErrorCode::InvalidRequest => ErrorCode::InvalidRequest,
         other => codec_bail!("unknown error code {}", other.0),
     })

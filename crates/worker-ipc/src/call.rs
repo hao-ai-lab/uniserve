@@ -719,25 +719,68 @@ pub enum CallStatus {
     Error = 2,
 }
 
-/// A deterministic error class for a failed completion.
+/// The failure classes of a worker, carried by a call's completion and by an
+/// error response alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum ErrorCode {
-    /// Call metadata or product declarations are invalid.
-    InvalidCall = 0,
-    /// A reserved or physical resource could not satisfy the call.
-    ResourceExhausted = 1,
+    /// The call kind is not one the worker's model implements.
+    UnsupportedCall = 0,
+    /// Call, batch or product metadata violates the protocol.
+    InvalidDescriptor = 1,
+    /// The worker's launch configuration cannot provide what a call needs.
+    UnsupportedSetup = 2,
+    /// A staged execution input is invalid for its declared route.
+    InputError = 3,
     /// Device computation failed.
-    ComputeError = 2,
-    /// The request was cancelled before completion.
-    Cancelled = 3,
-    /// An invariant failed within the worker.
-    Internal = 4,
+    ComputeError = 4,
+    /// A reserved or physical resource could not satisfy the call.
+    ResourceError = 5,
+    /// An invariant failed within the worker. The engine stops serving.
+    InvariantViolation = 6,
+    /// The worker process is unsafe for further work.
+    FatalWorkerFailure = 7,
     /// The worker refuses the request itself: its admitted size does not fit
     /// what the worker's model serves or provisioned, such as conditions
     /// beyond the condition capacity. The completion states why.
-    InvalidRequest = 5,
+    InvalidRequest = 8,
+}
+
+impl ErrorCode {
+    /// Every code in declaration order.
+    pub const ALL: [Self; 9] = [
+        Self::UnsupportedCall,
+        Self::InvalidDescriptor,
+        Self::UnsupportedSetup,
+        Self::InputError,
+        Self::ComputeError,
+        Self::ResourceError,
+        Self::InvariantViolation,
+        Self::FatalWorkerFailure,
+        Self::InvalidRequest,
+    ];
+
+    /// Returns the snake_case name the Python worker spells the code with.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedCall => "unsupported_call",
+            Self::InvalidDescriptor => "invalid_descriptor",
+            Self::UnsupportedSetup => "unsupported_setup",
+            Self::InputError => "input_error",
+            Self::ComputeError => "compute_error",
+            Self::ResourceError => "resource_error",
+            Self::InvariantViolation => "invariant_violation",
+            Self::FatalWorkerFailure => "fatal_worker_failure",
+            Self::InvalidRequest => "invalid_request",
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Device-observed finish candidates for a token call.

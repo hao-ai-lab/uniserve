@@ -1441,7 +1441,7 @@ pub(super) fn response<'a>(
         WorkerResponse::Ok { .. } => {}
         WorkerResponse::Error { error, .. } => {
             args.message = Some(b.create_string(&error.message));
-            args.code = error.code.as_deref().map(|s| b.create_string(s));
+            args.code = Some(error_code_to_fb(error.code));
             // `fatal` is an optional scalar (`bool = null`): `Some` writes it
             // even when false, and `response_from_table` requires it on error
             // responses.

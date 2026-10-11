@@ -7,8 +7,8 @@ completion does.
 
 import pytest
 
-from uniserve_worker.errors import WorkerError
-from uniserve_worker.protocol.call import CallStatus, ErrorCode
+from uniserve_worker.errors import ErrorCode, WorkerError
+from uniserve_worker.protocol.call import CallStatus
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.output import (
     FinishFlags,

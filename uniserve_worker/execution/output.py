@@ -27,6 +27,7 @@ from typing import Final
 import torch
 
 from uniserve.runtime.resources import close_resources
+from uniserve_worker.errors import ErrorCode
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.request import (
     RequestPool,
@@ -36,7 +37,7 @@ from uniserve_worker.execution.request import (
 )
 from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.protocol.batch import LatentParams, TensorPublication
-from uniserve_worker.protocol.call import Call, CallKind, CallStatus, ErrorCode
+from uniserve_worker.protocol.call import Call, CallKind, CallStatus
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.output import (
     FinishFlags,
@@ -70,9 +71,9 @@ _SAMPLING_FIELDS_PER_CALL: Final[int] = 4
 
 
 # Control-flow signals raised by `sampled_tokens`; `PendingOutput.materialize`
-# maps an invalid distribution to `ErrorCode.INVALID_CALL` and a predicated
-# call to `CallStatus.PREDICATED`. Their names describe the condition instead
-# of ending in "Error".
+# maps an invalid distribution to `ErrorCode.INVALID_DESCRIPTOR` and a
+# predicated call to `CallStatus.PREDICATED`. Their names describe the
+# condition instead of ending in "Error".
 class _InvalidSamplingDistribution(RuntimeError):  # noqa: N818
     """Marks a sampling row whose filtered probability mass is unusable."""
 
@@ -483,7 +484,7 @@ class PendingOutput:
         - An inactive sampled predicate (or a call already marked predicated)
           reports `CallStatus.PREDICATED` at the request's accepted progress.
         - An invalid sampling distribution reports `CallStatus.ERROR` with
-          `ErrorCode.INVALID_CALL`.
+          `ErrorCode.INVALID_DESCRIPTOR`.
 
         These suppressed outcomes report no tokens, scores, product
         generations, finish flags, or KV output; `media_output` is reported
@@ -588,7 +589,7 @@ class PendingOutput:
                     suppressed = True
                 except _InvalidSamplingDistribution:
                     status = CallStatus.ERROR
-                    error_code = ErrorCode.INVALID_CALL
+                    error_code = ErrorCode.INVALID_DESCRIPTOR
                     suppressed = True
                 else:
                     if self.token.sampling_range is not None:

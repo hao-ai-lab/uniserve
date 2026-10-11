@@ -52,6 +52,7 @@ from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve.runtime.prefix_cache import plan_units
 from uniserve.sampling import SamplingParams
 from uniserve_models import loading as models
+from uniserve_worker.errors import ErrorCode
 from uniserve_worker.model_executor.image_inputs import prepare_image
 from uniserve_worker.protocol.batch import (
     Batch,
@@ -68,7 +69,6 @@ from uniserve_worker.protocol.call import (
     Call,
     CallCoordinates,
     CallStatus,
-    ErrorCode,
     ForwardMode,
     MediaCall,
     Readout,
@@ -713,5 +713,5 @@ def test_an_undecodable_image_fails_its_encode_with_the_reason(
         (record,) = _run(worker, _encode(2, payload, soft=70)).completions
 
     assert record.status is CallStatus.ERROR
-    assert record.error_code is ErrorCode.INVALID_CALL
+    assert record.error_code is ErrorCode.INVALID_DESCRIPTOR
     assert "inline image payload is not a valid encoded image" in caplog.text

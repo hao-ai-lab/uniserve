@@ -34,7 +34,7 @@ from uniserve.model import Logits
 from uniserve_models.stub import Model
 from uniserve_models.stub import entry_points as entry_points
 from uniserve_worker.config.execution import LaneConfig, WorkerConfig
-from uniserve_worker.errors import WorkerError
+from uniserve_worker.errors import ErrorCode, WorkerError
 from uniserve_worker.protocol.batch import (
     BlockTable,
     Free,
@@ -48,7 +48,6 @@ from uniserve_worker.protocol.call import (
     Call,
     CallCoordinates,
     CallStatus,
-    ErrorCode,
     ForwardMode,
     ImageParams,
     MediaCall,
@@ -313,7 +312,7 @@ def test_text_extension_rejects_missing_input_tokens() -> None:
         ),
     )
     assert report.completions[0].status is CallStatus.ERROR
-    assert report.completions[0].error_code is ErrorCode.INVALID_CALL
+    assert report.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
 
 
 def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent() -> (  # noqa: E501
@@ -365,7 +364,7 @@ def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent()
     )
 
     assert report.completions[0].status is CallStatus.ERROR
-    assert report.completions[0].error_code is ErrorCode.INVALID_CALL
+    assert report.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
 
 
 def test_decode_reuses_the_published_request_page_table() -> None:
@@ -913,7 +912,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
     failed = finalized_report(worker, worker.submit(batch))
 
     assert failed.completions[0].status is CallStatus.ERROR
-    assert failed.completions[0].error_code is ErrorCode.INVALID_CALL
+    assert failed.completions[0].error_code is ErrorCode.INVALID_DESCRIPTOR
     assert failed.completions[0].num_completed_steps == 0
 
     replacement, _replacement_latent = diffusion_step_call(

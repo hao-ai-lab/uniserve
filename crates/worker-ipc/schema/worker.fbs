@@ -49,12 +49,17 @@ enum FeatureKind : ubyte { Vision, Latent }
 /// `Predicated` reports a call skipped because its predicate was false.
 enum CallStatus : ubyte { Ok, Predicated, Error }
 
+/// The failure classes of a worker, carried by a call's completion and by an
+/// error response alike.
 enum ErrorCode : ubyte {
-  InvalidCall,
-  ResourceExhausted,
+  UnsupportedCall,
+  InvalidDescriptor,
+  UnsupportedSetup,
+  InputError,
   ComputeError,
-  Cancelled,
-  Internal,
+  ResourceError,
+  InvariantViolation,
+  FatalWorkerFailure,
   InvalidRequest
 }
 
@@ -774,15 +779,14 @@ table ErrorCallIdentity {
 /// Rank-to-engine envelope. `response_from_table` enforces the legal field
 /// set per kind: `Info` carries only `info`, `Result` only `result`, and `Ok`
 /// nothing. `Error` carries no success payload and requires a non-empty
-/// `message` and `fatal`; the remaining error fields are optional, and an
-/// empty `code` reads as absent.
+/// `message`, a `code` and `fatal`; the remaining error fields are optional.
 table WorkerResponse {
   kind:RespKind;
   message_id:ulong = null;
   info:WorkerInfo;
   result:BatchOutput;
   message:string;
-  code:string;
+  code:ErrorCode = null;
   /// Whether the worker is unsafe to serve further requests.
   fatal:bool = null;
   phase:string;

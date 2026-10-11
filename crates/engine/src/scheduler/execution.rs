@@ -2495,7 +2495,7 @@ impl Scheduler {
                     self.emit(id, event);
                 }
                 record.status = CallStatus::Error;
-                record.error_code = Some(uniserve_worker_ipc::ErrorCode::ResourceExhausted);
+                record.error_code = Some(uniserve_worker_ipc::ErrorCode::ResourceError);
                 None
             }
         };
@@ -2856,19 +2856,17 @@ impl Scheduler {
     /// executor errors and control-plane invariant violations remain fatal.
     ///
     /// A `WorkerFailure` is reconciled by `fail_after_worker_failure`; the
-    /// worker codes `SchedulerBug` and `InvariantViolation` also latch
-    /// engine-fatal. Losing every execution-capable worker also stops the
+    /// worker code `InvariantViolation` also latches engine-fatal. Losing every execution-capable worker also stops the
     /// engine, so later admissions cannot wait for capacity that will never
     /// return. Any other error latches engine-fatal and fails every in-flight
     /// call.
     pub(super) fn on_executor_error(&mut self, error: anyhow::Error) {
         if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
-            let execution = failure.execution.as_ref();
-            let code = execution.and_then(|value| value.code.as_deref());
-            if matches!(code, Some("SchedulerBug" | "InvariantViolation")) {
+            let code = failure.execution.as_ref().map(|value| value.code);
+            if code == Some(uniserve_worker_ipc::ErrorCode::InvariantViolation) {
                 self.fatal = true;
                 tracing::error!(worker = %failure.worker_id, ?code, "control-plane invariant failed: {error}");
-            } else if code == Some("InputError") {
+            } else if code == Some(uniserve_worker_ipc::ErrorCode::InputError) {
                 tracing::info!(worker = %failure.worker_id, ?code, "Worker rejected request: {error}");
             } else if !failure.refusals.is_empty()
                 && failure

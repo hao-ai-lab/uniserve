@@ -1356,7 +1356,7 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
         message_id: opt_u64(dict, intern!(py, "message_id"))?,
         error: WorkerResponseError {
             message: string_of(&get(dict, intern!(py, "message"))?)?,
-            code: opt_string(dict, intern!(py, "code"))?,
+            code: error_code_of(&get(dict, intern!(py, "code"))?)?,
             fatal: bool_of(&get(dict, intern!(py, "fatal"))?)?,
             phase: opt_string(dict, intern!(py, "phase"))?,
             route: opt_string(dict, intern!(py, "route"))?,
@@ -1526,15 +1526,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
     };
     let error_code = match get(dict, intern!(py, "error_code"))? {
         value if value.is_none() => None,
-        value => Some(match value.cast::<PyString>().ok()?.to_str().ok()? {
-            "invalid_call" => ErrorCode::InvalidCall,
-            "resource_exhausted" => ErrorCode::ResourceExhausted,
-            "compute_error" => ErrorCode::ComputeError,
-            "cancelled" => ErrorCode::Cancelled,
-            "internal" => ErrorCode::Internal,
-            "invalid_request" => ErrorCode::InvalidRequest,
-            _ => return None,
-        }),
+        value => Some(error_code_of(&value)?),
     };
 
     let flags = get(dict, intern!(py, "finish_flags"))?;
@@ -1974,6 +1966,15 @@ fn opt_bool(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Optio
         Some(value) if value.is_none() => Some(None),
         Some(value) => Some(Some(bool_of(&value)?)),
     }
+}
+
+/// Reads a failure class by the snake_case name `ErrorCode::as_str` spells;
+/// an unknown name rejects the record.
+fn error_code_of(value: &Bound<'_, PyAny>) -> Option<ErrorCode> {
+    let name = value.cast::<PyString>().ok()?.to_str().ok()?.to_owned();
+    ErrorCode::ALL
+        .into_iter()
+        .find(|code| code.as_str() == name)
 }
 
 /// Decodes an absent, `None`, or strict string mapping field.

@@ -47,8 +47,8 @@ from uniserve import _slices
 from uniserve.runtime import EventPool
 from uniserve.runtime.device import canonical_device
 from uniserve_worker.errors import (
+    ErrorCode,
     WorkerError,
-    WorkerErrorCode,
     invalid_descriptor,
     resource_error,
 )
@@ -128,7 +128,7 @@ def device_product_capacity_bytes(
 def _invariant(message: str) -> WorkerError:
     """Construct a classified invariant error for device-product misuse."""
     return WorkerError(
-        code=WorkerErrorCode.INVARIANT_VIOLATION,
+        code=ErrorCode.INVARIANT_VIOLATION,
         message=message,
         fatal=True,
     )

@@ -959,8 +959,8 @@ impl WorkerGroup {
     /// failed are resolved, at most one per invocation. When a rank that
     /// succeeded still holds unjoined calls, the ranks disagree: the batch is
     /// retired and a plain error returned. Otherwise every error must be
-    /// identical, or a plain error is returned. A fatal error, a
-    /// `SchedulerBug` or `InvariantViolation` code, or a batch carrying a
+    /// identical, or a plain error is returned. A fatal error, an
+    /// `InvariantViolation`, or a batch carrying a
     /// `Free` command returns the `WorkerExecError` itself; `poll_batch`
     /// answers these and the plain errors with recovery. Any other error
     /// retires the batch and returns a `WorkerFailure` naming its unjoined
@@ -1015,10 +1015,7 @@ impl WorkerGroup {
             }
             let batch = &self.pending_batches[&batch_id].batch;
             if canonical.fatal
-                || matches!(
-                    canonical.code.as_deref(),
-                    Some("SchedulerBug" | "InvariantViolation")
-                )
+                || canonical.code == uniserve_worker_ipc::ErrorCode::InvariantViolation
                 || batch
                     .commands
                     .iter()

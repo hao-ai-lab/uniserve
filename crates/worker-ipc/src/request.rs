@@ -143,8 +143,8 @@ pub struct ErrorCallIdentity {
 pub struct WorkerResponseError {
     /// Human-readable failure description.
     pub message: String,
-    /// Optional stable machine-readable error code.
-    pub code: Option<String>,
+    /// Failure class.
+    pub code: ErrorCode,
     /// Whether the worker is unsafe to serve further requests.
     pub fatal: bool,
     /// Optional worker phase that failed.

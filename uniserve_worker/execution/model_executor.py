@@ -90,10 +90,10 @@ from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.config.execution import LaneConfig, WorkerConfig
 from uniserve_worker.errors import (
     ComputeError,
+    ErrorCode,
     InputError,
     ResourceError,
     WorkerError,
-    WorkerErrorCode,
     classify,
     invalid_descriptor,
     unsupported_setup,
@@ -2751,8 +2751,8 @@ def _execution_failure(
         return error
     classified = classify(error)
     if isinstance(error, CUDAGraphError) or classified.code in {
-        WorkerErrorCode.RESOURCE_ERROR,
-        WorkerErrorCode.FATAL_WORKER_FAILURE,
+        ErrorCode.RESOURCE_ERROR,
+        ErrorCode.FATAL_WORKER_FAILURE,
     }:
         return ResourceError(
             str(error) or type(error).__name__,

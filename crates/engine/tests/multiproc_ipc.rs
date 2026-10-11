@@ -365,7 +365,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                     anyhow::bail!("duplicate submission was accepted");
                 };
                 anyhow::ensure!(
-                    error.code.as_deref() == Some("InvalidDescriptor"),
+                    error.code == ErrorCode::InvalidDescriptor,
                     "duplicate must be a protocol error"
                 );
             }
@@ -1876,7 +1876,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     let closed = execute(&mut executor, descendant)?;
     let closed_record = &closed.results[0].output;
     assert_eq!(closed_record.status, CallStatus::Error);
-    assert_eq!(closed_record.error_code, Some(ErrorCode::InvalidCall));
+    assert_eq!(closed_record.error_code, Some(ErrorCode::InvalidDescriptor));
 
     qualify_kv_rank_locations(&mut executor)?;
 

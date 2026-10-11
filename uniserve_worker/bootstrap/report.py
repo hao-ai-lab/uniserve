@@ -262,8 +262,7 @@ def build_worker_layout(
         if layout.info.max_decode_calls
         else 0,
         components=tuple(
-            ComponentInfo(name, outputs.get(name, ()))
-            for name, _ in components
+            ComponentInfo(name, outputs.get(name, ())) for name, _ in components
         ),
     )
     return replace(layout, info=info)

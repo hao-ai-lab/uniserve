@@ -724,7 +724,7 @@ impl SimEngine {
     /// `predicate_values`. Errors when a chained call states coordinates other
     /// than the request's own, when sampling rejects the call's RNG, or when
     /// synthetic media encoding or publication fails. A sampling pipeline with
-    /// no valid distribution yields an `Error` record with `InvalidCall`
+    /// no valid distribution yields an `Error` record with `InvalidDescriptor`
     /// instead.
     fn execute_call(
         vocab: usize,
@@ -824,7 +824,7 @@ impl SimEngine {
                     )?
                     else {
                         record.status = CallStatus::Error;
-                        record.error_code = Some(ErrorCode::InvalidCall);
+                        record.error_code = Some(ErrorCode::InvalidDescriptor);
                         return Ok(record);
                     };
                     record.finish_flags.eos = output.token == fake_eos;

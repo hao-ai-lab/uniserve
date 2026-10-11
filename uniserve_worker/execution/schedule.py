@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
 from uniserve.runtime.resources import close_resources
-from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.errors import ErrorCode, invalid_descriptor
 from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.calls import _predicated_outcome
@@ -33,7 +33,6 @@ from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
-    ErrorCode,
     ForwardMode,
     MediaCall,
     TransferMode,

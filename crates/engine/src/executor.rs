@@ -1297,8 +1297,8 @@ pub struct WorkerExecError {
     pub batch_id: Option<u64>,
     /// Whether the error invalidates the worker process or executor.
     pub fatal: bool,
-    /// Stable worker-defined error code, when classified.
-    pub code: Option<String>,
+    /// Failure class the worker assigned.
+    pub code: uniserve_worker_ipc::ErrorCode,
     /// Human-readable failure description.
     pub message: String,
     /// Execution phase in which the failure occurred, when known.

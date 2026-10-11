@@ -42,8 +42,8 @@ import torch
 
 from uniserve.runtime.resources import close_resources
 from uniserve_worker.errors import (
+    ErrorCode,
     WorkerError,
-    WorkerErrorCode,
     classify,
     invalid_descriptor,
     resource_error,
@@ -502,7 +502,7 @@ class Executor:
                 # batch would leave them waiting for a participant that never
                 # arrives. The rank cannot serve further collective work.
                 raise WorkerError(
-                    code=WorkerErrorCode.INVARIANT_VIOLATION,
+                    code=ErrorCode.INVARIANT_VIOLATION,
                     message=(
                         f"collective sequence does not advance: batch "
                         f"{batch.batch_id} carries {batch.collective_seq} "

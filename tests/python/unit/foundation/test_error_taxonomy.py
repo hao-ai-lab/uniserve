@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from uniserve.runtime import EventPoolError
-from uniserve_worker.errors import WorkerError, WorkerErrorCode, classify
+from uniserve_worker.errors import ErrorCode, WorkerError, classify
 from uniserve_worker.protocol.identity import CallId
 
 pytestmark = pytest.mark.unit
@@ -32,8 +32,8 @@ OOM_MESSAGE_VARIANTS = [
 def test_runtime_error_with_oom_marker_classifies_as_resource_error(message):
     err = classify(RuntimeError(message))
 
-    assert err.code == WorkerErrorCode.RESOURCE_ERROR
-    assert err.code == "ResourceError"
+    assert err.code == ErrorCode.RESOURCE_ERROR
+    assert err.code == "resource_error"
     assert err.fatal is False
 
 
@@ -45,7 +45,7 @@ def test_out_of_memory_error_type_classifies_as_oom_without_message_marker():
 
     err = classify(OutOfMemoryError("workspace allocation request denied"))
 
-    assert err.code == WorkerErrorCode.RESOURCE_ERROR
+    assert err.code == ErrorCode.RESOURCE_ERROR
     assert err.fatal is False
 
 
@@ -61,14 +61,14 @@ def test_oom_detection_walks_class_hierarchy_for_subclasses():
 
     err = classify(DeviceAllocFailure("alloc denied"))
 
-    assert err.code == WorkerErrorCode.RESOURCE_ERROR
+    assert err.code == ErrorCode.RESOURCE_ERROR
 
 
 def test_generic_runtime_error_classifies_as_compute_error():
     err = classify(RuntimeError("kaboom: tensor shape mismatch in layer 3"))
 
-    assert err.code == WorkerErrorCode.COMPUTE_ERROR
-    assert err.code == "ComputeError"
+    assert err.code == ErrorCode.COMPUTE_ERROR
+    assert err.code == "compute_error"
     assert err.fatal is False
 
 
@@ -77,7 +77,7 @@ def test_event_pool_error_classifies_as_fatal_invariant_violation():
         EventPoolError("device event reference accounting is invalid")
     )
 
-    assert err.code == WorkerErrorCode.INVARIANT_VIOLATION
+    assert err.code == ErrorCode.INVARIANT_VIOLATION
     assert err.fatal is True
 
 
@@ -95,7 +95,7 @@ def test_event_pool_error_classifies_as_fatal_invariant_violation():
 def test_non_matching_allocation_messages_are_compute_error(message):
     err = classify(RuntimeError(message))
 
-    assert err.code == WorkerErrorCode.COMPUTE_ERROR
+    assert err.code == ErrorCode.COMPUTE_ERROR
 
 
 def test_fatal_cuda_marker_takes_precedence_over_oom_in_same_message():
@@ -107,13 +107,13 @@ def test_fatal_cuda_marker_takes_precedence_over_oom_in_same_message():
         )
     )
 
-    assert err.code == WorkerErrorCode.FATAL_WORKER_FAILURE
+    assert err.code == ErrorCode.FATAL_WORKER_FAILURE
     assert err.fatal is True
 
 
 def test_to_mapping_emits_canonical_error_context():
     err = WorkerError(
-        code=WorkerErrorCode.RESOURCE_ERROR,
+        code=ErrorCode.RESOURCE_ERROR,
         message="CUDA out of memory",
         fatal=False,
         req_id=42,
@@ -128,7 +128,7 @@ def test_to_mapping_emits_canonical_error_context():
     snapshot = err.to_mapping()
 
     assert snapshot["kind"] == "error"
-    assert snapshot["code"] == "ResourceError"
+    assert snapshot["code"] == "resource_error"
     assert snapshot["message"] == "CUDA out of memory"
     assert snapshot["fatal"] is False
     assert snapshot["phase"] == "run"

@@ -120,20 +120,6 @@ class CallStatus(StrEnum):
     ERROR = "error"
 
 
-class ErrorCode(StrEnum):
-    """Classifies bounded execution failures returned to the scheduler."""
-
-    INVALID_CALL = "invalid_call"
-    RESOURCE_EXHAUSTED = "resource_exhausted"
-    COMPUTE_ERROR = "compute_error"
-    CANCELLED = "cancelled"
-    INTERNAL = "internal"
-    # The worker refuses the request itself: its admitted size does not fit
-    # what the model serves or the worker provisioned. The completion states
-    # why (``RequestOutput.error_message``).
-    INVALID_REQUEST = "invalid_request"
-
-
 # Computations that advance a request's accepted progress; mirrors the Rust
 # `CallKind::advances_state`. `RequestPool.predecessors` chains a request's
 # calls from its latest state-advancing call (on the media path only
