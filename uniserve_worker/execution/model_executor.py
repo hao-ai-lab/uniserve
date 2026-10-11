@@ -1335,7 +1335,9 @@ class ModelExecutor:
         if self.image_builder is not None:
             from uniserve.media import image
 
-            self.flow_cfg_branches = (1, 2, 3)
+            self.flow_cfg_branches = tuple(
+                range(1, self.image_builder.denoiser.guidance_branches + 1)
+            )
             self.flow_captures = select_flow_captures(
                 config.flow_graph_shapes,
                 config.flow_graph_batch_sizes,

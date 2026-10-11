@@ -491,11 +491,14 @@ def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
 def capture_image_parameters(cfg_branches, *, steps, height, width):
     """Build fixed image-generation params whose CFG scales fit a branch count.
 
-    One branch runs unconditioned, two add text guidance, and three add text
-    and image guidance; each count maps to its (text, image) scale pair.
-    ``prepare_flow`` checks that the resulting guidance realizes the count.
+    A scale of one leaves its unconditional branch out and equal text and
+    image scales share one, so the conditioned branch alone needs both scales
+    at one, a second branch text guidance, and a third an image scale that
+    differs from the text scale. ``prepare_flow`` checks that the resulting
+    guidance realizes the count.
     """
-    text, image = {1: (1.0, 1.0), 2: (4.0, 1.0), 3: (4.0, 2.0)}[cfg_branches]
+    text = 1.0 if cfg_branches == 1 else 4.0
+    image = 2.0 if cfg_branches == 3 else 1.0
     return ImageParams(
         steps=steps,
         cfg_text_scale=text,
