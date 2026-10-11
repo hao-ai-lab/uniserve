@@ -129,7 +129,9 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--attention-backend` | `auto` | Attention provider for every call: `torch`, `flash_attn`, `flash_attn_4`, `flashinfer`, `trtllm`, `sgl_kernel` or `prefix_block`; `auto` selects a native kernel per call |
 | `--api-key` | Unset | Bearer token for public routes |
 | `--request-timeout` | Unset | Seconds until response headers; streamed bodies are not bounded |
-| `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation and System One requests; video requests use video job slots |
+| `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation, System One and synchronous video requests |
+| `--video-job-retention` | `3600` | Seconds a completed or failed asynchronous video job stays retrievable |
+| `--max-video-job-bytes` | `1073741824` | Bytes of generated video the asynchronous jobs keep, retained artifacts and unfinished downloads together |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
 | `--image-fetch-timeout` | `20` | Seconds allowed to fetch one `http(s)` image URL, including redirects and the complete body |
 | `--image-fetch-max-bytes` | `20000000` | Largest accepted input image in bytes, for fetched URLs and `data:` URLs alike |

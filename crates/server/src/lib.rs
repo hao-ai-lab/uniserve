@@ -38,7 +38,7 @@ use crate::serving::systemone::ReadoutEncoder;
 use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime};
 use crate::serving::{LoadedModel, LoadedRenderer};
 use anyhow::{Context as _, Result};
-pub use config::{Config, EngineSettings, HttpListenerMode, VideoMediaSettings};
+pub use config::{Config, EngineSettings, HttpListenerMode, VideoJobSettings, VideoMediaSettings};
 use tracing::info;
 pub use uniserve_engine::SchedulingPolicy;
 use uniserve_engine::{EngineConfig, SpecialTokenIds, WorkerProcessArgs};
@@ -286,6 +286,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .with_api_key(config.api_key.clone())
             .with_request_timeout(config.request_timeout)
             .with_max_concurrent_requests(config.max_concurrent_requests)
-            .with_video_body_limit(config.video_media.body_limit()),
+            .with_video_body_limit(config.video_media.body_limit())
+            .with_video_jobs(config.video_jobs),
     ))
 }

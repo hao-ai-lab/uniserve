@@ -186,9 +186,8 @@ pub struct Config {
     /// Optional timeout until a request's response head is returned; streamed
     /// response bodies (chat SSE and video downloads) are not bounded by it.
     pub request_timeout: Option<Duration>,
-    /// Optional HTTP admission limit for in-flight chat completion and image
-    /// generation requests. Video requests are bounded by the video job slots
-    /// instead.
+    /// Optional HTTP admission limit for in-flight chat completion, image
+    /// generation, System One and synchronous video requests.
     pub max_concurrent_requests: Option<u64>,
     /// Maximum time to wait for active HTTP requests to drain on shutdown.
     /// Zero aborts the server as soon as shutdown begins.
@@ -200,6 +199,8 @@ pub struct Config {
     /// Where video-request condition media may come from, and how large it
     /// may be.
     pub video_media: VideoMediaSettings,
+    /// How long, and how much, the asynchronous video jobs keep.
+    pub video_jobs: VideoJobSettings,
     /// Time, size, and destination limits for request image references.
     pub image_fetch: ImageFetchPolicy,
     /// How System One questions are divided among readout prompts and canvases.
@@ -211,6 +212,32 @@ pub struct Config {
     /// ones it takes and refuses any other at startup; MiniMax H3's reads
     /// its reference sizing (`serving::video::plan::ReferenceConfig`).
     pub mm_processor_kwargs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Retention and memory policy of the video job store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct VideoJobSettings {
+    /// How long a completed or failed job is retained before it is deleted.
+    pub retention: Duration,
+    /// Bytes of generated video the store keeps: retained artifacts and
+    /// artifacts an unfinished download still holds.
+    pub max_retained_bytes: usize,
+}
+
+impl VideoJobSettings {
+    /// The default retention, one hour, in seconds.
+    pub const DEFAULT_RETENTION_SECONDS: u64 = 3600;
+    /// The default retained-video budget, 1 GiB.
+    pub const DEFAULT_MAX_RETAINED_BYTES: usize = 1 << 30;
+}
+
+impl Default for VideoJobSettings {
+    fn default() -> Self {
+        Self {
+            retention: Duration::from_secs(Self::DEFAULT_RETENTION_SECONDS),
+            max_retained_bytes: Self::DEFAULT_MAX_RETAINED_BYTES,
+        }
+    }
 }
 
 /// Sources and limits of the condition media of video requests.
@@ -284,6 +311,7 @@ impl Default for Config {
             shutdown_timeout: Duration::from_secs(0),
             reasoning_parsing: true,
             video_media: VideoMediaSettings::default(),
+            video_jobs: VideoJobSettings::default(),
             image_fetch: ImageFetchPolicy::default(),
             readout: ReadoutOptions::default(),
             diffusion_generation: DenoisingOverrides::default(),

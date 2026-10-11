@@ -30,7 +30,7 @@ use uniserve_server::serving::systemone::{
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, ImageFetchPolicy,
-    SchedulingPolicy, VideoMediaSettings,
+    SchedulingPolicy, VideoJobSettings, VideoMediaSettings,
 };
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
@@ -212,6 +212,15 @@ pub(crate) struct SharedRuntimeArgs {
     /// Bytes of condition media one video request may carry in total.
     #[arg(long = "max-request-bytes", default_value_t = VideoMediaSettings::DEFAULT_MAX_REQUEST_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
     pub max_request_bytes: u64,
+    /// Seconds a completed or failed asynchronous video job stays retrievable
+    /// before the server deletes it.
+    #[arg(long = "video-job-retention", default_value_t = VideoJobSettings::DEFAULT_RETENTION_SECONDS, value_parser = clap::value_parser!(u64).range(1..))]
+    pub video_job_retention: u64,
+    /// Bytes of generated video the asynchronous video jobs keep, retained
+    /// artifacts and unfinished downloads together. Retained artifacts are
+    /// shared-memory mappings, so this is the memory the job store may hold.
+    #[arg(long = "max-video-job-bytes", default_value_t = VideoJobSettings::DEFAULT_MAX_RETAINED_BYTES, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub max_video_job_bytes: usize,
     /// `ffprobe` executable that probes video and audio condition media.
     #[arg(long, default_value = "ffprobe", value_name = "PATH")]
     pub ffprobe: std::path::PathBuf,
@@ -365,9 +374,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// SSE streams and video downloads) are not bounded by it.
     #[arg(long = "request-timeout", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub request_timeout: Option<u64>,
-    /// HTTP admission limit for in-flight chat completion and image generation
-    /// requests, which are shed with 503 above it. Video requests are bounded
-    /// by the video job slots instead.
+    /// HTTP admission limit for in-flight chat completion, image generation,
+    /// System One and synchronous video requests, which are shed with 503
+    /// above it.
     #[arg(long = "max-concurrent-requests", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub max_concurrent_requests: Option<u64>,
     /// Enable or disable periodic logging of engine statistics.
@@ -563,6 +572,10 @@ impl SharedRuntimeArgs {
                 remote_media: self.remote_media,
                 max_request_bytes: self.max_request_bytes,
                 ffprobe: self.ffprobe,
+            },
+            video_jobs: VideoJobSettings {
+                retention: Duration::from_secs(self.video_job_retention),
+                max_retained_bytes: self.max_video_job_bytes,
             },
             image_fetch: ImageFetchPolicy {
                 timeout: Duration::from_secs(self.image_fetch_timeout),
