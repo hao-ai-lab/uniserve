@@ -43,63 +43,37 @@ def cuda_cache():
     torch.cuda.empty_cache()
 
 
-@pytest.mark.slow
 @pytest.mark.usefixtures("cuda_cache")
 @torch.inference_mode()
-def test_large_hopper_key_domain_preserves_head_values_on_graph_replay(stream):
-    """Whole-domain sparse attention supports more than 2**31 KV references.
+def test_a_plan_beyond_the_provider_mask_range_is_refused(stream):
+    """The FlashInfer provider refuses a plan its mask offsets cannot address.
 
-    Constant per-head binary vectors make the exact attention result known
-    without materializing a dense score matrix. Every query tile reaches the
-    same selected keys; sampling one row per tile covers all CSR row offsets.
+    1600 query tiles of 56 heads selecting 384 tiles each need 34 million
+    selected tiles, beyond the 4.19 million that 32-bit packed-mask byte
+    offsets address; the plan is refused before any launch.
     """
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("this large-domain fixture qualifies Hopper attention")
-    if torch.cuda.mem_get_info()[0] < 48 * 1024**3:
-        pytest.skip("large-domain graph replay requires 48 GiB of free memory")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the FlashInfer provider is validated on SM100 only")
 
     tiles, heads, selected, width = 1600, 56, 384, 128
     rows = tiles * 64
     q = torch.zeros(rows, heads, width, device="cuda", dtype=torch.bfloat16)
-    k = torch.zeros_like(q)
-    codes = (
-        torch.arange(heads, device="cuda")[:, None]
-        >> (torch.arange(width, device="cuda")[None, :] % 6)
-    ) & 1
-    codes = codes.to(q.dtype)
-    value = codes.expand(rows, -1, -1).contiguous()
-    out = torch.empty_like(q)
-    valid = torch.full((tiles,), 64, device="cuda", dtype=torch.int32)
     batch = vsa.BlockInput(
         vsa.Pattern(((selected,) * tiles,), 0, 0, 64),
         torch.arange(selected, device="cuda", dtype=torch.int32)
         .expand(heads, tiles, -1)
         .contiguous(),
         torch.full((heads, tiles), selected, device="cuda", dtype=torch.int32),
-        valid,
+        torch.full((tiles,), 64, device="cuda", dtype=torch.int32),
         0,
     )
     module = vsa.BlockAttention(128**-0.5)
 
-    def invoke():
-        return module(q, k, value, batch, out=out)
-
     stream.wait(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream, vsa="flashinfer") as context:
         context.prepare(None)
-        invoke()
-        torch.testing.assert_close(
-            out[::64], codes.expand(tiles, -1, -1), rtol=2e-2, atol=2e-2
-        )
-        with CUDAGraph(context=context) as graph:
-            graph.capture(invoke)
-            valid.fill_(32)
-            codes = 1 - codes
-            value.copy_(codes.expand(rows, -1, -1))
-            graph.replay()
-            torch.testing.assert_close(
-                out[::64], codes.expand(tiles, -1, -1), rtol=2e-2, atol=2e-2
-            )
+        with pytest.raises(RuntimeError, match="selected tiles per plan"):
+            module(q, q, q, batch, out=torch.empty_like(q))
 
 
 # Tiles of 64 rows: a dense tile, a segment of three tiles, an empty dense

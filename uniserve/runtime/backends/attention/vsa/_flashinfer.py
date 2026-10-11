@@ -253,11 +253,21 @@ def _plan_for(
         ),
     )
     counts = counts.reshape(-1)
+    index_count = int(counts.sum(dtype=torch.int64))
+    # FIXME: FlashInfer addresses the packed key mask through int32 byte
+    # offsets (`_mask_indptr_buf`), `_TILE * _TILE // 8` bytes for each
+    # selected tile, so a plan can select at most this many tiles. A larger
+    # plan needs the head-flattened rows planned in independent windows.
+    max_selected_tiles = (2**31 - 1) // (_TILE * _TILE // 8)
+    if index_count > max_selected_tiles:
+        raise RuntimeError(
+            f"the FlashInfer VSA provider addresses at most "
+            f"{max_selected_tiles} selected tiles per plan, got {index_count}"
+        )
     indptr_host = torch.empty(counts.numel() + 1, dtype=torch.int32)
     indptr_host[0] = 0
     torch.cumsum(counts, dim=0, out=indptr_host[1:])
     indptr = indptr_host.to(query.device)
-    index_count = int(indptr_host[-1])
     requirements = {
         "indices": BufferConfig((index_count,), torch.int32),
         "mask": BufferConfig(
