@@ -60,9 +60,6 @@ pub struct VideoService {
     latent_encoding_lane: u32,
     media: VideoMediaSettings,
     processor: VideoProcessor,
-    /// Denoiser rows the deployment provisions for one request's conditions
-    /// (`--max-condition-rows`) when it states them.
-    max_condition_rows: Option<u32>,
 }
 
 impl VideoService {
@@ -126,16 +123,7 @@ impl VideoService {
             tasks,
             latent_encoding_lane: latent_encoding_lane.max(1),
             media: media.clone(),
-            max_condition_rows: None,
         })
-    }
-
-    /// States the denoiser rows the deployment provisions for one request's
-    /// conditions, so a request that needs more is refused with the knob
-    /// that raises them.
-    pub fn with_condition_rows(mut self, max_condition_rows: Option<u32>) -> Self {
-        self.max_condition_rows = max_condition_rows;
-        self
     }
 
     /// The denoiser network evaluations of every request: one per schedule
@@ -293,28 +281,6 @@ impl VideoService {
             })?;
             conditions.push(condition.describe(plan.canvas, source.locator(), bands));
             media.push(Arc::new(source));
-        }
-
-        // The deployment's denoiser provisions `--max-condition-rows` for the
-        // conditions of one request, counted as it packs them: the rows of
-        // every condition's video and soundtrack latents. Naming both here
-        // gives a client the knob that raises the capacity, which the
-        // product-by-product check of the engine does not.
-        let rows: u64 = conditions
-            .iter()
-            .map(|condition| condition.video_rows() + u64::from(condition.audio_rows))
-            .sum();
-        if let Some(capacity) = self.max_condition_rows
-            && rows > u64::from(capacity)
-        {
-            return Err(ApiError::invalid_request(
-                format!(
-                    "conditions: the conditions take {rows} denoiser rows, more than the \
-                     {capacity} this deployment serves; serve with a larger \
-                     --max-condition-rows"
-                ),
-                Some("conditions"),
-            ));
         }
         Ok(ProcessedVideo {
             request: DiffusionRequest {
@@ -484,25 +450,6 @@ mod tests {
                 top: 0,
                 size: own,
             })
-        );
-
-        // A deployment that provisions fewer condition rows than the request's
-        // refuses it naming both and the option that raises them.
-        let refused = service(4, ReferenceConfig::RELEASED)
-            .with_condition_rows(Some(4096))
-            .process(
-                &ServeRequestId::new("reference"),
-                &request(body.clone()),
-                1 << 16,
-            )
-            .await
-            .unwrap_err();
-        let message = format!("{refused:?}");
-        assert!(
-            message.contains("7296")
-                && message.contains("4096")
-                && message.contains("--max-condition-rows"),
-            "{message}"
         );
 
         let processed = service(4, ReferenceConfig::RELEASED)
