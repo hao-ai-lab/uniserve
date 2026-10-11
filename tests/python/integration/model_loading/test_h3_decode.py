@@ -22,7 +22,7 @@ from uniserve.tensors import TensorOutput
 from uniserve_models import loading as models
 from uniserve_models.minimax_h3.packing import (
     audio_latent_frames,
-    tile_packing,
+    segment_packing,
     video_latent_frames,
 )
 from uniserve_worker.bootstrap.distributed import initialize_components
@@ -105,8 +105,13 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                     .permute(0, 2, 3, 5, 1, 4, 6)
                     .reshape(-1, 96)
                 )
-                packed = tile_packing(
-                    num_text_tokens=64, num_frames=frames, canvas=WIDE
+                packed = segment_packing(
+                    num_frames=frames,
+                    canvas=WIDE,
+                    text_rows=64,
+                    condition_rows=0,
+                    tile=64,
+                    token_multiple=64,
                 )
                 latents = raster.index_select(
                     0, packed.video_raster_indices.to("cuda:0")

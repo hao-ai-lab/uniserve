@@ -51,8 +51,6 @@ def test_dense_attention_averages_only_visible_values():
         torch.empty(0, dtype=torch.int64),
     )
     cosine = torch.ones(8, 3 * config.rope_frequency_dim)
-    actual = layer(
-        hidden, cosine, torch.zeros_like(cosine), inputs, workspace={}
-    )
+    actual = layer(hidden, cosine, torch.zeros_like(cosine), inputs)
     expected = hidden[:6].mean(0).expand_as(hidden)
     torch.testing.assert_close(actual, expected)

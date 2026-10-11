@@ -513,9 +513,11 @@ class MergedColumnParallelLinear(nn.Module):
         """Project gathered token intervals, fusing branches that share
         quantization.
 
-        With ``out``, ``[num_tokens, width]`` storage of every branch such
-        as ``output_buffers`` allocates, each interval is projected into its
-        rows and the yielded values are those rows.
+        With ``out``, storage of every branch such as ``output_buffers``
+        allocates for the rows of this rank's context interval of
+        ``num_tokens`` (all of them without a context partition), each
+        interval is projected into its rows and the yielded values are those
+        rows.
         """  # noqa: D205
         from ._chunks import (
             _assemble,
@@ -524,12 +526,21 @@ class MergedColumnParallelLinear(nn.Module):
             projection_inputs,
         )
 
+        branches = tuple(branch for _, branch in self._branches())
+        # ``out`` holds the context interval's rows, which start at the
+        # interval's first token.
+        first = (
+            0
+            if out is None
+            else _partition(branches[0], None, token_slice, num_tokens)[2].start
+        )
+
         def rows(interval: slice) -> Mapping[str, torch.Tensor] | None:
             if out is None:
                 return None
-            return {name: value[interval] for name, value in out.items()}
+            window = slice(interval.start - first, interval.stop - first)
+            return {name: value[window] for name, value in out.items()}
 
-        branches = tuple(branch for _, branch in self._branches())
         if len({branch.input_quantizer for branch in branches}) != 1:
             if not isinstance(x, torch.Tensor):
                 x = _assemble(

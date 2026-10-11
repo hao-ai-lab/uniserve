@@ -13,7 +13,8 @@ eager results bit for bit:
   to the tensors' dtype, as two eager element-wise operations round them.
 - ``select_tiles`` chooses every query tile's key tiles from its pooled
   scores in one pass, the result of the stable sorts, cumulative sums and
-  scatters of ``uniserve.nn.attention.vsa.segments.select``.
+  scatters of ``uniserve.nn.attention.vsa.segments.select``. The query tiles
+  may be a window of the sequence's tiles, as a context partition holds.
 
 Tensors are ``[rows, heads, width]`` with any row and head strides and a unit
 column stride; compressed tiles are ``[heads, tiles, width]``.
@@ -65,7 +66,7 @@ if triton is not None:
     @triton.jit
     def _zero_tile_padding_kernel(
         values,
-        valid_sizes,
+        variable_block_sizes,
         stride_row,
         stride_head,
         heads: tl.constexpr,
@@ -76,7 +77,7 @@ if triton is not None:
         """Store zeros to one tile's row block past the tile's valid size."""
         tile = tl.program_id(0)
         block = tl.program_id(1)
-        valid = tl.load(valid_sizes + tile)
+        valid = tl.load(variable_block_sizes + tile)
         # A row block wholly inside the valid rows stores nothing.
         if (block + 1) * block_rows > valid:
             local = block * block_rows + tl.arange(0, block_rows)
@@ -144,17 +145,19 @@ if triton is not None:
             total.to(output.dtype.element_ty, fp_downcast_rounding="rtne"),
         )
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["query_offset"])
     def _select_tiles_kernel(
         scores,
         tile_segments,
-        valid_sizes,
+        variable_block_sizes,
         segment_starts,
         segment_keep,
         kept,
         indices,
         counts,
+        query_tiles,
         tiles,
+        query_offset,
         block: tl.constexpr,
         tile_bits: tl.constexpr,
     ):
@@ -165,16 +168,18 @@ if triton is not None:
         ``segment_keep`` tiles besides every live dense tile; a dense query
         tile keeps every live tile and an empty one none. The kept tiles are
         stored first in ascending order, then the others in ascending order.
+        Query ``q`` of the program grid is tile ``query_offset + q`` of the
+        sequence; the tables hold every tile.
         """
         query = tl.program_id(0)
         head = tl.program_id(1)
-        row = (head * tiles + query).to(tl.int64)
+        row = (head * query_tiles + query).to(tl.int64)
         keys = tl.arange(0, block)
         present = keys < tiles
         segments = tl.load(tile_segments + keys, mask=present, other=-1)
-        live = tl.load(valid_sizes + keys, mask=present, other=0) > 0
-        query_segment = tl.load(tile_segments + query)
-        query_live = tl.load(valid_sizes + query) > 0
+        live = tl.load(variable_block_sizes + keys, mask=present, other=0) > 0
+        query_segment = tl.load(tile_segments + query_offset + query)
+        query_live = tl.load(variable_block_sizes + query_offset + query) > 0
 
         mask = live & query_live
         if query_live & (query_segment >= 0):
@@ -240,13 +245,13 @@ def _rows_layout(value: torch.Tensor, name: str) -> None:
 
 
 def zero_tile_padding(
-    values: torch.Tensor, valid_sizes: torch.Tensor, tile: int
+    values: torch.Tensor, variable_block_sizes: torch.Tensor, tile: int
 ) -> None:
     """Store zeros to every row past its tile's valid size, in place.
 
     ``values`` is ``[tiles * tile, heads, width]`` with unit column stride
-    and ``valid_sizes`` the int32 valid rows of each ``tile``-row tile, read
-    on the device. Rows within a tile's valid size are not touched.
+    and ``variable_block_sizes`` the int32 valid rows of each ``tile``-row
+    tile, read on the device. Rows within a tile's valid size are not touched.
 
     Raises:
         RuntimeError: Triton cannot launch on the tensors' device.
@@ -255,11 +260,11 @@ def zero_tile_padding(
     if not launchable(values.device):
         raise RuntimeError("tile padding requires Triton")
     _rows_layout(values, "tile rows")
-    tiles = int(valid_sizes.numel())
+    tiles = int(variable_block_sizes.numel())
     if (
         tile % _BLOCK_ROWS
         or values.shape[0] != tiles * tile
-        or valid_sizes.dtype != torch.int32
+        or variable_block_sizes.dtype != torch.int32
     ):
         raise ValueError(
             "tile padding needs whole tiles and an int32 valid-size table"
@@ -269,7 +274,7 @@ def zero_tile_padding(
         return
     _zero_tile_padding_kernel[(tiles, tile // _BLOCK_ROWS)](
         values,
-        valid_sizes,
+        variable_block_sizes,
         int(values.stride(0)),
         int(values.stride(1)),
         heads,
@@ -341,36 +346,40 @@ def add_gated_tiles(
 def select_tiles(
     scores: torch.Tensor,
     tile_segments: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
     segment_starts: torch.Tensor,
     segment_keep: torch.Tensor,
+    *,
+    query_tile_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Choose every query tile's key tiles from its pooled scores.
 
-    ``scores`` is the contiguous FP32 ``[heads, tiles, tiles]`` (query tile,
-    key tile) matrix and the tables are the int32 per-tile vectors of
-    ``uniserve.nn.attention.vsa.Segments``. A dense query tile keeps every
-    live key tile; a video query tile keeps every live dense tile and, of
-    each segment ``r``, the ``segment_keep[r]`` tiles of that segment with the
-    highest scores, equal scores in ascending tile order, NaN above every
-    number and -0 equal to +0; an empty query tile keeps none.
+    ``scores`` is the contiguous FP32 ``[heads, query tiles, tiles]`` (query
+    tile, key tile) matrix and the tables are the int32 per-tile vectors of
+    ``uniserve.nn.attention.vsa.Segments``, one entry per tile of the
+    sequence. Query tile ``q`` of the scores is tile ``query_tile_offset + q``
+    of the sequence. A dense query tile keeps every live key tile; a video
+    query tile keeps every live dense tile and, of each segment ``r``, the
+    ``segment_keep[r]`` tiles of that segment with the highest scores, equal
+    scores in ascending tile order, NaN above every number and -0 equal to
+    +0; an empty query tile keeps none.
 
-    Returns ``[heads, tiles, tiles]`` int32 key-tile indices, each query
+    Returns ``[heads, query tiles, tiles]`` int32 key-tile indices, each query
     tile's kept tiles first in ascending order followed by the unkept tiles
-    in ascending order, and ``[heads, tiles]`` int32 counts.
+    in ascending order, and ``[heads, query tiles]`` int32 counts.
 
     Raises:
         RuntimeError: Triton cannot launch on the scores' device.
-        ValueError: The scores or tables do not describe one tile set, or
-            there are more tiles than the packed key's 13 tile bits hold.
+        ValueError: The scores or tables do not describe one tile set, the
+            query tiles leave the sequence, or there are more tiles than the
+            packed key's 13 tile bits hold.
     """
     if not launchable(scores.device):
         raise RuntimeError("tile selection requires Triton")
-    heads, tiles = int(scores.shape[0]), int(scores.shape[-1])
-    tables = (tile_segments, valid_sizes, segment_starts, segment_keep)
+    heads, query_tiles, tiles = (int(size) for size in scores.shape)
+    tables = (tile_segments, variable_block_sizes, segment_starts, segment_keep)
     if (
         scores.ndim != 3
-        or scores.shape[1] != tiles
         or scores.dtype != torch.float32
         or not scores.is_contiguous()
         or any(
@@ -379,35 +388,39 @@ def select_tiles(
             or table.device != scores.device
             for table in tables
         )
+        or not 0 <= query_tile_offset <= tiles - query_tiles
         or tiles > 1 << _TILE_BITS
     ):
         raise ValueError(
-            "tile selection needs [heads, tiles, tiles] FP32 scores, int32 "
-            f"tables of the same tiles and at most {1 << _TILE_BITS} tiles"
+            "tile selection needs [heads, query tiles, tiles] FP32 scores "
+            "over a window of the tables' tiles, int32 tables of the same "
+            f"tiles and at most {1 << _TILE_BITS} tiles"
         )
     indices = torch.empty(
-        (heads, tiles, tiles), dtype=torch.int32, device=scores.device
+        (heads, query_tiles, tiles), dtype=torch.int32, device=scores.device
     )
     counts = torch.empty(
-        (heads, tiles), dtype=torch.int32, device=scores.device
+        (heads, query_tiles), dtype=torch.int32, device=scores.device
     )
-    if heads == 0 or tiles == 0:
+    if heads == 0 or query_tiles == 0:
         return indices, counts
     block = triton.next_power_of_2(tiles)
     # Each program returns its segment choice to tile order through one row.
     kept = torch.empty(
-        (heads * tiles, block), dtype=torch.int8, device=scores.device
+        (heads * query_tiles, block), dtype=torch.int8, device=scores.device
     )
-    _select_tiles_kernel[(tiles, heads)](
+    _select_tiles_kernel[(query_tiles, heads)](
         scores,
         tile_segments,
-        valid_sizes,
+        variable_block_sizes,
         segment_starts,
         segment_keep,
         kept,
         indices,
         counts,
+        query_tiles,
         tiles,
+        query_tile_offset,
         block,
         _TILE_BITS,
         num_warps=8 if block >= 1024 else 4,

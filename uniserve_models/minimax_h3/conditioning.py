@@ -33,6 +33,7 @@ from uniserve.nn.attention import (
     SequenceLengths,
     VisibleInput,
 )
+from uniserve.nn.functional import Rounding
 
 from .config import TransformerConfig
 
@@ -73,7 +74,7 @@ class RefinerBlock(nn.Module):
         self.mlp = GatedMLP(
             config.hidden_size,
             config.intermediate_size,
-            rounding=config.rounding,
+            rounding=Rounding.STEPWISE,
         )
 
     def forward(

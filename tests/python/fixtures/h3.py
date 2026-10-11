@@ -4,7 +4,6 @@ from dataclasses import replace
 
 from uniserve.diffusion import BlockGrid, RungGrid, UniformGrid
 from uniserve.media import image
-from uniserve.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     Config,
     DenoiserConfig,
@@ -33,12 +32,9 @@ def dmd_denoiser(
     """A FastH3 DMD student: sparse tile-64 attention, text-only.
 
     It generates the export's training buckets (``DMD_CANVASES``).
-
-    Its transformer rounds once, as normalization assigns single-segment
-    sparse attention.
     """
     return DenoiserConfig(
-        transformer=replace(transformer, rounding=Rounding.ONCE),
+        transformer=transformer,
         grids={
             "video": RungGrid(rungs, shift=video_shift, clock=1000.0),
             "audio": RungGrid(rungs, shift=AUDIO_SHIFT, clock=1000.0),
@@ -71,7 +67,7 @@ def base_denoiser(
 def omniref_denoiser(
     transformer: TransformerConfig = TransformerConfig(),
 ) -> DenoiserConfig:
-    """A FastH3 OmniRef PDD student: 32 heads, multi-segment tile-128 VSA."""
+    """A FastH3 OmniRef PDD student: 32 heads, tile-128 VSA over segments."""
     return DenoiserConfig(
         transformer=replace(transformer, output_heads=32),
         grids={

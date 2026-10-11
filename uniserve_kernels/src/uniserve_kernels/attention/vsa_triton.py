@@ -41,9 +41,9 @@ if triton is not None:
         key,
         value,
         output,
-        block_indices,
-        block_counts,
-        valid_sizes,
+        q2k_index,
+        q2k_num,
+        variable_block_sizes,
         query_stride_row: tl.constexpr,
         query_stride_head: tl.constexpr,
         key_stride_row: tl.constexpr,
@@ -95,7 +95,7 @@ if triton is not None:
         normalizer_sum = tl.zeros((block_m,), tl.float32)
         accumulator = tl.zeros((block_m, head_dim), tl.float32)
         selected_count = tl.load(
-            block_counts + head * counts_stride_head + query_tile
+            q2k_num + head * counts_stride_head + query_tile
         )
         # Counts past the index row width are clamped so the loop never
         # reads beyond the row. Key-tile identifiers are not bounds-checked.
@@ -105,12 +105,12 @@ if triton is not None:
             0, selected_count, num_stages=pipeline_stages
         ):
             key_tile = tl.load(
-                block_indices
+                q2k_index
                 + head * indices_stride_head
                 + query_tile * indices_stride_tile
                 + selected_offset
             )
-            valid_rows = tl.load(valid_sizes + key_tile)
+            valid_rows = tl.load(variable_block_sizes + key_tile)
             key_rows_offset = key_tile * tile_size + tl.arange(0, block_n)
             key_mask = tl.arange(0, block_n) < valid_rows
             key_values = tl.load(
@@ -195,9 +195,9 @@ def _validate_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
-    block_indices: torch.Tensor,
-    block_counts: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    q2k_index: torch.Tensor,
+    q2k_num: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
 ) -> None:
     """Validate the public sparse-attention tensors and metadata."""
     if query.ndim != 3 or query.shape[1] < 1 or query.shape[2] != _HEAD_DIM:
@@ -237,11 +237,11 @@ def _validate_attention(
 
     query_tiles = query.shape[0] // _TILE
     if (
-        block_indices.ndim != 3
-        or tuple(block_indices.shape[:2]) != (query.shape[1], query_tiles)
-        or block_indices.shape[2] < 1
-        or block_counts.shape != (query.shape[1], query_tiles)
-        or valid_sizes.shape != (key.shape[0] // _TILE,)
+        q2k_index.ndim != 3
+        or tuple(q2k_index.shape[:2]) != (query.shape[1], query_tiles)
+        or q2k_index.shape[2] < 1
+        or q2k_num.shape != (query.shape[1], query_tiles)
+        or variable_block_sizes.shape != (key.shape[0] // _TILE,)
     ):
         raise ValueError(
             "Triton sparse attention metadata does not match Q/K/V"
@@ -250,7 +250,7 @@ def _validate_attention(
         tensor.dtype != torch.int32
         or tensor.device != query.device
         or not tensor.is_contiguous()
-        for tensor in (block_indices, block_counts, valid_sizes)
+        for tensor in (q2k_index, q2k_num, variable_block_sizes)
     ):
         raise ValueError(
             "Triton sparse attention metadata must be contiguous CUDA int32"
@@ -277,9 +277,9 @@ def block_sparse_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
-    block_indices: torch.Tensor,
-    block_counts: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    q2k_index: torch.Tensor,
+    q2k_num: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
     *,
     scale: float = _SOFTMAX_SCALE,
 ) -> torch.Tensor:
@@ -288,11 +288,12 @@ def block_sparse_attention(
     ``query`` and ``output`` are ``[query_rows, heads, 128]`` and ``key`` and
     ``value`` are ``[key_rows, heads, 128]``, all BF16 with unit column
     stride (``output`` contiguous) and both row counts multiples of 64.
-    ``block_indices`` is ``[heads, query_tiles, width]`` and
-    ``block_counts`` is ``[heads, query_tiles]``, both int32; ``valid_sizes``
-    has one int32 entry per key tile. Validation covers shapes, dtypes,
-    devices and contiguity but not the index values: every key-tile
-    identifier within a row's count must be below the key tile count.
+    ``q2k_index`` is ``[heads, query_tiles, width]`` and
+    ``q2k_num`` is ``[heads, query_tiles]``, both int32;
+    ``variable_block_sizes`` has one int32 entry per key tile. Validation
+    covers shapes, dtypes, devices and contiguity but not the index values:
+    every key-tile identifier within a row's count must be below the key tile
+    count.
     Counts above ``width`` are clamped to it.
 
     Returns:
@@ -312,9 +313,9 @@ def block_sparse_attention(
         key,
         value,
         output,
-        block_indices,
-        block_counts,
-        valid_sizes,
+        q2k_index,
+        q2k_num,
+        variable_block_sizes,
     )
     assert triton is not None
     block_m, num_warps, pipeline_stages = _launch_config(query.device)
@@ -325,9 +326,9 @@ def block_sparse_attention(
         key,
         value,
         output,
-        block_indices,
-        block_counts,
-        valid_sizes,
+        q2k_index,
+        q2k_num,
+        variable_block_sizes,
         int(query.stride(0)),
         int(query.stride(1)),
         int(key.stride(0)),
@@ -336,11 +337,11 @@ def block_sparse_attention(
         int(value.stride(1)),
         int(output.stride(0)),
         int(output.stride(1)),
-        int(block_indices.stride(0)),
-        int(block_indices.stride(1)),
-        int(block_counts.stride(0)),
+        int(q2k_index.stride(0)),
+        int(q2k_index.stride(1)),
+        int(q2k_num.stride(0)),
         query_rows,
-        int(block_indices.shape[2]),
+        int(q2k_index.shape[2]),
         scale,
         _LOG2E,
         _TILE,

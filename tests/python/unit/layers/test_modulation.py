@@ -82,12 +82,6 @@ def test_block_edges_match_strided_bf16_reference(
         states, (rows,), device="cuda", dtype=torch.long
     )
 
-    expected_attn_norm = _rmsnorm(hidden, weight, eps)
-    expected_attn_norm = (
-        expected_attn_norm
-        * (1.0 + scale_attn.index_select(0, row_indices).double())
-        + shift_attn.index_select(0, row_indices).double()
-    )
     actual_attn_norm = modulated_rms_norm(
         hidden,
         weight,
@@ -95,17 +89,6 @@ def test_block_edges_match_strided_bf16_reference(
         scale_attn,
         row_indices,
         eps=eps,
-    )
-
-    expected_residual = (
-        hidden.double()
-        + gate_attn.index_select(0, row_indices).double() * attention.double()
-    )
-    expected_ffn_norm = _rmsnorm(expected_residual, weight, eps)
-    expected_ffn_norm = (
-        expected_ffn_norm
-        * (1.0 + scale_ffn.index_select(0, row_indices).double())
-        + shift_ffn.index_select(0, row_indices).double()
     )
     actual_residual, actual_ffn_norm = gated_residual_rms_norm(
         hidden,
@@ -117,10 +100,6 @@ def test_block_edges_match_strided_bf16_reference(
         row_indices,
         eps=eps,
     )
-    expected_output = (
-        expected_residual
-        + gate_ffn.index_select(0, row_indices).double() * feed_forward.double()
-    )
     actual_output = gated_residual(
         actual_residual,
         feed_forward.clone(),
@@ -128,27 +107,47 @@ def test_block_edges_match_strided_bf16_reference(
         row_indices,
     )
 
-    torch.testing.assert_close(
-        actual_attn_norm.double(),
-        expected_attn_norm.double(),
-        rtol=2e-2,
-        atol=2e-2,
+    # Tensor operations on the host evaluate the same per-operation rounding
+    # recipe the kernels do, in their own reduction order.
+    host = {
+        "hidden": hidden.cpu(),
+        "weight": weight.cpu(),
+        "indices": row_indices.cpu(),
+    }
+    expected_attn_norm = modulated_rms_norm(
+        host["hidden"],
+        host["weight"],
+        shift_attn.cpu(),
+        scale_attn.cpu(),
+        host["indices"],
+        eps=eps,
     )
-    torch.testing.assert_close(
-        actual_residual.double(),
-        expected_residual.double(),
-        rtol=2e-2,
-        atol=2e-2,
+    expected_residual, expected_ffn_norm = gated_residual_rms_norm(
+        host["hidden"],
+        attention.cpu(),
+        gate_attn.cpu(),
+        host["weight"],
+        shift_ffn.cpu(),
+        scale_ffn.cpu(),
+        host["indices"],
+        eps=eps,
     )
-    torch.testing.assert_close(
-        actual_ffn_norm.double(),
-        expected_ffn_norm.double(),
-        rtol=2e-2,
-        atol=2e-2,
+    expected_output = gated_residual(
+        expected_residual.clone(),
+        feed_forward.cpu(),
+        gate_ffn.cpu(),
+        host["indices"],
     )
-    torch.testing.assert_close(
-        actual_output.double(), expected_output.double(), rtol=2e-2, atol=2e-2
-    )
+
+    for actual, expected in (
+        (actual_attn_norm, expected_attn_norm),
+        (actual_residual, expected_residual),
+        (actual_ffn_norm, expected_ffn_norm),
+        (actual_output, expected_output),
+    ):
+        torch.testing.assert_close(
+            actual.cpu().double(), expected.double(), rtol=2e-2, atol=2e-2
+        )
 
 
 @pytest.mark.parametrize("expanded", [128, 14336])
@@ -355,8 +354,8 @@ def _unit_rows(rows: int, width: int, device: str) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
-def test_stepwise_modulation_rounds_each_eager_operation(device) -> None:
-    """Stepwise modulation equals eager BF16 PyTorch bit for bit."""
+def test_modulation_rounds_each_eager_operation(device) -> None:
+    """Modulation equals eager BF16 PyTorch bit for bit."""
     torch.manual_seed(11)
     rows, width, eps = 64, 5376, 1e-6
     hidden = _unit_rows(rows, width, device)
@@ -383,7 +382,6 @@ def test_stepwise_modulation_rounds_each_eager_operation(device) -> None:
         scale,
         row_indices,
         eps=eps,
-        rounding=Rounding.STEPWISE,
     )
     summed, normalized = gated_residual_rms_norm(
         hidden,
@@ -394,7 +392,6 @@ def test_stepwise_modulation_rounds_each_eager_operation(device) -> None:
         scale,
         row_indices,
         eps=eps,
-        rounding=Rounding.STEPWISE,
     )
 
     torch.testing.assert_close(modulated, eager(hidden), rtol=0, atol=0)
@@ -403,8 +400,8 @@ def test_stepwise_modulation_rounds_each_eager_operation(device) -> None:
 
 
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
-def test_stepwise_gated_residual_rounds_the_gated_update(device) -> None:
-    """Stepwise gated residuals equal eager BF16 PyTorch bit for bit."""
+def test_gated_residual_rounds_the_gated_update(device) -> None:
+    """Gated residuals equal eager BF16 PyTorch bit for bit."""
     torch.manual_seed(12)
     hidden = torch.randn(96, 384, device=device).to(torch.bfloat16)
     update = torch.randn(96, 384, device=device).to(torch.bfloat16)
@@ -412,13 +409,7 @@ def test_stepwise_gated_residual_rounds_the_gated_update(device) -> None:
     row_indices = torch.randint(0, 3, (96,), device=device)
 
     expected = hidden + gate.index_select(0, row_indices) * update
-    actual = gated_residual(
-        hidden,
-        update.clone(),
-        gate,
-        row_indices,
-        rounding=Rounding.STEPWISE,
-    )
+    actual = gated_residual(hidden, update.clone(), gate, row_indices)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
@@ -466,17 +457,6 @@ def test_modulation_kernels_cover_every_floating_activation(dtype, tolerance):
         states, (rows,), generator=generator, device="cuda"
     )
 
-    def modulate(value):
-        return (
-            _rmsnorm(value, weight, 1e-6)
-            * (1.0 + scale.index_select(0, row_indices).double())
-            + shift.index_select(0, row_indices).double()
-        )
-
-    summed = (
-        hidden.double()
-        + gate.index_select(0, row_indices).double() * update.double()
-    )
     normalized = modulated_rms_norm(
         hidden, weight, shift, scale, row_indices, eps=1e-6
     )
@@ -491,12 +471,36 @@ def test_modulation_kernels_cover_every_floating_activation(dtype, tolerance):
         eps=1e-6,
     )
 
+    # Tensor operations on the host evaluate the same recipe.
+    host_indices = row_indices.cpu()
+    expected_normalized = modulated_rms_norm(
+        hidden.cpu(),
+        weight.cpu(),
+        shift.cpu(),
+        scale.cpu(),
+        host_indices,
+        eps=1e-6,
+    )
+    expected_residual, expected_gated = gated_residual_rms_norm(
+        hidden.cpu(),
+        update.cpu(),
+        gate.cpu(),
+        weight.cpu(),
+        shift.cpu(),
+        scale.cpu(),
+        host_indices,
+        eps=1e-6,
+    )
+
     for actual, expected in (
-        (normalized, modulate(hidden)),
-        (residual, summed),
-        (gated, modulate(summed)),
+        (normalized, expected_normalized),
+        (residual, expected_residual),
+        (gated, expected_gated),
     ):
         assert actual.dtype == dtype
         torch.testing.assert_close(
-            actual.double(), expected, rtol=tolerance, atol=tolerance
+            actual.cpu().double(),
+            expected.double(),
+            rtol=tolerance,
+            atol=tolerance,
         )

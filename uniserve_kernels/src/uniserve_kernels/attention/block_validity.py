@@ -16,18 +16,18 @@ def block_validity(
     seqlen_info,
     aux_tensors: list,
 ) -> cute.TensorSSA:
-    """Keep the first ``valid_sizes[tile]`` keys of each 64-row block.
+    """Keep the first ``variable_block_sizes[tile]`` keys of each 64-row block.
 
     FlashAttention calls this predicate for each score element. The borrowed
     auxiliary tensor is a contiguous int32 vector of live row counts, shared
     across heads and queries. Bounds protect its final partial kernel tile.
     """
     del batch, head, q_idx, seqlen_info
-    valid_sizes = aux_tensors[0]
+    variable_block_sizes = aux_tensors[0]
     tile = kv_idx[0] // 64
     valid = cutlass.Int32(0)
-    if tile < valid_sizes.shape[0]:
-        valid = valid_sizes[tile]
+    if tile < variable_block_sizes.shape[0]:
+        valid = variable_block_sizes[tile]
     return kv_idx % 64 < scalar_to_ssa(valid, cutlass.Int32)
 
 

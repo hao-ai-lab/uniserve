@@ -1,11 +1,11 @@
 """RMS and layer normalization with residual and modulation epilogues.
 
 Statistics, residual sums and affine transforms accumulate in FP32 and round
-once at the output dtype boundary. The modulation epilogues also evaluate
-``Rounding.STEPWISE``, which rounds after each operation of the eager
-expression. CUDA calls run UniServe's kernels and raise ``ValueError`` when
-no kernel accepts their operands; other devices evaluate the same formula
-with tensor operations.
+once at the output dtype boundary. The modulation epilogues instead round
+after each operation of the eager expression, as PyTorch evaluates it in the
+activation dtype. CUDA calls run UniServe's kernels and raise ``ValueError``
+when no kernel accepts their operands; other devices evaluate the same
+formula with tensor operations.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from torch.nn import functional as F
 from uniserve_kernels.triton import require_kernel
 
 from ._moe import Routes
-from ._tensors import Rounding, check_output, result
+from ._tensors import check_output, result
 
 if TYPE_CHECKING:
     from uniserve.quantization import Quantizer
@@ -548,34 +548,28 @@ def scaled_residual_layer_norm_absmax(
 
 
 def _modulate(
-    value, weight, shift, scale, row_indices, eps, rounding, dtype
+    value, weight, shift, scale, row_indices, eps, dtype
 ) -> torch.Tensor:
     """Return ``rms(value) * weight * (1 + scale[i]) + shift[i]`` in FP32.
 
-    Stepwise rounding returns FP32 values that the activation ``dtype``
-    holds exactly: the weighted normalization, ``1 + scale``, the product and
-    the shifted sum each round to it. ``value`` may be an FP32 sum.
+    The result holds values that the activation ``dtype`` holds exactly: the
+    weighted normalization, ``1 + scale``, the product and the shifted sum
+    each round to it. ``value`` is the rounded residual sum.
     """
     scale = scale.index_select(0, row_indices).float()
     shift = shift.index_select(0, row_indices).float()
-    if rounding is Rounding.ONCE:
-        return _rms(value, eps) * weight.float() * (1.0 + scale) + shift
-
     normalized = (_rms(value, eps) * weight.float()).to(dtype).float()
     factor = (1.0 + scale).to(dtype).float()
     product = (normalized * factor).to(dtype).float()
     return (product + shift).to(dtype).float()
 
 
-def _gated_sum(hidden, update, gate, row_indices, rounding) -> torch.Tensor:
+def _gated_sum(hidden, update, gate, row_indices) -> torch.Tensor:
     """Return ``hidden + gate[i] * update`` in FP32.
 
-    Stepwise rounding rounds the gated update and then the sum to
-    ``hidden.dtype``.
+    The gated update and then the sum round to ``hidden.dtype``.
     """
     gated = gate.index_select(0, row_indices).float() * update.float()
-    if rounding is Rounding.ONCE:
-        return hidden.float() + gated
     gated = gated.to(hidden.dtype).float()
     return (hidden.float() + gated).to(hidden.dtype).float()
 
@@ -589,14 +583,13 @@ def modulated_rms_norm(
     *,
     eps: float,
     retain: torch.Tensor | None = None,
-    rounding: Rounding = Rounding.ONCE,
 ) -> torch.Tensor:
     """Return ``rms(value) * weight * (1 + scale[i]) + shift[i]`` per row.
 
     ``row_indices`` selects each row's modulation parameters. ``retain``
     receives a copy of ``value`` in the same pass, so a caller keeping the
-    residual while ``value`` lives in borrowed scratch reads it once.
-    ``rounding`` selects where the expression rounds to ``value.dtype``.
+    residual while ``value`` lives in borrowed scratch reads it once. Each
+    operation of the expression rounds to ``value.dtype``.
     """
     from uniserve_kernels.norm import modulation
 
@@ -633,14 +626,13 @@ def modulated_rms_norm(
             eps,
             output,
             retain=retain,
-            stepwise=rounding is Rounding.STEPWISE,
         )
         return output
 
     if retain is not None:
         retain.copy_(value)
     return _modulate(
-        value, weight, shift, scale, row_indices, eps, rounding, value.dtype
+        value, weight, shift, scale, row_indices, eps, value.dtype
     ).to(value.dtype)
 
 
@@ -649,13 +641,10 @@ def gated_residual(
     update: torch.Tensor,
     gate: torch.Tensor,
     row_indices: torch.Tensor,
-    *,
-    rounding: Rounding = Rounding.ONCE,
 ) -> torch.Tensor:
     """Return ``hidden + gate[i] * update``; the kernel consumes ``update``.
 
-    ``rounding`` selects whether the gated update rounds to ``hidden.dtype``
-    before the sum.
+    The gated update rounds to ``hidden.dtype`` before the sum.
     """
     from uniserve_kernels.norm import modulation
 
@@ -670,17 +659,9 @@ def gated_residual(
             gate=gate,
             row_indices=row_indices,
         )
-        modulation.gated_residual(
-            hidden,
-            update,
-            gate,
-            row_indices,
-            stepwise=rounding is Rounding.STEPWISE,
-        )
+        modulation.gated_residual(hidden, update, gate, row_indices)
         return update
-    return _gated_sum(hidden, update, gate, row_indices, rounding).to(
-        hidden.dtype
-    )
+    return _gated_sum(hidden, update, gate, row_indices).to(hidden.dtype)
 
 
 def _require_gated_modulation(function, hidden, update, gate, *parameters):
@@ -706,14 +687,12 @@ def gated_residual_rms_norm(
     row_indices: torch.Tensor,
     *,
     eps: float,
-    rounding: Rounding = Rounding.ONCE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return a gated residual and its modulated normalization.
 
-    With ``Rounding.ONCE`` the normalization reads the unrounded FP32
-    residual sum; with ``Rounding.STEPWISE`` it reads the rounded residual
-    and every intermediate rounds. ``update`` is consumed and may back the
-    returned activation-dtype residual.
+    The normalization reads the rounded residual and every intermediate
+    rounds. ``update`` is consumed and may back the returned
+    activation-dtype residual.
     """
     from uniserve_kernels.norm import modulation
 
@@ -739,13 +718,12 @@ def gated_residual_rms_norm(
             normalized,
             update=update,
             gate=gate,
-            stepwise=rounding is Rounding.STEPWISE,
         )
         return update, normalized
 
-    summed = _gated_sum(hidden, update, gate, row_indices, rounding)
+    summed = _gated_sum(hidden, update, gate, row_indices)
     normalized = _modulate(
-        summed, weight, shift, scale, row_indices, eps, rounding, hidden.dtype
+        summed, weight, shift, scale, row_indices, eps, hidden.dtype
     )
     return summed.to(hidden.dtype), normalized.to(hidden.dtype)
 
@@ -760,14 +738,13 @@ def gated_residual_rms_norm_fp8(
     row_indices: torch.Tensor,
     *,
     eps: float,
-    rounding: Rounding = Rounding.ONCE,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return the residual and its row-scaled E4M3 modulated normalization.
 
     ``update`` is consumed and may back the returned residual. The
-    ``[rows, 1]`` FP32 scales dequantize the returned values. ``rounding``
-    applies as in ``gated_residual_rms_norm``; a stepwise normalization
-    rounds to the activation dtype before it is encoded.
+    ``[rows, 1]`` FP32 scales dequantize the returned values. The
+    normalization rounds as in ``gated_residual_rms_norm`` before it is
+    encoded.
     """
     from uniserve_kernels.norm import modulation
 
@@ -798,15 +775,14 @@ def gated_residual_rms_norm_fp8(
             update=update,
             gate=gate,
             output_scale=scales,
-            stepwise=rounding is Rounding.STEPWISE,
         )
         return update, values, scales
 
     from uniserve.quantization import Quantizer
 
-    summed = _gated_sum(hidden, update, gate, row_indices, rounding)
+    summed = _gated_sum(hidden, update, gate, row_indices)
     normalized = _modulate(
-        summed, weight, shift, scale, row_indices, eps, rounding, hidden.dtype
+        summed, weight, shift, scale, row_indices, eps, hidden.dtype
     )
     encoded = Quantizer("fp8", axis=0).quantize(
         normalized.reshape(-1, normalized.shape[-1])

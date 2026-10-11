@@ -163,7 +163,9 @@ def test_tiles_follow_the_reference_segments(name):
     )
     reference_sizes = case["valid_sizes"]
     for reference, ours in pairs.items():
-        assert int(tables.valid_sizes[ours]) == reference_sizes[reference]
+        assert (
+            int(tables.variable_block_sizes[ours]) == reference_sizes[reference]
+        )
         if reference < case["prefix_tiles"]:
             assert int(tables.tile_segments[ours]) == vsa.DENSE_TILE
         else:
@@ -174,9 +176,9 @@ def test_tiles_follow_the_reference_segments(name):
             )
             assert int(tables.tile_segments[ours]) == segment
     # Every other tile, spare capacity and alignment alike, is empty.
-    empty = torch.ones(tables.valid_sizes.numel(), dtype=torch.bool)
+    empty = torch.ones(tables.variable_block_sizes.numel(), dtype=torch.bool)
     empty[list(pairs.values())] = False
-    assert not tables.valid_sizes[empty].any()
+    assert not tables.variable_block_sizes[empty].any()
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
@@ -188,14 +190,17 @@ def test_selection_keeps_the_reference_key_tiles(name):
     )
     ours = torch.tensor([pairs[index] for index in range(len(pairs))])
     reference_scores = torch.tensor(case["scores"])
-    heads, tiles = reference_scores.shape[0], tables.valid_sizes.numel()
+    heads, tiles = (
+        reference_scores.shape[0],
+        tables.variable_block_sizes.numel(),
+    )
     # Empty tiles score highest, so selection must exclude them by state.
     scores = torch.full((heads, tiles, tiles), 1e4)
     scores[:, ours[:, None], ours[None, :]] = reference_scores
     segments = vsa.Segments(
         packing.tile,
         packing.padded_tokens,
-        tables.valid_sizes,
+        tables.variable_block_sizes,
         tables.tile_segments,
         tables.segment_starts,
         tables.segment_keep,
