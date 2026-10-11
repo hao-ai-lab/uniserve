@@ -244,6 +244,34 @@ impl MediaCall {
             Self::Muxing => "muxing",
         }
     }
+
+    /// Returns the calls that read this call's products in a video request's
+    /// graph.
+    ///
+    /// A producing call's readers are the calls whose inputs it declares, in
+    /// the order the graph consumes them. The engine plans consumption from
+    /// this table and the worker sizes persistent product storage from it
+    /// ([`Self::reads_resident_state`] separates the readers of resident
+    /// state).
+    pub const fn readers(self) -> &'static [Self] {
+        match self {
+            Self::MediaReading => &[Self::VisionEncoding, Self::LatentEncoding],
+            Self::VisionEncoding => &[Self::TextEncoding],
+            Self::TextEncoding | Self::LatentEncoding => &[Self::LatentPreparation],
+            Self::LatentPreparation => &[Self::Denoising],
+            Self::Denoising => &[Self::Denoising, Self::VideoDecoding, Self::AudioDecoding],
+            Self::VideoDecoding => &[Self::VideoEncoding],
+            Self::VideoEncoding => &[Self::Muxing],
+            Self::AudioDecoding => &[Self::AudioEncoding],
+            Self::ImageDecoding | Self::AudioEncoding | Self::Muxing => &[],
+        }
+    }
+
+    /// Returns whether this call reads its predecessor's trajectory from the
+    /// denoiser's resident state instead of a persistent product.
+    pub const fn reads_resident_state(self) -> bool {
+        matches!(self, Self::Denoising)
+    }
 }
 
 /// Understanding and generation branches of a multimodal model.

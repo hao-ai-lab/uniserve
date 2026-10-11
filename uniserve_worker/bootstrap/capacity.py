@@ -49,6 +49,7 @@ from uniserve.runtime.device import (
 )
 from uniserve.runtime.kv_cache import Planes
 from uniserve.tensors import BufferConfig
+from uniserve_worker import _uniserve_ipc as _ipc
 from uniserve_worker.bootstrap.cache import resolved_block_size, table_widths
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import (
@@ -335,22 +336,12 @@ def local_product_storage_bytes(
         Bytes of one request's products backed on this rank.
     """
     consumers: dict[str, set[str]] = {}
-    # These are the concrete persistent Tensor consumers of the video path.
-    # Denoising state is resident; encoders consume decoded output buffers.
-    for source_call, destination_call in (
-        (MediaCall.MEDIA_READING, MediaCall.VISION_ENCODING),
-        (MediaCall.MEDIA_READING, MediaCall.LATENT_ENCODING),
-        (MediaCall.VISION_ENCODING, MediaCall.TEXT_ENCODING),
-        (MediaCall.LATENT_ENCODING, MediaCall.LATENT_PREPARATION),
-        (MediaCall.TEXT_ENCODING, MediaCall.LATENT_PREPARATION),
-        (MediaCall.DENOISING, MediaCall.VIDEO_DECODING),
-        (MediaCall.DENOISING, MediaCall.AUDIO_DECODING),
-        (MediaCall.VIDEO_DECODING, MediaCall.VIDEO_ENCODING),
-        (MediaCall.AUDIO_DECODING, MediaCall.AUDIO_ENCODING),
-        (MediaCall.VIDEO_ENCODING, MediaCall.MUXING),
-    ):
-        source = media_components.get(source_call)
-        destination = media_components.get(destination_call)
+    # The persistent tensor edges of the video graph, which the schema states
+    # once (`MediaCall::readers`): denoising state is resident, so its
+    # readers are not among them.
+    for source_call, destination_call in _ipc.product_edges():
+        source = media_components.get(MediaCall(source_call))
+        destination = media_components.get(MediaCall(destination_call))
         if source is not None and destination is not None:
             consumers.setdefault(source, set()).add(destination)
 

@@ -77,32 +77,6 @@ pub(crate) struct VideoGraph {
     condition_audio: bool,
 }
 
-/// The calls whose consumption order is fixed by kind, as one request's
-/// graph connects them: each producing call with its reading calls.
-const EDGES: [(MediaCall, &[MediaCall]); 11] = [
-    (
-        MediaCall::MediaReading,
-        &[MediaCall::VisionEncoding, MediaCall::LatentEncoding],
-    ),
-    (MediaCall::VisionEncoding, &[MediaCall::TextEncoding]),
-    (MediaCall::TextEncoding, &[MediaCall::LatentPreparation]),
-    (MediaCall::LatentEncoding, &[MediaCall::LatentPreparation]),
-    (MediaCall::LatentPreparation, &[MediaCall::Denoising]),
-    (
-        MediaCall::Denoising,
-        &[
-            MediaCall::Denoising,
-            MediaCall::VideoDecoding,
-            MediaCall::AudioDecoding,
-        ],
-    ),
-    (MediaCall::VideoDecoding, &[MediaCall::VideoEncoding]),
-    (MediaCall::VideoEncoding, &[MediaCall::Muxing]),
-    (MediaCall::AudioDecoding, &[MediaCall::AudioEncoding]),
-    (MediaCall::AudioEncoding, &[]),
-    (MediaCall::Muxing, &[]),
-];
-
 /// The media calls every video request runs, whatever its task.
 const GENERATION_CALLS: [MediaCall; 8] = [
     MediaCall::TextEncoding,
@@ -274,17 +248,11 @@ impl VideoGraph {
         if !self.runs(call) {
             return Vec::new();
         }
-        EDGES
+        call.readers()
             .iter()
-            .find(|(producer, _)| *producer == call)
-            .map(|(_, readers)| {
-                readers
-                    .iter()
-                    .copied()
-                    .filter(|reader| self.runs(*reader))
-                    .collect()
-            })
-            .unwrap_or_default()
+            .copied()
+            .filter(|reader| self.runs(*reader))
+            .collect()
     }
 
     /// Every product the request reserves at admission.

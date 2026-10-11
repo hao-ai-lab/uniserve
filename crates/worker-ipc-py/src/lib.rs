@@ -532,6 +532,23 @@ fn service_name(id: &str) -> String {
     uniserve_worker_ipc::service_name(id)
 }
 
+#[pyfunction]
+/// Returns each `(producer, reader)` pair of media calls whose products travel
+/// through persistent tensor storage: a reader's inputs the producer declares,
+/// excluding the readers of resident denoiser state.
+fn product_edges() -> Vec<(&'static str, &'static str)> {
+    uniserve_worker_ipc::MediaCall::ALL
+        .into_iter()
+        .flat_map(|producer| {
+            producer
+                .readers()
+                .iter()
+                .filter(|reader| !reader.reads_resident_state())
+                .map(move |reader| (producer.as_str(), reader.as_str()))
+        })
+        .collect()
+}
+
 /// Resolves one aligned 32-bit word inside a writable buffer.
 ///
 /// A shared-storage segment's header words are read and written by different
@@ -588,6 +605,7 @@ fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStreamSignal>()?;
     m.add_class::<PyErrorCode>()?;
     m.add_function(wrap_pyfunction!(service_name, m)?)?;
+    m.add_function(wrap_pyfunction!(product_edges, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_store_u32, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_load_u32, m)?)?;
     Ok(())

@@ -226,6 +226,12 @@ def service_name(id: str) -> str:
     """
     ...
 
+def product_edges() -> list[tuple[str, str]]:
+    """Return each ``(producer, reader)`` pair of media calls whose products
+    travel through persistent tensor storage, as the schema's graph states them.
+    """
+    ...
+
 def atomic_store_u32(buffer: memoryview, offset: int, value: int) -> None:
     """Store a 32-bit word with release ordering.
 
