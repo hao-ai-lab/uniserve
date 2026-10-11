@@ -1304,14 +1304,17 @@ fn prefix_cache_configuration_controls_reuse() {
         // caching is enabled. Page tails still require ordinary prefill.
         for rid in 1..=2 {
             let mut events = engine
-                .submit(uniserve_core::Request::Umm(generation_request(
-                    RequestId(rid),
-                    text_input(prompt.clone()),
-                    SamplingParams::default(),
-                    ImageParams::default(),
-                    GenerationConstraint::UndOnly,
-                    8,
-                )))
+                .submit(
+                    generation_request(
+                        RequestId(rid),
+                        text_input(prompt.clone()),
+                        SamplingParams::default(),
+                        ImageParams::default(),
+                        GenerationConstraint::UndOnly,
+                        8,
+                    )
+                    .into(),
+                )
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut tokens = Vec::new();

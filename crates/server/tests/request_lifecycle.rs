@@ -66,7 +66,7 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRun
             served_name: "sim-model".to_string(),
             parameters: ModelParameters::Qwen3,
             sampling_defaults: SamplingDefaults::default(),
-            max_model_tokens: Some(4096),
+            max_model_len: 4096,
             primary_eos_token_id: Some(128),
             eos_token_ids: BTreeSet::from([128]),
         },
@@ -81,7 +81,6 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRun
         ),
         uniserve_server::serving::WorkerCapabilities {
             limits: client.generation_limits(),
-            max_model_tokens: 4096,
         },
         false,
     )

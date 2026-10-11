@@ -40,7 +40,7 @@ pub use codec::stats::ForwardStats;
 pub use events::{
     ArtifactEvent, Canvas, DiffusionRequest, DiffusionRequestError, DiffusionSamplingParams,
     EngineCoreOutput, FinishReason, MediaKind, PositionLogprobs, RejectionKind, Request,
-    RuntimeFamily, StopReason, TokenLogprob, VideoTask,
+    StopReason, TokenLogprob, VideoTask,
 };
 pub use generation::{
     CachePolicy, CanvasSampling, FeedbackNextToken, FeedbackSource, GenerationConstraint,

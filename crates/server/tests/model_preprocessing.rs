@@ -221,7 +221,7 @@ fn try_resolved_model(
                 description.id(),
                 directory.path().to_str().unwrap(),
                 &files,
-                None,
+                Some(4096),
                 tokenizer.as_ref(),
             ))
             .unwrap(),
@@ -236,10 +236,7 @@ fn try_resolved_model(
         config,
         Arc::clone(&tokenizer),
         renderer,
-        uniserve_server::serving::WorkerCapabilities {
-            limits,
-            max_model_tokens: 4096,
-        },
+        uniserve_server::serving::WorkerCapabilities { limits },
         true,
     )?;
     Ok((directory, tokenizer, model))
@@ -709,7 +706,6 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         RequestRenderer::Video(video_service(denoiser, 10.0, &tokenizer)),
         uniserve_server::serving::WorkerCapabilities {
             limits: runtime_limits(),
-            max_model_tokens: 4096,
         },
         true,
     )
@@ -807,10 +803,10 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     }
 }
 
-/// `InputProcessor::new` replaces the checkpoint's context length with the
-/// worker's `max_model_tokens`, and text preprocessing enforces that bound.
+/// Text preprocessing refuses a prompt longer than the model's
+/// `max_model_len`.
 #[test]
-fn worker_context_capacity_limits_preprocessed_requests() {
+fn context_length_limits_preprocessed_requests() {
     let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::Qwen3, "qwen3");
     let renderer = HfChatRenderer::new(
         Some(CHAT_TEMPLATE.to_string()),
@@ -818,19 +814,19 @@ fn worker_context_capacity_limits_preprocessed_requests() {
         ChatTemplateContentFormatOption::String,
     )
     .unwrap();
+    let mut config = loaded.config().clone();
+    config.max_model_len = 8;
     let processor = InputProcessor::new(
-        loaded.config().clone(),
+        config,
         tokenizer,
         RequestRenderer::Chat(renderer),
         uniserve_server::serving::WorkerCapabilities {
             limits: runtime_limits(),
-            max_model_tokens: 8,
         },
         true,
     )
     .unwrap();
 
-    assert_eq!(processor.config().max_model_tokens, Some(8));
     let request = uniserve_server::serving::TextPromptRequest::new(
         "context-capacity",
         "This prompt exceeds eight tokens",
@@ -1130,7 +1126,6 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
         RequestRenderer::Chat(renderer),
         uniserve_server::serving::WorkerCapabilities {
             limits: runtime_limits(),
-            max_model_tokens: 4096,
         },
         true,
     )

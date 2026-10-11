@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::error::{Error, Result};
-use uniserve_core::{GenerationLimits, Request, RequestId, RuntimeFamily};
+use uniserve_core::{GenerationLimits, Request, RequestId};
 use uniserve_engine::{EngineCore, EventRx, Executor, SubmitError};
 
 /// In-process engine client owned by the server layer.
@@ -141,9 +141,9 @@ impl EngineClient {
     /// Wraps initialized engine cores with request tracking and periodic
     /// statistics export.
     ///
-    /// The replicas must serve the same model under the same limits, since a
-    /// request is validated once against the client's limits and may land on
-    /// any replica; a mismatch fails. One export task per core publishes a
+    /// The replicas' workers must report the same generation limits and
+    /// denoising schedule, since a request is prepared once against the
+    /// client's and may land on any replica; a mismatch fails. One export task per core publishes a
     /// scheduler-stats snapshot every second under that core's engine index,
     /// matching `engine_count`. Each task holds only a weak reference to its
     /// core, so it does not keep the engine alive and exits on the first tick
@@ -155,15 +155,11 @@ impl EngineClient {
             message: "an engine client needs at least one engine core".to_string(),
         })?;
         for core in &cores[1..] {
-            if core.model_name() != first.model_name()
-                || core.max_model_len() != first.max_model_len()
-                || core.generation_limits() != first.generation_limits()
-                || core.model_dtype() != first.model_dtype()
-                || core.runtime_family() != first.runtime_family()
+            if core.generation_limits() != first.generation_limits()
                 || core.info().denoise_steps() != first.info().denoise_steps()
             {
                 return Err(Error::ClientClosed {
-                    message: "data-parallel replicas serve different models or limits".to_string(),
+                    message: "data-parallel replicas report different limits".to_string(),
                 });
             }
         }
@@ -219,11 +215,6 @@ impl EngineClient {
     /// Returns the number of engine cores, one per data-parallel replica.
     pub fn engine_count(&self) -> usize {
         self.cores.len()
-    }
-
-    /// Returns the maximum supported model context length.
-    pub fn max_model_len(&self) -> u32 {
-        self.first().max_model_len()
     }
 
     /// Returns worker-advertised generation limits.
@@ -284,7 +275,6 @@ impl EngineClient {
     /// - `Error::UnknownRequestId` or `Error::DuplicateRequestId` when the
     ///   registration cannot be claimed (see `RequestRegistry::reserved_id` and
     ///   `RequestRegistry::claim_submission`).
-    /// - `Error::ClientClosed` when the runtime family is `Diffusion`.
     /// - `Error::Submit` when the engine refuses the request.
     ///
     /// Every error after a successful claim releases the claim again through
@@ -298,25 +288,12 @@ impl EngineClient {
     ) -> Result<EventRx> {
         let rid = self.requests.reserved_id(&external_request_id)?;
         request.request_id = rid;
-        let request = match self.first().runtime_family() {
-            RuntimeFamily::Ar => Request::Ar(request),
-            RuntimeFamily::Umm => Request::Umm(request),
-            RuntimeFamily::BlockDiffusion => Request::BlockDiffusion(request),
-            RuntimeFamily::Diffusion => {
-                self.requests.claim_submission(&external_request_id, rid)?;
-                self.requests.release_engine(&external_request_id, rid);
-                return Err(Error::ClientClosed {
-                    message: "text generation is unavailable for a diffusion runtime".to_string(),
-                });
-            }
-        };
-        self.submit(external_request_id, rid, request)
+        self.submit(external_request_id, rid, request.into())
     }
 
     /// Submits one terminal media request and returns its event receiver.
     ///
-    /// Fails like `submit_generation`, except that `Error::ClientClosed` is
-    /// returned when the runtime family is not `Diffusion`.
+    /// Fails like `submit_generation`.
     pub async fn submit_media(
         &self,
         external_request_id: String,
@@ -324,13 +301,6 @@ impl EngineClient {
     ) -> Result<EventRx> {
         let rid = self.requests.reserved_id(&external_request_id)?;
         request.request_id = rid;
-        if self.first().runtime_family() != RuntimeFamily::Diffusion {
-            self.requests.claim_submission(&external_request_id, rid)?;
-            self.requests.release_engine(&external_request_id, rid);
-            return Err(Error::ClientClosed {
-                message: "diffusion generation is unavailable for this runtime".to_string(),
-            });
-        }
         self.submit(external_request_id, rid, Request::Diffusion(request))
     }
 

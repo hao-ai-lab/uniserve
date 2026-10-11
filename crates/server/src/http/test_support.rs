@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use tower::ServiceExt as _;
-use uniserve_core::{ModelDtype, RuntimeFamily};
+use uniserve_core::ModelDtype;
 use uniserve_engine::{EngineConfig, SimEngine, SimExecutor};
 
 use crate::AppState;
@@ -51,18 +51,13 @@ pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
         served_name: SERVED_MODEL.to_string(),
         parameters,
         sampling_defaults: SamplingDefaults::default(),
-        max_model_tokens: Some(4096),
+        max_model_len: 4096,
         primary_eos_token_id: Some(2),
         eos_token_ids: BTreeSet::from([2]),
     };
     let mut config = EngineConfig::sim(SERVED_MODEL);
-    match model.parameters {
-        ModelParameters::MiniMaxH3 => config.runtime_family = RuntimeFamily::Diffusion,
-        ModelParameters::DiffusionGemma(_) => {
-            config.runtime_family = model.runtime_family();
-            config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
-        }
-        _ => {}
+    if let ModelParameters::DiffusionGemma(_) = model.parameters {
+        config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
     }
     let client = Arc::new(
         EngineClient::connect_with_executor(config, Box::new(SimExecutor::new(SimEngine::new())))
@@ -85,7 +80,6 @@ pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
         renderer,
         WorkerCapabilities {
             limits: client.generation_limits(),
-            max_model_tokens: 4096,
         },
         false,
     )

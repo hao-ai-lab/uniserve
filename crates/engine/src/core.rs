@@ -35,8 +35,7 @@ use anyhow::Context as _;
 #[cfg(test)]
 use uniserve_core::ComponentDistribution;
 use uniserve_core::{
-    CommandWaker, ComponentConfig, GenerationLimits, ModelDtype, ParallelConfig, Request,
-    RequestId, RuntimeFamily,
+    CommandWaker, ComponentConfig, GenerationLimits, ModelDtype, ParallelConfig, Request, RequestId,
 };
 use uniserve_worker_ipc::WorkerInfo;
 
@@ -335,8 +334,6 @@ impl WorkerConfig {
 /// or one per data-parallel replica.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Request runtime selected for this configuration.
-    pub runtime_family: RuntimeFamily,
     /// Model generation requirements, intersected with loaded worker capacities.
     pub generation_limits: GenerationLimits,
     /// Maximum number of calls assembled into a single forward batch.
@@ -356,8 +353,6 @@ pub struct EngineConfig {
     pub prefix_cache: bool,
     /// Waiting queue policy for admitting/scheduling requests.
     pub scheduler_policy: SchedulingPolicy,
-    /// Maximum model context length reported to the frontend.
-    pub max_model_len: u32,
     /// Static computation components and physical rank membership.
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
@@ -414,7 +409,6 @@ impl EngineConfig {
             ..WorkerProcessArgs::default()
         };
         Self {
-            runtime_family: RuntimeFamily::Umm,
             generation_limits: crate::scheduler::unbounded_umm_generation_limits(),
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
@@ -423,7 +417,6 @@ impl EngineConfig {
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
-            max_model_len: 8192,
             workers: vec![WorkerConfig::placed(
                 &["localhost".to_owned()],
                 "cpu",
@@ -465,8 +458,6 @@ pub struct EngineCore {
     model_name: String,
     model_dtype: ModelDtype,
     generation_limits: GenerationLimits,
-    max_model_len: u32,
-    runtime_family: RuntimeFamily,
     /// Engine-dead latch: set after `Scheduler::run` returns a fatal exit
     /// (executor or worker failure). A scheduler thread panic does not set it.
     dead: Arc<AtomicBool>,
@@ -807,7 +798,6 @@ impl EngineCore {
                 policy: config.scheduler_policy,
                 ..Default::default()
             },
-            config.runtime_family,
             config.worker_process.model_dtype,
             config.generation_limits,
         )?;
@@ -843,8 +833,6 @@ impl EngineCore {
             model_name: config.worker_process.model,
             model_dtype,
             generation_limits,
-            max_model_len: config.max_model_len,
-            runtime_family: config.runtime_family,
             dead,
             next_id: AtomicU64::new(1),
             sched_thread: Mutex::new(Some(sched_thread)),
@@ -889,16 +877,6 @@ impl EngineCore {
     /// Returns the model parameter data type.
     pub fn model_dtype(&self) -> ModelDtype {
         self.model_dtype
-    }
-
-    /// Returns the configured maximum model context length.
-    pub fn max_model_len(&self) -> u32 {
-        self.max_model_len
-    }
-
-    /// Returns the request runtime family.
-    pub const fn runtime_family(&self) -> RuntimeFamily {
-        self.runtime_family
     }
 
     /// Allocates the next internal scheduler request id.

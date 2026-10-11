@@ -532,7 +532,7 @@ fn tokenize_bagel_with_slots(
 /// model context while the request decodes text, sampling or stop controls
 /// are invalid, `GenerationRequest::validate_resources` rejects the request
 /// against the loaded limits, the KV requirement exceeds
-/// `ModelConfig::max_model_tokens` even after shrinking the text budget, or
+/// `ModelConfig::max_model_len` even after shrinking the text budget, or
 /// the final request fails `GenerationRequest::validate`.
 pub(super) fn prepare_generation_resources(
     processor: &crate::serving::InputProcessor,
@@ -559,7 +559,7 @@ pub(super) fn prepare_generation_resources(
         crate::serving::text::resolve_max_tokens(
             controls.max_tokens,
             processor.config.sampling_defaults.max_output_tokens,
-            Some(processor.config.max_model_tokens()),
+            Some(processor.config.max_model_len),
             prompt_tokens,
         )
         .map_err(|error| error.to_string())? as usize
@@ -595,8 +595,8 @@ pub(super) fn prepare_generation_resources(
     // Shrink the text budget by the excess once; at least one text token must
     // remain. The check after this block covers requests that do not decode
     // text and so have no budget to shrink.
-    if max_kv_tokens > processor.config.max_model_tokens() as usize && generation.decodes_text() {
-        let excess = max_kv_tokens - processor.config.max_model_tokens() as usize;
+    if max_kv_tokens > processor.config.max_model_len as usize && generation.decodes_text() {
+        let excess = max_kv_tokens - processor.config.max_model_len as usize;
         generation.max_und_tokens = generation.max_und_tokens
             .checked_sub(excess)
             .filter(|value| *value > 0)
@@ -604,7 +604,7 @@ pub(super) fn prepare_generation_resources(
                 format!(
                     "generation context requires at least {} KV tokens, exceeding the {}-token runtime limit",
                     max_kv_tokens.saturating_sub(generation.max_und_tokens),
-                    processor.config.max_model_tokens()
+                    processor.config.max_model_len
                 )
             })?;
         max_kv_tokens = generation
@@ -612,11 +612,10 @@ pub(super) fn prepare_generation_resources(
             .map_err(|error| error.to_string())?;
     }
 
-    if max_kv_tokens > processor.config.max_model_tokens() as usize {
+    if max_kv_tokens > processor.config.max_model_len as usize {
         return Err(format!(
             "generation requires {} KV tokens, exceeding the {}-token runtime limit",
-            max_kv_tokens,
-            processor.config.max_model_tokens()
+            max_kv_tokens, processor.config.max_model_len
         )
         .into());
     }

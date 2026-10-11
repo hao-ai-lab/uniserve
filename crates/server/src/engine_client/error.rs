@@ -29,9 +29,9 @@ pub enum Error {
     /// The engine rejected request submission.
     #[error(transparent)]
     Submit(#[from] uniserve_engine::SubmitError),
-    /// The client cannot serve the call: the engine failed to start or to
-    /// complete its shutdown, or the loaded runtime family does not serve the
-    /// submitted request kind.
+    /// The client cannot serve the call: the engine failed to start, its
+    /// data-parallel replicas disagree, or it failed to complete its
+    /// shutdown.
     #[error("engine client is closed: {message}")]
     ClientClosed {
         /// Human-readable closure context.

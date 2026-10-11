@@ -106,8 +106,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 anyhow::anyhow!("invalid --diffusion-generation-config: {message}")
             })?;
     }
-    let runtime_family = model_config.runtime_family();
-    let effective_max_model_len = model_config.max_model_tokens();
+    let max_model_len = model_config.max_model_len;
     let channel_payload_capacity = model_config.channel_payload_capacity();
     let control_tokens = special_token_ids(&model_config);
     let generation_limits =
@@ -142,7 +141,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .max(channel_payload_capacity),
         max_batch_calls,
         max_batch_tokens,
-        max_model_len: effective_max_model_len,
+        max_model_len,
         max_video_seconds: config.engine.max_video_seconds,
         max_condition_rows: config.engine.max_condition_rows,
         // Video workers provision only the frame counts the API admits.
@@ -175,7 +174,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         ..config.engine.worker_process.clone()
     };
     let engine_config = EngineConfig {
-        runtime_family,
         generation_limits,
         max_batch: config.engine.max_batch,
         max_num_batched_tokens: config.engine.max_num_batched_tokens,
@@ -184,7 +182,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         mixed_prefill_tokens: config.engine.mixed_prefill_tokens,
         prefix_cache: config.engine.prefix_cache,
         scheduler_policy: config.engine.scheduler_policy,
-        max_model_len: effective_max_model_len,
         workers: config.engine.workers.clone(),
         transfer: config.engine.transfer.clone(),
         data_parallel_size: config.engine.data_parallel_size,
@@ -198,9 +195,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         EngineClient::connect(engine_config).context("failed to start the UniServe engine")?;
 
     let engine = Arc::new(client);
-    // The served context limit never exceeds the length the engine reports,
-    // which is the `max_model_len` passed in `engine_config`.
-    let route_max_model_len = effective_max_model_len.min(engine.max_model_len());
     // A video checkpoint serves what its placed denoiser declares in the
     // worker handshake, planned against the conditioner's vision processor.
     let renderer = match renderer {
@@ -241,7 +235,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 Arc::clone(&tokenizer),
                 profile,
                 config.readout,
-                route_max_model_len,
+                max_model_len,
             )
             .context("failed to prepare the System One readout")?;
             info!(
@@ -260,7 +254,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         renderer,
         crate::serving::WorkerCapabilities {
             limits: engine.generation_limits(),
-            max_model_tokens: route_max_model_len,
         },
         config.reasoning_parsing,
     )

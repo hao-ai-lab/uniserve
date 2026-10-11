@@ -505,9 +505,7 @@ impl EngineHandle {
         // Stop-string matching happens in the frontend decoder, which must
         // withhold acknowledgement until it has checked each token.
         let acknowledge_on_receive = match &request {
-            Request::Ar(request) | Request::Umm(request) | Request::BlockDiffusion(request) => {
-                request.stop_strings.is_empty()
-            }
+            Request::Generation(request) => request.stop_strings.is_empty(),
             Request::Diffusion(_) => false,
         };
         let (event_tx, event_rx) = event_channel_with_waker(

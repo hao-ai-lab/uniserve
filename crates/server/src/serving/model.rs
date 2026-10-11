@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use crate::config::EngineSettings;
 use crate::profile::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::omni::sensenova::SenseNovaProfile;
@@ -141,11 +140,10 @@ impl ModelConfig {
     /// Loads model facts and the tokenizer/template resources needed by preprocessing.
     ///
     /// A diffusers pipeline has no chat template and carries its conditioner's
-    /// vision processor geometry instead. The returned `max_model_tokens` is
-    /// always set: the configured `max_model_len`, else, for a root
-    /// configuration, its `max_position_embeddings` or
-    /// `EngineSettings::DEFAULT_MAX_MODEL_LEN`, and for a pipeline the model's
-    /// default prompt limit.
+    /// vision processor geometry instead. The returned `max_model_len` is the
+    /// configured one, else, for a root configuration, its
+    /// `max_position_embeddings` or `EngineSettings::DEFAULT_MAX_MODEL_LEN`,
+    /// and for a pipeline the model's default prompt limit.
     pub(crate) async fn load(
         config: &crate::Config,
     ) -> std::result::Result<LoadedModel, ModelResolutionError> {
@@ -189,7 +187,7 @@ impl ModelConfig {
 
         let files = ResolvedModelFiles::new(&config.model).await?;
         let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);
-        let mut model = Self::from_files(
+        let model = Self::from_files(
             &served_name,
             &config.model,
             &files,
@@ -207,13 +205,6 @@ impl ModelConfig {
             ))
             .into());
         }
-        model.max_model_tokens = Some(
-            config
-                .engine
-                .max_model_len
-                .or(model.max_model_tokens)
-                .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN),
-        );
         // DiffusionGemma's template renders each image part itself, as one
         // image token that preprocessing expands; the omni models replace
         // image parts before rendering.
@@ -240,15 +231,6 @@ impl ModelConfig {
             tokenizer,
             renderer: LoadedRenderer::Chat(Box::new(renderer)),
         })
-    }
-
-    /// Model's effective startup context ceiling.
-    ///
-    /// `InputProcessor::new` replaces the stored value with `WorkerCapabilities::max_model_tokens`,
-    /// so after binding this returns the served limit.
-    pub(crate) fn max_model_tokens(&self) -> u32 {
-        self.max_model_tokens
-            .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN)
     }
 
     /// Worker IPC slot capacity this model's messages require in each direction.
@@ -278,18 +260,6 @@ impl ModelConfig {
             ModelParameters::Qwen3
             | ModelParameters::MiniMaxH3
             | ModelParameters::DiffusionGemma(_) => None,
-        }
-    }
-
-    /// Execution family selected by the loaded model settings.
-    pub(crate) fn runtime_family(&self) -> uniserve_core::RuntimeFamily {
-        match self.parameters {
-            ModelParameters::Qwen3 => uniserve_core::RuntimeFamily::Ar,
-            ModelParameters::SenseNova(_) | ModelParameters::Bagel(_) => {
-                uniserve_core::RuntimeFamily::Umm
-            }
-            ModelParameters::MiniMaxH3 => uniserve_core::RuntimeFamily::Diffusion,
-            ModelParameters::DiffusionGemma(_) => uniserve_core::RuntimeFamily::BlockDiffusion,
         }
     }
 
@@ -338,32 +308,26 @@ impl ModelConfig {
 pub struct WorkerCapabilities {
     /// Runtime generation features and resource limits.
     pub limits: GenerationLimits,
-    /// Effective context ceiling after intersecting model and worker limits.
-    pub max_model_tokens: u32,
 }
 
 impl InputProcessor {
     /// Binds model resources to verified worker capabilities without rebuilding model data.
     ///
-    /// Replaces the model's context ceiling with `worker.max_model_tokens`. `renderer` is the
-    /// checkpoint's chat template, or the video service a video pipeline's denoiser handshake
-    /// built.
+    /// `renderer` is the checkpoint's chat template, or the video service a video pipeline's
+    /// denoiser handshake built.
     ///
     /// # Errors
     ///
     /// Returns `ServeError::ModelResolution` with `MissingFeature` when the worker limits do
     /// not cover the features the configured model needs.
     pub fn new(
-        mut config: ModelConfig,
+        config: ModelConfig,
         tokenizer: DynTokenizer,
         renderer: RequestRenderer,
         worker: WorkerCapabilities,
         parse_reasoning: bool,
     ) -> Result<Self> {
-        let WorkerCapabilities {
-            limits,
-            max_model_tokens,
-        } = worker;
+        let WorkerCapabilities { limits } = worker;
 
         let needs = match &config.parameters {
             ModelParameters::Qwen3 => GenerationFeatures::UNDERSTANDING,
@@ -388,9 +352,6 @@ impl InputProcessor {
             }
             _ => false,
         };
-        // Bind the actual worker ceilings once before sharing immutable model facts.
-        config.max_model_tokens = Some(max_model_tokens);
-
         Ok(Self {
             config,
             tokenizer,
@@ -434,7 +395,7 @@ impl InputProcessor {
     pub fn video_capabilities(&self) -> serde_json::Value {
         self.video_service()
             .map_or(serde_json::Value::Null, |video| {
-                video.capabilities(self.config.max_model_tokens())
+                video.capabilities(self.config.max_model_len)
             })
     }
 
@@ -460,7 +421,7 @@ impl InputProcessor {
         };
         crate::openai::utils::check_model_served(&request.model, self.served_model_name())?;
         video
-            .process(request_id, request, self.config.max_model_tokens())
+            .process(request_id, request, self.config.max_model_len)
             .await
     }
 
@@ -926,7 +887,7 @@ impl InputProcessor {
         let max_tokens = resolve_max_tokens(
             sampling.max_tokens,
             defaults.max_output_tokens,
-            Some(self.config.max_model_tokens()),
+            Some(self.config.max_model_len),
             prompt_len,
         )?;
         let min_tokens = sampling.min_tokens.unwrap_or(0);
@@ -1092,7 +1053,7 @@ mod tests {
         } = ModelConfig::load(&config(&directory)).await.unwrap();
 
         assert_eq!(model.description(), ModelDescription::DiffusionGemma);
-        assert_eq!(model.max_model_tokens, Some(262_144));
+        assert_eq!(model.max_model_len, 262_144);
         assert!(model.eos_token_ids.is_superset(&[1, 50, 106].into()));
         assert!(matches!(renderer, LoadedRenderer::Chat(_)));
         let ModelParameters::DiffusionGemma(profile) = &model.parameters else {
@@ -1109,10 +1070,6 @@ mod tests {
         );
         assert_eq!(profile.denoising.max_denoising_steps, 48);
         assert!(!profile.quantized);
-        assert_eq!(
-            model.runtime_family(),
-            uniserve_core::RuntimeFamily::BlockDiffusion
-        );
     }
 
     #[tokio::test]
@@ -1128,18 +1085,23 @@ mod tests {
         );
     }
 
-    /// Binds a DiffusionGemma checkpoint to a block-diffusion worker whose
-    /// context holds `max_model_tokens` tokens.
-    async fn diffusion_gemma_processor(
-        directory: &TempDir,
-        max_model_tokens: u32,
-    ) -> InputProcessor {
+    /// Binds a DiffusionGemma checkpoint whose context holds `max_model_len`
+    /// tokens to a block-diffusion worker.
+    async fn diffusion_gemma_processor(directory: &TempDir, max_model_len: u32) -> InputProcessor {
         let LoadedModel {
             config: model,
             tokenizer,
             renderer,
             ..
-        } = ModelConfig::load(&config(directory)).await.unwrap();
+        } = ModelConfig::load(&Config {
+            engine: crate::EngineSettings {
+                max_model_len: Some(max_model_len),
+                ..crate::EngineSettings::default()
+            },
+            ..config(directory)
+        })
+        .await
+        .unwrap();
         let LoadedRenderer::Chat(renderer) = renderer else {
             unreachable!("a DiffusionGemma checkpoint renders chat");
         };
@@ -1158,7 +1120,6 @@ mod tests {
                     encoder_cache_entries: u32::MAX,
                     ..Default::default()
                 },
-                max_model_tokens,
             },
             true,
         )

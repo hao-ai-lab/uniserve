@@ -30,7 +30,7 @@ use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode}
 
 use anyhow::Context as _;
 use uniserve_core::{
-    DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, Request, RequestId, RuntimeFamily,
+    DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, Request, RequestId,
     SamplingParams, UnitId,
 };
 use uniserve_engine::{
@@ -1544,7 +1544,6 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
     let mut config = EngineConfig::sim("stub");
-    config.runtime_family = RuntimeFamily::Ar;
     config.generation_limits = uniserve_core::GenerationLimits {
         features: uniserve_core::GenerationFeatures::UNDERSTANDING,
         latent_downsample: 1,
@@ -1620,7 +1619,6 @@ fn launched_workers_hold_a_request_row_per_running_request() -> anyhow::Result<(
     const RUNNING: usize = 200;
 
     let mut config = EngineConfig::sim("stub");
-    config.runtime_family = RuntimeFamily::Ar;
     config.generation_limits = uniserve_core::GenerationLimits {
         features: uniserve_core::GenerationFeatures::UNDERSTANDING,
         latent_downsample: 1,
@@ -1703,7 +1701,6 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
         .with_max_level(tracing::Level::ERROR)
         .try_init();
     let mut config = EngineConfig::sim("stub");
-    config.runtime_family = RuntimeFamily::Diffusion;
     config.generation_limits = uniserve_core::GenerationLimits {
         latent_downsample: 1,
         max_cfg_branches: 1,
