@@ -187,7 +187,7 @@ def _run(rank, rendezvous, directory, source):
         stream.wait(torch.cuda.current_stream(device))
         with (
             stream,
-            ExecutionContext(model, stream=stream, vsa="cute") as execution,
+            ExecutionContext(model, stream=stream, vsa="sm100") as execution,
         ):
             execution.prepare(layout)
             requirements = model.state_buffers(layout)

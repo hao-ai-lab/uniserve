@@ -3,25 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from functools import partial
 from importlib import import_module
 
 import torch
 
 from uniserve.nn.attention.vsa.inputs import BlockInput, Pattern
 
-from ._rows import _Rows
-
 
 class Operator:
-    """One numerical signature's plans, scratch and per-scale row producers.
+    """One numerical signature's plans and scratch.
 
     Serialized call sites may share an operator; block IDs remain live inputs.
     A concrete operator supplies ``kernel``, the numerical call
-    ``kernel(q, k, v, out, indices, counts, valid_sizes, scale=...)`` that
-    evaluates complete calls over the pattern's tiles (``Pattern.tile``
-    rows), and may supply a different ``row_kernel`` for row production,
-    which serves 64-row tiles.
+    ``kernel(q, k, v, out, block_indices, block_counts, valid_sizes,
+    scale=...)`` that evaluates complete calls over the pattern's tiles
+    (``Pattern.tile`` rows). K and V rows past a tile's valid size must be
+    finite.
     """
 
     kernel: Callable[..., object]
@@ -55,13 +52,6 @@ class Operator:
         # that every operator of the owning context shares; without it the
         # operator allocates its own.
         self.transient = transient
-        # Row producers own the query maps they plan, one per softmax scale.
-        self._rows: dict[float, _Rows] = {}
-
-    @property
-    def row_kernel(self) -> Callable[..., object]:
-        """Return the numerical call used for row production."""
-        return self.kernel
 
     def bind(self, batch: BlockInput) -> None:
         """Check a live batch against the prepared pattern before use."""
@@ -127,59 +117,9 @@ class Operator:
         )
         return out
 
-    def rows(
-        self,
-        q,
-        k,
-        v,
-        batch,
-        *,
-        gate,
-        compressed,
-        out,
-        owners,
-        chunk_tokens,
-        packed,
-        scale,
-    ):
-        """Return a producer of owner row intervals over one fine attention.
-
-        The first produced interval launches ``row_kernel`` over the complete
-        packed query domain; every interval then composes its own rows into
-        its transport destinations. ``out`` stays borrowed until the last
-        interval has been composed.
-
-        Raises:
-            ValueError: The pattern's tiles are not 64 rows, the tile the
-                row composition addresses.
-        """
-        self.bind(batch)
-        if self.pattern.tile != 64:
-            raise ValueError("VSA row production composes 64-row tiles")
-        producer = self._rows.get(scale)
-        if producer is None:
-            producer = self._rows[scale] = _Rows(
-                partial(self.row_kernel, scale=scale), self.transient
-            )
-        return producer.prepare(
-            q,
-            k,
-            v,
-            mask_block_indices=batch.block_indices,
-            mask_block_count=batch.block_counts,
-            valid_sizes=batch.valid_sizes,
-            gate=gate,
-            compressed=compressed,
-            attention_output=out,
-            owners=owners,
-            chunk_rows=chunk_tokens,
-            packed=packed,
-        )
-
     def close(self):
         """Release plans and borrowed workspace; the operator is not reused."""
         self._closed = True
-        self._rows.clear()
         self.workspace = {}
 
 
@@ -230,6 +170,10 @@ class Backend:
         )
 
 
+# Provider modules in the order ``"auto"`` probes them.
+_PROVIDERS = ("sm100", "flashinfer", "triton")
+
+
 def resolve(backend, *, device, tile):
     """Return the Backend for a name or instance that serves ``tile``.
 
@@ -247,7 +191,7 @@ def resolve(backend, *, device, tile):
     # Every provider runs CUDA kernels; other devices have none to probe.
     cuda = torch.device(device).type == "cuda"
     if backend == "auto":
-        for name in ("sm100", "flashinfer", "triton"):
+        for name in _PROVIDERS:
             candidate = import_module(f"{__name__}.{name}")
             if cuda and tile in candidate.TILES and candidate.available(device):
                 return candidate.Backend()
@@ -255,7 +199,7 @@ def resolve(backend, *, device, tile):
             f"no installed VSA backend serves {tile}-row tiles on {device}"
         )
 
-    if backend not in {"sm100", "cute", "flashinfer", "triton"}:
+    if backend not in _PROVIDERS:
         raise ValueError(f"unknown VSA backend {backend!r}")
     module = import_module(f"{__name__}.{backend}")
     if not cuda or tile not in module.TILES or not module.available(device):

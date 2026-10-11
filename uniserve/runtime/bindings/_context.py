@@ -137,7 +137,7 @@ class _ContextPlan:
             # The gather writes each owner's window in topology order, and
             # within a window the Ulysses members' tokens follow their own
             # order, so the map is built by walking owners then head fibers.
-            members = self.parallel.key_group.ranks
+            members = self.parallel.context_group.ranks
             owner_capacity = self.keys.capacity * layer.exchange.group.size
             # Walk owners in topology order, pairing each physical slot with
             # the logical token index it carries.

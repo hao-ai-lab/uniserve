@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard, cast
 
 from uniserve.diffusion import BlockGrid, FixedGrid, RungGrid, UniformGrid
 from uniserve.media import image
-from uniserve.nn.functional import Rounding
 from uniserve_models import qwen3_vl
 
 from . import audio_vae, video_vae
@@ -159,12 +158,7 @@ class TransformerConfig:
 
     ``output_heads`` is 1 for an ordinary DiT and the fine-grid interval
     count for a parallel-decoding (PDD) student, whose output projections
-    hold one head-major prediction per interval. ``rounding`` is the
-    elementwise recipe for the block epilogues (modulation, gated residuals,
-    Q/K rotation and SwiGLU gating): the base release and the ref2va
-    students are defined by references that round after every eager BF16
-    operation; the t2va students keep UniServe's single-rounding kernels,
-    with which their published results were served.
+    hold one head-major prediction per interval.
     """
 
     hidden_size: int = 5376
@@ -184,7 +178,6 @@ class TransformerConfig:
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
     output_heads: int = 1
-    rounding: Rounding = Rounding.STEPWISE
 
     def __post_init__(self) -> None:
         for name in (
@@ -218,8 +211,6 @@ class TransformerConfig:
                 raise ValueError(
                     f"H3 transformer {name} must be finite and positive"
                 )
-        if not isinstance(self.rounding, Rounding):
-            raise ValueError("H3 transformer rounding must be a Rounding")
         # Each of the three rotary axes (time, height, width) rotates
         # 2 * rope_frequency_dim channels of a head; the rest stay unrotated.
         if (
@@ -251,11 +242,9 @@ class SparseAttention:
     """Video sparse attention over ``tile``-row spatiotemporal tiles.
 
     Each video query tile keeps ``ceil((1 - sparsity) n)`` of the ``n`` key
-    tiles of the generated video. Without ``reference_keep`` the generated
-    video is the only selected segment, packed in 64-row tiles
-    (``packing.TilePacking``, the t2va students). With it, every reference
-    video is a segment of its own, of which a query keeps the fraction
-    ``reference_keep`` (``packing.SegmentPacking``, the ref2va students).
+    tiles of the generated video. Every reference video is a segment of its
+    own, of which a query keeps the fraction ``reference_keep``; a network
+    without reference videos states none (``packing.SegmentPacking``).
     """
 
     tile: int
@@ -283,8 +272,6 @@ class SparseAttention:
             raise ValueError("H3 VSA sparsity must lie in [0, 1)")
         if self.reference_keep is not None and not 0 < self.reference_keep <= 1:
             raise ValueError("H3 reference keep rate must lie in (0, 1]")
-        if self.reference_keep is None and self.tile != 64:
-            raise ValueError("single-segment H3 sparse attention tiles 64 rows")
 
 
 Attention: TypeAlias = DenseAttention | SparseAttention
@@ -495,9 +482,7 @@ def _fasth3_grids(
     return _modality_grids(grid, shifts)
 
 
-def _transformer(
-    values: Mapping[str, Any], *, heads: int, rounding: Rounding
-) -> TransformerConfig:
+def _transformer(values: Mapping[str, Any], *, heads: int) -> TransformerConfig:
     missing = set(TRANSFORMER_FIELDS) - values.keys()
     if missing:
         raise ValueError(
@@ -512,7 +497,6 @@ def _transformer(
         )
     return TransformerConfig(
         output_heads=heads,
-        rounding=rounding,
         **{
             target: values[source]
             for source, target in TRANSFORMER_FIELDS.items()
@@ -692,16 +676,7 @@ def normalize(
             if contract is None
             else _fasth3_attention(contract)
         )
-        # Single-segment VSA normalizes and rotates Q/K in its fused input
-        # preparation, which rounds once.
-        transformer = _transformer(
-            values,
-            heads=heads,
-            rounding=Rounding.ONCE
-            if isinstance(attention, SparseAttention)
-            and attention.reference_keep is None
-            else Rounding.STEPWISE,
-        )
+        transformer = _transformer(values, heads=heads)
         if contract is None:
             grids = _modality_grids(
                 partial(UniformGrid, UNIFORM_GRID_POINTS), shifts

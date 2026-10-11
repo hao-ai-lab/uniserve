@@ -12,7 +12,6 @@ import torch
 
 from uniserve.diffusion import BlockGrid, RungGrid, UniformGrid
 from uniserve.loading import Config as IOConfig
-from uniserve.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     DenseAttention,
     Model,
@@ -78,8 +77,6 @@ def test_t2va_fasth3_resolves_its_trained_rungs(checkpoint):
         (480, 640),
         (480, 832),
     ]
-    # Single-segment sparse attention keeps the single-rounding epilogues.
-    assert denoiser.transformer.rounding is Rounding.ONCE
 
 
 def test_base_release_serves_both_task_families(base):
@@ -98,8 +95,7 @@ def test_base_release_serves_both_task_families(base):
         }
         assert denoiser.canvases is None
         # The released DiTs follow the diffusers eager BF16 arithmetic.
-        assert denoiser.transformer.rounding is Rounding.STEPWISE
-    points = entry_points(config)
+        points = entry_points(config)
     assert {"transformer", "transformer_ref"} <= set(points)
     with torch.device("meta"):
         model = Model(config)
@@ -145,9 +141,6 @@ def test_ref2va_fasth3_branches_from_the_reference_partition(checkpoint):
     )
     assert denoiser.tasks == ("ref2va",)
     assert denoiser.canvases is None
-    # Reference-segment sparse attention follows the reference's eager BF16
-    # arithmetic.
-    assert denoiser.transformer.rounding is Rounding.STEPWISE
 
 
 def test_parallel_decoding_blocks_must_cover_the_heads(checkpoint):
