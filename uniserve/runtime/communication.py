@@ -30,9 +30,6 @@ class StreamCollectives(Protocol):
     def start_all_gather(
         self, output: torch.Tensor, value: torch.Tensor
     ) -> Any: ...
-    def start_all_to_all(
-        self, output: torch.Tensor, value: torch.Tensor
-    ) -> Any: ...
     def all_to_all(
         self,
         output: torch.Tensor,
@@ -138,18 +135,6 @@ def start_all_gather(
             work = dist.all_gather_into_tensor(
                 output, input, group=group, async_op=True
             )
-    return Transfer(work, input.device)
-
-
-def start_all_to_all(
-    output: torch.Tensor, input: torch.Tensor, group
-) -> Transfer:
-    """Publish an equal-split exchange in backend member order."""
-    bound = stream_collectives(group.group_name)
-    if bound is not None:
-        work = bound.start_all_to_all(output, input)
-    else:
-        work = dist.all_to_all_single(output, input, group=group, async_op=True)
     return Transfer(work, input.device)
 
 

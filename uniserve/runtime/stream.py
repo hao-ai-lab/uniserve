@@ -21,8 +21,8 @@ class CUDAStream:
     Ingress/output event slots are reused in submission order on the worker.
 
     The stream also owns its :attr:`communication`: the communicators that
-    enqueue collectives on it, their registered windows and the storage behind
-    them. Execution contexts on the stream borrow these resources, and
+    enqueue collectives on it and the transport buffers its gathers borrow.
+    Execution contexts on the stream borrow these resources, and
     :meth:`close` retires them collectively with the stream.
     """
 
@@ -66,7 +66,7 @@ class CUDAStream:
         """Own the resources bound to an existing full-device PyTorch stream.
 
         The PyTorch stream remains its creator's; closing this owner retires
-        the communicators, windows and storage bound to the stream.
+        the communicators and gather pools bound to the stream.
         """
         return cls(device=stream.device, stream=stream, event_slots=event_slots)
 

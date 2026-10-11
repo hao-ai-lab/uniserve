@@ -142,8 +142,8 @@ class ExecutionContext(Generic[SizeT]):
     tensor stored in the physical row order that kernel reads.
 
     ``stream`` is a borrowed :class:`CUDAStream`. Its communication owner
-    holds the communicators, registered windows and window storage every
-    context on the stream shares; this context never retires them.
+    holds the communicators and gather pools every context on the stream
+    shares; this context never retires them.
     ``scratch``, when given, is a borrowed :class:`Scratch` whose other
     borrowers run on the same stream; the caller closes it after every
     borrower retires. Without it the context owns a private one.
@@ -832,7 +832,7 @@ class ExecutionContext(Generic[SizeT]):
             ):
                 values.clear()
             self._allocations.clear()
-            # Communicators and registered windows outlive this context: they
+            # Communicators and gather pools outlive this context: they
             # belong to its stream, and a later context on the same stream
             # reuses them rather than issuing a bootstrap its peers have no
             # reason to join.
