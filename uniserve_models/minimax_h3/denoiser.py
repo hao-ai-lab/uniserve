@@ -124,9 +124,7 @@ def modulation_timesteps(
     exactly those of every occurrence.
     """
     groups = timestep_groups(config)
-    values = {
-        name: grid.endpoints("cpu") for name, grid in config.grids.items()
-    }
+    values = {name: grid.schedule("cpu") for name, grid in config.grids.items()}
     video, audio = (values[name].timesteps for name in ("video", "audio"))
     steps = []
     for index in range(values["video"].num_steps):
@@ -1201,7 +1199,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 )
         video = patchify_video(noise["video"][0])[0]
         starts = (
-            self.make_schedules(None, shift=None, device="cpu")
+            self.make_schedules(device="cpu")
             if isinstance(self.config.grids["video"], BlockGrid)
             else None
         )

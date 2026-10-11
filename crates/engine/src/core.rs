@@ -792,6 +792,7 @@ impl EngineCore {
                 max_num_seqs: config.max_num_seqs.max(1),
                 long_prefill_threshold: config.long_prefill_threshold.max(1),
                 policy: config.scheduler_policy,
+                canvas: config.worker_process.canvas_sampling,
                 ..Default::default()
             },
             config.worker_process.model_dtype,

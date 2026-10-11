@@ -169,13 +169,12 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
         code: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
-            max_latent_bytes: 8192,
             ..Bounds::default()
         },
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut encode = Batch::new(3, Vec::new(), vec![encode]);
     encode.collective_seq = 3;
@@ -607,7 +606,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
 
         let copy = TensorRef {
@@ -647,7 +646,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         // Reads partial results until the submitted batch is done, requiring
         // every call to succeed and never to complete twice.
@@ -825,7 +824,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     assert_eq!(outputs[&verify_id].kv_computed_len, 5);
     assert_eq!(outputs[&resumed_id].committed_tokens, vec![1002]);
     assert_eq!(outputs[&resumed_id].kv_visible_len, 4);
-    assert_eq!(outputs[&resumed_id].position, 4);
     executor.close()?;
     Ok(())
 }
@@ -906,7 +904,6 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         DiffusionSamplingParams {
             num_frames: 22,
             video_units: 1,
-            num_inference_steps: 4,
             seed: 1000,
             width: 1344,
             height: 768,
@@ -959,7 +956,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         inputs: vec![],
         outputs: vec![value.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut source = Batch::new(1, vec![admission], vec![produce]);
     source.buffer_allocations.push(BufferAllocation {
@@ -1005,7 +1002,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         inputs: vec![value.clone()],
         outputs: vec![copied.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut consumer = Batch::new(2, vec![], vec![consume]);
     consumer.buffer_allocations.push(BufferAllocation {
@@ -1231,7 +1228,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
         inputs: vec![value.clone()],
         outputs: vec![copied.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut refused = Batch::new(2, vec![admission], vec![consume]);
     refused.buffer_allocations.push(BufferAllocation {
@@ -1693,7 +1690,6 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
                 sampling: DiffusionSamplingParams {
                     num_frames: 22,
                     video_units: 3,
-                    num_inference_steps: 4,
                     seed: index as u64,
                     width: 1344,
                     height: 768,
@@ -1827,7 +1823,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     continuation.calls[0].bounds.max_completion_bytes = 4 + 2 * 12;
     let continued = execute(&mut executor, continuation)?;
     assert_eq!(continued.results[0].output.status, CallStatus::Ok);
-    assert_eq!(continued.results[0].output.position, 3);
+    assert_eq!(continued.results[0].output.kv_visible_len, 3);
     assert!(continued.results[0].output.sampled_logprob.is_some());
     assert_eq!(
         continued.results[0].output.top_logprobs[0].token_id,
@@ -1968,7 +1964,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut publish = Batch::new(10, Vec::new(), vec![call]);
     publish.collective_seq = 6;
@@ -2326,7 +2322,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         inputs: vec![input.clone()],
         outputs: vec![output.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut batch = Batch::new(3, vec![admission], vec![call]);
     batch.buffer_allocations = [(&input, 0), (&output, 256)]
@@ -2553,7 +2549,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let publish = Batch::new(6, Vec::new(), vec![publish]);
 
@@ -2598,7 +2594,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     executor.submit(bind(
         Batch::new(7, vec![admission.clone()], vec![transfer]),
@@ -2646,13 +2642,12 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         code: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
-            max_latent_bytes: 8192,
             ..Bounds::default()
         },
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut encode = Batch::new(8, Vec::new(), vec![encode]);
     encode
@@ -2776,13 +2771,12 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: feature.max_bytes(),
-            max_latent_bytes: feature.max_bytes(),
             ..Bounds::default()
         },
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut retained = Batch::new(15, vec![next], vec![retained]);
     // The source product lives at offset zero on encoder-1. Its destination
@@ -3221,18 +3215,17 @@ fn text_admission(
             negative_token_ids: Vec::new(),
             finish_token_ids: Vec::new(),
             initial_position: 0,
-            canvas: None,
         }),
         None,
         0,
     )?)
 }
 
-/// The coordinates a call entering after `output` executes at, as the engine
-/// derives them from the completion it observed.
+/// The coordinates a call entering after `output` executes at, for a request
+/// whose completions advance its logical position with its visible KV.
 fn coordinates_after(output: &uniserve_worker_ipc::RequestOutput) -> CallCoordinates {
     CallCoordinates {
-        logical_position: output.position,
+        logical_position: output.kv_visible_len,
         kv_visible_len: output.kv_visible_len,
         kv_computed_len: output.kv_computed_len,
         flow_step: output.num_completed_steps,
@@ -3312,7 +3305,7 @@ fn token_batch(
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let input_length = tokens.len() as u32;
     let mut batch = Batch::new(batch_id, admission.into_iter().collect(), vec![call]);

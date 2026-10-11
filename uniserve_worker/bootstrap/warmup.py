@@ -1112,15 +1112,15 @@ def _warmup_canvas(requests: _WarmupRequests) -> None:
     """Exercise the canvas steps and block commits of a generating denoiser.
 
     Admits one request per row of the largest sampler chunk
-    (``CanvasRunner.step_rows``) with the served canvas sampling, prefills
-    one prompt token each, runs one canvas step over each row count up to a
-    whole chunk, and commits one canvas-length block. A step splits its
-    rows into whole chunks and one remainder, so these are all the chunk
-    shapes a step can run: the sampler kernels load and its
-    self-conditioning product chooses each shape's algorithm, and the
-    canvas pass's attention and expert kernels and the commit's prefill
-    kernels are chosen, before any request arrives. Returns without running
-    when the worker already holds requests. Drops its requests afterwards.
+    (``CanvasRunner.step_rows``), prefills one prompt token each, runs one
+    canvas step over each row count up to a whole chunk, and commits one
+    canvas-length block. A step splits its rows into whole chunks and one
+    remainder, so these are all the chunk shapes a step can run: the
+    sampler kernels load and its self-conditioning product chooses each
+    shape's algorithm, and the canvas pass's attention and expert kernels
+    and the commit's prefill kernels are chosen, before any request arrives.
+    Returns without running when the worker already holds requests. Drops
+    its requests afterwards.
     """
     from uniserve.sampling import SamplingParams
     from uniserve_worker.protocol.batch import GenerationParams, NewRequest
@@ -1143,14 +1143,11 @@ def _warmup_canvas(requests: _WarmupRequests) -> None:
     length = slots.canvas_length
     request_ids = tuple(range(1, runner.step_rows + 1))
     keys = {sid: RequestKey(0, sid, 1) for sid in request_ids}
-    sampling = slots.served
     admissions = tuple(
         NewRequest(
             keys[sid],
             request_pool_idx=sid,
-            generation=GenerationParams(
-                sampling=SamplingParams(seed=sid), canvas=sampling
-            ),
+            generation=GenerationParams(sampling=SamplingParams(seed=sid)),
         )
         for sid in request_ids
     )
@@ -1202,7 +1199,7 @@ def _warmup_canvas(requests: _WarmupRequests) -> None:
             calls.append(step(sid, CallId(batch, index), block, number))
             progress[sid] = (
                 (block + 1, 0)
-                if number + 1 == sampling.max_steps
+                if number + 1 == slots.constants.steps
                 else (block, number + 1)
             )
         _execute_warmup(
@@ -1247,8 +1244,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         Bounds,
         Call,
         CallCoordinates,
-        DrawLayout,
-        Rng,
     )
     from uniserve_worker.protocol.tensor import (
         DeviceDim,
@@ -1406,18 +1401,11 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                     call_id=call_id,
                     coordinates=CallCoordinates(),
                     kind=MediaCall.LATENT_PREPARATION,
-                    bounds=Bounds(
-                        max_tokens=1,
-                        max_latent_bytes=max_latent_elements * 2,
-                    ),
+                    bounds=Bounds(max_tokens=1),
                     kv_input=conditioning,
                     latent_output=initial_latent,
                     completion_output=ready,
-                    rng=Rng(
-                        seed=0,
-                        semantic_index_base=1,
-                        draw_layout=DrawLayout.FLOW_NOISE,
-                    ),
+                    image_index=1,
                 )
             )
 
@@ -1460,10 +1448,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                         call_id=call_id,
                         coordinates=CallCoordinates(flow_step=quantum),
                         kind=MediaCall.DENOISING,
-                        bounds=Bounds(
-                            max_tokens=1,
-                            max_latent_bytes=max_latent_elements * 2,
-                        ),
+                        bounds=Bounds(max_tokens=1),
                         kv_input=conditioning,
                         latent_input=current,
                         latent_output=output,

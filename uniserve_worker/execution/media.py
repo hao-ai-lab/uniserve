@@ -101,10 +101,7 @@ def video_shape(runner: ModelExecutor, admission: NewRequest):
     except ValueError as error:
         raise invalid_descriptor(str(error)) from error
 
-    if (
-        media.video_units != len(windows)
-        or media.num_inference_steps != builder.num_steps
-    ):
+    if media.video_units != len(windows):
         raise invalid_descriptor("video request has invalid computation bounds")
     return size
 
@@ -720,9 +717,9 @@ def open_state(runner: ModelExecutor, size) -> DiffusionState:
     return DiffusionState.open(
         builder.denoiser,
         size,
-        steps=builder.num_steps,
-        shift=None,
-        device=runner.worker_config.device,
+        schedules=builder.denoiser.make_schedules(
+            device=runner.worker_config.device
+        ),
     )
 
 
@@ -1014,10 +1011,7 @@ def execute(
         # Only the call that completes denoising may declare products, and
         # it publishes the step's result, the final samples.
         if call.outputs:
-            if (
-                calls.require_progress(request).flow_step
-                != media.num_inference_steps
-            ):
+            if calls.require_progress(request).flow_step != builder.num_steps:
                 raise invalid_descriptor(
                     "final latent products require completed denoising"
                 )
@@ -1141,7 +1135,6 @@ def execute(
     # denoising step keeps the ``flow_step`` it advanced above.
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
     return request
 

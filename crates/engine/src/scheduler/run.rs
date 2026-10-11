@@ -253,6 +253,21 @@ impl Scheduler {
             config.max_batch = config.max_batch.min(max_batch_calls.max(1));
         }
 
+        // A canvas step and a block commit each spend a whole canvas of one
+        // scheduling step's token budget, so the deployment's canvas must
+        // fit it.
+        if let Some(canvas) = config.canvas {
+            if let Some(parameter) = canvas.invalid_parameter() {
+                anyhow::bail!("block-diffusion sampling parameter `{parameter}` is out of range");
+            }
+            anyhow::ensure!(
+                canvas.canvas_length as usize <= config.max_num_batched_tokens,
+                "a {}-token generation canvas exceeds the {}-token step budget",
+                canvas.canvas_length,
+                config.max_num_batched_tokens
+            );
+        }
+
         // Storage and scheduler statistics share the resolved worker capacities.
         let cache = KVCacheManager::from_worker_info(&info);
         let stats = Arc::new(SchedulerStats::default());

@@ -5,7 +5,8 @@
 //! soft-token run ([`ControlTokens::expand_images`]), and the engine writes
 //! the image's vision features where that run stands ([`engine_images`]).
 //! The reply is generated in canvases of the checkpoint's `canvas_length`
-//! tokens under the server's block-diffusion sampling ([`canvas_sampling`]),
+//! tokens under the deployment's block-diffusion sampling
+//! ([`canvas_sampling`]), which the engine and its workers are launched with,
 //! and Gemma-4 parsers split its thought channel and tool calls
 //! ([`Gemma4ChatOutputProcessor`]). Token-sampling controls have no meaning
 //! for a denoised canvas, so a request that sets one is refused
@@ -66,9 +67,10 @@ pub(crate) fn engine_images(
     (prompt, inputs)
 }
 
-/// Returns the block-diffusion sampling of every canvas the server
+/// Returns the block-diffusion sampling of every canvas the deployment
 /// generates: the checkpoint's canvas length under its sampler defaults, as
-/// the server's configuration overrides them.
+/// the server's configuration overrides them. The engine and the workers are
+/// launched with it; requests do not carry it.
 pub(crate) fn canvas_sampling(profile: &DiffusionGemmaProfile) -> CanvasSampling {
     let denoising = &profile.denoising;
     CanvasSampling {
@@ -238,7 +240,6 @@ impl InputProcessor {
                 .seed
                 .unwrap_or_else(|| uuid::Uuid::new_v4().as_u64_pair().0),
         );
-        generation.canvas = Some(canvas_sampling(profile));
         decode.skip_special_tokens = chat.decode_options.skip_special_tokens;
         Ok(OutputProcessorPolicy::Chat(ChatOutputProcessor::Gemma4(
             processor,
@@ -339,6 +340,7 @@ mod tests {
             },
             quantized: false,
         };
+        let sampling = super::canvas_sampling(&profile);
         let model = ModelConfig {
             served_name: "sim-model".to_string(),
             parameters: ModelParameters::DiffusionGemma(profile),
@@ -350,7 +352,9 @@ mod tests {
 
         let mut worker = SimEngine::new();
         worker.set_text_len(TEXT_LEN);
+        worker.set_canvas_sampling(sampling);
         let mut config = EngineConfig::sim("sim-model");
+        config.worker_process.canvas_sampling = Some(sampling);
         config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
         let client = Arc::new(
             EngineClient::connect_with_executor(config, Box::new(SimExecutor::new(worker)))

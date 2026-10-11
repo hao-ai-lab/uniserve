@@ -3,10 +3,10 @@
 A ``Grid`` declares where one modality's trajectory evaluates the network:
 the points of a checkpoint's trained or released grid, or the step count a
 request chooses, and the shift that maps them to noise levels.
-``Grid.schedule`` materializes the declaration, with the request parameters
-it admits, as the ``Schedule`` endpoints a trajectory steps through. Each
-grid is evaluated on the host by fixed precision rules, so a schedule does
-not depend on the device that holds it.
+``schedule`` materializes the declaration, with the request parameters a
+``LinearGrid`` admits, as the ``Schedule`` endpoints a trajectory steps
+through. Each grid is evaluated on the host by fixed precision rules, so a
+schedule does not depend on the device that holds it.
 """
 
 import math
@@ -81,31 +81,15 @@ class Schedule:
 class Grid(ABC):
     """Where one modality's trajectory evaluates the network.
 
-    A denoiser declares one grid per modality. A request may choose the
-    step count, the shift, both or neither, as the grid admits;
-    ``schedule`` validates those choices and builds the endpoints.
+    A denoiser declares one grid per modality. A ``FixedGrid`` is the
+    checkpoint's own; a ``LinearGrid`` leaves the step count and the shift
+    to each request.
     """
 
     @property
     @abstractmethod
     def num_steps(self) -> int | None:
         """Network evaluations of the grid, None when requests choose them."""
-
-    @abstractmethod
-    def schedule(
-        self,
-        *,
-        steps: int | None = None,
-        shift: float | None = None,
-        device: torch.device | str,
-    ) -> Schedule:
-        """Build the schedule of a request's ``steps`` and ``shift``.
-
-        None leaves a parameter to the grid.
-
-        Raises:
-            ValueError: The grid does not admit the requested parameters.
-        """
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +121,21 @@ class LinearGrid(Grid):
     def num_steps(self) -> None:
         return None
 
-    def schedule(self, *, steps=None, shift=None, device) -> Schedule:
+    def schedule(
+        self,
+        *,
+        steps: int,
+        shift: float | None = None,
+        device: torch.device | str,
+    ) -> Schedule:
+        """Build the schedule of a request's ``steps`` and ``shift``.
+
+        None leaves the shift to the grid.
+
+        Raises:
+            ValueError: ``steps`` is not positive or the shift is not finite
+                and positive.
+        """
         if type(steps) is not int or steps < 1:
             raise ValueError("a linear grid needs a positive step count")
         shift = self.shift if shift is None else shift
@@ -174,8 +172,7 @@ class LinearGrid(Grid):
 class FixedGrid(Grid):
     """A checkpoint's own grid, which requests cannot change.
 
-    A request may restate the step count but not choose another, and may
-    not choose a shift; ``shift`` is the trained one.
+    The grid fixes the step count and ``shift`` is the trained one.
     """
 
     shift: float
@@ -184,16 +181,8 @@ class FixedGrid(Grid):
     @abstractmethod
     def num_steps(self) -> int: ...
 
-    def schedule(self, *, steps=None, shift=None, device) -> Schedule:
-        if shift is not None or steps not in (None, self.num_steps):
-            raise ValueError(
-                f"the checkpoint's grid evaluates the network {self.num_steps} "
-                "times at its trained shift"
-            )
-        return self.endpoints(device)
-
     @abstractmethod
-    def endpoints(self, device: torch.device | str) -> Schedule:
+    def schedule(self, device: torch.device | str) -> Schedule:
         """Build the grid's schedule on ``device``."""
 
 
@@ -221,7 +210,7 @@ class UniformGrid(FixedGrid):
     def num_steps(self) -> int:
         return self._sigmas().numel() - 1
 
-    def endpoints(self, device) -> Schedule:
+    def schedule(self, device) -> Schedule:
         sigmas = self._sigmas()
         timesteps = 1.0 - sigmas
         return Schedule(
@@ -277,7 +266,7 @@ class RungGrid(FixedGrid):
     def num_steps(self) -> int:
         return len(self.rungs)
 
-    def endpoints(self, device) -> Schedule:
+    def schedule(self, device) -> Schedule:
         sigmas = tuple(
             _shifted(rung / self.clock, self.shift) for rung in (*self.rungs, 0)
         )
@@ -366,7 +355,7 @@ class BlockGrid(FixedGrid):
         weights = self.weights[self.nodes[block] : self.nodes[block + 1]]
         return weights / weights.sum()
 
-    def endpoints(self, device) -> Schedule:
+    def schedule(self, device) -> Schedule:
         nodes = self._fine()[
             torch.tensor(self.nodes, dtype=torch.long, device="cpu")
         ]

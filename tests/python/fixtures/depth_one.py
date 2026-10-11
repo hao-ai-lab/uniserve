@@ -39,11 +39,9 @@ from uniserve_worker.protocol.call import (
     Call,
     CallCoordinates,
     CallStatus,
-    DrawLayout,
     ForwardMode,
     ImageParams,
     MediaCall,
-    Rng,
     TransferMode,
     VisionInput,
 )
@@ -429,8 +427,20 @@ def observe_completions(worker: object, report: BatchOutput) -> None:
             if entry is not None:
                 ledger[record.request_key] = entry
             continue
+        # The engine holds the request's logical position itself: the call
+        # advanced it with the KV it accepted.
+        entered = submitted.get((record.request_key, record.call_id))
+        advanced = (
+            record.kv_visible_len - entered.kv_visible_len
+            if entered is not None
+            else 0
+        )
         ledger[record.request_key] = CallCoordinates(
-            logical_position=record.position,
+            logical_position=(
+                entered.logical_position + advanced
+                if entered is not None
+                else record.kv_visible_len
+            ),
             kv_visible_len=record.kv_visible_len,
             kv_computed_len=record.kv_computed_len,
             flow_step=record.num_completed_steps,
@@ -738,7 +748,6 @@ def token_call(
     block_table_delta: Sequence[int] = (),
     predicate: TensorRef | None = None,
     logprobs: bool = False,
-    rng: Rng | None = None,
 ) -> Call:
     """Build a token computation with its actual model input IDs."""
     block_table = _BLOCK_TABLES.setdefault(rk, [])
@@ -777,13 +786,11 @@ def token_call(
         kind=mode,
         bounds=Bounds(
             max_tokens=max(1, len(tokens)),
-            max_kv_units=len(added),
             max_completion_bytes=((1 << 16) - 1 if logprobs else 0),
         ),
         input_token_ids=tuple(int(value) for value in tokens),
         token_output=token_output,
         predicate=predicate,
-        rng=rng,
     )
     return call
 
@@ -824,7 +831,7 @@ def encode_call(
         # that encodes images from its own component names that component,
         # while one that encodes from its language backbone names "model".
         component=component,
-        bounds=Bounds(max_tokens=64, max_latent_bytes=8_192),
+        bounds=Bounds(max_tokens=64),
         input_image=image_base64,
         image_input=source_product,
         encoder_output=output_ref,
@@ -838,7 +845,6 @@ def diffusion_prepare_call(
     call_id: CallId,
     predecessor: CallId,
     conditioning: BufferId,
-    seed: int = 29,
     image_index: int = 1,
 ) -> tuple[Call, TensorRef]:
     image = _IMAGE_PARAMS[rk]
@@ -867,15 +873,11 @@ def diffusion_prepare_call(
         call_id=call_id,
         coordinates=CallCoordinates(),
         kind=MediaCall.LATENT_PREPARATION,
-        bounds=Bounds(max_tokens=1, max_latent_bytes=latent.max_bytes),
+        bounds=Bounds(max_tokens=1),
         kv_input=conditioning,
         latent_output=latent,
         completion_output=ready,
-        rng=Rng(
-            seed=int(seed),
-            semantic_index_base=int(image_index),
-            draw_layout=DrawLayout.FLOW_NOISE,
-        ),
+        image_index=int(image_index),
     )
     _LATENT_STEPS[latent] = 0
     return call, latent
@@ -905,7 +907,7 @@ def diffusion_step_call(
         call_id=call_id,
         coordinates=CallCoordinates(),
         kind=MediaCall.DENOISING,
-        bounds=Bounds(max_tokens=int(steps), max_latent_bytes=output.max_bytes),
+        bounds=Bounds(max_tokens=int(steps)),
         kv_input=conditioning,
         latent_input=latent,
         latent_output=output,
@@ -963,7 +965,6 @@ def diffusion_finalize_call(
         coordinates=CallCoordinates(),
         kind=MediaCall.IMAGE_DECODING,
         bounds=Bounds(
-            max_latent_bytes=(3 * 16 * 16 * 2 if feedback_source else 0),
             max_completion_bytes=65_536,
         ),
         latent_input=latent,

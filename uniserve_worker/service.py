@@ -26,7 +26,6 @@ from uniserve_worker.errors import WorkerError, classify
 from uniserve_worker.execution.executor import Submission
 from uniserve_worker.profiling import record_failure, worker_range_name
 from uniserve_worker.protocol import messages
-from uniserve_worker.protocol.batch import Batch
 from uniserve_worker.protocol.worker_info import RequestKind, ResponseKind
 
 if TYPE_CHECKING:
@@ -254,15 +253,8 @@ class Service:
                 )
                 submission = None
             else:
-                raw_batch = messages.required(request, "batch", kind)
-                # The IPC extension delivers a constructed `Batch`; a plain
-                # mapping is decoded and validated here.
-                with profile_range("uniserve.worker.batch_decode"):
-                    batch = (
-                        raw_batch
-                        if isinstance(raw_batch, Batch)
-                        else Batch.from_mapping(raw_batch)
-                    )
+                # The IPC extension delivers a constructed `Batch`.
+                batch = messages.required(request, "batch", kind)
                 submission = self.worker.submit(batch)
                 response = messages.response(ResponseKind.RESULT)
             self._pending.append(

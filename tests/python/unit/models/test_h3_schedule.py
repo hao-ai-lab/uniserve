@@ -14,7 +14,7 @@ pytestmark = pytest.mark.unit
 def test_fixed_modality_endpoints():
     with torch.device("meta"):
         model = Denoiser(dmd_denoiser())
-    schedules = model.make_schedules(4, shift=None, device="cpu")
+    schedules = model.make_schedules(device="cpu")
     assert tuple(schedules) == ("video", "audio")
     for name, shift in (("video", 12.0), ("audio", 3.0)):
         # Each rung is an unshifted noise level on the 1000-step clock,
@@ -37,21 +37,11 @@ def test_fixed_modality_endpoints():
         assert schedules[name].num_steps == 4
 
 
-@pytest.mark.parametrize(
-    "steps,shift", [(1, None), (2, None), (3, None), (5, None), (4, 1.0)]
-)
-def test_rejects_untrained_schedule(steps, shift):
-    with torch.device("meta"):
-        model = Denoiser(dmd_denoiser())
-    with pytest.raises(ValueError, match="evaluates the network 4 times"):
-        model.make_schedules(steps, shift=shift, device="cpu")
-
-
 def test_released_grid_matches_the_reference_scheduler():
     """The full-step schedule is the diffusers scheduler's, bit for bit."""
     with torch.device("meta"):
         model = Denoiser(base_denoiser())
-    schedules = model.make_schedules(49, shift=None, device="cpu")
+    schedules = model.make_schedules(device="cpu")
     for name, shift in (("video", 12.0), ("audio", 3.0)):
         reference = MiniMaxH3Scheduler(shift=shift)
         reference.set_timesteps(50, device="cpu")

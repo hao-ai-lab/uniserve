@@ -231,47 +231,23 @@ impl CallKind {
 
 /// Hard resource maxima the scheduler reserves before a call runs.
 ///
-/// [`Call::validate`] checks `max_tokens` against `input_token_ids` and
-/// `max_latent_bytes` against encoder, latent, and image outputs;
+/// [`Call::validate`] checks `max_tokens` against `input_token_ids`;
 /// [`Batch::validate`] checks `max_transfer_bytes` against installed KV
-/// inputs. Neither checks `max_kv_units` or `max_completion_bytes`.
+/// inputs. Neither checks `max_completion_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Bounds {
     /// Maximum tokens the call may process or produce.
     pub max_tokens: u32,
     /// Paged-KV units newly allocated to the request's tables and first
-    /// declared to workers by this call.
+    /// declared to workers by this call. The engine's own accounting: it is
+    /// not on the wire, since a worker learns the units from the batch's
+    /// `new_cache_units`, and a decoded call states zero.
+    #[serde(skip)]
     pub max_kv_units: u32,
-    /// Maximum latent storage in bytes.
-    pub max_latent_bytes: u64,
     /// Maximum host-visible completion data in bytes.
     pub max_completion_bytes: u64,
     /// Maximum cross-call transfer data in bytes.
     pub max_transfer_bytes: u64,
-}
-
-/// How the common sampler consumes deterministic random draws.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum DrawLayout {
-    /// One draw used to sample a target token.
-    TargetSampling = 0,
-    /// Draw sequence used to propose speculative tokens.
-    SpeculativeProposal = 1,
-    /// Draw sequence used to generate diffusion noise.
-    FlowNoise = 2,
-}
-
-/// Deterministic random-draw coordinates for one call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Rng {
-    /// Request-level random seed.
-    pub seed: u64,
-    /// First semantic draw index assigned to the call.
-    pub semantic_index_base: u64,
-    /// Mapping from semantic work to deterministic draws.
-    pub draw_layout: DrawLayout,
 }
 
 /// Branch-local token processor inputs for one sampling call.
@@ -344,13 +320,14 @@ impl CallCoordinates {
 
 /// One denoising step of a block-diffusion request's resident canvas.
 ///
-/// The request's admitted `ArRequestParams::canvas` fixes the sampling; the
-/// worker holds the canvas, its self-conditioning input and its stopping
-/// history in the request's slot. `block` counts the blocks already
-/// committed to the request's context and `step` the steps already run on
-/// this canvas; step zero starts the canvas from random tokens. The step
-/// that stops the canvas, by convergence or by reaching the admitted step
-/// limit, reports the canvas's argmax tokens as its committed tokens.
+/// The worker's launch configuration fixes the sampling, and the request's
+/// admitted `SamplingParams::seed` its draws; the worker holds the canvas,
+/// its self-conditioning input and its stopping history in the request's
+/// slot. `block` counts the blocks already committed to the request's
+/// context and `step` the steps already run on this canvas; step zero
+/// starts the canvas from random tokens. The step that stops the canvas, by
+/// convergence or by reaching the sampling's step limit, reports the
+/// canvas's argmax tokens as its committed tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CanvasStep {
     /// Blocks committed to the request's context before this canvas.
@@ -492,8 +469,11 @@ pub struct Call {
     /// Device predicate that enables execution: a U8 flag or a packed I64
     /// continuation scalar. A false predicate yields [`CallStatus::Predicated`].
     pub predicate: Option<TensorRef>,
-    /// Deterministic sampling coordinates.
-    pub rng: Option<Rng>,
+    /// Index of the image a latent preparation initializes: positive, and
+    /// assigned by the engine, which alone knows how many images the request
+    /// generates. The worker derives the image's noise seed from its own
+    /// admitted image seed and this index.
+    pub image_index: Option<u32>,
     /// Host-side sampler constraints for this computation; absent uses admission defaults.
     pub sampling_state: Option<SamplingState>,
     /// Host-known prompt, draft, or decode input tokens in model input order,
@@ -603,8 +583,8 @@ impl Call {
     /// Checks identity, component, coordinates, the token bound, canonical
     /// sampling-state sets, the encoded-image source, KV publication
     /// identities, product ownership, generations, output indices, dtypes and
-    /// byte bounds, cross-request inputs, and the predicate. `rng` is not
-    /// checked. Relationships to other calls and to the batch's allocation
+    /// cross-request inputs, the predicate, and a positive image index.
+    /// Relationships to other calls and to the batch's allocation
     /// tables belong to [`Batch::validate`].
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish call identity, component, coordinates, and token capacity.
@@ -729,17 +709,6 @@ impl Call {
             );
         }
 
-        for output in self
-            .encoder_output
-            .iter()
-            .chain(self.latent_output.iter())
-            .chain(self.image_output.iter())
-        {
-            ensure_valid!(
-                output.max_bytes() <= self.bounds.max_latent_bytes,
-                "image or trajectory output exceeds its declared byte capacity"
-            );
-        }
         if let Some(input) = &self.token_input {
             ensure_valid!(
                 self.code == CallKind::Transfer(TransferMode::Tensor),
@@ -898,8 +867,6 @@ pub struct RequestOutput {
     pub call_id: CallId,
     /// Terminal execution status.
     pub status: CallStatus,
-    /// Allocation generations for products emitted by the call.
-    pub product_generations: Vec<u32>,
     /// Error classification when `status` is [`CallStatus::Error`].
     pub error_code: Option<ErrorCode>,
     /// Why the worker refused the request, exactly when `error_code` is
@@ -908,10 +875,6 @@ pub struct RequestOutput {
     pub error_message: Option<String>,
     /// Worker timing measurements for the call.
     pub timing_counters: TimingCounters,
-    /// Kind that produced this result; must match the submitted call.
-    pub code: CallKind,
-    /// Model position for the next input, including image-feedback position advances.
-    pub position: u32,
     /// Accepted KV prefix available to a successor.
     pub kv_visible_len: u32,
     /// KV extent initialized by execution, including rejected speculative positions.
@@ -938,7 +901,13 @@ pub struct RequestOutput {
 }
 
 impl RequestOutput {
-    /// Validates completion identity, status, accepted lengths, and product generations.
+    /// Validates completion identity, status, accepted lengths, and the
+    /// ownership of a KV publication.
+    ///
+    /// Rules that relate a completion to the kind of the call it answers
+    /// are the caller's, which holds the call: a KV publication answers a
+    /// successful KV-publish call, and candidate log-probabilities a
+    /// successful token-denoising call.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.call_id.batch_id > 0,
@@ -948,7 +917,6 @@ impl RequestOutput {
             publication.validate()?;
             ensure_valid!(
                 self.status == CallStatus::Ok
-                    && self.code == CallKind::Transfer(TransferMode::KvPublish)
                     && publication.source.owner == self.request_key
                     && publication.source.producer_call_id == self.call_id,
                 "KV publication does not belong to its successful completion"
@@ -974,14 +942,12 @@ impl RequestOutput {
             "a refused request's completion, and only one, states why"
         );
         ensure_valid!(
-            self.candidate_logprobs.is_empty()
-                || (self.status == CallStatus::Ok
-                    && self.code == CallKind::Forward(ForwardMode::TokenDenoising)),
-            "candidate log-probabilities belong to a successful token-denoising completion"
+            self.candidate_logprobs.is_empty() || self.status == CallStatus::Ok,
+            "candidate log-probabilities belong to a successful completion"
         );
         if self.status == CallStatus::Predicated {
             ensure_valid!(
-                self.committed_tokens.as_slice().is_empty() && self.product_generations.is_empty(),
+                self.committed_tokens.as_slice().is_empty(),
                 "a predicated completion must select its parent without semantic output"
             );
             ensure_valid!(
@@ -1087,12 +1053,9 @@ pub struct ArRequestParams {
     pub finish_token_ids: Vec<u32>,
     /// Logical position assigned to the first request token.
     pub initial_position: u32,
-    /// Block-diffusion sampling of a request that generates its text in
-    /// canvases; its seed is `sampling.seed`.
-    pub canvas: Option<CanvasSampling>,
 }
 
-pub use uniserve_core::{CanvasSampling, DiffusionSamplingParams};
+pub use uniserve_core::DiffusionSamplingParams;
 
 /// What a video request admits besides its sampling controls.
 ///
@@ -1219,8 +1182,7 @@ impl NewRequest {
                     && diffusion.video_units > 0
                     && diffusion.height > 0
                     && diffusion.width > 0
-                    && self.prompt_token_ids.len() <= u32::MAX as usize
-                    && diffusion.num_inference_steps > 0,
+                    && self.prompt_token_ids.len() <= u32::MAX as usize,
                 "diffusion parameters are invalid"
             );
         }

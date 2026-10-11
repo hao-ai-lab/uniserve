@@ -127,10 +127,6 @@ def commit_batch(
                     raise invalid_descriptor(
                         "KV publication exceeds its transfer-byte bound"
                     )
-                # Called only for its check, which raises when the descriptor
-                # exceeds ``MAX_TRANSFER_HANDLE_BYTES`` or names an unknown
-                # transport.
-                outcome.kv_output.encoded_size_bound()
 
             # The bound covers score values and prompt-position counts; framing
             # is owned by the single IPC result message, not by stored products.
@@ -443,18 +439,14 @@ def _validate_completion_products(
 ) -> None:
     """Require each completion product to be declared by its call.
 
-    Raises ``invalid_descriptor`` for an undeclared product, and for a
-    product whose locators exceed ``MAX_TRANSFER_HANDLE_BYTES`` or name an
-    unknown transport.
+    Raises ``invalid_descriptor`` for an undeclared product.
     """
     declared = {output: output for output in call.tensor_outputs()}
     for product in products:
-        reference = declared.get(product.product)
-        if reference is None:
+        if product.product not in declared:
             raise invalid_descriptor(
                 "completion carries a product not declared by its call"
             )
-        product.encoded_size_bound()
 
 
 def _publish_predicates(

@@ -9,7 +9,14 @@ from typing import Any, Generic, Protocol, TypeVar, cast
 import torch
 from torch import nn
 
-from uniserve.diffusion import FixedGrid, Grid, NoiseScale, Schedule, Solver
+from uniserve.diffusion import (
+    FixedGrid,
+    Grid,
+    LinearGrid,
+    NoiseScale,
+    Schedule,
+    Solver,
+)
 from uniserve.distributed import DeviceMesh
 from uniserve.media import image, video
 from uniserve.nn.functional import patchify
@@ -104,7 +111,11 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
     With explicit solver, evaluation grids and mathematical partitioning.
     ``grids`` declares each modality's ``Grid``; every modality's trajectory
     evaluates the network equally often, so the grids either all fix the
-    same step count or all leave it to requests.
+    same step count or all leave it to requests. A denoiser whose grids are
+    fixed builds its schedules from the checkpoint alone
+    (``VideoDenoiser.make_schedules``); one whose requests choose the step
+    count and shift builds them from those choices
+    (``ImageDenoiser.make_schedules``).
     """
 
     def __init__(
@@ -161,28 +172,6 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
     def num_steps(self) -> int | None:
         """Network evaluations of a trajectory, None when requests choose."""
         return next(iter(self.grids.values())).num_steps
-
-    def make_schedules(
-        self,
-        steps: int | None,
-        *,
-        shift: float | None,
-        device: torch.device | str,
-    ) -> Mapping[str, Schedule]:
-        """Build every modality's schedule for a request.
-
-        ``steps`` and ``shift`` are the request's choices, None leaving a
-        parameter to the grids (``Grid.schedule``).
-
-        Raises:
-            ValueError: A grid does not admit the requested parameters.
-        """
-        return {
-            name: self.grids[name].schedule(
-                steps=steps, shift=shift, device=device
-            )
-            for name in self.modalities
-        }
 
     def layout_size(self, size: SizeT) -> SizeT:
         """Return the smallest layout that holds ``size``.
@@ -266,6 +255,16 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         super().__init__(**options)
         if any(not isinstance(grid, FixedGrid) for grid in self.grids.values()):
             raise ValueError("a video denoiser evaluates its fixed grids")
+
+    def make_schedules(
+        self, *, device: torch.device | str
+    ) -> Mapping[str, Schedule]:
+        """Build every modality's schedule from the checkpoint's grids."""
+        # ``__init__`` admits only fixed grids.
+        return {
+            name: cast(FixedGrid, self.grids[name]).schedule(device)
+            for name in self.modalities
+        }
 
     @property
     def canvases(self) -> tuple[image.Config, ...]:
@@ -487,7 +486,7 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
         noise_scale: NoiseScale,
         prediction_dtype: torch.dtype,
         solver: Solver,
-        grid: Grid,
+        grid: LinearGrid,
     ):
         super().__init__(
             modalities=("image",),
@@ -509,6 +508,19 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
             downsample,
         )
         self.noise_scale = noise_scale
+
+    def make_schedules(
+        self, steps: int, *, shift: float | None, device: torch.device | str
+    ) -> Mapping[str, Schedule]:
+        """Build the image schedule of a request's ``steps`` and ``shift``.
+
+        None leaves the shift to the grid.
+
+        Raises:
+            ValueError: The grid does not admit the requested parameters.
+        """
+        grid = cast(LinearGrid, self.grids["image"])
+        return {"image": grid.schedule(steps=steps, shift=shift, device=device)}
 
     def latent_shape(
         self, modality: str, size: image.Config

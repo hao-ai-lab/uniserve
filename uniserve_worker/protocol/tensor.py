@@ -20,7 +20,6 @@ from typing import TypeAlias
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import identity
 from uniserve_worker.protocol.validation import (
-    _enum,
     _map,
     _seq,
     _str,
@@ -304,29 +303,6 @@ class TensorRef:
         to be at least this large.
         """
         return self.shape_bound.max_elements * self.dtype.element_bytes
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "tensor_ref"
-    ) -> TensorRef:
-        """Parse and validate a typed logical product and its storage bounds."""
-        data = _map(value, where)
-        return cls(
-            request_key=identity.RequestKey.from_mapping(
-                data.get("request_key"), f"{where}.request_key"
-            ),
-            producer_call_id=identity.CallId.from_mapping(
-                data.get("producer_call_id"), f"{where}.producer_call_id"
-            ),
-            output_index=_uint(
-                data.get("output_index"), f"{where}.output_index"
-            ),
-            generation=_uint(data.get("generation"), f"{where}.generation"),
-            dtype=_enum(DType, data.get("dtype"), f"{where}.dtype"),
-            shape_bound=ShapeBound.from_mapping(
-                data.get("shape_bound"), f"{where}.shape_bound"
-            ),
-        )
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize the complete logical product description for IPC."""

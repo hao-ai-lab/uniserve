@@ -89,12 +89,12 @@ use crate::storage::{
     BufferPool, BufferSpan, KVCacheManager, LatentPages, LatentPool, RequestPool, RequestSlot,
 };
 use crossbeam_channel::Receiver;
+use uniserve_core::RequestId;
 use uniserve_core::{
-    ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest, MediaKind,
-    PositionLogprobs, Request, SharedMedia, TokenLogprob,
+    ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest,
+    GenerationRequestError, MediaKind, PositionLogprobs, Request, SharedMedia, TokenLogprob,
 };
 use uniserve_core::{ImageIngestStep, RejectionKind, UnitId, encoder_cache_key};
-use uniserve_core::RequestId;
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,

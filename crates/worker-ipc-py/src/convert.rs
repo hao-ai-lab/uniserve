@@ -23,8 +23,8 @@
 //! The encoder constructs many records positionally, so its argument order is
 //! coupled to the field order of the Python dataclasses in
 //! `uniserve_worker.protocol` and to the parameters of `batch_from_validated`.
-//! The round-trip test at the bottom of this file checks that each native
-//! batch equals `Batch.from_mapping(batch.to_mapping())`.
+//! The round-trip test at the bottom of this file reads the fields of each
+//! native batch back by name.
 //!
 //! Decoding is strict: integers reject Python `bool`, strings must be `str`,
 //! byte payloads must be `bytes`, and sequences must be `list` (except the
@@ -45,10 +45,10 @@ use uniserve_core::{
 use uniserve_worker_ipc::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
     BufferAllocation, BufferId, CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType,
-    DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCallIdentity, ErrorCode,
-    FeatureKind, FinishFlags, ForwardStats, KvGroupTransfer, KvTransfer, LatentParams, Locator,
-    MediaOutput, NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication,
-    TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
+    DecodeRange, DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode, FeatureKind,
+    FinishFlags, ForwardStats, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaOutput,
+    NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication, TensorRef,
+    TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
     WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
@@ -96,7 +96,6 @@ struct RequestTypes {
     device_dim: Py<PyAny>,
     bounds: Py<PyAny>,
     call_coordinates: Py<PyAny>,
-    rng: Py<PyAny>,
     sampling_state: Py<PyAny>,
     readout: Py<PyAny>,
     canvas_step: Py<PyAny>,
@@ -108,7 +107,6 @@ struct RequestTypes {
     free: Py<PyAny>,
     batch_from_validated: Py<PyAny>,
     dtypes: [Py<PyAny>; 7],
-    draw_layouts: [Py<PyAny>; 3],
     forward_modes: [Py<PyAny>; ForwardMode::ALL.len()],
     media_calls: [Py<PyAny>; MediaCall::ALL.len()],
     transfer_modes: [Py<PyAny>; TransferMode::ALL.len()],
@@ -158,7 +156,6 @@ impl RequestTypes {
         records.insert("BufferAllocation", class(&module, "BufferAllocation")?);
         records.insert("NewRequest", class(&module, "NewRequest")?);
         records.insert("GenerationParams", class(&module, "GenerationParams")?);
-        records.insert("CanvasSampling", class(&module, "CanvasSampling")?);
         records.insert("DiffusionParams", class(&module, "DiffusionParams")?);
         records.insert("TensorPublication", class(&module, "TensorPublication")?);
         let module = py.import("uniserve_worker.protocol.video")?;
@@ -213,7 +210,6 @@ impl RequestTypes {
             device_dim: class(&tensor, "DeviceDim")?,
             bounds: class(&call, "Bounds")?,
             call_coordinates: class(&call, "CallCoordinates")?,
-            rng: class(&call, "Rng")?,
             sampling_state: class(&call, "SamplingState")?,
             readout: class(&call, "Readout")?,
             canvas_step: class(&call, "CanvasStep")?,
@@ -228,20 +224,14 @@ impl RequestTypes {
                 "batch_from_validated",
             )?,
 
-            // The `dtypes` and `draw_layouts` spellings sit at the indices that
-            // `dtype` and the draw-layout match in `RequestConversion::call`
-            // hardcode (the Rust discriminant values). `kind` indexes the other
-            // three with `as usize`, which relies on each `ALL` array listing
+            // The `dtypes` spellings sit at the indices that `dtype` hardcodes
+            // (the Rust discriminant values). `kind` indexes the other three
+            // with `as usize`, which relies on each `ALL` array listing
             // variants in declaration order.
             dtypes: enum_members(
                 &tensor,
                 "DType",
                 ["u8", "i32", "i64", "f16", "bf16", "f32", "i16"],
-            )?,
-            draw_layouts: enum_members(
-                &call,
-                "DrawLayout",
-                ["target_sampling", "speculative_proposal", "flow_noise"],
             )?,
             forward_modes: enum_members(
                 &call,
@@ -436,8 +426,6 @@ impl<'py> RequestConversion<'py> {
         ))?;
         let bounds = self.types.bounds.bind(self.py).call1((
             call.bounds.max_tokens,
-            call.bounds.max_kv_units,
-            call.bounds.max_latent_bytes,
             call.bounds.max_completion_bytes,
             call.bounds.max_transfer_bytes,
         ))?;
@@ -459,24 +447,6 @@ impl<'py> RequestConversion<'py> {
             .as_ref()
             .map(|predicate| self.tensor_ref(predicate))
             .transpose()?;
-        let rng = call
-            .rng
-            .as_ref()
-            .map(|rng| {
-                // Indices follow the `draw_layouts` order in `RequestTypes::build`.
-                let layout = match rng.draw_layout {
-                    DrawLayout::TargetSampling => 0,
-                    DrawLayout::SpeculativeProposal => 1,
-                    DrawLayout::FlowNoise => 2,
-                };
-                self.types.rng.bind(self.py).call1((
-                    rng.seed,
-                    rng.semantic_index_base,
-                    self.types.draw_layouts[layout].bind(self.py).clone(),
-                ))
-            })
-            .transpose()?;
-
         let py = self.py;
         let sampling_state = call
             .sampling_state
@@ -593,8 +563,7 @@ impl<'py> RequestConversion<'py> {
                 predicate
                     .map(Bound::into_any)
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                rng.map(Bound::into_any)
-                    .unwrap_or_else(|| py.None().into_bound(py)),
+                call.image_index.into_pyobject(py)?.into_any(),
                 sampling_state
                     .map(Bound::into_any)
                     .unwrap_or_else(|| py.None().into_bound(py)),
@@ -1020,36 +989,7 @@ fn ar_params_to_py<'py>(py: Python<'py>, ar: &ArRequestParams) -> PyResult<Bound
         u32_tuple(py, &ar.finish_token_ids)?,
     )?;
     dict.set_item(intern!(py, "initial_position"), ar.initial_position)?;
-    dict.set_item(
-        intern!(py, "canvas"),
-        ar.canvas
-            .as_ref()
-            .map(|canvas| canvas_sampling_to_py(py, canvas))
-            .transpose()?,
-    )?;
     construct(py, "GenerationParams", &dict)
-}
-
-/// Converts block-diffusion sampling parameters into the worker's record.
-fn canvas_sampling_to_py<'py>(
-    py: Python<'py>,
-    canvas: &uniserve_worker_ipc::CanvasSampling,
-) -> PyResult<Bound<'py, PyAny>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "canvas_length"), canvas.canvas_length)?;
-    dict.set_item(intern!(py, "max_steps"), canvas.max_steps)?;
-    dict.set_item(intern!(py, "entropy_bound"), canvas.entropy_bound)?;
-    dict.set_item(intern!(py, "t_min"), canvas.t_min)?;
-    dict.set_item(intern!(py, "t_max"), canvas.t_max)?;
-    dict.set_item(
-        intern!(py, "confidence_threshold"),
-        canvas.confidence_threshold,
-    )?;
-    dict.set_item(
-        intern!(py, "stability_threshold"),
-        canvas.stability_threshold,
-    )?;
-    construct(py, "CanvasSampling", &dict)
 }
 
 /// Converts diffusion admission parameters and resolved media geometry.
@@ -1060,10 +1000,6 @@ fn diffusion_params_to_py<'py>(
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "num_frames"), diffusion.num_frames)?;
     dict.set_item(intern!(py, "video_units"), diffusion.video_units)?;
-    dict.set_item(
-        intern!(py, "num_inference_steps"),
-        diffusion.num_inference_steps,
-    )?;
     dict.set_item(intern!(py, "seed"), diffusion.seed)?;
     dict.set_item(intern!(py, "width"), diffusion.width)?;
     dict.set_item(intern!(py, "height"), diffusion.height)?;
@@ -1154,12 +1090,10 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
         intern!(py, "negative_prompt"),
         image.negative_prompt.as_str(),
     )?;
-    dict.set_item(intern!(py, "max_images"), image.max_images)?;
     dict.set_item(
         intern!(py, "image_prompts"),
         PyTuple::new(py, image.image_prompts.iter().map(|prompt| prompt.as_str()))?,
     )?;
-    dict.set_item(intern!(py, "retain_images"), image.retain_images)?;
     construct(py, "ImageParams", &dict)
 }
 
@@ -1664,20 +1598,12 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
         call_id: computation_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
         status,
-        product_generations: u32_vec(&get(dict, intern!(py, "product_generations"))?)?,
         error_code,
         error_message: match get(dict, intern!(py, "error_message")) {
             Some(value) if !value.is_none() => Some(string_of(&value)?),
             _ => None,
         },
         timing_counters,
-        code: {
-            let name = string_of(&get(dict, intern!(py, "code"))?)?;
-            CallKind::ALL
-                .into_iter()
-                .find(|code| code.as_str() == name)?
-        },
-        position: u32_of(&get(dict, intern!(py, "position"))?)?,
         kv_visible_len: u32_of(&get(dict, intern!(py, "kv_visible_len"))?)?,
         kv_computed_len: u32_of(&get(dict, intern!(py, "kv_computed_len"))?)?,
         num_completed_steps: u32_of(&get(dict, intern!(py, "num_completed_steps"))?)?,
@@ -2265,7 +2191,6 @@ mod tests {
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
-                canvas: None,
             }),
             None,
             2,
@@ -2313,13 +2238,12 @@ mod tests {
             code: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,
-                max_kv_units: 1,
                 ..Bounds::default()
             },
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         let block_tables = vec![BlockTable {
             request_pool_idx: 1,
@@ -2349,7 +2273,6 @@ mod tests {
             DiffusionSamplingParams {
                 num_frames: 22,
                 video_units: 3,
-                num_inference_steps: 4,
                 seed: 29,
                 width: 1344,
                 height: 768,
@@ -2393,7 +2316,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         let latent_params = vec![LatentParams {
             request_key: media_key,
@@ -2449,7 +2372,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         // A token-denoising readout of two canvas rows of two tokens over a
         // request that already holds its prompt.
@@ -2534,12 +2457,9 @@ mod tests {
                 request_key,
                 call_id: CallId::new(13, 0),
                 status: CallStatus::Ok,
-                product_generations: vec![5],
                 error_code: None,
                 error_message: None,
                 timing_counters: TimingCounters::default(),
-                code: CallKind::Forward(ForwardMode::Decode),
-                position: 2,
                 kv_visible_len: 2,
                 num_completed_steps: 0,
                 kv_computed_len: 2,
@@ -2560,12 +2480,10 @@ mod tests {
         let mut publication = result.completions[0].clone();
         publication.request_key = RequestKey::new(1, RequestId(4), 1);
         publication.call_id = CallId::new(13, 1);
-        publication.code = CallKind::Transfer(TransferMode::KvPublish);
         publication.committed_tokens.clear();
         publication.sampled_logprob = None;
         publication.top_logprobs.clear();
         publication.prompt_logprobs.clear();
-        publication.product_generations.clear();
         publication.kv_output = Some(kv_publication(BufferId {
             owner: publication.request_key,
             producer_call_id: publication.call_id,
@@ -2576,12 +2494,10 @@ mod tests {
         let mut readout = result.completions[0].clone();
         readout.request_key = RequestKey::new(1, RequestId(5), 1);
         readout.call_id = CallId::new(13, 2);
-        readout.code = CallKind::Forward(ForwardMode::TokenDenoising);
         readout.committed_tokens.clear();
         readout.sampled_logprob = None;
         readout.top_logprobs.clear();
         readout.prompt_logprobs.clear();
-        readout.product_generations.clear();
         readout.candidate_logprobs = vec![-0.5, -2.25, -9.0];
         result.completions.push(publication);
         result.completions.push(readout);
@@ -2605,11 +2521,30 @@ mod tests {
         pythonize(py, &response).unwrap()
     }
 
+    /// Reads `path` from a Python record: attribute names separated by dots,
+    /// where a number indexes a sequence.
+    fn field<'py>(record: &Bound<'py, PyAny>, path: &str) -> Bound<'py, PyAny> {
+        path.split('.').fold(record.clone(), |value, segment| {
+            match segment.parse::<usize>() {
+                Ok(index) => value.get_item(index).unwrap(),
+                Err(_) => value.getattr(segment).unwrap(),
+            }
+        })
+    }
+
+    /// Reads the unsigned integers at `paths` of a Python record.
+    fn uints(record: &Bound<'_, PyAny>, paths: &[&str]) -> Vec<u64> {
+        paths
+            .iter()
+            .map(|path| field(record, path).extract::<u64>().unwrap())
+            .collect()
+    }
+
     /// Drives the four submit requests through a real `PyServer` and back.
     ///
-    /// Each natively constructed batch must equal what the Python codec
-    /// decodes from its own mapping, and the reply to the KV batch must decode
-    /// in Rust to `result_response()`.
+    /// Each natively constructed batch must hold the submitted values under
+    /// the Python records' field names, and the reply to the KV batch must
+    /// decode in Rust to `result_response()`.
     #[test]
     fn native_execute_and_result_round_trip_preserves_values() {
         Python::initialize();
@@ -2666,12 +2601,6 @@ mod tests {
                     .call_method1("insert", (0, source.to_str().unwrap()))
                     .unwrap();
             }
-            let canonical = py
-                .import("uniserve_worker.protocol.batch")
-                .unwrap()
-                .getattr("Batch")
-                .unwrap();
-
             for (index, request) in requests.iter().enumerate() {
                 let native_request = server.recv(py).unwrap();
                 let request_dict = native_request.bind(py).cast::<PyDict>().unwrap();
@@ -2689,25 +2618,105 @@ mod tests {
                 );
                 assert_eq!(native_batch.getattr("calls").unwrap().len().unwrap(), 1);
 
-                // The natively constructed batch must be exactly what the
-                // canonical codec decodes from its own IPC form.
-                let round_tripped = canonical
-                    .call_method1(
-                        "from_mapping",
-                        (native_batch.call_method0("to_mapping").unwrap(),),
-                    )
-                    .unwrap();
-                assert!(
-                    round_tripped.eq(&native_batch).unwrap(),
-                    "native batch construction diverged from the canonical codec"
+                // Records built positionally hold each submitted value under
+                // its own field name.
+                let call = native_batch.getattr("calls").unwrap().get_item(0).unwrap();
+                let submitted = &batch.calls[0];
+                assert_eq!(
+                    uints(
+                        &call,
+                        &[
+                            "request_key.engine_id",
+                            "request_key.request_id",
+                            "request_key.request_epoch",
+                            "call_id.batch_id",
+                            "call_id.request_index",
+                        ],
+                    ),
+                    [
+                        submitted.request_key.engine_id,
+                        submitted.request_key.request_id.0,
+                        submitted.request_key.request_epoch,
+                        submitted.call_id.batch_id,
+                        u64::from(submitted.call_id.request_index),
+                    ]
+                );
+                assert_eq!(
+                    field(&call, "kind.value").extract::<String>().unwrap(),
+                    submitted.code.as_str()
+                );
+                assert_eq!(
+                    field(&call, "component").extract::<String>().unwrap(),
+                    submitted.component
+                );
+                assert_eq!(
+                    uints(
+                        &call,
+                        &[
+                            "bounds.max_tokens",
+                            "bounds.max_completion_bytes",
+                            "bounds.max_transfer_bytes",
+                        ],
+                    ),
+                    [
+                        u64::from(submitted.bounds.max_tokens),
+                        submitted.bounds.max_completion_bytes,
+                        submitted.bounds.max_transfer_bytes,
+                    ]
+                );
+                for (column, expected) in [
+                    ("forward_call_indices", &batch.forward.call_indices),
+                    ("request_pool_indices", &batch.forward.request_pool_indices),
+                    ("seq_lens", &batch.forward.seq_lens),
+                    ("query_lens", &batch.forward.query_lens),
+                ] {
+                    assert_eq!(
+                        &field(&native_batch, column).extract::<Vec<u32>>().unwrap(),
+                        expected
+                    );
+                }
+                assert_eq!(
+                    field(&native_batch, "write_kv")
+                        .extract::<Vec<bool>>()
+                        .unwrap(),
+                    batch.forward.write_kv
                 );
 
-                let call = native_batch.getattr("calls").unwrap().get_item(0).unwrap();
                 match index {
                     // The token call carries host-staged inputs and the
                     // sampling state the worker reads per call; its
                     // admission carries the request's input image count.
                     0 => {
+                        assert_eq!(
+                            uints(
+                                &native_batch,
+                                &[
+                                    "block_tables.0.request_pool_idx",
+                                    "block_tables.0.group_id",
+                                    "block_tables.0.start_page",
+                                    "block_tables.0.unit_ids.0",
+                                    "block_tables.0.allocated_tokens",
+                                    "new_cache_units.0.request_pool_idx",
+                                    "new_cache_units.0.group_id",
+                                    "new_cache_units.0.unit_ids.0",
+                                    "admissions.0.request_pool_idx",
+                                    "calls.0.token_output.output_index",
+                                    "calls.0.token_output.generation",
+                                ],
+                            ),
+                            [1, 0, 0, 1, 2, 1, 0, 1, 1, 0, 5]
+                        );
+                        assert!(
+                            field(&native_batch, "admissions.0.generation.sampling.ignore_eos")
+                                .extract::<bool>()
+                                .unwrap()
+                        );
+                        assert_eq!(
+                            field(&call, "token_output.dtype.value")
+                                .extract::<String>()
+                                .unwrap(),
+                            "i64"
+                        );
                         assert_eq!(
                             native_batch
                                 .getattr("admissions")
@@ -2785,6 +2794,47 @@ mod tests {
                                 .extract::<Vec<u32>>()
                                 .unwrap(),
                             vec![17, 23, 65_537]
+                        );
+                        assert_eq!(
+                            uints(
+                                &media,
+                                &[
+                                    "request_pool_idx",
+                                    "diffusion.num_frames",
+                                    "diffusion.video_units",
+                                    "diffusion.seed",
+                                    "diffusion.width",
+                                    "diffusion.height",
+                                ],
+                            ),
+                            [2, 22, 3, 29, 1344, 768]
+                        );
+                        assert_eq!(
+                            field(&media, "video.task.value")
+                                .extract::<String>()
+                                .unwrap(),
+                            "t2va"
+                        );
+                        assert_eq!(
+                            field(&media, "video.text_tags")
+                                .extract::<Vec<u32>>()
+                                .unwrap(),
+                            vec![1; 3]
+                        );
+                        assert_eq!(
+                            uints(
+                                &native_batch,
+                                &[
+                                    "latent_params.0.call_id.batch_id",
+                                    "latent_params.0.page_table.0",
+                                    "latent_params.0.latent_units",
+                                    "latent_params.0.height",
+                                    "latent_params.0.width",
+                                    "latent_params.0.start_step",
+                                    "latent_params.0.step_count",
+                                ],
+                            ),
+                            [12, 1, 64, 768, 1344, 0, 0]
                         );
                         server
                             .respond(py, &acknowledgement(py, batch.batch_id))

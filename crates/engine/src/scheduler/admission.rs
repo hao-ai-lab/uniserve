@@ -71,21 +71,23 @@ impl Scheduler {
             });
             return;
         }
-        // A canvas step and a block commit each spend a whole canvas of one
-        // scheduling step's token budget.
-        if let Some(canvas) = req
-            .canvas
-            .as_ref()
-            .filter(|canvas| canvas.canvas_length as usize > self.config.max_num_batched_tokens)
-        {
-            let _ = event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: format!(
-                    "a {}-token generation canvas exceeds the {}-token step budget",
-                    canvas.canvas_length, self.config.max_num_batched_tokens
-                ),
-            });
-            return;
+        // A request the deployment generates in canvases generates text only
+        // and names the seed its draws follow.
+        if self.config.canvas.is_some() && !req.is_readout() {
+            let error = if req.generates_images() {
+                Some(GenerationRequestError::CanvasGeneratesTextOnly)
+            } else if req.sampling.seed.is_none() {
+                Some(GenerationRequestError::UnseededCanvas)
+            } else {
+                None
+            };
+            if let Some(error) = error {
+                let _ = event_tx.send(EngineCoreOutput::Rejected {
+                    kind: RejectionKind::Invalid,
+                    message: format!("invalid generation request: {error:?}"),
+                });
+                return;
+            }
         }
         if let Some(feature) = self.missing_required_feature(&req) {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
@@ -407,9 +409,8 @@ impl Scheduler {
     ///
     /// Rejects with `RejectionKind::Invalid` when the request fails
     /// validation; the worker reports no muxing component or no video
-    /// denoiser; the denoiser does not serve the request's task; the request's
-    /// inference-step count differs from the loaded model's; its call graph
-    /// cannot be built; or `media_outputs` cannot bound its products. A
+    /// denoiser; the denoiser does not serve the request's task; its call
+    /// graph cannot be built; or `media_outputs` cannot bound its products. A
     /// served task's calls all have components: the executor checked them at
     /// startup. Rejects with `RejectionKind::Overloaded` when the waiting
     /// bound is reached. A rejection's send result is ignored.
@@ -458,13 +459,6 @@ impl Scheduler {
                     "the deployment's denoiser does not serve {}",
                     request.task.as_str()
                 ),
-            );
-            return;
-        }
-        if request.sampling.num_inference_steps != self.info.num_inference_steps {
-            reject(
-                RejectionKind::Invalid,
-                "request prediction count disagrees with the loaded model".to_string(),
             );
             return;
         }
@@ -571,6 +565,18 @@ impl Scheduler {
             let Some(submission) = self.waiting_media.pop_front() else {
                 break;
             };
+            // The denoiser's fixed schedule sets every request's step count;
+            // submission refused requests while the worker reports none.
+            let Some(steps) = self
+                .info
+                .video_denoiser
+                .as_ref()
+                .map(|video| video.denoise_steps())
+            else {
+                self.waiting_media.push_front(submission);
+                self.invariant_broken("a queued media request has a video denoiser");
+                break;
+            };
             let id = submission.request.request_id;
             let request_epoch = self.next_request_epoch;
             let request_key = RequestKey::new(self.engine_id, id, request_epoch);
@@ -639,7 +645,6 @@ impl Scheduler {
             }
             self.next_request_epoch = self.next_request_epoch.saturating_add(1);
             let root = CallId::new(0, 0);
-            let steps = submission.request.sampling.num_inference_steps;
             let mut state = MediaFlowState {
                 request: submission.request,
                 graph: submission.graph,
@@ -715,9 +720,14 @@ impl Scheduler {
         &self,
         request: &GenerationRequest,
     ) -> Option<uniserve_core::GenerationFeatures> {
-        self.generation_limits
-            .covers(request.required_features())
-            .err()
+        // A block-diffusion runtime generates every request it does not read
+        // out in canvases.
+        let features = if self.config.canvas.is_some() && !request.is_readout() {
+            request.canvas_features()
+        } else {
+            request.required_features()
+        };
+        self.generation_limits.covers(features).err()
     }
 
     /// Returns whether the worker tracks image-latent capacity.

@@ -227,7 +227,6 @@ class WorkerInfo:
     # handles.
     fabric_handles: bool = False
     media_components: dict[MediaCall, str] = field(default_factory=dict)
-    num_inference_steps: int = 0
     # What the deployment's video denoiser serves; ``None`` without one.
     video_denoiser: VideoDenoiserInfo | None = None
 
@@ -272,7 +271,6 @@ class WorkerInfo:
                 call.value: component
                 for call, component in self.media_components.items()
             },
-            "num_inference_steps": self.num_inference_steps,
             "video_denoiser": None
             if self.video_denoiser is None
             else self.video_denoiser.to_mapping(),

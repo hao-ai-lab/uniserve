@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import TypeAlias
 
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.protocol.validation import _map, _nonnegative, _uint
+from uniserve_worker.protocol.validation import _nonnegative
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -64,24 +64,6 @@ class CallId:
             object.__setattr__(self, "_hash_value", value)
         return value
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "computation_id"
-    ) -> CallId:
-        """Parse a batch and request-ordinal pair.
-
-        An existing `CallId` instance is returned unchanged.
-        """
-        if isinstance(value, cls):
-            return value
-        data = _map(value, where)
-        return cls(
-            batch_id=_uint(data.get("batch_id"), f"{where}.batch_id"),
-            request_index=_uint(
-                data.get("request_index"), f"{where}.request_index"
-            ),
-        )
-
     def to_mapping(self) -> dict[str, object]:
         """Serialize the computation identity for IPC."""
         return {"batch_id": self.batch_id, "request_index": self.request_index}
@@ -117,20 +99,6 @@ class RequestKey:
             value = hash((self.engine_id, self.request_id, self.request_epoch))
             object.__setattr__(self, "_hash_value", value)
         return value
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "request_key"
-    ) -> RequestKey:
-        """Parse an engine instance id, request id, and admission epoch."""
-        data = _map(value, where)
-        return cls(
-            engine_id=_uint(data.get("engine_id"), f"{where}.engine_id"),
-            request_id=_uint(data.get("request_id"), f"{where}.request_id"),
-            request_epoch=_uint(
-                data.get("request_epoch"), f"{where}.request_epoch"
-            ),
-        )
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize the complete request-generation identity for IPC."""
@@ -179,21 +147,6 @@ class BufferId:
             )
             object.__setattr__(self, "_hash_value", value)
         return value
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str = "buffer_id") -> BufferId:
-        """Parse a versioned persistent-buffer identity from the wire schema."""
-        data = _map(value, where)
-        return cls(
-            owner=RequestKey.from_mapping(data.get("owner"), f"{where}.owner"),
-            producer_call_id=CallId.from_mapping(
-                data.get("producer_call_id"), f"{where}.producer_call_id"
-            ),
-            output_index=_uint(
-                data.get("output_index"), f"{where}.output_index"
-            ),
-            generation=_uint(data.get("generation"), f"{where}.generation"),
-        )
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize buffer ownership and generation into the wire mapping."""

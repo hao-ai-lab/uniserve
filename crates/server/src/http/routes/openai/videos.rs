@@ -342,6 +342,12 @@ pub(crate) async fn videos_create(
             .into_response();
     };
     let sampling = prepared.request.sampling;
+    // Every request runs the denoiser's fixed schedule.
+    let total_steps = state
+        .runtime()
+        .model()
+        .video_service()
+        .map_or(0, |video| video.num_inference_steps());
 
     // Public IDs are server-generated; caller request-ID headers cannot collide with retained jobs.
     let id = format!("video_{}", uuid::Uuid::new_v4().simple());
@@ -359,7 +365,7 @@ pub(crate) async fn videos_create(
         status: "queued",
         phase: "queued".to_owned(),
         completed_steps: 0,
-        total_steps: sampling.num_inference_steps,
+        total_steps,
         inference_time_s: None,
         stage_durations: None,
         error: None,

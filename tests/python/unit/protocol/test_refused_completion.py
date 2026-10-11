@@ -8,7 +8,7 @@ completion does.
 import pytest
 
 from uniserve_worker.errors import WorkerError
-from uniserve_worker.protocol.call import CallStatus, ErrorCode, MediaCall
+from uniserve_worker.protocol.call import CallStatus, ErrorCode
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.output import (
     FinishFlags,
@@ -26,12 +26,9 @@ def _completion(error_code, error_message):
         request_key=RequestKey(engine_id=0, request_id=7, request_epoch=1),
         call_id=CallId(3, 0),
         status=CallStatus.ERROR,
-        product_generations=(),
         error_code=error_code,
         error_message=error_message,
         timing_counters=TimingCounters(),
-        kind=MediaCall.VISION_ENCODING,
-        position=0,
         kv_visible_len=0,
         kv_computed_len=0,
         num_completed_steps=0,
@@ -45,7 +42,7 @@ def test_a_refusal_carries_its_reason_across_the_wire():
     refused.validate()
     mapping = refused.to_mapping()
     assert mapping["error_code"] == "invalid_request"
-    assert RequestOutput.from_mapping(mapping) == refused
+    assert mapping["error_message"] == REASON
 
 
 @pytest.mark.parametrize(

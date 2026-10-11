@@ -288,8 +288,6 @@ pub struct DiffusionSamplingParams {
     pub num_frames: u32,
     /// Video media units the decoder reconstructs, independent of GPU rank count.
     pub video_units: u32,
-    /// Number of denoising steps in the trajectory.
-    pub num_inference_steps: u32,
     /// Deterministic request-level noise seed.
     pub seed: u64,
     /// Output raster width in pixels: the request's canvas.
@@ -328,7 +326,7 @@ impl DiffusionRequest {
     /// Checks the request's own consistency.
     ///
     /// The prompt is nonempty, its token count fits in `u32` and every token
-    /// has a tag; the frame, media-unit, and step counts and the canvas are
+    /// has a tag; the frame and media-unit counts and the canvas are
     /// positive; `t2va` has no conditions, `fl2va` only keyframes and
     /// `ref2va` at least one condition; every condition is consistent
     /// ([`VideoCondition::validate`]) and its media is published in `media`
@@ -346,7 +344,6 @@ impl DiffusionRequest {
 
         if self.sampling.num_frames == 0
             || self.sampling.video_units == 0
-            || self.sampling.num_inference_steps == 0
             || self.sampling.width == 0
             || self.sampling.height == 0
             || self.prompt_token_ids.len() > u32::MAX as usize

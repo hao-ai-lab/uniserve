@@ -521,7 +521,6 @@ def execute(
     # Host media calls consume products without advancing any trajectory.
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.host.tasks = tasks
     request.host.finish = finish
     # The call has no product at commit; a video encode's ``finish`` sets

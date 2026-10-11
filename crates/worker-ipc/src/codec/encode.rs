@@ -74,18 +74,6 @@ fn tensor_ref<'a>(b: &mut FlatBufferBuilder<'a>, v: &TensorRef) -> WIPOffset<fbs
     )
 }
 
-fn rng<'a>(b: &mut FlatBufferBuilder<'a>, v: &Rng) -> WIPOffset<fbs::Rng<'a>> {
-    let draw_layout = draw_layout_to_fb(v.draw_layout);
-    fbs::Rng::create(
-        b,
-        &fbs::RngArgs {
-            seed: v.seed,
-            semantic_index_base: v.semantic_index_base,
-            draw_layout,
-        },
-    )
-}
-
 fn coordinates<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &CallCoordinates,
@@ -219,9 +207,7 @@ fn image<'a>(
             width: v.width,
             seed: v.seed,
             negative_prompt,
-            max_images: v.max_images,
             image_prompts,
-            retain_images: v.retain_images,
         },
     )
 }
@@ -233,20 +219,6 @@ fn ar<'a>(
     let sampling = Some(sampling(b, &v.sampling));
     let negative_token_ids = Some(b.create_vector(&v.negative_token_ids));
     let finish_token_ids = Some(b.create_vector(&v.finish_token_ids));
-    let canvas = v.canvas.as_ref().map(|canvas| {
-        fbs::CanvasSampling::create(
-            b,
-            &fbs::CanvasSamplingArgs {
-                canvas_length: canvas.canvas_length,
-                max_steps: canvas.max_steps,
-                entropy_bound: canvas.entropy_bound,
-                t_min: canvas.t_min,
-                t_max: canvas.t_max,
-                confidence_threshold: canvas.confidence_threshold,
-                stability_threshold: canvas.stability_threshold,
-            },
-        )
-    });
     fbs::ArRequestParams::create(
         b,
         &fbs::ArRequestParamsArgs {
@@ -254,7 +226,6 @@ fn ar<'a>(
             negative_token_ids,
             finish_token_ids,
             initial_position: v.initial_position,
-            canvas,
         },
     )
 }
@@ -268,7 +239,6 @@ fn diffusion<'a>(
         &fbs::DiffusionSamplingParamsArgs {
             num_frames: v.num_frames,
             video_units: v.video_units,
-            num_inference_steps: v.num_inference_steps,
             seed: v.seed,
             width: v.width,
             height: v.height,
@@ -506,8 +476,6 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
     // The schema has no `Bounds` table: the bounds are scalar fields of the
     // `Call` table, which `call_from_table` reassembles.
     let max_tokens = v.bounds.max_tokens;
-    let max_kv_units = v.bounds.max_kv_units;
-    let max_latent_bytes = v.bounds.max_latent_bytes;
     let max_completion_bytes = v.bounds.max_completion_bytes;
     let max_transfer_bytes = v.bounds.max_transfer_bytes;
 
@@ -566,7 +534,6 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
         .map(|value| tensor_ref(b, value));
     let predicate = v.predicate.as_ref().map(|value| tensor_ref(b, value));
 
-    let rng = v.rng.as_ref().map(|value| rng(b, value));
     let sampling_state = v
         .sampling_state
         .as_ref()
@@ -596,8 +563,6 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             component,
             code: Some(&code),
             max_tokens,
-            max_kv_units,
-            max_latent_bytes,
             max_completion_bytes,
             max_transfer_bytes,
             inputs,
@@ -614,7 +579,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             completion_output,
             transition_output,
             predicate,
-            rng,
+            image_index: v.image_index.unwrap_or(0),
             sampling_state,
             input_token_ids,
             input_image,
@@ -1106,14 +1071,12 @@ fn completion<'a>(
     let request_key = Some(request_key(b, &v.request_key));
     let call_id = fbs::CallId::new(v.call_id.batch_id, v.call_id.request_index);
     let status = call_status_to_fb(v.status);
-    let product_generations = Some(b.create_vector(&v.product_generations));
     let error_code = v.error_code.map(error_code_to_fb);
     let error_message = v
         .error_message
         .as_deref()
         .map(|message| b.create_string(message));
     let timing_counters = Some(timing(b, &v.timing_counters));
-    let code = computation_to_fb(v.code);
     let committed_tokens = Some(b.create_vector(&v.committed_tokens));
     let top_logprobs = {
         let items = v.top_logprobs.iter().map(token_logprob).collect::<Vec<_>>();
@@ -1137,12 +1100,9 @@ fn completion<'a>(
             request_key,
             call_id: Some(&call_id),
             status,
-            product_generations,
             error_code,
             error_message,
             timing_counters,
-            code: Some(&code),
-            position: v.position,
             kv_visible_len: v.kv_visible_len,
             kv_computed_len: v.kv_computed_len,
             num_completed_steps: v.num_completed_steps,
@@ -1512,7 +1472,6 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             encoder_entry_bytes: v.encoder_entry_bytes,
             max_unresolved_calls: v.max_unresolved_calls,
             media_components,
-            num_inference_steps: v.num_inference_steps,
             host_lane_capacity: v.host_lane_capacity,
             video_denoiser,
             max_prefill_calls: v.max_prefill_calls,

@@ -12,9 +12,9 @@ carries a published KV extent.
 These records mirror the worker-ipc crate's `Locator`, `TensorTransfer`, and
 `KvTransfer`, whose validators the crate's codec runs whenever it encodes or
 decodes a batch or a batch result, so the two sides must change together.
-`Locator.to_mapping` writes, and `Locator.from_mapping` reads, a flattened
-form with a plain ``transport`` string beside the handle's fields; the PyO3
-extension decodes that form rather than the crate's serde representation.
+`Locator.to_mapping` writes a flattened form with a plain ``transport`` string
+beside the handle's fields; the PyO3 extension decodes that form rather than
+the crate's serde representation.
 """
 
 from __future__ import annotations
@@ -28,20 +28,10 @@ from typing import TypeAlias
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import identity
 from uniserve_worker.protocol.validation import (
-    _bytes,
-    _int,
-    _ints,
     _map,
-    _seq,
     _str,
     _uint,
-    _uints,
 )
-
-#: Upper bound on a transfer descriptor's estimated encoded size, in bytes. It
-#: equals the worker-ipc crate's `MAX_TRANSFER_HANDLE_BYTES`, which the crate's
-#: validators enforce on their own estimate of the same descriptor.
-MAX_TRANSFER_HANDLE_BYTES = 64 * 1024
 
 #: Bytes of a POSIX file-descriptor allocation handle. It names an open file of
 #: the exporting process, so a consumer on the same host receives a usable
@@ -339,87 +329,6 @@ class Locator:
                 "CUDA VMM physical spans do not match its shape"
             )
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "transfer locator"
-    ) -> Locator:
-        """Parse a locator from the flattened mapping `to_mapping` writes.
-
-        The ``transport`` key selects the handle type (``local``,
-        ``channel``, ``posix_shm``, or ``cuda_vmm``), and the handle's fields
-        sit beside it. Each constructed record validates itself.
-        """
-        data = _map(value, where)
-        kind = _str(data.get("transport"), f"{where}.transport")
-
-        if kind == "local":
-            transport: TransferTransport = LocalTransfer(
-                endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
-                key=_uint(data.get("key"), f"{where}.key"),
-            )
-        elif kind == "channel":
-            transport = ChannelTransfer(
-                endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
-                payload=_bytes(data.get("payload"), f"{where}.payload"),
-            )
-        elif kind == "posix_shm":
-            transport = PosixShmTransfer(
-                endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
-                name=_str(data.get("name"), f"{where}.name"),
-            )
-        elif kind == "cuda_vmm":
-            transport = CudaVmmTransfer(
-                endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
-                publication_id=_str(
-                    data.get("publication_id"), f"{where}.publication_id"
-                ),
-                storage_size_bytes=_uint(
-                    data.get("storage_size_bytes"),
-                    f"{where}.storage_size_bytes",
-                ),
-                storage_offsets_bytes=tuple(
-                    _ints(
-                        data.get("storage_offsets_bytes"),
-                        f"{where}.storage_offsets_bytes",
-                    )
-                ),
-                span_lengths=tuple(
-                    _ints(data.get("span_lengths"), f"{where}.span_lengths")
-                ),
-                span_counts=tuple(
-                    _ints(data.get("span_counts"), f"{where}.span_counts")
-                ),
-                tensor_stride=tuple(
-                    _ints(data.get("tensor_stride"), f"{where}.tensor_stride")
-                ),
-                ready_event_handle=_bytes(
-                    data.get("ready_event_handle"),
-                    f"{where}.ready_event_handle",
-                ),
-                allocation_handle=_bytes(
-                    data.get("allocation_handle"),
-                    f"{where}.allocation_handle",
-                ),
-                acknowledgment_offset=_int(
-                    data.get("acknowledgment_offset"),
-                    f"{where}.acknowledgment_offset",
-                ),
-            )
-        else:
-            raise invalid_descriptor(f"{where}.transport is invalid")
-
-        return cls(
-            source=WorkerEndpoint.from_mapping(
-                data.get("source"), f"{where}.source"
-            ),
-            transport=transport,
-            nbytes=_uint(data.get("nbytes"), f"{where}.nbytes"),
-            dtype=_str(data.get("dtype"), f"{where}.dtype"),
-            shape=tuple(_uints(data.get("shape"), f"{where}.shape")),
-            offset=tuple(_uints(data.get("offset"), f"{where}.offset")),
-            device=_str(data.get("device"), f"{where}.device"),
-        )
-
     def to_mapping(self) -> dict[str, object]:
         """Encode the view and its handle as one flattened wire mapping."""
         output: dict[str, object] = {
@@ -531,21 +440,6 @@ class TensorTransfer:
         """Bytes of the whole logical tensor, not of any one location."""
         first = self.locations[0]
         return math.prod(self.shape) * (first.nbytes // math.prod(first.shape))
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "tensor transfer"
-    ) -> TensorTransfer:
-        data = _map(value, where)
-        return cls(
-            shape=tuple(_uints(data.get("shape"), f"{where}.shape")),
-            locations=tuple(
-                Locator.from_mapping(item, f"{where}.locations[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("locations"), f"{where}.locations")
-                )
-            ),
-        )
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -694,23 +588,6 @@ class KvGroupTransfer:
             else 0
         )
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "kv_group_transfer"
-    ) -> KvGroupTransfer:
-        """Decode one group's carried interval and tensors."""
-        data = _map(value, where)
-        return cls(
-            start=_uint(data.get("start"), f"{where}.start"),
-            page_tokens=_uint(data.get("page_tokens"), f"{where}.page_tokens"),
-            tensors=tuple(
-                TensorTransfer.from_mapping(item, f"{where}.tensors[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("tensors"), f"{where}.tensors")
-                )
-            ),
-        )
-
     def to_mapping(self) -> dict[str, object]:
         """Encode one group's carried interval and tensors."""
         return {
@@ -729,11 +606,8 @@ class KvTransfer:
     its tokens from its `KvGroupTransfer.start` on. An unchanged extent
     carries no groups; otherwise there is one entry per cache group, in
     table order. `compute_dtype` is the precision used when reading
-    quantized source pages. `__post_init__` does not check the descriptor
-    size bound; the output commit in `uniserve_worker.execution.commit` and
-    `Batch.validate` run `encoded_size_bound`. The worker-ipc crate's
-    `KvTransfer::validate` checks the same relations and the size bound in
-    the crate's codec.
+    quantized source pages. The worker-ipc crate's `KvTransfer::validate`
+    checks the same relations in the crate's codec.
     """
 
     groups: tuple[KvGroupTransfer, ...]
@@ -781,44 +655,6 @@ class KvTransfer:
             tensor for group in self.groups for tensor in group.tensors
         )
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "kv_transfer"
-    ) -> KvTransfer:
-        """Decode source identity and every group's physical representation.
-
-        Absent ``base_extent`` and ``published_extent`` decode as zero.
-        """
-        data = _map(value, where)
-        raw_base = data.get("base")
-        return cls(
-            groups=tuple(
-                KvGroupTransfer.from_mapping(item, f"{where}.groups[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("groups"), f"{where}.groups")
-                )
-            ),
-            source=identity.BufferId.from_mapping(
-                data.get("source"), f"{where}.source"
-            ),
-            destination=_str(data.get("destination"), f"{where}.destination"),
-            base=(
-                None
-                if raw_base is None
-                else identity.BufferId.from_mapping(raw_base, f"{where}.base")
-            ),
-            base_extent=_uint(
-                data.get("base_extent", 0), f"{where}.base_extent"
-            ),
-            published_extent=_uint(
-                data.get("published_extent", 0),
-                f"{where}.published_extent",
-            ),
-            compute_dtype=_str(
-                data.get("compute_dtype"), f"{where}.compute_dtype"
-            ),
-        )
-
     def to_mapping(self) -> dict[str, object]:
         """Encode the cache publication without a generic product envelope."""
         return {
@@ -830,30 +666,6 @@ class KvTransfer:
             "published_extent": self.published_extent,
             "compute_dtype": self.compute_dtype,
         }
-
-    def encoded_size_bound(self) -> int:
-        """Return the estimated descriptor size, enforcing the handle bound.
-
-        The estimate covers every page and scale locator of every group plus
-        the publication metadata, and parallels the worker-ipc crate's
-        `KvTransfer::encoded_size_bound`.
-
-        Raises:
-            WorkerError: `invalid_descriptor` when the estimate exceeds
-                `MAX_TRANSFER_HANDLE_BYTES` or a locator names an unknown
-                transport.
-        """
-        size = (
-            _tensor_transfers_size(self.tensors)
-            + 32 * len(self.groups)
-            + len(self.destination.encode())
-            + len(self.compute_dtype.encode())
-        )
-        if size > MAX_TRANSFER_HANDLE_BYTES:
-            raise invalid_descriptor(
-                "KV transfer exceeds its descriptor byte bound"
-            )
-        return size
 
 
 @dataclass(frozen=True, slots=True)
@@ -875,62 +687,3 @@ class LatentTransferValue:
 TransferValue: TypeAlias = (
     EncoderTransferValue | DeviceProductTransferValue | LatentTransferValue
 )
-
-
-def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
-    """Estimate the encoded byte size of tensor locators for handle bounding.
-
-    The integer constants are conservative per-record overheads (field names,
-    tags, lengths), not exact wire sizes; only string and list lengths are
-    measured from the values themselves. The estimate parallels the
-    worker-ipc crate's `transfer_encoded_size`, which the crate's validators
-    check against the same bound when the codec encodes or decodes a batch
-    or a batch result; an estimate here below the crate's lets the worker
-    commit a descriptor that the codec then rejects.
-    """
-    locators = tuple(
-        location for tensor in tensors for location in tensor.locations
-    )
-    size = 512 + sum(64 + 8 * len(tensor.shape) for tensor in tensors)
-
-    for locator in locators:
-        size += (
-            256
-            + len(locator.dtype.encode())
-            + len(locator.device.encode())
-            + 16 * len(locator.shape)
-            + len(locator.source.worker_id.encode())
-            + len(locator.source.node.encode())
-            + len(locator.source.address_space.encode())
-            + len(locator.source.incarnation.encode())
-        )
-
-        transport = locator.transport
-        if isinstance(transport, LocalTransfer):
-            size += len(transport.endpoint.encode()) + 16
-        elif isinstance(transport, PosixShmTransfer):
-            size += (
-                len(transport.endpoint.encode())
-                + len(transport.name.encode())
-                + 16
-            )
-        elif isinstance(transport, ChannelTransfer):
-            # The bytes are the product, not the handle: their budget is the
-            # channel's byte capacity and the message caps of the rank channel
-            # they travel on, so only the locator's framing counts here.
-            size += len(transport.endpoint.encode()) + 24
-        elif isinstance(transport, CudaVmmTransfer):
-            size += (
-                len(transport.endpoint.encode())
-                + len(transport.publication_id.encode())
-                + len(transport.ready_event_handle)
-                + 8 * len(transport.tensor_stride)
-                + 8 * len(transport.storage_offsets_bytes)
-                + 12 * len(transport.span_lengths)
-                + 64
-            )
-        else:
-            raise invalid_descriptor(
-                "tensor transfer names an unknown transport"
-            )
-    return size

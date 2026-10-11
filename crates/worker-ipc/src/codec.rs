@@ -43,10 +43,10 @@ use crate::schema::uniserve::ipc as fbs;
 use crate::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds,
     BufferAllocation, BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind,
-    CallStatus, CanvasSampling, CanvasStep, DType, DecodeRange, DiffusionSamplingParams, DimBound,
-    DrawLayout, ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
+    CallStatus, CanvasStep, DType, DecodeRange, DiffusionSamplingParams, DimBound,
+    ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
     ForwardStats, KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall,
-    MediaOutput, NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
+    MediaOutput, NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind,
     SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
     TransferHandle, TransferMode, TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint,
     WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
@@ -579,15 +579,6 @@ fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRe
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
         initial_position: admission.initial_position(),
-        canvas: admission.canvas().map(|canvas| CanvasSampling {
-            canvas_length: canvas.canvas_length(),
-            max_steps: canvas.max_steps(),
-            entropy_bound: canvas.entropy_bound(),
-            t_min: canvas.t_min(),
-            t_max: canvas.t_max(),
-            confidence_threshold: canvas.confidence_threshold(),
-            stability_threshold: canvas.stability_threshold(),
-        }),
     })
 }
 
@@ -617,14 +608,13 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
 }
 
 /// Decodes diffusion admission parameters; `NewRequest::validate` checks the
-/// frame, unit, and step counts and the output raster.
+/// frame and unit counts and the output raster.
 fn diffusion_params_from_table(
     admission: fbs::DiffusionSamplingParams<'_>,
 ) -> CodecResult<DiffusionSamplingParams> {
     Ok(DiffusionSamplingParams {
         num_frames: admission.num_frames(),
         video_units: admission.video_units(),
-        num_inference_steps: admission.num_inference_steps(),
         seed: admission.seed(),
         width: admission.width(),
         height: admission.height(),
@@ -785,8 +775,7 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
         code: computation_from_fb(call.code())?,
         bounds: Bounds {
             max_tokens: call.max_tokens(),
-            max_kv_units: call.max_kv_units(),
-            max_latent_bytes: call.max_latent_bytes(),
+            max_kv_units: 0,
             max_completion_bytes: call.max_completion_bytes(),
             max_transfer_bytes: call.max_transfer_bytes(),
         },
@@ -851,7 +840,7 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             .map(tensor_ref_from_table)
             .transpose()?,
         predicate: call.predicate().map(tensor_ref_from_table).transpose()?,
-        rng: call.rng().map(rng_from_table).transpose()?,
+        image_index: Some(call.image_index()).filter(|&index| index != 0),
     };
     call.validate()?;
     Ok(call)
@@ -984,15 +973,6 @@ fn tensor_ref_from_table(reference: fbs::TensorRef<'_>) -> CodecResult<TensorRef
     Ok(tensor)
 }
 
-/// Decodes deterministic random coordinates, rejecting an unknown draw layout.
-fn rng_from_table(rng: fbs::Rng<'_>) -> CodecResult<Rng> {
-    Ok(Rng {
-        seed: rng.seed(),
-        semantic_index_base: rng.semantic_index_base(),
-        draw_layout: draw_layout_from_fb(rng.draw_layout())?,
-    })
-}
-
 /// Decodes a batch output, preserving report order, then validates it with
 /// `BatchOutput::validate`.
 fn run_result_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutput> {
@@ -1087,10 +1067,6 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
         request_key: request_key_from_table(record.request_key(), "completion.request_key")?,
         call_id: computation_id_from_fb(record.call_id())?,
         status: call_status_from_fb(record.status())?,
-        product_generations: record
-            .product_generations()
-            .map(|items| items.iter().collect())
-            .unwrap_or_default(),
         error_code: record.error_code().map(error_code_from_fb).transpose()?,
         error_message: record.error_message().map(str::to_owned),
         timing_counters: TimingCounters {
@@ -1099,8 +1075,6 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
             copy_us: timing_counters.copy_us(),
             host_us: timing_counters.host_us(),
         },
-        code: computation_from_fb(record.code())?,
-        position: record.position(),
         kv_visible_len: record.kv_visible_len(),
         kv_computed_len: record.kv_computed_len(),
         num_completed_steps: record.num_completed_steps(),
@@ -1242,7 +1216,6 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             }
             components
         },
-        num_inference_steps: info.num_inference_steps(),
         video_denoiser: info.video_denoiser().map(video_denoiser_from_table),
     };
     info.validate()?;
@@ -1334,12 +1307,12 @@ fn image_from_table(image: fbs::ImageParams<'_>) -> CodecResult<uniserve_core::I
             .negative_prompt()
             .map(str::to_string)
             .unwrap_or_default(),
-        max_images: image.max_images(),
+        max_images: 1,
         image_prompts: image
             .image_prompts()
             .map(|items| items.iter().map(str::to_string).collect())
             .unwrap_or_default(),
-        retain_images: image.retain_images(),
+        retain_images: true,
     })
 }
 
@@ -1898,25 +1871,6 @@ fn dtype_from_fb(dtype: fbs::DType) -> CodecResult<DType> {
         fbs::DType::BF16 => DType::BF16,
         fbs::DType::F32 => DType::F32,
         other => codec_bail!("unknown dtype {}", other.0),
-    })
-}
-
-/// Maps a random-draw layout to its stable FlatBuffers discriminant.
-fn draw_layout_to_fb(layout: DrawLayout) -> fbs::DrawLayout {
-    match layout {
-        DrawLayout::TargetSampling => fbs::DrawLayout::TargetSampling,
-        DrawLayout::SpeculativeProposal => fbs::DrawLayout::SpeculativeProposal,
-        DrawLayout::FlowNoise => fbs::DrawLayout::FlowNoise,
-    }
-}
-
-/// Decodes a supported FlatBuffers random-draw layout.
-fn draw_layout_from_fb(layout: fbs::DrawLayout) -> CodecResult<DrawLayout> {
-    Ok(match layout {
-        fbs::DrawLayout::TargetSampling => DrawLayout::TargetSampling,
-        fbs::DrawLayout::SpeculativeProposal => DrawLayout::SpeculativeProposal,
-        fbs::DrawLayout::FlowNoise => DrawLayout::FlowNoise,
-        other => codec_bail!("unknown draw layout {}", other.0),
     })
 }
 

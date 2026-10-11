@@ -192,16 +192,16 @@ impl ExecutorInfo {
     /// The exceptions are the KV cache, whose layout the KV pools must share
     /// and whose unit count is their smallest; request slots of a deployment
     /// that muxes video,
-    /// the narrowest per-component sum of replica slots; and the diffusion
-    /// step count and latent page geometry, taken from the first denoising
-    /// pool and zero without one.
+    /// the narrowest per-component sum of replica slots; and the video
+    /// denoiser and latent page geometry, taken from the first denoising
+    /// pool and absent or zero without one.
     ///
     /// # Errors
     ///
     /// Fails when there are no pools. With several pools, it also fails when
     /// media routing conflicts or is incomplete, when a deployment that muxes
-    /// video reports no diffusion step count, when denoising pools disagree on the
-    /// step count, when KV pools disagree on cache layout or a routed KV pool
+    /// video reports no video denoiser, when pools describe the denoiser
+    /// differently, when KV pools disagree on cache layout or a routed KV pool
     /// has no cache, when summed capacities overflow `u32`, or when the merged
     /// record fails `WorkerInfo::validate`.
     pub fn runtime_info(&self) -> anyhow::Result<WorkerInfo> {
@@ -246,25 +246,15 @@ impl ExecutorInfo {
         let mut merged = self.workers[seed_index].1.clone();
         merged.media_components = self.media_routing()?;
         let denoising = routed(CallKind::Media(MediaCall::Denoising));
-        merged.num_inference_steps = denoising.map_or(0, |info| info.num_inference_steps);
         // Every worker describes the deployment's placed denoiser alike; the
         // denoising worker's description is the deployment's.
         merged.video_denoiser = denoising.and_then(|info| info.video_denoiser.clone());
-        // A deployment that assembles video denoises over a fixed ladder,
-        // which the denoising worker reports.
+        // A deployment that assembles video denoises over the fixed schedule
+        // the denoising worker describes.
         anyhow::ensure!(
             !merged.media_components.contains_key(&MediaCall::Muxing)
-                || merged.num_inference_steps > 0,
-            "a deployment that muxes video reports no diffusion step count"
-        );
-        anyhow::ensure!(
-            self.workers.iter().all(|(_, info)| {
-                !info
-                    .supported_calls
-                    .contains(&CallKind::Media(MediaCall::Denoising))
-                    || info.num_inference_steps == merged.num_inference_steps
-            }),
-            "workers disagree on diffusion steps"
+                || merged.video_denoiser.is_some(),
+            "a deployment that muxes video reports no video denoiser"
         );
         anyhow::ensure!(
             self.workers
@@ -1336,7 +1326,10 @@ pub trait Executor: Send {
 mod tests {
     use super::*;
 
-    fn media_info(routes: &[(MediaCall, &str)], steps: u32) -> WorkerInfo {
+    /// A worker serving `routes`; the one that denoises describes the
+    /// deployment's fixed schedule.
+    fn media_info(routes: &[(MediaCall, &str)]) -> WorkerInfo {
+        let denoises = routes.iter().any(|(call, _)| *call == MediaCall::Denoising);
         WorkerInfo {
             media_components: routes
                 .iter()
@@ -1346,7 +1339,13 @@ mod tests {
                 .iter()
                 .map(|(call, _)| CallKind::Media(*call))
                 .collect(),
-            num_inference_steps: steps,
+            video_denoiser: denoises.then(|| VideoDenoiserInfo {
+                tasks: vec!["t2va".to_owned()],
+                schedule_points: 5,
+                video_shift: 12.0,
+                audio_shift: 3.0,
+                canvases: Vec::new(),
+            }),
             ..WorkerInfo::default()
         }
     }
@@ -1354,10 +1353,9 @@ mod tests {
     fn media_pool(
         id: &str,
         routes: &[(MediaCall, &str)],
-        steps: u32,
         request_slots: u32,
     ) -> (WorkerId, WorkerInfo) {
-        let mut info = media_info(routes, steps);
+        let mut info = media_info(routes);
         info.endpoint.worker_id = id.to_owned();
         info.request_slots = request_slots;
         info.components = routes
@@ -1387,7 +1385,6 @@ mod tests {
                 (MediaCall::AudioEncoding, "muxer"),
                 (MediaCall::Muxing, "muxer"),
             ],
-            4,
             request_slots,
         )
     }
@@ -1414,9 +1411,9 @@ mod tests {
             (MediaCall::AudioDecoding, "audio_decoder"),
         ];
         let info = ExecutorInfo::from_workers(vec![
-            media_pool("text", &[(MediaCall::TextEncoding, "text_encoder")], 0, 8),
-            media_pool("flow-0", &flow, 4, 2),
-            media_pool("flow-1", &flow, 4, 2),
+            media_pool("text", &[(MediaCall::TextEncoding, "text_encoder")], 8),
+            media_pool("flow-0", &flow, 2),
+            media_pool("flow-1", &flow, 2),
             media_pool(
                 "host",
                 &[
@@ -1424,7 +1421,6 @@ mod tests {
                     (MediaCall::AudioEncoding, "muxer"),
                     (MediaCall::Muxing, "muxer"),
                 ],
-                0,
                 16,
             ),
         ])?;
@@ -1439,24 +1435,18 @@ mod tests {
     fn media_routing_is_the_union_over_workers() {
         // A model worker decodes and a host worker encodes and muxes; the
         // deployment's routing names every video call once.
-        let model = media_info(
-            &[
-                (MediaCall::TextEncoding, "text_encoder"),
-                (MediaCall::LatentPreparation, "denoiser"),
-                (MediaCall::Denoising, "denoiser"),
-                (MediaCall::VideoDecoding, "video_decoder"),
-                (MediaCall::AudioDecoding, "audio_decoder"),
-            ],
-            4,
-        );
-        let host = media_info(
-            &[
-                (MediaCall::VideoEncoding, "video_codec"),
-                (MediaCall::AudioEncoding, "muxer"),
-                (MediaCall::Muxing, "muxer"),
-            ],
-            0,
-        );
+        let model = media_info(&[
+            (MediaCall::TextEncoding, "text_encoder"),
+            (MediaCall::LatentPreparation, "denoiser"),
+            (MediaCall::Denoising, "denoiser"),
+            (MediaCall::VideoDecoding, "video_decoder"),
+            (MediaCall::AudioDecoding, "audio_decoder"),
+        ]);
+        let host = media_info(&[
+            (MediaCall::VideoEncoding, "video_codec"),
+            (MediaCall::AudioEncoding, "muxer"),
+            (MediaCall::Muxing, "muxer"),
+        ]);
         let info = ExecutorInfo {
             workers: vec![
                 (WorkerId("model".to_owned()), model),
@@ -1478,7 +1468,7 @@ mod tests {
     fn media_lanes_count_the_units_one_call_covers() {
         let encoder = |id: &str, ranks: usize, units_per_rank: usize| {
             let (id, mut info) =
-                media_pool(id, &[(MediaCall::LatentEncoding, "latent_encoder")], 0, 1);
+                media_pool(id, &[(MediaCall::LatentEncoding, "latent_encoder")], 1);
             let config = &mut info.components[0].config;
             config.ranks = (0..ranks).collect();
             config.distribution = Some(uniserve_core::ComponentDistribution::TemporalUnits);
@@ -1510,7 +1500,6 @@ mod tests {
                     (MediaCall::LatentEncoding, "latent_encoder"),
                     (MediaCall::TextEncoding, "text_encoder"),
                 ],
-                0,
                 1,
             );
             for binding in &mut info.components {
@@ -1531,7 +1520,6 @@ mod tests {
             lanes(vec![media_pool(
                 "a",
                 &[(MediaCall::Denoising, "denoiser")],
-                4,
                 1
             )]),
             None
@@ -1554,7 +1542,7 @@ mod tests {
             (MediaCall::Muxing, "muxer"),
         ];
         let serving = |tasks: &[&str], routes: &[(MediaCall, &str)]| {
-            let mut info = media_info(routes, 4);
+            let mut info = media_info(routes);
             info.video_denoiser = Some(VideoDenoiserInfo {
                 tasks: tasks.iter().map(|task| (*task).to_owned()).collect(),
                 schedule_points: 5,
@@ -1589,8 +1577,8 @@ mod tests {
 
     #[test]
     fn media_routing_refuses_an_incomplete_video_graph_and_a_repeated_call() {
-        let model = media_info(&[(MediaCall::VideoDecoding, "video_decoder")], 4);
-        let host = media_info(&[(MediaCall::Muxing, "muxer")], 0);
+        let model = media_info(&[(MediaCall::VideoDecoding, "video_decoder")]);
+        let host = media_info(&[(MediaCall::Muxing, "muxer")]);
         let info = ExecutorInfo {
             workers: vec![
                 (WorkerId("model".to_owned()), model.clone()),
@@ -1604,7 +1592,7 @@ mod tests {
             .to_string();
         assert!(message.contains("VideoEncoding"), "{message}");
 
-        let other = media_info(&[(MediaCall::VideoDecoding, "decoder")], 4);
+        let other = media_info(&[(MediaCall::VideoDecoding, "decoder")]);
         let info = ExecutorInfo {
             workers: vec![
                 (WorkerId("model".to_owned()), model),

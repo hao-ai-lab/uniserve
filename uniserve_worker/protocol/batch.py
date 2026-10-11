@@ -8,15 +8,13 @@ host-supplied input tensors (`TensorPublication`). The records mirror the
 Rust `Batch` in `uniserve_worker_ipc`, whose `Batch::validate` is the
 authoritative check; `Batch.validate` here re-implements part of it.
 
-Records reach Python on two paths. The PyO3 transport (`crates/worker-ipc-py`)
-decodes and validates a frame in Rust, builds each member record through its
-constructor, and assembles the `Batch` with
-`construction.batch_from_validated`, which skips `Batch.validate`. It calls
-`BlockTable`, `CacheUnitAllocation`, `Start`, `Finish`, and `Free`
-positionally, so their field order is part of that contract, and the other
-records by keyword, so their field names are. Python callers build a `Batch`
-through its constructor or `Batch.from_mapping`, both of which run
-`Batch.validate`.
+The PyO3 transport (`crates/worker-ipc-py`) decodes and validates a frame in
+Rust, builds each member record through its constructor, and assembles the
+`Batch` with `construction.batch_from_validated`, which skips
+`Batch.validate`. It calls `BlockTable`, `CacheUnitAllocation`, `Start`,
+`Finish`, and `Free` positionally, so their field order is part of that
+contract, and the other records by keyword, so their field names are. Python
+callers build a `Batch` through its constructor, which runs `Batch.validate`.
 """
 
 from __future__ import annotations
@@ -32,15 +30,10 @@ from uniserve.media import image
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import call, identity, tensor, transfer
 from uniserve_worker.protocol.validation import (
-    _bool,
     _float,
     _map,
     _nonnegative,
-    _seq,
-    _str,
-    _tagged,
     _uint,
-    _uints,
 )
 from uniserve_worker.protocol.video import VideoAdmission
 
@@ -55,16 +48,6 @@ class Start:
     def request_key(self) -> identity.RequestKey:
         """Expose the request generation registered by this start command."""
         return self.request.request_key
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str = "start command") -> Start:
-        """Parse a request admission from a start-command payload."""
-        data = _map(value, where)
-        return cls(
-            request=NewRequest.from_mapping(
-                data.get("request"), f"{where}.request"
-            )
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,74 +107,9 @@ def _command_variant_index(command: BatchCommand) -> int:
     return 2
 
 
-def command_from_mapping(
-    value: object,
-    where: str = "batch command",
-) -> BatchCommand:
-    """Parse a ``{"kind": ..., "value": ...}`` lifecycle command.
-
-    Raises:
-        WorkerError: From `invalid_descriptor` when the value is not a
-            tagged mapping, its kind is not ``start``, ``finish``, or
-            ``free``, or its payload is invalid.
-    """
-    kind, payload = _tagged(value, where)
-    data = _map(payload, f"{where}.value")
-    if kind == "start":
-        return Start.from_mapping(data, f"{where}.value")
-
-    if kind == "finish":
-        request_key = identity.RequestKey.from_mapping(
-            data.get("request_key"), f"{where}.value.request_key"
-        )
-        command: BatchCommand = Finish(
-            request_key=request_key,
-            retained_buffers=tuple(
-                identity.BufferId.from_mapping(
-                    buffer, f"{where}.value.retained_buffers[{index}]"
-                )
-                for index, buffer in enumerate(
-                    _seq(
-                        data.get("retained_buffers"),
-                        f"{where}.value.retained_buffers",
-                    )
-                )
-            ),
-        )
-    elif kind == "free":
-        command = Free(
-            buffer=identity.BufferId.from_mapping(
-                data.get("buffer"), f"{where}.value.buffer"
-            )
-        )
-    else:
-        raise invalid_descriptor(f"{where} has unknown variant {kind!r}")
-    return command
-
-
-def command_to_mapping(command: BatchCommand) -> dict[str, object]:
-    """Encode a lifecycle command with its stable variant tag."""
-    if isinstance(command, Start):
-        return {
-            "kind": "start",
-            "value": {"request": command.request.to_mapping()},
-        }
-    if isinstance(command, Finish):
-        return {
-            "kind": "finish",
-            "value": {
-                "request_key": command.request_key.to_mapping(),
-                "retained_buffers": [
-                    buffer.to_mapping() for buffer in command.retained_buffers
-                ],
-            },
-        }
-    return {"kind": "free", "value": {"buffer": command.buffer.to_mapping()}}
-
-
 @dataclass(frozen=True, slots=True)
 class CanvasSampling:
-    """Block-diffusion sampling of a request that generates in canvases.
+    """Block-diffusion sampling of the canvases a deployment generates.
 
     A block of ``canvas_length`` tokens starts as random tokens and is
     denoised for at most ``max_steps`` steps: each samples every position at
@@ -236,7 +154,7 @@ class CanvasSampling:
     def from_mapping(
         cls, value: object, where: str = "canvas sampling"
     ) -> CanvasSampling:
-        """Parse block-diffusion sampling parameters."""
+        """Parse the sampling a worker's launch descriptor states."""
         data = _map(value, where)
         return cls(
             canvas_length=_uint(
@@ -257,25 +175,10 @@ class CanvasSampling:
             ),
         )
 
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize block-diffusion sampling parameters."""
-        return {
-            "canvas_length": self.canvas_length,
-            "max_steps": self.max_steps,
-            "entropy_bound": self.entropy_bound,
-            "t_min": self.t_min,
-            "t_max": self.t_max,
-            "confidence_threshold": self.confidence_threshold,
-            "stability_threshold": self.stability_threshold,
-        }
-
 
 @dataclass(frozen=True, slots=True)
 class GenerationParams:
-    """Sampling policy and token controls for autoregressive execution.
-
-    Serialized under the ``ar`` key of a `NewRequest` mapping.
-    """
+    """Sampling policy and token controls for autoregressive execution."""
 
     sampling: sampling.SamplingParams = field(
         default_factory=sampling.SamplingParams
@@ -288,8 +191,6 @@ class GenerationParams:
     # prefix-cache hit, and `RequestPool.start` begins the request with this
     # many tokens visible and computed.
     initial_position: int = 0
-    # Block-diffusion sampling of a request generating in canvases.
-    canvas: CanvasSampling | None = None
 
     def __post_init__(self) -> None:
         """Require a nonnegative initial position and canonical stop tokens.
@@ -309,46 +210,6 @@ class GenerationParams:
                 "autoregressive finish token ids are not canonical"
             )
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "autoregressive parameters"
-    ) -> GenerationParams:
-        """Parse sampling policy, token controls, and initial position.
-
-        Absent fields take their defaults.
-        """
-        data = _map(value, where)
-        return cls(
-            sampling=call._sampling_params_from_mapping(
-                data.get("sampling", {}), f"{where}.sampling"
-            ),
-            negative_token_ids=_uints(
-                data.get("negative_token_ids", ()),
-                f"{where}.negative_token_ids",
-            ),
-            finish_token_ids=_uints(
-                data.get("finish_token_ids", ()), f"{where}.finish_token_ids"
-            ),
-            initial_position=_uint(
-                data.get("initial_position", 0), f"{where}.initial_position"
-            ),
-            canvas=None
-            if data.get("canvas") is None
-            else CanvasSampling.from_mapping(
-                data.get("canvas"), f"{where}.canvas"
-            ),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize autoregressive sampling and token controls."""
-        return {
-            "sampling": call._sampling_params_to_mapping(self.sampling),
-            "negative_token_ids": list(self.negative_token_ids),
-            "finish_token_ids": list(self.finish_token_ids),
-            "initial_position": self.initial_position,
-            "canvas": None if self.canvas is None else self.canvas.to_mapping(),
-        }
-
 
 @dataclass(frozen=True, slots=True)
 class DiffusionParams:
@@ -361,8 +222,6 @@ class DiffusionParams:
     num_frames: int
     # Video media units the decoder reconstructs, independent of rank count.
     video_units: int
-    # Denoising steps in the trajectory.
-    num_inference_steps: int
     # Deterministic noise seed; nonnegative.
     seed: int
     # Output raster in pixels: the request's canvas.
@@ -374,7 +233,6 @@ class DiffusionParams:
         for name in (
             "num_frames",
             "video_units",
-            "num_inference_steps",
             "width",
             "height",
         ):
@@ -386,34 +244,6 @@ class DiffusionParams:
     def canvas(self) -> image.Config:
         """The request's output raster."""
         return image.Config(self.height, self.width)
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "diffusion sampling"
-    ) -> DiffusionParams:
-        """Parse the core's effective diffusion parameters."""
-        data = _map(value, where)
-        return cls(
-            num_frames=_uint(data.get("num_frames"), f"{where}.num_frames"),
-            video_units=_uint(data.get("video_units"), f"{where}.video_units"),
-            num_inference_steps=_uint(
-                data.get("num_inference_steps"), f"{where}.num_inference_steps"
-            ),
-            seed=_uint(data.get("seed"), f"{where}.seed"),
-            width=_uint(data.get("width"), f"{where}.width"),
-            height=_uint(data.get("height"), f"{where}.height"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize the shared diffusion parameter definition."""
-        return {
-            "num_frames": self.num_frames,
-            "video_units": self.video_units,
-            "num_inference_steps": self.num_inference_steps,
-            "seed": self.seed,
-            "width": self.width,
-            "height": self.height,
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,76 +305,6 @@ class NewRequest:
                 "request start must declare one runtime-family parameter set"
             )
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "admission"
-    ) -> NewRequest:
-        """Parse a request's identity, slot, prompt, and family parameters.
-
-        A family key that is absent or null leaves that family unset.
-        """
-        data = _map(value, where)
-        image_data = data.get("image")
-        admission = cls(
-            request_key=identity.RequestKey.from_mapping(
-                data.get("request_key"), f"{where}.request_key"
-            ),
-            request_pool_idx=_uint(
-                data.get("request_pool_idx"), f"{where}.request_pool_idx"
-            ),
-            prompt_token_ids=_uints(
-                data.get("prompt_token_ids", ()), f"{where}.prompt_token_ids"
-            ),
-            input_images=_uint(
-                data.get("input_images", 0), f"{where}.input_images"
-            ),
-            generation=(
-                None
-                if data.get("ar") is None
-                else GenerationParams.from_mapping(data["ar"], f"{where}.ar")
-            ),
-            image=(
-                None
-                if image_data is None
-                else call.ImageParams.from_mapping(
-                    image_data,
-                    f"{where}.image",
-                )
-            ),
-            diffusion=(
-                None
-                if data.get("diffusion") is None
-                else DiffusionParams.from_mapping(
-                    data["diffusion"], f"{where}.diffusion"
-                )
-            ),
-            video=(
-                None
-                if data.get("video") is None
-                else VideoAdmission.from_mapping(
-                    data["video"], f"{where}.video"
-                )
-            ),
-        )
-        return admission
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize request identity, slot, and family parameters."""
-        return {
-            "request_key": self.request_key.to_mapping(),
-            "request_pool_idx": self.request_pool_idx,
-            "prompt_token_ids": list(self.prompt_token_ids),
-            "input_images": self.input_images,
-            "ar": None
-            if self.generation is None
-            else self.generation.to_mapping(),
-            "image": None if self.image is None else self.image.to_mapping(),
-            "diffusion": None
-            if self.diffusion is None
-            else self.diffusion.to_mapping(),
-            "video": None if self.video is None else self.video.to_mapping(),
-        }
-
 
 @dataclass(frozen=True, slots=True)
 class BlockTable:
@@ -580,39 +340,6 @@ class BlockTable:
         ):
             raise invalid_descriptor("block table is invalid")
 
-    @classmethod
-    def from_mapping(
-        cls,
-        value: object,
-        where: str = "block table",
-    ) -> BlockTable:
-        """Parse an installed KV unit table and its allocated token extent."""
-        data = _map(value, where)
-
-        def uint_field(name: str) -> int:
-            """Decode a nonnegative integer field."""
-            return _uint(data.get(name), f"{where}.{name}")
-
-        unit_ids = _uints(data.get("unit_ids", ()), f"{where}.unit_ids")
-        fields = (
-            uint_field("request_pool_idx"),
-            uint_field("group_id"),
-            uint_field("start_page"),
-            unit_ids,
-            uint_field("allocated_tokens"),
-        )
-        return cls(*fields)
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize an installed request-and-group KV unit table."""
-        return {
-            "request_pool_idx": self.request_pool_idx,
-            "group_id": self.group_id,
-            "start_page": self.start_page,
-            "unit_ids": list(self.unit_ids),
-            "allocated_tokens": self.allocated_tokens,
-        }
-
 
 @dataclass(frozen=True, slots=True)
 class CacheUnitAllocation:
@@ -639,35 +366,6 @@ class CacheUnitAllocation:
             or len(set(self.unit_ids)) != len(self.unit_ids)
         ):
             raise invalid_descriptor("cache-unit allocation is invalid")
-
-    @classmethod
-    def from_mapping(
-        cls,
-        value: object,
-        where: str = "cache-unit allocation",
-    ) -> CacheUnitAllocation:
-        """Parse newly assigned KV units for one slot and cache group."""
-        data = _map(value, where)
-
-        def uint_field(name: str) -> int:
-            """Decode a nonnegative integer field."""
-            return _uint(data.get(name), f"{where}.{name}")
-
-        unit_ids = _uints(data.get("unit_ids", ()), f"{where}.unit_ids")
-        fields = (
-            uint_field("request_pool_idx"),
-            uint_field("group_id"),
-            unit_ids,
-        )
-        return cls(*fields)
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize newly assigned KV units for lane registration."""
-        return {
-            "request_pool_idx": self.request_pool_idx,
-            "group_id": self.group_id,
-            "unit_ids": list(self.unit_ids),
-        }
 
 
 def _validate_forward_inputs(
@@ -753,44 +451,6 @@ class LatentParams:
                 "a page, or carries page zero"
             )
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "latent params"
-    ) -> LatentParams:
-        """Parse latent pages, raster shape, and the solver-step range."""
-        data = _map(value, where)
-        return cls(
-            request_key=identity.RequestKey.from_mapping(
-                data.get("request_key"), f"{where}.request_key"
-            ),
-            call_id=identity.CallId.from_mapping(
-                data.get("call_id"), f"{where}.call_id"
-            ),
-            page_table=_uints(
-                data.get("page_table", ()), f"{where}.page_table"
-            ),
-            latent_units=_uint(
-                data.get("latent_units"), f"{where}.latent_units"
-            ),
-            height=_uint(data.get("height"), f"{where}.height"),
-            width=_uint(data.get("width"), f"{where}.width"),
-            start_step=_uint(data.get("start_step"), f"{where}.start_step"),
-            step_count=_uint(data.get("step_count"), f"{where}.step_count"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize the trajectory's pages, raster, and step range."""
-        return {
-            "request_key": self.request_key.to_mapping(),
-            "call_id": self.call_id.to_mapping(),
-            "page_table": list(self.page_table),
-            "latent_units": self.latent_units,
-            "height": self.height,
-            "width": self.width,
-            "start_step": self.start_step,
-            "step_count": self.step_count,
-        }
-
 
 class MediaTrack(StrEnum):
     """Independent media stream addressed by a bounded call."""
@@ -829,37 +489,6 @@ class DecodeRange:
         if len(set(self.ranks)) != len(self.ranks):
             raise invalid_descriptor("decode params name each rank once")
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "decode params"
-    ) -> DecodeRange:
-        """Parse the call's cursor, unit bound, and ranks."""
-        data = _map(value, where)
-        return cls(
-            request_key=identity.RequestKey.from_mapping(
-                data.get("request_key"), f"{where}.request_key"
-            ),
-            call_id=identity.CallId.from_mapping(
-                data.get("call_id"), f"{where}.call_id"
-            ),
-            cursor=_uint(data.get("cursor"), f"{where}.cursor"),
-            max_units=_uint(data.get("max_units"), f"{where}.max_units"),
-            ranks=tuple(
-                _uint(rank, f"{where}.ranks[{index}]")
-                for index, rank in enumerate(data.get("ranks", ()))
-            ),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize the call's cursor, unit bound, and ranks."""
-        return {
-            "request_key": self.request_key.to_mapping(),
-            "call_id": self.call_id.to_mapping(),
-            "cursor": self.cursor,
-            "max_units": self.max_units,
-            "ranks": list(self.ranks),
-        }
-
 
 @dataclass(frozen=True, slots=True)
 class BufferAllocation:
@@ -878,28 +507,6 @@ class BufferAllocation:
             raise invalid_descriptor("buffer params span is invalid")
         if self.offset + self.bytes > (1 << 64) - 1:
             raise invalid_descriptor("buffer params span overflows")
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "buffer params"
-    ) -> BufferAllocation:
-        """Parse a persistent buffer's byte span."""
-        data = _map(value, where)
-        return cls(
-            buffer=identity.BufferId.from_mapping(
-                data.get("buffer"), f"{where}.buffer"
-            ),
-            offset=_uint(data.get("offset"), f"{where}.offset"),
-            bytes=_uint(data.get("bytes"), f"{where}.bytes"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize persistent-buffer identity, offset, and byte extent."""
-        return {
-            "buffer": self.buffer.to_mapping(),
-            "offset": self.offset,
-            "bytes": self.bytes,
-        }
 
 
 def _validate_buffer_allocations(
@@ -1008,7 +615,7 @@ class Batch:
         its byte bound, and buffer allocations cover the buffer outputs.
 
         It covers part of the Rust `Batch::validate`. Among other rules, it
-        does not run ``Call.validate``, require unique block tables or
+        does not validate each call, require unique block tables or
         cache-page allocations inside their tables, match latent params and
         decode ranges to the calls, or check latent page overlap.
 
@@ -1105,12 +712,11 @@ class Batch:
                 )
             supplied_inputs.add(product)
 
-        # Each KV transfer's descriptor must fit the transfer-handle bound and
-        # its source must be unique. It installs into exactly one
-        # ``KV_INSTALL`` call whose transfer-byte bound covers its tensors.
+        # Each KV transfer's source must be unique. It installs into exactly
+        # one ``KV_INSTALL`` call whose transfer-byte bound covers its
+        # tensors.
         sources: set[identity.BufferId] = set()
         for publication in self.kv_inputs:
-            publication.encoded_size_bound()
             if publication.source in sources:
                 raise invalid_descriptor("batch repeats a KV input")
             sources.add(publication.source)
@@ -1137,163 +743,6 @@ class Batch:
             self.calls, self.buffer_allocations, "batch"
         )
 
-    @classmethod
-    def from_mapping(cls, value: object) -> Batch:
-        """Parse a batch mapping and validate it.
-
-        Member records are parsed with their own checks, and the batch then
-        runs `validate`.
-        """
-        data = _map(value, "execute batch")
-        batch_id = _uint(data.get("batch_id"), "execute batch.batch_id")
-
-        calls = tuple(
-            call.Call.from_mapping(item, f"execute batch.calls[{index}]")
-            for index, item in enumerate(
-                _seq(data.get("calls", ()), "execute batch.calls")
-            )
-        )
-        commands = tuple(
-            command_from_mapping(
-                item,
-                f"execute batch.commands[{index}]",
-            )
-            for index, item in enumerate(
-                _seq(data.get("commands", ()), "execute batch.commands")
-            )
-        )
-        input_products = tuple(
-            TensorPublication.from_mapping(
-                item, f"execute batch.input_products[{index}]"
-            )
-            for index, item in enumerate(
-                _seq(
-                    data.get("input_products", ()),
-                    "execute batch.input_products",
-                )
-            )
-        )
-
-        return cls(
-            batch_id=batch_id,
-            collective_seq=_uint(
-                data.get("collective_seq"), "execute batch.collective_seq"
-            ),
-            calls=calls,
-            block_tables=tuple(
-                BlockTable.from_mapping(
-                    item, f"execute batch.block_tables[{index}]"
-                )
-                for index, item in enumerate(
-                    _seq(
-                        data.get("block_tables", ()),
-                        "execute batch.block_tables",
-                    )
-                )
-            ),
-            new_cache_units=tuple(
-                CacheUnitAllocation.from_mapping(
-                    item, f"execute batch.new_cache_units[{index}]"
-                )
-                for index, item in enumerate(
-                    _seq(
-                        data.get("new_cache_units", ()),
-                        "execute batch.new_cache_units",
-                    )
-                )
-            ),
-            forward_call_indices=_uints(
-                data.get("forward_call_indices", ()),
-                "forward inputs.forward_call_indices",
-            ),
-            request_pool_indices=_uints(
-                data.get("request_pool_indices", ()),
-                "forward inputs.request_pool_indices",
-            ),
-            seq_lens=_uints(
-                data.get("seq_lens", ()), "forward inputs.seq_lens"
-            ),
-            query_lens=_uints(
-                data.get("query_lens", ()), "forward inputs.query_lens"
-            ),
-            write_kv=tuple(
-                _bool(value, "forward inputs.write_kv")
-                for value in _seq(
-                    data.get("write_kv", ()), "forward inputs.write_kv"
-                )
-            ),
-            latent_params=tuple(
-                LatentParams.from_mapping(
-                    item, f"execute batch.latent_params[{index}]"
-                )
-                for index, item in enumerate(
-                    _seq(
-                        data.get("latent_params", ()),
-                        "execute batch.latent_params",
-                    )
-                )
-            ),
-            decode_ranges=tuple(
-                DecodeRange.from_mapping(
-                    item, f"execute batch.decode_ranges[{index}]"
-                )
-                for index, item in enumerate(
-                    _seq(
-                        data.get("decode_ranges", ()),
-                        "execute batch.decode_ranges",
-                    )
-                )
-            ),
-            buffer_allocations=tuple(
-                BufferAllocation.from_mapping(
-                    item, f"execute batch.buffer_allocations[{index}]"
-                )
-                for index, item in enumerate(
-                    _seq(
-                        data.get("buffer_allocations", ()),
-                        "execute batch.buffer_allocations",
-                    )
-                )
-            ),
-            commands=commands,
-            input_products=input_products,
-            kv_inputs=tuple(
-                transfer.KvTransfer.from_mapping(value)
-                for value in _seq(data.get("kv_inputs", ()), "batch.kv_inputs")
-            ),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Encode the batch with the keys `from_mapping` reads."""
-        return {
-            "batch_id": self.batch_id,
-            "collective_seq": self.collective_seq,
-            "calls": [value.to_mapping() for value in self.calls],
-            "block_tables": [value.to_mapping() for value in self.block_tables],
-            "new_cache_units": [
-                value.to_mapping() for value in self.new_cache_units
-            ],
-            "forward_call_indices": list(self.forward_call_indices),
-            "request_pool_indices": list(self.request_pool_indices),
-            "seq_lens": list(self.seq_lens),
-            "query_lens": list(self.query_lens),
-            "write_kv": list(self.write_kv),
-            "latent_params": [
-                value.to_mapping() for value in self.latent_params
-            ],
-            "decode_ranges": [
-                value.to_mapping() for value in self.decode_ranges
-            ],
-            "buffer_allocations": [
-                value.to_mapping() for value in self.buffer_allocations
-            ],
-            "commands": [command_to_mapping(value) for value in self.commands],
-            "input_products": [
-                value.to_mapping() for value in self.input_products
-            ],
-            "kv_inputs": [value.to_mapping() for value in self.kv_inputs],
-        }
-
 
 @dataclass(frozen=True, slots=True)
 class TensorPublication:
@@ -1305,88 +754,6 @@ class TensorPublication:
 
     product: tensor.TensorRef
     value: transfer.TransferValue
-
-    def encoded_size_bound(self) -> int:
-        """Return the estimated encoded size of the tensor's locators.
-
-        Raises:
-            WorkerError: From `invalid_descriptor` when the estimate exceeds
-                ``transfer.MAX_TRANSFER_HANDLE_BYTES`` or a locator names an
-                unknown transport.
-        """
-        size = transfer._tensor_transfers_size((self.value.tensor,))
-        if size > transfer.MAX_TRANSFER_HANDLE_BYTES:
-            raise invalid_descriptor("transfer metadata exceeds its byte bound")
-        return size
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "tensor publication"
-    ) -> TensorPublication:
-        """Parse a tensor identity and its tagged transfer value.
-
-        The value's kind is ``encoder``, ``device_product``, or ``latent``.
-
-        Raises:
-            WorkerError: From `invalid_descriptor` on an unknown kind or an
-                invalid field.
-        """
-        data = _map(value, where)
-        product = tensor.TensorRef.from_mapping(
-            data.get("product"), f"{where}.product"
-        )
-        transfer_data = _map(data.get("value"), f"{where}.value")
-        kind = _str(transfer_data.get("kind"), f"{where}.value.kind")
-        payload = _map(transfer_data.get("value"), f"{where}.value.value")
-
-        # Height/width default to zero for device products and are required
-        # for every other transfer kind.
-        height = _uint(
-            payload.get("height", 0)
-            if kind == "device_product"
-            else payload.get("height"),
-            f"{where}.value.height",
-        )
-        width = _uint(
-            payload.get("width", 0)
-            if kind == "device_product"
-            else payload.get("width"),
-            f"{where}.value.width",
-        )
-        tensor_value = transfer.TensorTransfer.from_mapping(
-            payload.get("tensor"), f"{where}.value.tensor"
-        )
-        if kind == "encoder":
-            typed: transfer.TransferValue = transfer.EncoderTransferValue(
-                height=height,
-                width=width,
-                payload_kind=_str(
-                    payload.get("payload_kind"), f"{where}.value.payload_kind"
-                ),
-                tensor=tensor_value,
-            )
-        elif kind == "device_product":
-            typed = transfer.DeviceProductTransferValue(
-                height=height,
-                width=width,
-                value_range=_str(
-                    payload.get("value_range", ""), f"{where}.value.value_range"
-                ),
-                tensor=tensor_value,
-            )
-        elif kind == "latent":
-            typed = transfer.LatentTransferValue(
-                height=height,
-                width=width,
-                latent_units=_uint(
-                    payload.get("latent_units"), f"{where}.value.latent_units"
-                ),
-                step=_uint(payload.get("step", 0), f"{where}.value.step"),
-                tensor=tensor_value,
-            )
-        else:
-            raise invalid_descriptor(f"{where}.value.kind is invalid")
-        return cls(product=product, value=typed)
 
     def to_mapping(self) -> dict[str, object]:
         """Encode the tensor identity and its kind-tagged transfer value."""

@@ -214,14 +214,14 @@ def _read_cuda_publications(channel) -> None:
         event_pool=event_pool,
     )
     try:
-        warmup = Locator.from_mapping(channel.recv())
+        warmup = channel.recv()
         value = _await_ticket(
             transport.fetch(warmup, device=torch.device("cuda:0"))
         )
         torch.cuda.synchronize()
         del value
         channel.send("ready")
-        locator = Locator.from_mapping(channel.recv())
+        locator = channel.recv()
         stream = torch.cuda.Stream()
         pending = torch.cuda.Event()
         destination = (
@@ -274,10 +274,10 @@ def test_cuda_vmm_read_does_not_wait_for_consumer_stream() -> None:
         publications.extend((warmup, locator))
         process.start()
         child.close()
-        parent.send(warmup.to_mapping())
+        parent.send(warmup)
         assert parent.poll(60), "CUDA VMM consumer did not become ready"
         assert parent.recv() == "ready"
-        parent.send(locator.to_mapping())
+        parent.send(locator)
         assert parent.poll(30), "CUDA VMM consumer did not finish its read"
         asynchronous, correct = parent.recv()
         process.join(30)
@@ -307,7 +307,7 @@ def _consume_fanout(channel, device_index: int) -> None:
     )
     try:
         channel.send("ready")
-        locator = Locator.from_mapping(channel.recv())
+        locator = channel.recv()
         value = _await_ticket(transport.fetch(locator, device=device))
         channel.send("readable")
         assert channel.recv() == "consume"
@@ -392,7 +392,7 @@ def test_cuda_vmm_serves_a_fanout_and_refuses_a_retired_publication() -> None:
         source = torch.arange(1024, dtype=torch.float32, device="cuda:0")
         locator = transport.publish(source)
         for channel, _process, _device in readers:
-            channel.send(locator.to_mapping())
+            channel.send(locator)
         for channel, _process, _device in readers:
             assert channel.poll(30), (
                 "CUDA VMM fan-out read did not become consumable"
@@ -507,7 +507,7 @@ def _serve_unusable_cuda_handle(channel) -> None:
         offset=(0,) * source.ndim,
         device="cuda:0",
     )
-    channel.send(locator.to_mapping())
+    channel.send(locator)
     # Keep the allocation alive until the receiver has observed the failure.
     assert channel.recv() == "close"
     channel.close()
@@ -530,7 +530,7 @@ def test_cuda_vmm_reports_an_unusable_handle_to_its_reader() -> None:
     child.close()
     try:
         assert parent.poll(60), "CUDA VMM source did not start"
-        locator = Locator.from_mapping(parent.recv())
+        locator = parent.recv()
         ticket = transport.fetch(locator, device=torch.device("cuda:0"))
         ready = threading.Event()
         ticket.add_done_callback(ready.set)
@@ -566,7 +566,7 @@ def _read_shm_publication(channel, slot: int) -> None:
     from uniserve_worker.transport.shared_storage import open_shared_storage
 
     channel.send("ready")
-    locator = Locator.from_mapping(channel.recv())
+    locator = channel.recv()
     storage = open_shared_storage(
         locator.transport.name, segment.HEADER_BYTES + locator.nbytes
     )
@@ -637,7 +637,7 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
         else:
             locator = transport.publish(source, consumers=(1, 2))
         for channel, _process in readers:
-            channel.send(locator.to_mapping())
+            channel.send(locator)
         for channel, _process in readers:
             assert channel.poll(30), (
                 "shared-storage reader did not find the segment ready"
@@ -811,7 +811,7 @@ def test_shm_producer_failure_fails_its_pending_read_and_preserves_independent_r
     child.close()
     try:
         assert parent.poll(60), "shared-storage publisher did not start"
-        locator = Locator.from_mapping(parent.recv())
+        locator = parent.recv()
         pending = consumer.fetch(locator, device=torch.device("cpu"))
         ready = threading.Event()
         pending.add_done_callback(ready.set)
@@ -950,7 +950,7 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
     child.close()
     try:
         assert parent.poll(60), "shared-storage publisher did not start"
-        locator = Locator.from_mapping(parent.recv())
+        locator = parent.recv()
         completed_source = producer.publish(torch.full(shard_shape, 3.0))
         completed = consumer.fetch(
             completed_source,
@@ -1151,7 +1151,7 @@ def _read_late_filled_publication(channel) -> None:
     )
     try:
         channel.send("ready")
-        locator = Locator.from_mapping(channel.recv())
+        locator = channel.recv()
         assert channel.recv() == "filled"
         value = _await_ticket(transport.fetch(locator, device=device))
         channel.send(bool(torch.equal(value.cpu(), torch.full((256,), 7.0))))
@@ -1192,7 +1192,7 @@ def test_cuda_vmm_publishes_a_row_whose_bytes_arrive_later() -> None:
         row = empty((256,), dtype=torch.float32, device=torch.device("cuda:0"))
         row.zero_()
         locator = transport.publish(row)
-        parent.send(locator.to_mapping())
+        parent.send(locator)
 
         # The producer writes the row after it is published, as the encode
         # round does, and only then admits the read.

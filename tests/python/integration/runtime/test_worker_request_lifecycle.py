@@ -114,7 +114,6 @@ def test_independent_product_work_preserves_request_progress(
         )
         assert continued.completions[0].status is CallStatus.OK
         assert continued.completions[0].committed_tokens == (1001,)
-        assert continued.completions[0].position == 2
 
 
 @pytest.mark.parametrize(
@@ -707,7 +706,6 @@ def test_a_call_whose_coordinates_contradict_the_request_is_refused() -> None:
             ),
         )
         assert primed.completions[0].status is CallStatus.OK
-        assert primed.completions[0].position == 2
         observation = record_completion(prefill, primed)
 
         decode = token_call(

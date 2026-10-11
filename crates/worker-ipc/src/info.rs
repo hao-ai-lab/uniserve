@@ -274,7 +274,7 @@ pub struct VideoDenoiserInfo {
     /// Task names the denoiser serves, in canonical order.
     pub tasks: Vec<String>,
     /// Sigma points of the fixed schedule, the clean endpoint included: one
-    /// more than the network evaluations (`WorkerInfo::num_inference_steps`).
+    /// more than the network evaluations ([`Self::denoise_steps`]).
     pub schedule_points: u32,
     /// Shift of the video schedule.
     pub video_shift: f64,
@@ -287,6 +287,12 @@ pub struct VideoDenoiserInfo {
 }
 
 impl VideoDenoiserInfo {
+    /// Network evaluations of every request: one per interval of the fixed
+    /// schedule.
+    pub fn denoise_steps(&self) -> u32 {
+        self.schedule_points - 1
+    }
+
     /// Checks that tasks are named once each, the schedule has an endpoint
     /// and positive finite shifts, and every canvas is positive.
     pub fn validate(&self) -> ValidationResult<()> {
@@ -324,8 +330,6 @@ pub struct WorkerInfo {
     /// Model-declared finite terminal-media computation, when supported.
     #[serde(default)]
     pub media_components: std::collections::BTreeMap<MediaCall, String>,
-    /// Effective number of diffusion predictions advertised by the loaded model.
-    pub num_inference_steps: u32,
     /// What the deployment's video denoiser serves, when the model has one.
     #[serde(default)]
     pub video_denoiser: Option<VideoDenoiserInfo>,
@@ -387,11 +391,6 @@ pub struct WorkerInfo {
 }
 
 impl WorkerInfo {
-    /// Returns the fixed prediction count from the model-declared plan.
-    pub fn denoise_steps(&self) -> u32 {
-        self.num_inference_steps
-    }
-
     /// Returns the advertised allocatable KV units, or zero when KV is
     /// unsupported.
     pub fn kv_usable_units(&self) -> u32 {
@@ -483,8 +482,7 @@ impl WorkerInfo {
         // Here every named call must be one it advertises, with a non-empty
         // component name. The video graph may span workers, a model worker
         // decoding and a host worker encoding and muxing, so its completeness
-        // and its diffusion step count are the executor's checks over every
-        // worker.
+        // is the executor's check over every worker.
         ensure_valid!(
             self.media_components.iter().all(|(call, component)| {
                 !component.is_empty() && self.supported_calls.contains(&CallKind::Media(*call))
@@ -493,10 +491,6 @@ impl WorkerInfo {
         );
         if let Some(video) = &self.video_denoiser {
             video.validate()?;
-            ensure_valid!(
-                video.schedule_points == self.num_inference_steps + 1,
-                "a video denoiser's schedule points disagree with its evaluations"
-            );
         }
         ensure_valid!(
             self.max_batch_calls > 0
@@ -546,7 +540,6 @@ impl Default for WorkerInfo {
     fn default() -> Self {
         Self {
             media_components: Default::default(),
-            num_inference_steps: 0,
             video_denoiser: None,
             fabric_handles: false,
             endpoint: WorkerEndpoint {

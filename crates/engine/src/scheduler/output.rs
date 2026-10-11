@@ -412,10 +412,11 @@ impl Scheduler {
                             })
                         {
                             let bos = self.ctrl.bos;
+                            let generates_canvases = self.config.canvas.is_some();
                             if let Some(st) = self.running.get_mut(&id) {
                                 if st.req.is_readout() {
                                     st.phase = Phase::Readout;
-                                } else if st.req.is_canvas_generation() {
+                                } else if generates_canvases {
                                     st.phase = Phase::Canvas;
                                 } else {
                                     st.next_token = bos;
@@ -543,8 +544,9 @@ impl Scheduler {
                 // follow. So does a canvas-generating request's, and each of
                 // its block commits, which extend the context the same way;
                 // the next block follows.
+                let generates_canvases = self.config.canvas.is_some();
                 if let Some(st) = self.running.get_mut(&id)
-                    && (st.req.is_readout() || st.req.is_canvas_generation())
+                    && (st.req.is_readout() || generates_canvases)
                 {
                     st.phase = if st.req.is_readout() {
                         Phase::Readout

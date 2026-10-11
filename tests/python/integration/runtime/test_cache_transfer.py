@@ -15,10 +15,8 @@ from uniserve.runtime import EventPool
 from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.transfer import (
-    MAX_TRANSFER_HANDLE_BYTES,
     KvGroupTransfer,
     KvTransfer,
-    Locator,
     TensorTransfer,
 )
 from uniserve_worker.storage.block_tables import GroupTable
@@ -57,7 +55,7 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
     child.close()
     try:
         assert parent.poll(30), "shared-storage publisher did not start"
-        locator = Locator.from_mapping(parent.recv())
+        locator = parent.recv()
         source = _buffer(1)
         field = TensorTransfer(shape=shape, locations=(locator,))
         publication = KvTransfer(
@@ -728,7 +726,6 @@ def test_deep_kv_publication_fits_its_descriptor_and_installs(
             shards.append(shard)
 
         merged = _merged(shards)
-        assert merged.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES
 
         # The consumer reads each layer's region over the peer mechanism.
         peer = mechanisms[1]

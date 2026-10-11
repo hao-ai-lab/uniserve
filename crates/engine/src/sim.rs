@@ -34,8 +34,8 @@ use uniserve_core::{
     try_apply_sampling_counts,
 };
 use uniserve_worker_ipc::{
-    BatchOutput, Call, CallKind, CallStatus, DrawLayout, ErrorCode, FinishFlags, NewRequest,
-    RequestOutput, SamplingState, TensorRef, TimingCounters, WorkerInfo,
+    BatchOutput, Call, CallKind, CallStatus, ErrorCode, FinishFlags, NewRequest, RequestOutput,
+    SamplingState, TensorRef, TimingCounters, WorkerInfo,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -480,6 +480,9 @@ pub struct SimEngine {
     /// Readout candidate whose log-probability is reported as NaN, as a
     /// worker with a numerical defect reports it.
     non_finite_candidate: Option<u32>,
+    /// Block-diffusion sampling the simulated worker is launched with, as a
+    /// worker's launch configuration states it.
+    canvas_sampling: Option<uniserve_core::CanvasSampling>,
     /// Releases for batches that skip a predicated call: such a batch returns
     /// only after taking one release, or once the sender is dropped.
     predicated_release: Option<Receiver<()>>,
@@ -517,6 +520,7 @@ impl SimEngine {
             vocab: SYNTH_VOCAB_SIZE,
             results_on_wait: false,
             non_finite_candidate: None,
+            canvas_sampling: None,
             predicated_release: None,
             requests: HashMap::new(),
             refused: HashMap::new(),
@@ -577,25 +581,23 @@ impl SimEngine {
         match request.sampling() {
             Some(sampling) => {
                 let draw = if sampling.temperature > 0.0 {
-                    let rng = call.rng.ok_or_else(|| {
-                        anyhow::anyhow!("stochastic sampling call has no RNG coordinates")
-                    })?;
-                    anyhow::ensure!(
-                        rng.draw_layout == DrawLayout::TargetSampling,
-                        "stochastic sampling call uses the wrong RNG layout"
-                    );
-                    anyhow::ensure!(
-                        rng.seed == sampling.seed.unwrap_or(0),
-                        "call RNG seed disagrees with admitted sampling"
-                    );
+                    // The draw follows the admitted seed and the sampled
+                    // token's logical position, which a prefill reaches past
+                    // its query tokens and a decode or verify one past its
+                    // first.
+                    let query_tokens = match call.code {
+                        CallKind::Forward(ForwardMode::Prefill) => call.bounds.max_tokens,
+                        _ => 1,
+                    };
+                    let position = u64::from(request.logical_position) + u64::from(query_tokens);
                     let key = philox::sampling_key(
-                        rng.seed,
+                        sampling.seed.unwrap_or(0),
                         call.request_key.engine_id,
                         request_id.0,
                         call.request_key.request_epoch,
                         philox::DRAW_LAYOUT_TARGET,
                     );
-                    philox::sampling_uniform(key, rng.semantic_index_base, 0, 0)
+                    philox::sampling_uniform(key, position, 0, 0)
                 } else {
                     0.0
                 };
@@ -657,6 +659,7 @@ impl SimEngine {
         text_len: usize,
         fake_eos: u32,
         non_finite_candidate: Option<u32>,
+        canvas_sampling: Option<uniserve_core::CanvasSampling>,
         call: &Call,
         request: &mut SimRequestState,
     ) -> anyhow::Result<RequestOutput> {
@@ -688,12 +691,9 @@ impl SimEngine {
             request_key: call.request_key,
             call_id: call.call_id,
             status: CallStatus::Ok,
-            product_generations: call.tensor_outputs().map(|out| out.generation).collect(),
             error_code: None,
             error_message: None,
             timing_counters: TimingCounters::default(),
-            code: call.code,
-            position: 0,
             kv_visible_len: 0,
             kv_computed_len: 0,
             num_completed_steps: 0,
@@ -703,7 +703,6 @@ impl SimEngine {
             media_output: None,
             kv_output: None,
         };
-        record.position = request.logical_position;
         set_kv_lengths(&mut record, request.kv_visible_len);
 
         match call.code {
@@ -738,7 +737,6 @@ impl SimEngine {
                             .logical_position
                             .saturating_add(call.bounds.max_tokens);
                     }
-                    record.position = request.logical_position;
                     set_kv_lengths(&mut record, request.kv_visible_len);
                 } else if samples_token {
                     let index = request.emitted;
@@ -754,7 +752,6 @@ impl SimEngine {
                     )?
                     else {
                         record.status = CallStatus::Error;
-                        record.product_generations.clear();
                         record.error_code = Some(ErrorCode::InvalidCall);
                         return Ok(record);
                     };
@@ -794,7 +791,6 @@ impl SimEngine {
                             .predicate_values
                             .insert(completion.clone(), transition);
                     }
-                    record.position = 1;
                     // Positions and KV advance by the query length: the whole
                     // bound for a prefill, one token for decode and verify.
                     if !visual_state {
@@ -808,7 +804,6 @@ impl SimEngine {
                             request.logical_position.saturating_add(query_tokens);
                         request.kv_visible_len =
                             request.kv_visible_len.saturating_add(query_tokens);
-                        record.position = request.logical_position;
                         set_kv_lengths(&mut record, request.kv_visible_len);
                     }
                     match work {
@@ -856,17 +851,14 @@ impl SimEngine {
                         call.call_id,
                         request.canvas
                     );
-                    let max_steps = request
-                        .admission
-                        .ar
-                        .as_ref()
-                        .and_then(|branch| branch.canvas.as_ref())
-                        .map(|canvas| canvas.max_steps)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "canvas call for a request admitted without canvas sampling"
-                            )
-                        })?;
+                    let max_steps =
+                        canvas_sampling
+                            .map(|canvas| canvas.max_steps)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "canvas call for a worker launched without canvas sampling"
+                                )
+                            })?;
                     let request_id = call.request_key.request_id;
                     if step.step < sim_canvas_stop_step(request_id, step.block, max_steps) {
                         request.canvas.step += 1;
@@ -996,12 +988,9 @@ impl SimEngine {
             request_key: call.request_key,
             call_id: call.call_id,
             status: CallStatus::Predicated,
-            product_generations: Vec::new(),
             error_code: None,
             error_message: None,
             timing_counters: TimingCounters::default(),
-            code: call.code,
-            position: request.logical_position,
             kv_visible_len: request.kv_visible_len,
             kv_computed_len: request.kv_visible_len,
             num_completed_steps: u32::from(request.flow_step),
@@ -1091,6 +1080,12 @@ impl SimEngine {
         {
             group.page_tokens = tokens;
         }
+    }
+
+    /// Launches the simulated worker with block-diffusion sampling: a canvas
+    /// step stops its block no later than the sampling's step limit.
+    pub fn set_canvas_sampling(&mut self, sampling: uniserve_core::CanvasSampling) {
+        self.canvas_sampling = Some(sampling);
     }
 
     /// Reports NaN as the log-probability of readout candidate `token`,
@@ -1262,6 +1257,7 @@ impl SimEngine {
         let text_len = self.text_len;
         let fake_eos = self.fake_eos;
         let non_finite_candidate = self.non_finite_candidate;
+        let canvas_sampling = self.canvas_sampling;
         let refused = &self.refused;
         let mut completions = Vec::with_capacity(batch.requests.len());
         for (call, _) in batch.requests {
@@ -1323,6 +1319,7 @@ impl SimEngine {
                 text_len,
                 fake_eos,
                 non_finite_candidate,
+                canvas_sampling,
                 &call,
                 request,
             )?;
@@ -1330,7 +1327,6 @@ impl SimEngine {
                 (call.code, refused.get(&call.request_key.request_id))
             {
                 completion.status = CallStatus::Error;
-                completion.product_generations.clear();
                 completion.media_output = None;
                 completion.error_code = Some(ErrorCode::InvalidRequest);
                 completion.error_message = Some(reason.clone());
@@ -1399,7 +1395,6 @@ mod tests {
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
-                canvas: None,
             }),
             None,
             0,
@@ -1457,7 +1452,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         ExecutionBatch::new(
             batch_id,

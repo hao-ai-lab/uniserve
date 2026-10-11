@@ -173,9 +173,7 @@ def generate(
         )
         for name, value in request.items():
             value.copy_(staged[name])
-        schedules = denoiser.make_schedules(
-            denoiser.num_steps, shift=None, device=device
-        )
+        schedules = denoiser.make_schedules(device=device)
         samples = {name: request[name] for name in denoiser.modalities}
         for step in range(denoiser.num_steps):
             inputs = DenoiserInput(

@@ -1299,7 +1299,7 @@ impl Scheduler {
             outputs,
             completion_output,
             predicate,
-            rng: None,
+            image_index: None,
         };
 
         // Record what this call schedules: the admission it carries, the
@@ -1976,7 +1976,7 @@ impl Scheduler {
             {
                 if state.req.is_readout() {
                     Phase::Readout
-                } else if state.req.is_canvas_generation() {
+                } else if self.config.canvas.is_some() {
                     Phase::Canvas
                 } else {
                     Phase::DecodeUnd
@@ -3203,6 +3203,7 @@ impl Scheduler {
                     state,
                     &record,
                     media.as_deref(),
+                    self.config.canvas.as_ref(),
                 ) {
                     self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;

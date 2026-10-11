@@ -36,7 +36,6 @@ from uniserve_worker.model_executor.input_batch import InputRow, TokenRow
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
-    DrawLayout,
     ForwardMode,
     SamplingState,
     VisionInput,
@@ -1147,7 +1146,6 @@ def token_outcome(
 
     request.status = CallStatus.OK
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.token.committed_tokens = committed_tokens
     return request
 
@@ -1406,14 +1404,13 @@ def build_sampling_metadata(
     ``logits`` holds one row per entry of ``positions``; a single row may be
     1-D. Each row receives its allowed or forced tokens, its penalty counts
     when penalties are enabled and, when sampling is stochastic, a Philox
-    uniform draw. A device-greedy call
-    without drafts or allowed or forced tokens carries no draw or parameter
-    tensors.
+    uniform draw keyed by the admitted seed and the row's position. A
+    device-greedy call without drafts or allowed or forced tokens carries no
+    draw or parameter tensors.
 
     Raises:
         WorkerError: ``invalid_descriptor`` when the request has no admitted
-            sampling parameters, stochastic sampling lacks matching
-            target-sampling RNG coordinates, or the logits do not align with
+            sampling parameters or the logits do not align with
             ``positions``; ``unsupported_setup`` when penalties
             are enabled and ``DecodeState`` disagrees with the vocabulary or
             device.
@@ -1441,36 +1438,11 @@ def build_sampling_metadata(
         )
 
     # Draws are addressed by request lineage and semantic position
-    # (`uniserve.nn.rng`), so the call's registered RNG coordinates must
-    # describe exactly these rows: the target-sampling layout, the admitted
-    # seed, and semantic indexes equal to `positions`.
-    rng = call.rng
-    if float(parameters.temperature) > 0.0:
-        if rng is None or rng.draw_layout is not DrawLayout.TARGET_SAMPLING:
-            raise invalid_descriptor(
-                "stochastic sampling requires target-sampling RNG coordinates"
-            )
-        if int(rng.seed) != int(parameters.seed or 0):
-            raise invalid_descriptor(
-                "call RNG seed disagrees with admitted sampling"
-            )
-        expected_positions = tuple(
-            range(
-                int(rng.semantic_index_base),
-                int(rng.semantic_index_base) + len(positions),
-            )
-        )
-        if positions != expected_positions:
-            raise invalid_descriptor(
-                "sampling positions disagree with registered semantic RNG "
-                "coordinates"
-            )
-
-    rng_seed = 0 if rng is None else int(rng.seed)
+    # (`uniserve.nn.rng`): the admitted seed and the row's position.
     stochastic = float(parameters.temperature) > 0.0
     draw_key = (
         sampling_key(
-            rng_seed,
+            int(parameters.seed or 0),
             int(call.request_key.engine_id),
             int(call.request_key.request_id),
             int(call.request_key.request_epoch),

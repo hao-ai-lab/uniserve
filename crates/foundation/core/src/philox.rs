@@ -26,8 +26,8 @@ const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Target-model sampling draw space.
 ///
-/// Draw-space values match the IPC `DrawLayout` discriminants and isolate
-/// semantic streams so activity in one stream cannot shift another.
+/// Draw-space values isolate semantic streams so activity in one stream
+/// cannot shift another.
 pub const DRAW_LAYOUT_TARGET: u64 = 0;
 /// Draw-space identifier for speculative proposal sampling.
 pub const DRAW_LAYOUT_PROPOSAL: u64 = 1;

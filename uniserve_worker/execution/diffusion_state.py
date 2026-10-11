@@ -82,12 +82,10 @@ class DiffusionState:
         denoiser,
         size,
         *,
-        steps: int,
-        shift: float | None,
-        device: torch.device | str,
+        schedules: Mapping[str, Schedule],
         guidance: Guidance | None = None,
     ) -> DiffusionState:
-        """Build a request's state from its admitted sampling parameters.
+        """Build a request's state on its ``schedules``.
 
         An ``ImageDenoiser`` attends to the request's KV prefixes; any other
         denoiser advances a ladder over its request slot.
@@ -95,7 +93,7 @@ class DiffusionState:
         attends = isinstance(denoiser, ImageDenoiser)
         return cls(
             size,
-            dict(denoiser.make_schedules(steps, shift=shift, device=device)),
+            dict(schedules),
             guidance,
             kv=KVConditioning() if attends else None,
             slot=None if attends else SlotLadder(),

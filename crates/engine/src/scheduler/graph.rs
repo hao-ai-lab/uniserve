@@ -346,7 +346,6 @@ mod tests {
             sampling: DiffusionSamplingParams {
                 num_frames: 124,
                 video_units: 7,
-                num_inference_steps: 49,
                 seed: 42,
                 width: 1344,
                 height: 768,

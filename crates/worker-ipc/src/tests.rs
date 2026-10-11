@@ -63,17 +63,12 @@ fn ar_decode_call() -> Call {
         code: kind,
         bounds: Bounds {
             max_tokens: 1,
-            max_kv_units: 1,
             ..Bounds::default()
         },
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: Some(Rng {
-            seed: 99,
-            semantic_index_base: 4,
-            draw_layout: DrawLayout::TargetSampling,
-        }),
+        image_index: Some(4),
     }
 }
 
@@ -142,7 +137,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     }
 }
 
@@ -170,13 +165,9 @@ fn completion_record() -> RequestOutput {
         call_id: CallId::new(11, 0),
 
         status: CallStatus::Ok,
-
-        product_generations: vec![3, 4],
         error_code: None,
         error_message: None,
         timing_counters: TimingCounters::default(),
-        code: CallKind::Forward(ForwardMode::Decode),
-        position: 5,
         kv_visible_len: 5,
         kv_computed_len: 5,
         num_completed_steps: 0,
@@ -199,7 +190,6 @@ fn admission() -> NewRequest {
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![2, 7],
             initial_position: 0,
-            canvas: None,
         }),
         None,
         3,
@@ -211,7 +201,6 @@ fn media_sampling() -> DiffusionSamplingParams {
     DiffusionSamplingParams {
         num_frames: 22,
         video_units: 3,
-        num_inference_steps: 4,
         seed: 17,
         width: 1024,
         height: 768,
@@ -419,7 +408,8 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
             });
             next_buffer_offset += bytes;
         }
-        let capacity_units = call.bounds.max_kv_units;
+        // Each forward call holds one fresh KV unit.
+        let capacity_units = u32::from(matches!(call.code, CallKind::Forward(_)));
         if capacity_units > 0 {
             // The request id doubles as the request pool slot, which forward
             // rows, block tables, and unit allocations require to be positive.
@@ -525,12 +515,10 @@ fn a_readout_and_its_candidate_logprobs_round_trip() {
 
     let mut record = completion_record();
     record.call_id = call_id;
-    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
     record.sampled_logprob = None;
     record.top_logprobs.clear();
     record.prompt_logprobs.clear();
     record.committed_tokens.clear();
-    record.product_generations.clear();
     record.candidate_logprobs = vec![-0.25, -3.5, -17.75];
     let report = lane_report(5, vec![record], Vec::new(), None, None);
     let decoded =
@@ -576,8 +564,7 @@ fn a_readout_must_address_the_canvas_of_a_token_denoising_call() {
     }
 }
 
-/// A canvas step of a block-diffusion request whose admission names its
-/// canvas sampling.
+/// A canvas step of a block-diffusion request.
 fn canvas_step_batch() -> Batch {
     let call_id = CallId::new(6, 0);
     let mut call = call_for(CallKind::Forward(ForwardMode::TokenDenoising), call_id);
@@ -596,15 +583,6 @@ fn canvas_step_batch() -> Batch {
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![1, 50, 106],
             initial_position: 0,
-            canvas: Some(CanvasSampling {
-                canvas_length: 256,
-                max_steps: 48,
-                entropy_bound: 0.1,
-                t_min: 0.4,
-                t_max: 0.8,
-                confidence_threshold: 0.005,
-                stability_threshold: 1,
-            }),
         }),
         None,
         0,
@@ -613,20 +591,18 @@ fn canvas_step_batch() -> Batch {
     batch_with_calls(6, vec![admission], vec![call])
 }
 
-/// A canvas step reaches the rank with its block and step and its request's
-/// admitted sampling, and its completion returns the stopped block's tokens.
+/// A canvas step reaches the rank with its block and step, and its
+/// completion returns the stopped block's tokens.
 #[test]
-fn a_canvas_step_its_sampling_and_its_block_round_trip() {
+fn a_canvas_step_and_its_block_round_trip() {
     let batch = canvas_step_batch();
     assert_eq!(execute_round_trip(batch.clone()), batch);
 
     let mut record = completion_record();
     record.call_id = CallId::new(6, 0);
-    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
     record.sampled_logprob = None;
     record.top_logprobs.clear();
     record.prompt_logprobs.clear();
-    record.product_generations.clear();
     record.committed_tokens = (0..256).collect();
     let report = lane_report(6, vec![record], Vec::new(), None, None);
     let decoded =
@@ -657,15 +633,11 @@ fn a_canvas_step_is_a_token_denoising_call_without_input_tokens() {
     }
 }
 
-/// Only a successful token-denoising completion reports candidate
-/// log-probabilities.
+/// Only a successful completion reports candidate log-probabilities.
 #[test]
-fn candidate_logprobs_belong_to_a_successful_token_denoising_completion() {
+fn candidate_logprobs_belong_to_a_successful_completion() {
     let mut record = completion_record();
     record.candidate_logprobs = vec![-1.0];
-    assert!(record.validate().is_err());
-
-    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
     assert!(record.validate().is_ok());
     record.status = CallStatus::Error;
     record.error_code = Some(ErrorCode::ComputeError);
@@ -849,7 +821,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             inputs: vec![latent.clone()],
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         // A video decode range may start past the first unit, while an audio
         // decode range must start at it. Neither call may omit its range.
@@ -1058,7 +1030,6 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     let mut report = lane_report(
         5,
         vec![RequestOutput {
-            code: CallKind::Transfer(TransferMode::KvPublish),
             kv_output: Some(KvTransfer {
                 groups: Vec::new(),
                 source,
@@ -1171,7 +1142,6 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
         let report = lane_report(
             5,
             vec![RequestOutput {
-                code: CallKind::Transfer(TransferMode::KvPublish),
                 kv_output: Some(KvTransfer {
                     groups: vec![
                         KvGroupTransfer {
@@ -1658,7 +1628,13 @@ fn worker_info_round_trips() {
 fn kv_free_worker_info_round_trips() {
     let info = WorkerInfo {
         media_components: video_components(),
-        num_inference_steps: 4,
+        video_denoiser: Some(VideoDenoiserInfo {
+            tasks: vec!["t2va".into()],
+            schedule_points: 5,
+            video_shift: 12.0,
+            audio_shift: 3.0,
+            canvases: Vec::new(),
+        }),
         supported_calls: video_components()
             .into_keys()
             .map(CallKind::Media)
@@ -1674,7 +1650,6 @@ fn kv_free_worker_info_round_trips() {
         panic!("decoded response must preserve its info variant");
     };
     assert_eq!(decoded, info);
-    assert_eq!(decoded.denoise_steps(), 4);
 }
 
 #[test]
@@ -1787,9 +1762,9 @@ fn full_image() -> ImageParams {
         width: 768,
         seed: Some(77),
         negative_prompt: "blurry".into(),
-        max_images: 2,
+        max_images: 1,
         image_prompts: vec!["p0".into(), "p1".into()],
-        retain_images: false,
+        retain_images: true,
     }
 }
 
@@ -1806,7 +1781,6 @@ fn comprehensive_batches() -> Vec<Batch> {
             negative_token_ids: vec![100, 101],
             finish_token_ids: vec![2, 7],
             initial_position: 128,
-            canvas: None,
         }),
         None,
         0,
@@ -1867,10 +1841,9 @@ fn comprehensive_batches() -> Vec<Batch> {
             code: kind,
             bounds: Bounds {
                 max_tokens: 7 + index as u32,
-                max_kv_units: 3,
-                max_latent_bytes: 1 << 20,
                 max_completion_bytes: 4096,
                 max_transfer_bytes: 1 << 16,
+                ..Bounds::default()
             },
             inputs: vec![tensor_for(
                 key,
@@ -1889,15 +1862,7 @@ fn comprehensive_batches() -> Vec<Batch> {
                 DType::U8,
                 ShapeBound::default(),
             )),
-            rng: Some(Rng {
-                seed: 99 + index as u64,
-                semantic_index_base: 4,
-                draw_layout: match index % 3 {
-                    0 => DrawLayout::TargetSampling,
-                    1 => DrawLayout::SpeculativeProposal,
-                    _ => DrawLayout::FlowNoise,
-                },
-            }),
+            image_index: Some(4 + index as u32),
         });
         // The admissions ride on the first batch of the pass, as a scheduler
         // places them ahead of the calls that use them.
@@ -1935,7 +1900,6 @@ fn full_caps() -> WorkerInfo {
         encoder_cache_entries: 64,
         encoder_entry_bytes: 128 << 20,
         media_components: video_components(),
-        num_inference_steps: 4,
         supported_calls: CallKind::ALL.to_vec(),
         // A full-attention group with 64-token pages of one unit and a
         // sliding-window group with 32-token pages of two units share one
@@ -2039,8 +2003,6 @@ fn full_run_result() -> BatchOutput {
         call_id: CallId::new(11, 0),
 
         status: CallStatus::Ok,
-
-        product_generations: vec![3, 5],
         error_code: None,
         error_message: None,
         timing_counters: TimingCounters {
@@ -2049,8 +2011,6 @@ fn full_run_result() -> BatchOutput {
             copy_us: 43,
             host_us: 44,
         },
-        code: CallKind::Forward(ForwardMode::Decode),
-        position: 5,
         kv_visible_len: 6,
         num_completed_steps: 7,
         kv_computed_len: 8,
@@ -2071,7 +2031,6 @@ fn full_run_result() -> BatchOutput {
     predicated_record.status = CallStatus::Predicated;
     predicated_record.committed_tokens.clear();
     predicated_record.finish_flags = FinishFlags::default();
-    predicated_record.product_generations = Vec::new();
     let mut error_record = ok_record.clone();
     error_record.request_key = key_for_request(102);
     error_record.call_id = CallId::new(11, 2);
@@ -2198,44 +2157,4 @@ fn ipc_decode_rejects_malformed_frames() {
     let mut response = encode_response(&WorkerResponse::ok()).unwrap();
     response.truncate(response.len() / 2);
     assert!(decode_response(&response).is_err());
-}
-
-#[test]
-fn a_channel_product_of_media_size_fits_the_transfer_handle_bound() {
-    // A five-second stereo PCM track: the bytes are the product and travel on
-    // the rank channel, so they do not count against the handle bound.
-    let samples = 5 * 32_000u64;
-    let mut reference = output_product(CallId::new(12, 0));
-    reference.dtype = DType::I16;
-    reference.shape_bound.dims = vec![
-        DimBound::Device {
-            max: samples as u32,
-        },
-        DimBound::Static(2),
-    ];
-    let publication = TensorPublication {
-        product: reference,
-        value: TransferHandle::DeviceProduct {
-            height: 0,
-            width: 0,
-            value_range: String::new(),
-            tensor: TensorTransfer {
-                shape: vec![samples, 2],
-                locations: vec![Locator {
-                    source: WorkerInfo::default().endpoint,
-                    transport: TransferTransport::Channel {
-                        endpoint: "tensor-publisher".into(),
-                        payload: vec![0u8; (samples * 4) as usize],
-                    },
-                    nbytes: samples * 4,
-                    dtype: "int16".into(),
-                    offset: vec![0, 0],
-                    shape: vec![samples, 2],
-                    device: "cpu".into(),
-                }],
-            },
-        },
-    };
-    assert!(publication.validate().is_ok());
-    assert!(publication.value.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES);
 }

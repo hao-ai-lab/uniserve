@@ -156,9 +156,9 @@ pub struct WorkerProcessArgs {
     pub video_frame_sizes: Option<String>,
     /// Block-diffusion sampling of every canvas the deployment generates, as
     /// the server resolves it; `None` when the served model generates no
-    /// canvases. The worker keeps the argmax history its stability
-    /// threshold needs, prepares its canvas steps for exactly this sampling,
-    /// and refuses a request that carries another.
+    /// canvases. The scheduler plans canvas steps under it and the worker
+    /// keeps the argmax history its stability threshold needs and prepares
+    /// its canvas steps for it: requests do not carry sampling.
     pub canvas_sampling: Option<uniserve_core::CanvasSampling>,
     /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,

@@ -33,10 +33,8 @@ from uniserve_worker.protocol.batch import GenerationParams, NewRequest
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
-    DrawLayout,
     ErrorCode,
     ForwardMode,
-    Rng,
     SamplingState,
 )
 from uniserve_worker.protocol.identity import CallId
@@ -64,11 +62,6 @@ def test_logprob_reporting_does_not_change_sample_selection(device, request):
         predecessor=root_parent(first),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
-        rng=Rng(
-            seed=71,
-            semantic_index_base=2,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
     second_op = token_call(
         second.request_key,
@@ -77,11 +70,6 @@ def test_logprob_reporting_does_not_change_sample_selection(device, request):
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
         logprobs=True,
-        rng=Rng(
-            seed=71,
-            semantic_index_base=2,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
 
     result = finalized_report(
@@ -143,14 +131,9 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
             )
             completion = report.completions[0]
             assert (
-                completion.position,
                 completion.kv_visible_len,
                 completion.kv_computed_len,
-            ) == (
-                2,
-                2,
-                2,
-            )
+            ) == (2, 2)
             primed.append((extend, report))
 
         decode_ops = []
@@ -189,14 +172,9 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                 expected_successor(expected_successor(prompt_end)),
             )
             assert (
-                completion.position,
                 completion.kv_visible_len,
                 completion.kv_computed_len,
-            ) == (
-                3,
-                3,
-                3,
-            )
+            ) == (3, 3)
 
 
 def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> (
@@ -242,12 +220,6 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> (
 
     assert result.completions[0].committed_tokens == (expected,)
     assert result.completions[1].committed_tokens == (expected,)
-    assert result.completions[0].product_generations == tuple(
-        output.generation for output in first_op.tensor_outputs()
-    )
-    assert result.completions[1].product_generations == tuple(
-        output.generation for output in second_op.tensor_outputs()
-    )
 
 
 def test_verify_commits_every_accepted_position() -> None:

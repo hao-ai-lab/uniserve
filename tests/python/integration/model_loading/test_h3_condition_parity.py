@@ -297,7 +297,6 @@ def test_conditioned_request_computes_the_model_first_step(
         diffusion=DiffusionParams(
             plan.num_frames,
             len(runner.video_decoder.frame_slices(plan.num_frames)),
-            builder.num_steps,
             SEED,
             width=plan.canvas.width,
             height=plan.canvas.height,
@@ -466,9 +465,7 @@ def test_conditioned_request_computes_the_model_first_step(
         for name in denoiser.modalities:
             assert _equal(first[name], request[name]), name
 
-        model_schedules = denoiser.make_schedules(
-            denoiser.num_steps, shift=None, device=DEVICE
-        )
+        model_schedules = denoiser.make_schedules(device=DEVICE)
         inputs = DenoiserInput(
             {
                 name: (

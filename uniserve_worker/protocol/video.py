@@ -20,7 +20,6 @@ from uniserve.media import image
 from uniserve.media import video as media_video
 from uniserve.model import ConditionRole
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.protocol.validation import _map, _seq, _str, _uint, _uints
 
 
 class VideoTask(StrEnum):
@@ -250,34 +249,6 @@ class VideoAdmission:
                 "only a conditioned video task carries conditions"
             )
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "video admission"
-    ) -> VideoAdmission:
-        """Parse a video admission from its mapping form."""
-        data = _map(value, where)
-        return cls(
-            task=VideoTask(_str(data.get("task"), f"{where}.task")),
-            text_tags=_uints(data.get("text_tags", ()), f"{where}.text_tags"),
-            conditions=tuple(
-                _condition_from_mapping(item, f"{where}.conditions[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("conditions", ()), f"{where}.conditions")
-                )
-            ),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize the admission; ``from_mapping`` reads it back."""
-        return {
-            "task": self.task.value,
-            "text_tags": list(self.text_tags),
-            "conditions": [
-                _condition_to_mapping(condition)
-                for condition in self.conditions
-            ],
-        }
-
     def vision_spans(self) -> tuple[tuple[int, int], ...]:
         """The presentation's vision blocks as ``(start, stop)`` token ranges.
 
@@ -292,133 +263,6 @@ class VideoAdmission:
                 spans.append((start, index))
                 start = None
         return tuple(spans)
-
-
-def _raster(value: object, where: str) -> image.Config:
-    data = _map(value, where)
-    return image.Config(
-        _uint(data.get("height"), f"{where}.height"),
-        _uint(data.get("width"), f"{where}.width"),
-    )
-
-
-def _raster_mapping(value: image.Config) -> dict[str, int]:
-    return {"height": value.height, "width": value.width}
-
-
-def _audio_from_mapping(value: object, where: str) -> AudioClip:
-    data = _map(value, where)
-    return AudioClip(
-        *(
-            _uint(data.get(name), f"{where}.{name}")
-            for name in (
-                "sample_rate",
-                "start_sample",
-                "source_samples",
-                "samples",
-            )
-        )
-    )
-
-
-def _condition_from_mapping(value: object, where: str) -> VideoCondition:
-    """Parse one condition; absent media fields are None."""
-    data = _map(value, where)
-    source = _map(data.get("source"), f"{where}.source")
-    fit = data.get("image")
-    clip = data.get("video")
-    track = data.get("audio")
-    vision = data.get("vision")
-    return VideoCondition(
-        role=ConditionRole(_str(data.get("role"), f"{where}.role")),
-        source=MediaLocator(
-            _str(source.get("name"), f"{where}.source.name"),
-            _uint(source.get("bytes"), f"{where}.source.bytes"),
-        ),
-        image=None
-        if fit is None
-        else ImageFit(
-            _raster(_map(fit, f"{where}.image").get("resized"), where),
-            _uint(fit.get("left"), f"{where}.image.left"),
-            _uint(fit.get("top"), f"{where}.image.top"),
-            _raster(fit.get("size"), f"{where}.image.size"),
-        ),
-        video=None
-        if clip is None
-        else VideoClip(
-            _raster(_map(clip, f"{where}.video").get("canvas"), where),
-            _uint(clip.get("start_frame"), f"{where}.video.start_frame"),
-            _uint(clip.get("frames"), f"{where}.video.frames"),
-            _uint(clip.get("vae_frames"), f"{where}.video.vae_frames"),
-        ),
-        audio=None
-        if track is None
-        else _audio_from_mapping(track, f"{where}.audio"),
-        vision=None
-        if vision is None
-        else ConditionVision(
-            grid=tuple(  # type: ignore[arg-type]
-                _uints(_map(vision, where).get("grid"), f"{where}.grid")
-            ),
-            tokens=_uint(vision.get("tokens"), f"{where}.vision.tokens"),
-            frame_indices=_uints(
-                vision.get("frame_indices", ()), f"{where}.frame_indices"
-            ),
-        ),
-        latent_units=_uints(
-            data.get("latent_units", ()), f"{where}.latent_units"
-        ),
-        audio_rows=_uint(data.get("audio_rows", 0), f"{where}.audio_rows"),
-    )
-
-
-def _condition_to_mapping(condition: VideoCondition) -> dict[str, object]:
-    fit, clip, track, vision = (
-        condition.image,
-        condition.video,
-        condition.audio,
-        condition.vision,
-    )
-    return {
-        "role": condition.role.value,
-        "source": {
-            "name": condition.source.name,
-            "bytes": condition.source.bytes,
-        },
-        "image": None
-        if fit is None
-        else {
-            "resized": _raster_mapping(fit.resized),
-            "left": fit.left,
-            "top": fit.top,
-            "size": _raster_mapping(fit.size),
-        },
-        "video": None
-        if clip is None
-        else {
-            "canvas": _raster_mapping(clip.canvas),
-            "start_frame": clip.start_frame,
-            "frames": clip.frames,
-            "vae_frames": clip.vae_frames,
-        },
-        "audio": None
-        if track is None
-        else {
-            "sample_rate": track.sample_rate,
-            "start_sample": track.start_sample,
-            "source_samples": track.source_samples,
-            "samples": track.samples,
-        },
-        "vision": None
-        if vision is None
-        else {
-            "grid": list(vision.grid),
-            "tokens": vision.tokens,
-            "frame_indices": list(vision.frame_indices),
-        },
-        "latent_units": list(condition.latent_units),
-        "audio_rows": condition.audio_rows,
-    }
 
 
 __all__ = [

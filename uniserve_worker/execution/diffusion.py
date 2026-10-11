@@ -45,7 +45,6 @@ from uniserve_worker.protocol.batch import TensorPublication
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
-    DrawLayout,
     ForwardMode,
     ImageParams,
 )
@@ -90,9 +89,11 @@ def image_state(builder, size, image: ImageParams) -> DiffusionState:
     return DiffusionState.open(
         denoiser,
         size,
-        steps=image.steps,
-        shift=image.timestep_shift if image.timestep_shift > 0 else None,
-        device="cpu",
+        schedules=denoiser.make_schedules(
+            image.steps,
+            shift=image.timestep_shift if image.timestep_shift > 0 else None,
+            device="cpu",
+        ),
         guidance=denoiser.make_guidance(
             text_scale=image.cfg_text_scale,
             image_scale=image.cfg_img_scale,
@@ -198,19 +199,8 @@ def prepare_latent(
             "media preparation repeats an active latent trajectory"
         )
 
-    rng = call.rng
-    if rng is None or rng.draw_layout is not DrawLayout.FLOW_NOISE:
-        raise invalid_descriptor(
-            "media preparation requires semantic flow-noise RNG coordinates"
-        )
-    if int(rng.seed) != int(image.seed or 0):
-        raise invalid_descriptor(
-            "media preparation seed disagrees with admitted image seed"
-        )
-    if int(rng.semantic_index_base) < 1:
-        raise invalid_descriptor(
-            "flow-noise semantic image index must be positive"
-        )
+    if call.image_index is None:
+        raise invalid_descriptor("media preparation names no image index")
     if int(output.generation) < 1:
         raise invalid_descriptor(
             "media preparation latent has no logical generation"
@@ -273,7 +263,6 @@ def prepare_latent(
     request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, cache, flow_step=0)
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
     return request
 
@@ -330,10 +319,6 @@ def initialize(
     image = request.request.image
     if image is None:
         raise invalid_descriptor("flow call has no admitted image parameters")
-    if call.rng is not None:
-        raise invalid_descriptor(
-            "flow continuation must inherit transition RNG state"
-        )
     if (
         int(latent_input.generation) < 1
         or int(latent_output.generation) < 1
@@ -607,7 +592,6 @@ def finish(
         flow_step=final_step,
     )
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
 
     # Branch prefixes live in pool slots separate from the request's own KV;
@@ -690,14 +674,13 @@ def initial_latent(
 ) -> None:
     """Draw a request's seeded initial latent into ``target``.
 
-    The seed is ``flow_noise_seed(seed, rng.semantic_index_base)``.
-    ``prepare_latent`` validates ``call.rng`` before calling this.
+    The noise seed is ``flow_noise_seed(seed, call.image_index)``.
+    ``prepare_latent`` checks that the call names its image index.
     """
-    rng = call.rng
-    assert rng is not None and rng.draw_layout is DrawLayout.FLOW_NOISE
+    assert call.image_index is not None
     require_inputs(model_runner).initialize(
         media_image.Config(height, width),
-        seed=flow_noise_seed(seed, int(rng.semantic_index_base)),
+        seed=flow_noise_seed(seed, int(call.image_index)),
         out=target,
     )
 

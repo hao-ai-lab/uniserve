@@ -364,7 +364,6 @@ class PendingOutput:
 
         self.status = CallStatus.OK
         self.finish_flags = FinishFlags()
-        self.product_generations: tuple[int, ...] = ()
         self.error_code: ErrorCode | None = None
         # Why the worker refuses the request, with ErrorCode.INVALID_REQUEST.
         self.error_message: str | None = None
@@ -659,7 +658,6 @@ class PendingOutput:
             request_key=self.request_key,
             call_id=self.call_id,
             status=status,
-            product_generations=() if suppressed else self.product_generations,
             error_code=error_code,
             # A materialization failure replaces a refusal's code, and with it
             # the refusal's reason.
@@ -667,8 +665,6 @@ class PendingOutput:
             if error_code is ErrorCode.INVALID_REQUEST
             else None,
             timing_counters=timing,
-            kind=self.kind,
-            position=0 if runtime is None else int(runtime.logical_position),
             kv_visible_len=0
             if runtime is None
             else int(runtime.kv_visible_len),

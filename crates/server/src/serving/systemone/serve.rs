@@ -230,6 +230,5 @@ fn readout_request(prompt: &ReadoutPrompt, images: &[media::ImageInput]) -> Gene
                     .collect(),
             })
             .collect(),
-        canvas: None,
     }
 }

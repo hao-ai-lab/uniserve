@@ -420,7 +420,6 @@ impl Scheduler {
                                     negative_token_ids: st.req.negative_prompt_token_ids.clone(),
                                     finish_token_ids,
                                     initial_position: st.num_computed_prompt_tokens,
-                                    canvas: st.req.canvas,
                                 }),
                                 st.req.generates_images().then(|| st.req.image.clone()),
                                 input_images,
@@ -1432,6 +1431,7 @@ impl Scheduler {
                 }
                 let sampling_state = self.build_token_masks(id, 0, 0);
 
+                let generates_canvases = self.config.canvas.is_some();
                 self.plan_computation(id, |_scheduler, request| {
                     generation::plan_prompt(
                         request,
@@ -1440,6 +1440,7 @@ impl Scheduler {
                         Vec::new(),
                         0,
                         sampling_state,
+                        generates_canvases,
                     )
                 })
             }
@@ -1467,14 +1468,7 @@ impl Scheduler {
                 }
 
                 self.plan_computation(id, |_scheduler, request| {
-                    generation::plan_decode(
-                        request,
-                        pos,
-                        None,
-                        input_token,
-                        relay_input,
-                        sampling_state,
-                    )
+                    generation::plan_decode(request, None, input_token, relay_input, sampling_state)
                 })
             }
             Phase::CloseKv => {
@@ -1578,7 +1572,6 @@ impl Scheduler {
                 feedback.feedback_source.as_ref()?;
                 let step_index = self.scheduled_feedback(id)?.0;
                 let is_final_step = step_index + 1 == feedback.feedback_encoders.len();
-                let logical_positions = feedback.num_feedback_positions;
                 let encoder_input = *feedback.feedback_encoders.get(step_index)?;
                 let feature = self
                     .pending_output(id, |call| call.encoder_output.as_ref())
@@ -1604,9 +1597,6 @@ impl Scheduler {
                         } else {
                             None
                         },
-                        Some(u64::from(
-                            logical_position.saturating_add(logical_positions.max(1)),
-                        )),
                     )
                 })
             }
@@ -1646,7 +1636,7 @@ impl Scheduler {
                 // chunk, or the previous block's commit, which makes the
                 // planned step the next block's step zero.
                 let st = self.running.get(&id)?;
-                let canvas = st.req.canvas.as_ref()?;
+                let canvas = self.config.canvas?;
                 let canvas_length = canvas.canvas_length as usize;
                 let pending = self.inflight.num_pending_calls(id);
                 if (pending > 0
@@ -1686,7 +1676,7 @@ impl Scheduler {
                     return None;
                 }
                 self.plan_computation(id, |_scheduler, request| {
-                    generation::plan_canvas_step(request, block, step)
+                    generation::plan_canvas_step(request, &canvas, block, step)
                 })
             }
             Phase::CommitCanvas => {
@@ -1771,7 +1761,6 @@ impl Scheduler {
                     feature,
                     false,
                     false,
-                    None,
                     None,
                 )
             });
@@ -1906,6 +1895,7 @@ impl Scheduler {
         }
 
         let sampling_state = self.build_token_masks(id, 0, 0);
+        let generates_canvases = self.config.canvas.is_some();
         self.plan_computation(id, |_scheduler, request| {
             generation::plan_prompt(
                 request,
@@ -1914,6 +1904,7 @@ impl Scheduler {
                 blocks,
                 block_tokens,
                 sampling_state,
+                generates_canvases,
             )
         })
     }

@@ -127,7 +127,6 @@ def _prepare_media(
     call_id: CallId,
     predecessor: object,
     batch_id: int,
-    seed: int = 29,
     image_index: int = 1,
 ):
     preparation, latent = diffusion_prepare_call(
@@ -135,7 +134,6 @@ def _prepare_media(
         call_id=call_id,
         predecessor=predecessor,
         conditioning=conditioning,
-        seed=seed,
         image_index=image_index,
     )
     report = worker.submit(
@@ -244,7 +242,6 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
 
     assert extended.completions[0].committed_tokens == (expected_successor(4),)
     assert extended.completions[0].kv_visible_len == 2
-    assert extended.completions[0].position == 2
 
     first_token = extended.completions[0].committed_tokens[0]
     observation = record_completion(extend, extended)
@@ -271,7 +268,6 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
         expected_successor(first_token),
     )
     assert decoded.completions[0].kv_visible_len == 3
-    assert decoded.completions[0].position == 3
 
 
 def test_prefix_reuse_continues_from_the_admitted_logical_position():
@@ -297,7 +293,6 @@ def test_prefix_reuse_continues_from_the_admitted_logical_position():
     )
 
     assert report.completions[0].kv_visible_len == 3
-    assert report.completions[0].position == 3
 
 
 def test_text_extension_rejects_missing_input_tokens() -> None:
@@ -530,14 +525,12 @@ def test_lane_and_graph_binding_preserve_token_and_flow_results(
     token = bound_sequence.completions[0]
     reference_token = plain_sequence.completions[0]
     assert token.committed_tokens == reference_token.committed_tokens
-    assert token.position == reference_token.position
     assert token.kv_visible_len == reference_token.kv_visible_len
     assert token.kv_computed_len == reference_token.kv_computed_len
     assert token.num_completed_steps == reference_token.num_completed_steps
 
     flow_completion = bound_flow.completions[0]
     reference_flow = plain_flow.completions[0]
-    assert flow_completion.position == reference_flow.position
     assert flow_completion.kv_visible_len == reference_flow.kv_visible_len
     assert flow_completion.kv_computed_len == reference_flow.kv_computed_len
     assert (
@@ -552,7 +545,7 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
 ):
     worker = execution_worker(queue_depth=3)
     admission = umm_params(
-        12, ImageParams(steps=1, height=16, width=16, seed=29, max_images=2)
+        12, ImageParams(steps=1, height=16, width=16, seed=29)
     )
     try:
         conditioning = _publish_conditioning(
@@ -1006,7 +999,6 @@ def test_initial_flow_noise_is_stable_across_call_schedules():
             call_id=CallId(call_id, 0),
             predecessor=root_parent(admission),
             batch_id=2,
-            seed=29,
             image_index=3,
         )
         flow, output_latent = diffusion_step_call(
@@ -1088,7 +1080,6 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
             call_id=CallId(2, 0),
             predecessor=root_parent(admission),
             batch_id=2,
-            seed=31,
         )
         step = 0
         call_id = 3
@@ -1636,7 +1627,6 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         kind=TransferMode.TENSOR,
         bounds=Bounds(
             max_transfer_bytes=source.max_bytes,
-            max_latent_bytes=output.max_bytes,
         ),
         vision_inputs=(VisionInput(0, source),),
         encoder_output=output,
@@ -1839,7 +1829,6 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
             call_id=CallId(2, 0),
             predecessor=root_parent(admission),
             conditioning=conditioning,
-            seed=31,
         )
         transitioned = finalized_report(
             producer,
@@ -1950,7 +1939,6 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             kind=TransferMode.TENSOR,
             bounds=Bounds(
                 max_transfer_bytes=final_latent.max_bytes,
-                max_latent_bytes=exported_latent.max_bytes,
             ),
             latent_input=final_latent,
             latent_output=exported_latent,
@@ -2113,10 +2101,6 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
     )
     completion = report.completions[0]
     assert completion.kv_visible_len == session_kv_before
-    assert completion.position == 2
-    assert completion.product_generations
-    assert completion.product_generations[0] == handle
-    assert completion.product_generations[0] != 0
 
 
 @pytest.mark.parametrize(
@@ -2131,7 +2115,7 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
     worker = execution_worker(transfer_backends=("shm",))
     admission = umm_params(
         76,
-        ImageParams(steps=1, height=16, width=16, seed=31, retain_images=True),
+        ImageParams(steps=1, height=16, width=16, seed=31),
     )
     try:
         conditioning = _publish_conditioning(
@@ -2144,7 +2128,6 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             call_id=CallId(2, 0),
             predecessor=root_parent(admission),
             batch_id=2,
-            seed=31,
         )
         step, completed = diffusion_step_call(
             admission.request_key,
@@ -2232,7 +2215,6 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             assert completion.error_code is ErrorCode.COMPUTE_ERROR
             assert completion.media_output is None
             assert completion.committed_tokens == ()
-            assert completion.product_generations == ()
         else:
             assert completion.status is CallStatus.OK
             assert _media_bytes(completion) == expected
@@ -2247,9 +2229,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         understanding.request_key,
         request_pool_idx=understanding.request_pool_idx,
         generation=understanding.generation,
-        image=ImageParams(
-            steps=2, height=16, width=16, seed=29, retain_images=True
-        ),
+        image=ImageParams(steps=2, height=16, width=16, seed=29),
     )
     extend = token_call(
         admission.request_key,
@@ -2389,7 +2369,6 @@ def test_generated_feedback_commits_absolute_visual_token_state():
 
     completion = report.completions[0]
     assert completion.committed_tokens == (next_token,)
-    assert completion.position == 4
     assert completion.kv_visible_len == 4
 
     feedback_observation = record_completion(state, report)
@@ -2618,7 +2597,6 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-    from uniserve_worker.protocol.output import BatchOutput
 
     with execution_worker(transfer_backends=("shm",), queue_depth=2) as worker:
         worker.warmup()
@@ -2695,9 +2673,9 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
                     for value in (endpoint.receive(), endpoint.receive())
                 }
                 assert responses[5]["kind"] == "result", responses[5]
-                result = BatchOutput.from_mapping(responses[5]["result"])
-                assert result.completions[0].status is CallStatus.OK
-                assert result.completions[0].num_completed_steps == 3
+                completion = responses[5]["result"]["completions"][0]
+                assert completion["status"] == CallStatus.OK.value
+                assert completion["num_completed_steps"] == 3
                 assert responses[6]["kind"] == "result", responses[6]
             finally:
                 # Failure cleanup sends the same valid release through IPC,
