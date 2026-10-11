@@ -86,10 +86,7 @@ class VideoEncoder(BaseVideoEncoder):
     row_group = _PATCH
 
     def __init__(self, config: video_vae.Config):
-        # Each causal stride maps T frames to ceil(T / stride).
-        span = config.clip_length
-        for stride in config.temporal_downsample_factors:
-            span = math.ceil(span / stride)
+        span = config.clip_latents
         if config.token_drop >= span:
             raise ValueError(
                 "H3 video token_drop must leave latent frames in a clip"

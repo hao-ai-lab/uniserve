@@ -66,11 +66,15 @@ from .inputs import (
     SequenceInput,
 )
 from .packing import (
+    AUDIO_SAMPLE_RATE,
     AUDIO_TAG,
     FPS,
+    VAE_FRAMES_PER_CHUNK,
+    VAE_LATENTS_PER_CHUNK,
     DensePacking,
     SegmentPacking,
     TilePacking,
+    align_num_frames,
     audio_latent_frames,
     condition_segments,
     dense_packing,
@@ -84,11 +88,8 @@ from .packing import (
     video_latent_frames,
 )
 from .processing import (
-    AUDIO_SAMPLE_RATE,
     MAX_IMAGE_REFERENCES,
     MAX_VIDEO_REFERENCES,
-    VAE_FRAMES_PER_CHUNK,
-    VAE_LATENTS_PER_CHUNK,
     reference_image_size,
 )
 from .transformer import Transformer, TransformerLayer
@@ -169,11 +170,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     numerical attention input and never represents a second computation batch.
     """
 
-    # A native temporal window covers 17 new frames and carries a 5-frame
-    # overlap, so a legal input length is 5 + 17k with a 22-frame minimum.
-    NATIVE_WINDOW_FRAMES = 17
-    NATIVE_OVERLAP_FRAMES = 5
-
     def __init__(self, config: DenoiserConfig):
         super().__init__(
             modalities=("video", "audio"),
@@ -214,10 +210,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     def tasks(self) -> tuple[str, ...]:
         return self.config.tasks
 
-    @property
-    def fixed_canvases(self) -> tuple[image.Config, ...] | None:
-        return self.config.canvases
-
     def max_conditions(
         self, num_frames: int, canvas: image.Config
     ) -> tuple[Condition, ...]:
@@ -255,7 +247,9 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             return size.condition_rows
 
         # A reference video keeps the leading whole VAE windows of the
-        # generated frames, and its soundtrack the generated duration.
+        # generated frames, and its soundtrack the generated duration. A
+        # soundtrack resampled to 32 kHz rounds up (``processing.audio_clip``),
+        # so the ceiling bounds the samples of every source rate.
         windows = max(
             1, (num_frames - VAE_LATENTS_PER_CHUNK) // VAE_FRAMES_PER_CHUNK
         )
@@ -314,8 +308,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
     def legal_frame_count(self, requested: int) -> int:
         """Round a requested duration up to the next complete native window."""
-        window, overlap = self.NATIVE_WINDOW_FRAMES, self.NATIVE_OVERLAP_FRAMES
-        return max(overlap + window, requested + (overlap - requested) % window)
+        return align_num_frames(requested)
 
     def make_size(
         self,

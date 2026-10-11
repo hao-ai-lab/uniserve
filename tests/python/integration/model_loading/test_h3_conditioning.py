@@ -134,10 +134,10 @@ def test_timestep_projection_preserves_both_modality_coordinates():
     ).eval()
     model = TimestepEmbedding(config)
     with torch.no_grad():
-        model.video_projection[0].weight.copy_(reference.linear_1.weight)
-        model.video_projection[0].bias.copy_(reference.linear_1.bias)
-        model.video_projection[2].weight.copy_(reference.linear_2.weight)
-        model.video_projection[2].bias.copy_(reference.linear_2.bias)
+        model.projection[0].weight.copy_(reference.linear_1.weight)
+        model.projection[0].bias.copy_(reference.linear_1.bias)
+        model.projection[2].weight.copy_(reference.linear_2.weight)
+        model.projection[2].bias.copy_(reference.linear_2.bias)
         times = torch.tensor([[0.0, 0.0], [0.125, 0.4], [0.7, 0.95]])
         features = get_timestep_embedding(
             times.flatten(),

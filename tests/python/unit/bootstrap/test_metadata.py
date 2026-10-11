@@ -58,12 +58,18 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
     path = tmp_path / "ema.safetensors"
     save_file({"latent_pos_embed.pos_embed": torch.zeros(9, 16)}, path)
 
-    raw = {
-        **(towers if inline else {}),
-        "start_of_image_id": 62,
-        "end_of_image_id": 63,
-    }
+    raw = towers if inline else {}
     (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "added_tokens": [
+                    {"id": 62, "content": "<|vision_start|>"},
+                    {"id": 63, "content": "<|vision_end|>"},
+                ]
+            }
+        )
+    )
     config = _bagel_config(tmp_path)
 
     assert config.text.hidden_size == 16
@@ -74,6 +80,7 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
     assert config.vae.latent_channels == 4
     assert config.vae.downsample * config.latent_patch_size == 4
     assert config.max_latent_size == 3
+    assert (config.start_of_image_id, config.end_of_image_id) == (62, 63)
 
     # Released checkpoints may serialize a constructor default; actual learned
     # positions determine both numerical packing and allocation bounds.
@@ -230,17 +237,16 @@ def test_h3_worker_advertises_bounded_media_products():
     assert info.max_batch_calls == 2
 
 
-def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes(tmp_path):
+def test_sensenova_reader_resolves_aliases(tmp_path):
     from uniserve_models.sensenova_u1 import read_config
 
+    # A checkpoint may carry window fields with windowing disabled.
     raw = neo_metadata()
     raw["llm_config"].update(
         use_sliding_window=False, sliding_window=64, max_window_layers=1
     )
     (tmp_path / "config.json").write_text(json.dumps(raw))
     config = read_config(tmp_path, IOConfig(), sources={})
-    assert config.text.layer_types == ("full_attention",) * 3
-    assert config.text.sliding_window == 64
     assert config.text.pad_token_id == 3
     assert config.vision.output_size == 16
     assert config.vision.downsample_ratio == 0.5
@@ -257,7 +263,11 @@ def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes(tmp_path):
             {"rope_theta": 20000.0},
             "conflicting aliases for rope_theta",
         ),
-        ("layer_types", ["full_attention"], "every decoder layer"),
+        (
+            "layer_types",
+            ["full_attention", "sliding_attention", "full_attention"],
+            "sliding-window attention is not supported",
+        ),
         ("num_key_value_heads", 3, "divisible by KV heads"),
         ("num_experts", 8, "sparse MoE is not supported"),
     ],
@@ -285,7 +295,7 @@ def test_sensenova_direct_config_rejects_mismatched_vision_features(tmp_path):
         replace(config, vision=replace(config.vision, output_size=32))
 
 
-def test_sensenova_reader_rejects_unimplemented_sliding_attention(tmp_path):
+def test_sensenova_reader_rejects_sliding_window_attention(tmp_path):
     from uniserve_models.sensenova_u1 import read_config
 
     raw = neo_metadata()
@@ -293,7 +303,9 @@ def test_sensenova_reader_rejects_unimplemented_sliding_attention(tmp_path):
         use_sliding_window=True, sliding_window=64, max_window_layers=1
     )
     (tmp_path / "config.json").write_text(json.dumps(raw))
-    with pytest.raises(ValueError, match="sliding_attention is not supported"):
+    with pytest.raises(
+        ValueError, match="sliding-window attention is not supported"
+    ):
         read_config(tmp_path, IOConfig(), sources={})
 
 

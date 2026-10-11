@@ -160,7 +160,8 @@ def _bagel_processor() -> ImageProcessor:
             32, 48, 2, 4, 2, 37, 1e-6, 1_000_000.0, 8, True, 64
         ),
         siglip.Config(14, 980, 3, siglip.TransformerConfig(32, 4, 48, 1, 1e-6)),
-        vae.Config(8, 3, 2, 32, 3, (1, 1), 1, 2, 0.5, 0.25),
+        # The released 8x autoencoder with 2x2 latent patches strides 16.
+        vae.Config(8, 3, 8, 32, 3, (1, 1, 1, 1), 1, 2, 0.5, 0.25),
         35,
         36,
         2,
@@ -210,7 +211,7 @@ def test_bagel_resize_matches_the_shared_fixture(case):
 def _sensenova_processor() -> ImageProcessor:
     """Build SenseNova U1's image processor at the published patch size."""
     config = u1.Config(
-        u1.TransformerConfig(37, 32, 48, 2, 4, 2, 8, ("full_attention",) * 2),
+        u1.TransformerConfig(37, 32, 48, 2, 4, 2, 8),
         vision.Config(16, 32, 0.5, 16, 3, 10000.0),
         flow.Config(
             flow.HeadConfig(32, 2, 1.0),

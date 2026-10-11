@@ -30,14 +30,21 @@ from uniserve.model import Condition, ConditionRole
 
 __all__ = [
     "AUDIO_CHANNELS",
+    "AUDIO_HOP",
+    "AUDIO_LATENTS_PER_SECOND",
+    "AUDIO_SAMPLE_RATE",
     "AUDIO_TAG",
     "CANVAS_MULTIPLE",
     "DensePacking",
+    "FPS",
     "Segment",
     "SegmentKind",
     "TEXT_TAG",
     "TilePacking",
+    "VAE_FRAMES_PER_CHUNK",
+    "VAE_LATENTS_PER_CHUNK",
     "VIDEO_TAG",
+    "align_num_frames",
     "audio_latent_frames",
     "condition_segments",
     "dense_packing",
@@ -57,10 +64,19 @@ VIDEO_TAG = 0
 TEXT_TAG = 1
 AUDIO_TAG = 2
 AUDIO_CHANNELS = 2
+
+# The H3 timeline: request planning, packing, encoding and reconstruction
+# all count frames, samples and latents on it. Video runs at FPS. The video
+# VAE encodes chunks of VAE_FRAMES_PER_CHUNK frames (its ``clip_length``)
+# into VAE_LATENTS_PER_CHUNK latent frames, so H3 generates
+# ``VAE_FRAMES_PER_CHUNK * n + VAE_LATENTS_PER_CHUNK`` frames, ``n``
+# positive. The audio VAE hops AUDIO_HOP samples at AUDIO_SAMPLE_RATE.
 FPS = 24
+VAE_FRAMES_PER_CHUNK = 17
+VAE_LATENTS_PER_CHUNK = 5
+AUDIO_SAMPLE_RATE = 32_000
 AUDIO_LATENTS_PER_SECOND = 40
-# The audio VAE's 32 kHz samples per latent.
-AUDIO_HOP = 32_000 // AUDIO_LATENTS_PER_SECOND
+AUDIO_HOP = AUDIO_SAMPLE_RATE // AUDIO_LATENTS_PER_SECOND
 ROPE_FRAME_RESCALE = 5.0 / 3.0
 # Output frames covered by each of the five latent frames of one 17-frame
 # clip: 1 + 4 * 4 = 17.
@@ -202,6 +218,19 @@ def latent_raster(canvas: image.Config) -> tuple[int, int]:
     return canvas.height // 16, canvas.width // 16
 
 
+def align_num_frames(num_frames: int) -> int:
+    """Round a frame count up to the next one H3 generates.
+
+    The result is the next ``17 * n + 5`` with ``n`` positive, so at least
+    22.
+    """
+    return max(
+        VAE_FRAMES_PER_CHUNK + VAE_LATENTS_PER_CHUNK,
+        num_frames
+        + (VAE_LATENTS_PER_CHUNK - num_frames) % VAE_FRAMES_PER_CHUNK,
+    )
+
+
 def video_latent_frames(num_frames: int) -> int:
     """Convert a valid H3 output-frame count into temporal video-VAE latents.
 
@@ -212,9 +241,14 @@ def video_latent_frames(num_frames: int) -> int:
         ValueError: ``num_frames`` is not an int of the form ``17 * n + 5``
             with ``n`` positive.
     """
-    if type(num_frames) is not int or num_frames < 22 or num_frames % 17 != 5:
+    if (
+        type(num_frames) is not int
+        or num_frames < VAE_FRAMES_PER_CHUNK + VAE_LATENTS_PER_CHUNK
+        or num_frames % VAE_FRAMES_PER_CHUNK != VAE_LATENTS_PER_CHUNK
+    ):
         raise ValueError("H3 frame count must have the form 17 * n + 5")
-    return (num_frames - 5) // 17 * 5 + 2
+    chunks = (num_frames - VAE_LATENTS_PER_CHUNK) // VAE_FRAMES_PER_CHUNK
+    return chunks * VAE_LATENTS_PER_CHUNK + 2
 
 
 def audio_latent_frames(num_frames: int) -> int:

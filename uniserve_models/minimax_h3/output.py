@@ -1,4 +1,4 @@
-"""H3 sampling clocks and RGB reconstruction.
+"""H3 RGB reconstruction.
 
 A video of ``17 * n + 5`` frames is decoded as ``n`` media units. Each unit
 decodes to 25 frames: a 17-frame body, three VAE padding frames, and a
@@ -8,7 +8,6 @@ these slices and blend weights.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 
 import torch
 
@@ -16,35 +15,27 @@ from uniserve.media import video
 from uniserve.model import VideoPostprocessor as BaseVideoPostprocessor
 from uniserve.tensors import BufferConfig, OutputLayout
 
-
-@dataclass(frozen=True, slots=True)
-class Config:
-    """The video frame and audio sample clocks in Hz.
-
-    The raster is a request's canvas, not a property of the model.
-    """
-
-    frame_rate: int = 24
-    sample_rate: int = 32000
-
-    def __post_init__(self):
-        if any(
-            type(value) is not int or value < 1
-            for value in (self.frame_rate, self.sample_rate)
-        ):
-            raise ValueError("media sampling clocks must be positive integers")
+from .packing import VAE_FRAMES_PER_CHUNK, VAE_LATENTS_PER_CHUNK
 
 
 def frame_slices(num_frames: int) -> tuple[slice, ...]:
     """Partition a complete H3 timeline into 17-frame bodies and its final overlap."""  # noqa: E501
-    if type(num_frames) is not int or num_frames < 22 or num_frames % 17 != 5:
+    body, tail = VAE_FRAMES_PER_CHUNK, VAE_LATENTS_PER_CHUNK
+    if (
+        type(num_frames) is not int
+        or num_frames < body + tail
+        or num_frames % body != tail
+    ):
         raise ValueError(
             "H3 frame count must have the form 17 * n + 5 with n positive"
         )
-    count = (num_frames - 5) // 17
+    count = (num_frames - tail) // body
     # Every unit covers a 17-frame body; the last unit adds the 5-frame tail.
     return tuple(
-        slice(index * 17, (index + 1) * 17 + (5 if index + 1 == count else 0))
+        slice(
+            index * body,
+            (index + 1) * body + (tail if index + 1 == count else 0),
+        )
         for index in range(count)
     )
 

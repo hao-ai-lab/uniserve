@@ -60,14 +60,6 @@ class TransformerLayer(nn.Module):
         self.post_attention_norms = nn.ModuleDict()
         self.mlps = nn.ModuleDict()
 
-        # Checkpoint activation aliases collapse onto three kernel names.
-        activation = (
-            "silu"
-            if config.hidden_act in {"silu", "swish", "silu_and_mul", "swiglu"}
-            else "gelu"
-            if config.hidden_act in {"gelu", "gelu_and_mul", "geglu"}
-            else "gelu_pytorch_tanh"
-        )
         for route in ("text", "flow"):
             self.input_norms[route] = RMSNorm(hidden, eps)
             # Head width splits into temporal / height / width rotary
@@ -94,7 +86,9 @@ class TransformerLayer(nn.Module):
             )
             self.post_attention_norms[route] = RMSNorm(hidden, eps)
             self.mlps[route] = GatedMLP(
-                hidden, config.intermediate_size, activation=activation
+                hidden,
+                config.intermediate_size,
+                activation=config.hidden_act,
             )
 
         # One attention module serves both routes. Its cache name is its
@@ -105,12 +99,6 @@ class TransformerLayer(nn.Module):
             config.num_key_value_heads,
             dim,
             cache_name=f"text.backbone.layers.{index}.attention",
-        )
-        # Always None: ``TransformerConfig`` rejects sliding_attention layers.
-        self.window = (
-            config.sliding_window
-            if config.layer_types[index] == "sliding_attention"
-            else None
         )
         self.temporal_rotary = RotaryEmbedding(
             dim // 2,

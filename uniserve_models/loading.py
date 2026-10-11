@@ -45,6 +45,8 @@ from uniserve.nn.moe import ExpertLinear
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizationConfig, Quantizer
 
+from .tokenizer import read_vocabulary, token_id
+
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)
 
@@ -421,43 +423,6 @@ def _config_sources(package, located, io):
     return sources
 
 
-def _tokenizer_vocabulary(path: Path) -> dict[str, object]:
-    """Map token text to ID from a ``tokenizer.json`` model and added tokens.
-
-    The model vocabulary is an object from token text to ID or, for a
-    Unigram model, a list of ``[text, score]`` rows whose position is the ID;
-    ``added_tokens`` is a list of objects carrying ``content`` and ``id``.
-    Added tokens override the model vocabulary. Any other layout raises
-    ``ValueError``; IDs are returned unchecked for ``_tokens`` to validate.
-    """
-    data = _json(path)
-    model = data.get("model", {})
-    vocabulary = model.get("vocab", {}) if isinstance(model, dict) else None
-    added = data.get("added_tokens", [])
-
-    if isinstance(vocabulary, list) and all(
-        isinstance(row, list) and row and isinstance(row[0], str)
-        for row in vocabulary
-    ):
-        vocabulary = {row[0]: index for index, row in enumerate(vocabulary)}
-    if (
-        not isinstance(vocabulary, dict)
-        or not isinstance(added, list)
-        or any(
-            not isinstance(entry, dict)
-            or not isinstance(entry.get("content"), str)
-            or "id" not in entry
-            for entry in added
-        )
-    ):
-        raise ValueError(f"tokenizer metadata {path} has a malformed layout")
-
-    return {
-        **vocabulary,
-        **{entry["content"]: entry["id"] for entry in added},
-    }
-
-
 def _tokens(processor, root):
     """Fill declared start/end feature-injection token IDs from checkpoint tokenizer files."""  # noqa: E501
     # Only tokens declared by text without an ID are resolved; a processor
@@ -476,40 +441,11 @@ def _tokens(processor, root):
     if not required:
         return processor
 
-    # Merge every vocabulary spelling a checkpoint may carry; later files
-    # override earlier ones for the same token text.
-    vocabulary: dict[str, object] = {}
-    if (root / "tokenizer.json").is_file():
-        vocabulary.update(_tokenizer_vocabulary(root / "tokenizer.json"))
-    for filename in ("vocab.json", "added_tokens.json"):
-        if (root / filename).is_file():
-            vocabulary.update(_json(root / filename))
-
-    path = root / "tokenizer_config.json"
-    if path.is_file():
-        # ``added_tokens_decoder`` maps each decimal ID to an object whose
-        # ``content`` is the token text.
-        decoder = _json(path).get("added_tokens_decoder", {})
-        if not isinstance(decoder, dict) or any(
-            not isinstance(entry, dict)
-            or not isinstance(entry.get("content"), str)
-            for entry in decoder.values()
-        ):
-            raise ValueError(
-                f"tokenizer metadata {path} has a malformed layout"
-            )
-        vocabulary.update(
-            {entry["content"]: int(index) for index, entry in decoder.items()}
-        )
-
-    updates = {}
-    for name, token in required.items():
-        index = vocabulary.get(token)
-        if type(index) is not int or index < 0:
-            raise ValueError(
-                f"tokenizer metadata does not define declared token {token!r}"
-            )
-        updates[name + "_id"] = index
+    vocabulary = read_vocabulary(root)
+    updates = {
+        name + "_id": token_id(vocabulary, token)
+        for name, token in required.items()
+    }
     return replace(processor, feature_injection=replace(injection, **updates))
 
 

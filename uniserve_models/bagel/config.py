@@ -12,6 +12,7 @@ from typing import Any
 from uniserve import loading
 from uniserve.loading import checkpoint
 from uniserve_models import siglip
+from uniserve_models.tokenizer import read_vocabulary, token_id
 
 from . import vae
 from .weights import checkpoint_sources
@@ -88,8 +89,10 @@ class Config:
         text: Shared MoT backbone dimensions.
         vision: SigLIP tower feeding understanding inputs.
         vae: FLUX autoencoder mapping pixels to latents.
-        start_of_image_id: Token that opens each framed image sequence.
-        end_of_image_id: Token that closes each framed image sequence.
+        start_of_image_id: Token that opens each framed image sequence,
+            the tokenizer's ``<|vision_start|>``.
+        end_of_image_id: Token that closes each framed image sequence, the
+            tokenizer's ``<|vision_end|>``.
         latent_patch_size: Autoencoder latent positions per flow token along
             each spatial axis.
         max_latent_size: Side of the learned square latent position grid, in
@@ -154,7 +157,8 @@ def read_config(
     absent optional fields take fixed defaults. The learned latent position
     grid is read from a tensor header of the primary source rather than from
     ``config.json``, so its table must be a square grid whose width matches
-    the text hidden size.
+    the text hidden size. The image marker IDs are the tokenizer files'
+    IDs of ``<|vision_start|>`` and ``<|vision_end|>``.
 
     Args:
         root: Local checkpoint directory containing ``config.json``.
@@ -167,13 +171,13 @@ def read_config(
         FileNotFoundError: If ``config.json`` or a tower config that is not
             inline is missing.
         ValueError: If a tower config is not an object; if a required text
-            dimension or the ``latent_pos_embed.pos_embed`` tensor is
-            absent; if the text width or head count is not a positive
-            integer or, without an explicit ``head_dim``, the head count does
-            not divide the width; if the latent position table is not a
-            square grid at text width; or if a config's ``__post_init__``
-            rejects a value. Malformed JSON and checkpoint metadata also
-            raise ``ValueError``.
+            dimension, the ``latent_pos_embed.pos_embed`` tensor or an image
+            marker token is absent; if the text width or head count is not a
+            positive integer or, without an explicit ``head_dim``, the head
+            count does not divide the width; if the latent position table is
+            not a square grid at text width; or if a config's
+            ``__post_init__`` rejects a value. Malformed JSON and checkpoint
+            metadata also raise ``ValueError``.
     """
     raw = json.loads((root / "config.json").read_text())
 
@@ -218,6 +222,8 @@ def read_config(
             "BAGEL latent position table must be a square grid at text width"
         )
     side = math.isqrt(shape[0])
+
+    vocabulary = read_vocabulary(root)
 
     # BAGEL runs one fewer SigLIP layer than its tower config declares, so
     # the count must be an integer before the subtraction.
@@ -266,8 +272,8 @@ def read_config(
             latent.get("scale_factor", 0.3611),
             latent.get("shift_factor", 0.1159),
         ),
-        raw.get("start_of_image_id", 151652),
-        raw.get("end_of_image_id", 151653),
+        token_id(vocabulary, "<|vision_start|>"),
+        token_id(vocabulary, "<|vision_end|>"),
         raw.get("latent_patch_size", 2),
         side,
         raw.get("timestep_shift", 1.0),

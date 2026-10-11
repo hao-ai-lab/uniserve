@@ -28,11 +28,13 @@ class Config:
 
     Field names follow the checkpoint ``config.json`` keys that
     ``read_config`` reads. ``head_dim`` may differ from
-    ``hidden_size // num_attention_heads``. ``rope_scaling`` is a typed
-    rotary recipe, None for plain rotary positions. ``mrope_sections`` gives
-    the interleaved multimodal rotary widths of a Qwen3-VL language model
-    (``MRotaryEmbedding``'s ``sections``); Qwen3 checkpoints rotate one
-    position axis and leave it None.
+    ``hidden_size // num_attention_heads``. ``hidden_act`` is the ``GatedMLP``
+    activation name that ``read_config`` resolves the checkpoint's name to.
+    ``rope_scaling`` is a typed rotary recipe, None for plain rotary
+    positions. ``mrope_sections`` gives the interleaved multimodal rotary
+    widths of a Qwen3-VL language model (``MRotaryEmbedding``'s
+    ``sections``); Qwen3 checkpoints rotate one position axis and leave it
+    None.
 
     A zero ``num_experts`` builds a dense ``GatedMLP`` of width
     ``intermediate_size`` in every layer (Qwen3). A positive value makes
@@ -46,8 +48,8 @@ class Config:
         ValueError: From ``__post_init__`` when a field has the wrong type or
             an invalid value, including odd ``head_dim``, query heads not
             divisible by KV heads, ``num_experts_per_tok`` above a nonzero
-            ``num_experts``, an unsupported ``hidden_act``, or an expert
-            activation no expert kernel implements.
+            ``num_experts``, or an expert activation no expert kernel
+            implements.
     """
 
     vocab_size: int
@@ -156,22 +158,6 @@ class Config:
                 "half the head dimension"
             )
 
-        # These are the aliases ``transformer._activation`` maps onto the
-        # gated MLP's activation kernels.
-        if self.hidden_act not in {
-            "silu",
-            "swish",
-            "silu_and_mul",
-            "swiglu",
-            "gelu",
-            "gelu_and_mul",
-            "geglu",
-            "gelu_pytorch_tanh",
-            "gelu_tanh",
-        }:
-            raise ValueError(
-                f"unsupported Qwen3 hidden_act {self.hidden_act!r}"
-            )
         if self.num_experts and self.hidden_act not in _EXPERT_ACTIVATIONS:
             raise ValueError(
                 f"Qwen3-MoE experts do not implement {self.hidden_act!r}; "
@@ -187,19 +173,36 @@ class Config:
         )
 
 
-# ``hidden_act`` aliases and the expert gating each one names.
-_EXPERT_ACTIVATIONS: Mapping[str, Activation] = {
+# Transformers ``hidden_act`` names and the ``GatedMLP`` activation each one
+# selects.
+_GATED_ACTIVATIONS: Mapping[str, str] = {
     "silu": "silu",
     "swish": "silu",
-    "silu_and_mul": "silu",
-    "swiglu": "silu",
+    "gelu": "gelu",
+    "gelu_pytorch_tanh": "gelu_pytorch_tanh",
+}
+
+# ``FusedMoE``'s name for each ``GatedMLP`` activation the expert kernels
+# implement; they have no exact GELU.
+_EXPERT_ACTIVATIONS: Mapping[str, Activation] = {
+    "silu": "silu",
     "gelu_pytorch_tanh": "gelu_tanh",
-    "gelu_tanh": "gelu_tanh",
 }
 
 
+def gated_activation(hidden_act: object, *, owner: str) -> str:
+    """Resolve a checkpoint's ``hidden_act`` to a ``GatedMLP`` activation.
+
+    A value that is not one of Transformers' names for SiLU, GELU or
+    tanh-approximated GELU raises ``ValueError`` naming ``owner``.
+    """
+    if not isinstance(hidden_act, str) or hidden_act not in _GATED_ACTIVATIONS:
+        raise ValueError(f"unsupported {owner} hidden_act {hidden_act!r}")
+    return _GATED_ACTIVATIONS[hidden_act]
+
+
 def expert_activation(hidden_act: str) -> Activation:
-    """Name the ``FusedMoE`` gating that ``hidden_act`` specifies."""
+    """Name the ``FusedMoE`` gating of ``Config.hidden_act``."""
     return _EXPERT_ACTIVATIONS[hidden_act]
 
 
@@ -251,16 +254,6 @@ def _boolean(config: Mapping[str, object], name: str, default: bool) -> bool:
     raw = config.get(name, default)
     if not isinstance(raw, bool):
         raise ValueError(f"Qwen3 config field {name!r} must be boolean")
-    return raw
-
-
-def _string(config: Mapping[str, object], name: str, default: str) -> str:
-    """Read a textual model setting with a default."""
-    raw = config.get(name, default)
-    if not isinstance(raw, str) or not raw:
-        raise ValueError(
-            f"Qwen3 config field {name!r} must be a non-empty string"
-        )
     return raw
 
 
@@ -433,7 +426,9 @@ def read_config(
         num_attention_heads=num_attention_heads,
         num_key_value_heads=num_key_value_heads,
         head_dim=head_dim,
-        hidden_act=_string(config, "hidden_act", "silu"),
+        hidden_act=gated_activation(
+            config.get("hidden_act", "silu"), owner="Qwen3"
+        ),
         rms_norm_eps=_number(config, "rms_norm_eps", 1e-6),
         rope_theta=_positive_float(rotary.theta, "rope_theta"),
         rope_scaling=rotary.scaling,

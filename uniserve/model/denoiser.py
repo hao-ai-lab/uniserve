@@ -290,16 +290,6 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
             for name, grid in self.grids.items()
         }
 
-    @property
-    def fixed_canvases(self) -> tuple[image.Config, ...] | None:
-        """The only canvases the network generates, or None for any canvas.
-
-        ``None`` generates every canvas of the model's canvas rule; a
-        deployment still prepares and admits only its selection of
-        ``canvases``.
-        """
-        raise NotImplementedError
-
     def max_conditions(
         self, num_frames: int, canvas: image.Config
     ) -> tuple[Condition, ...]:

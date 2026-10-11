@@ -51,10 +51,15 @@ from .config import (
 )
 from .packing import (
     AUDIO_CHANNELS,
+    AUDIO_HOP,
+    AUDIO_SAMPLE_RATE,
     CANVAS_MULTIPLE,
     FPS,
     TEXT_TAG,
+    VAE_FRAMES_PER_CHUNK,
+    VAE_LATENTS_PER_CHUNK,
     VIDEO_TAG,
+    align_num_frames,
     audio_latent_frames,
     video_latent_frames,
 )
@@ -109,14 +114,8 @@ DEFAULT_ASPECT_RATIO = (16, 9)
 # included and without an area cap.
 REFERENCE_IMAGE_SHORT_EDGE = 2048
 
-# The video VAE encodes 17-frame windows plus a 5-frame overlap.
-VAE_FRAMES_PER_CHUNK = 17
-VAE_LATENTS_PER_CHUNK = 5
+# A reference video holds at least one complete VAE window.
 MIN_REFERENCE_FRAMES = VAE_FRAMES_PER_CHUNK + VAE_LATENTS_PER_CHUNK
-
-# The audio VAE hops 800 samples at 32 kHz, i.e. 40 latents per second.
-AUDIO_SAMPLE_RATE = 32000
-AUDIO_HOP = 800
 
 # The conditioner reads a reference video at 2 frames per second.
 VIDEO_SAMPLE_FPS = 2.0
@@ -572,10 +571,7 @@ def frame_count(seconds: float, max_seconds: float = MAX_SECONDS) -> int:
             f"duration must lie in [{MIN_SECONDS:g}, {max_seconds:g}] "
             f"seconds, got {seconds:g}"
         )
-    requested = round(seconds * FPS)
-    return (
-        requested + (VAE_LATENTS_PER_CHUNK - requested) % VAE_FRAMES_PER_CHUNK
-    )
+    return align_num_frames(round(seconds * FPS))
 
 
 def reference_image_size(width: int, height: int) -> image.Config:
