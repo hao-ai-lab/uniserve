@@ -391,9 +391,7 @@ class Config:
 
 
 # Checkpoint config field names mapped to the typed config fields they fill.
-# ``_normalize`` reads the checkpoint through them, and ``weights`` maps back
-# through them to construct the native modules whose parameter names it
-# enumerates.
+# ``normalize`` reads the checkpoint through them.
 TRANSFORMER_FIELDS = {
     "num_attention_heads": "num_attention_heads",
     "attention_head_dim": "head_dim",

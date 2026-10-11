@@ -159,11 +159,12 @@ def test_h3_loading_rejects_unknown_records_on_each_pipeline_stage(
     loaded = load()
     skipped = {name for report in loaded.reports for name in report.skipped}
     assert f"transformer_blocks.{1 - rank}.attn.to_q.weight" in skipped
+    # Records of a module this stage reads that the model does not know, a
+    # layer beyond the checkpoint's depth, and a module no stage declares.
     unknown = (
-        "time_embedder.unknown.weight",
+        f"transformer_blocks.{rank}.attn.unknown.weight",
         "transformer_blocks.50.attn.to_q.weight",
-        "transformer_blocks.0.adaln_proj.unknown.weight",
-        "token_refiner.unknown.weight",
+        "unknown.weight",
     )
     source.update(dict.fromkeys(unknown, torch.zeros(1)))
     # safetensors requires independently owned values for distinct records.
