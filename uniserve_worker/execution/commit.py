@@ -120,13 +120,6 @@ def commit_batch(
                     raise invalid_descriptor(
                         "KV publication differs from its declared output"
                     )
-                if (
-                    sum(tensor.nbytes for tensor in outcome.kv_output.tensors)
-                    > call.bounds.max_transfer_bytes
-                ):
-                    raise invalid_descriptor(
-                        "KV publication exceeds its transfer-byte bound"
-                    )
 
             # The bound covers score values and prompt-position counts; framing
             # is owned by the single IPC result message, not by stored products.
