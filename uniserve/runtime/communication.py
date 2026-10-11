@@ -3,8 +3,7 @@
 Numerical code calls :class:`uniserve.distributed.Communicator`, which orders
 logical members. This module resolves each call to the stream-bound
 communicator selected by the active execution scope or, without one, to the
-initialized process group, and owns asynchronous completion. Torch custom ops
-keep the process-group name traceable through captured graphs.
+initialized process group, and owns asynchronous completion.
 """
 
 from __future__ import annotations
@@ -55,8 +54,6 @@ class StreamCollectives(Protocol):
         self, output: torch.Tensor, value: torch.Tensor, dst: int, src: int
     ) -> None: ...
 
-    def close(self) -> None: ...
-
 
 _BOUND_COLLECTIVES: ContextVar[Mapping[str, StreamCollectives] | None] = (
     ContextVar("stream_collectives", default=None)
@@ -99,17 +96,6 @@ def stream_collectives(group_name: str) -> StreamCollectives | None:
         raise RuntimeError(
             f"stream scope has no binding for communicator {group_name!r}"
         ) from None
-
-
-def process_group(name: str):
-    """Resolve a process group from its stable backend name.
-
-    A name is traceable through custom ops; process-group objects cannot
-    cross a torch.library schema or a captured graph boundary.
-    """
-    return dist.distributed_c10d._resolve_process_group(
-        dist.distributed_c10d.GroupName(name)
-    )
 
 
 class Transfer:
@@ -167,54 +153,44 @@ def start_all_to_all(
     return Transfer(work, input.device)
 
 
-@torch.library.custom_op(
-    "uniserve::all_gather_into_tensor", mutates_args=("output",)
-)
-def all_gather_into_tensor(
-    output: torch.Tensor, input: torch.Tensor, group_name: str
-) -> None:
-    """Gather equal contributions into ``output`` in backend rank order."""
+def all_gather(output: torch.Tensor, input: torch.Tensor, group) -> None:
+    """Gather equal contributions into ``output`` in backend rank order.
+
+    ``output`` is contiguous storage of any shape holding one ``input``-sized
+    contribution per member.
+    """
     with profile_range(
-        f"uniserve.collective kind=all_gather group={group_name} "
+        f"uniserve.collective kind=all_gather group={group.group_name} "
         f"rank={dist.get_rank()}"
     ):
-        group = process_group(group_name)
         # In-place AllGather registers one stable allocation for both source
         # and destination. Symmetric workspaces can then use NCCL copy engines.
-        local = output.view(-1).narrow(
-            0, group.rank() * input.numel(), input.numel()
-        )
-        local = local.view_as(input)
-        local.copy_(input)
-        bound = stream_collectives(group_name)
+        # Both operands are passed flat: Gloo accepts a concatenation of the
+        # contributions along the leading axis but not a stack of them.
+        flat = output.view(-1)
+        local = flat.narrow(0, group.rank() * input.numel(), input.numel())
+        local.view_as(input).copy_(input)
+        bound = stream_collectives(group.group_name)
         if bound is not None:
             # Immediate consumers need no fork onto the transport stream.
-            bound.all_gather(output, local)
+            bound.all_gather(flat, local)
         else:
-            start_all_gather(output, local, group).wait()
+            start_all_gather(flat, local, group).wait()
 
 
-@all_gather_into_tensor.register_fake
-def _all_gather_into_tensor_fake(output, input, group_name):
-    pass
-
-
-@torch.library.custom_op(
-    "uniserve::all_to_all_single_into", mutates_args=("output",)
-)
-def all_to_all_single_into(
+def all_to_all(
     output: torch.Tensor,
     input: torch.Tensor,
     output_splits: list[int],
     input_splits: list[int],
-    group_name: str,
+    group,
 ) -> None:
     """Exchange leading-axis partitions in backend rank order."""
     with profile_range(
-        f"uniserve.collective kind=all_to_all group={group_name} "
+        f"uniserve.collective kind=all_to_all group={group.group_name} "
         f"rank={dist.get_rank()}"
     ):
-        bound = stream_collectives(group_name)
+        bound = stream_collectives(group.group_name)
         if bound is not None:
             bound.all_to_all(output, input, output_splits, input_splits)
             return
@@ -229,59 +205,25 @@ def all_to_all_single_into(
             input,
             output_split_sizes=None if equal_counts else output_splits,
             input_split_sizes=None if equal_counts else input_splits,
-            group=process_group(group_name),
+            group=group,
             async_op=True,
         )
         Transfer(work, input.device).wait()
 
 
-@all_to_all_single_into.register_fake
-def _all_to_all_single_into_fake(
-    output, input, output_splits, input_splits, group_name
-):
-    pass
-
-
-@torch.library.custom_op("uniserve::all_reduce_max", mutates_args=("value",))
-def all_reduce_max(value: torch.Tensor, group_name: str) -> None:
-    """Reduce ``value`` in place to its elementwise maximum."""
-    with profile_range(
-        f"uniserve.collective kind=all_reduce_max group={group_name} "
-        f"rank={dist.get_rank()}"
-    ):
-        bound = stream_collectives(group_name)
-        if bound is not None:
-            bound.all_reduce(value, "max")
-            return
-        work = dist.all_reduce(
-            value,
-            op=dist.ReduceOp.MAX,
-            group=process_group(group_name),
-            async_op=True,
-        )
-        Transfer(work, value.device).wait()
-
-
-@all_reduce_max.register_fake
-def _all_reduce_max_fake(value, group_name):
-    pass
-
-
-@torch.library.custom_op("uniserve::group_send_recv", mutates_args=("output",))
 def send_recv(
     value: torch.Tensor,
     output: torch.Tensor,
     dst: int,
     src: int,
-    group_name: str,
+    group,
 ) -> None:
     """Send ``value`` bytes to ``dst`` and receive ``output`` from ``src``."""
-    group = process_group(group_name)
     with profile_range(
-        f"uniserve.collective kind=send_recv group={group_name} "
+        f"uniserve.collective kind=send_recv group={group.group_name} "
         f"rank={dist.get_rank()}"
     ):
-        bound = stream_collectives(group_name)
+        bound = stream_collectives(group.group_name)
         if bound is not None:
             bound.send_recv(output, value, dst, src)
             return
@@ -297,11 +239,6 @@ def send_recv(
             Transfer(work, value.device).wait()
 
 
-@send_recv.register_fake
-def _send_recv_fake(value, output, dst, src, group_name):
-    pass
-
-
 _REDUCTIONS = {
     "sum": dist.ReduceOp.SUM,
     "min": dist.ReduceOp.MIN,
@@ -314,19 +251,8 @@ def all_reduce(value: torch.Tensor, op: str, group) -> None:
     bound = stream_collectives(group.group_name)
     if bound is not None:
         bound.all_reduce(value, op)
-    elif op == "max":
-        all_reduce_max(value, group.group_name)
     else:
         dist.all_reduce(value, op=_REDUCTIONS[op], group=group)
-
-
-def all_gather(storage: torch.Tensor, value: torch.Tensor, group) -> None:
-    """Gather ``value`` into the leading backend-ordered axis of ``storage``."""
-    bound = stream_collectives(group.group_name)
-    if bound is not None:
-        bound.all_gather(storage, value)
-    else:
-        dist.all_gather(list(storage.unbind(0)), value, group=group)
 
 
 def gather(

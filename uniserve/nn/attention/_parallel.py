@@ -25,17 +25,12 @@ class AttentionBuffers:
 
     Gather storage holds a compact replicated key domain: every owner's active
     rows, in topology order, in this rank's own storage.
-    ``valid_sizes`` stores valid-row counts for the layout's explicit block
-    size; numerical backends populate it when masking aligned owner capacity.
     """
 
     key: torch.Tensor
     value: torch.Tensor
     local_key: torch.Tensor
     local_value: torch.Tensor
-    valid_sizes: torch.Tensor
-    sync_input: torch.Tensor
-    sync_output: torch.Tensor
 
 
 @dataclass(frozen=True)

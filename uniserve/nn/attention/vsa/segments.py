@@ -161,13 +161,11 @@ class SegmentAttention(nn.Module):
         size hold unspecified values.
 
         Raises:
-            ValueError: Projections that do not cover the segment tiles, or a
-                tile size other than the block attention's.
+            ValueError: Projections that do not cover the segment tiles.
         """
         tile = segments.tile
         if (
-            tile != self.attention.tile_size
-            or q.ndim != 3
+            q.ndim != 3
             or any(value.shape != q.shape for value in (k, v, gate))
             or q.shape[0] != segments.padded_tokens
         ):

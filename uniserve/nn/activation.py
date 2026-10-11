@@ -52,19 +52,17 @@ class GELUAndMul(nn.Module):
         return functional.gelu_and_mul(x, approximate=self.approximate, out=out)
 
 
-# Checkpoint activation aliases resolve to one module per numerical formula.
+# Elementwise activations of non-gated MLPs, by the names checkpoints use. A
+# name resolves to one module per numerical formula; gated activations take a
+# packed tensor of both halves and are the MLP's own (``SiLUAndMul``,
+# ``GELUAndMul``).
 _ACT_FN_REGISTRY: dict[str, Callable[[], nn.Module]] = {
     "silu": nn.SiLU,
     "swish": nn.SiLU,
     "gelu": nn.GELU,
     "gelu_pytorch_tanh": lambda: nn.GELU(approximate="tanh"),
     "gelu_fast": lambda: nn.GELU(approximate="tanh"),
-    "gelu_approx": lambda: nn.GELU(approximate="tanh"),
     "relu": nn.ReLU,
-    "silu_and_mul": SiLUAndMul,
-    "swiglu": SiLUAndMul,
-    "gelu_and_mul": GELUAndMul,
-    "geglu": GELUAndMul,
 }
 
 

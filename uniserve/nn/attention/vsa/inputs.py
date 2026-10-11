@@ -6,9 +6,6 @@ from dataclasses import dataclass
 
 import torch
 
-# Rows of one query tile and of one key block that block attention serves.
-TILE_SIZES = (64, 128)
-
 
 @dataclass(frozen=True, slots=True)
 class Pattern:
@@ -18,8 +15,9 @@ class Pattern:
     query tile's key tiles: the block map's device counts, which backends
     read, may be lower where prefix key tiles hold no valid rows. A dense
     prefix has at most the keys ``range(dense_key_tiles)``. ``tile`` is the
-    rows of one query tile and of one key block. Backends may specialize this
-    declared mathematical domain without inspecting device data on the host.
+    rows of one query tile and of one key block; resolving a backend refuses
+    a tile no installed kernel serves. Backends may specialize this declared
+    mathematical domain without inspecting device data on the host.
     """
 
     row_counts: tuple[tuple[int, ...], ...]
@@ -28,10 +26,10 @@ class Pattern:
     tile: int
 
     def __post_init__(self):
-        if self.tile not in TILE_SIZES:
-            raise ValueError(f"VSA tiles hold one of {TILE_SIZES} rows")
         if (
-            not isinstance(self.row_counts, tuple)
+            type(self.tile) is not int
+            or self.tile < 1
+            or not isinstance(self.row_counts, tuple)
             or not self.row_counts
             or not self.row_counts[0]
             or any(
@@ -53,7 +51,8 @@ class Pattern:
             )
         ):
             raise ValueError(
-                "VSA pattern has invalid tile counts or dense visibility"
+                "VSA pattern has an invalid tile, tile counts or dense "
+                "visibility"
             )
 
     def counts(
@@ -239,7 +238,7 @@ class Segments:
     every assignment of tiles to segments.
 
     Attributes:
-        tile: Rows of one tile, one of ``TILE_SIZES``.
+        tile: Rows of one tile.
         padded_tokens: Packed rows, whole tiles.
         valid_sizes: Valid rows of each tile; they lead the tile's rows.
         tile_segments: ``DENSE_TILE`` for a dense or empty tile, else the
@@ -262,11 +261,11 @@ class Segments:
 
     def __post_init__(self):
         if (
-            self.tile not in TILE_SIZES
+            self.tile < 1
             or self.padded_tokens < self.tile
             or self.padded_tokens % self.tile
         ):
-            raise ValueError("VSA segments require whole tiles of a VSA tile")
+            raise ValueError("VSA segments require whole tiles")
         tiles = self.padded_tokens // self.tile
         if any(
             value.shape != (tiles,) or value.dtype != torch.int32

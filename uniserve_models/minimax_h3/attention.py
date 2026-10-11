@@ -320,7 +320,7 @@ class SegmentSparse(nn.Module):
     follow the checkpoint's rounding recipe (``TransformerConfig.rounding``).
     """
 
-    def __init__(self, config: TransformerConfig, *, tile: int):
+    def __init__(self, config: TransformerConfig):
         super().__init__()
         self.head_dim = config.head_dim
         self.rounding = config.rounding
@@ -335,7 +335,7 @@ class SegmentSparse(nn.Module):
         self.query_norm = RMSNorm(config.head_dim, config.qk_norm_eps)
         self.key_norm = RMSNorm(config.head_dim, config.qk_norm_eps)
         self.vsa = vsa.SegmentAttention(
-            vsa.BlockAttention(config.head_dim**-0.5, tile_size=tile)
+            vsa.BlockAttention(config.head_dim**-0.5)
         )
 
     def workspace_buffers(

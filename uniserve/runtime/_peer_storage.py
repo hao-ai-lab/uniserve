@@ -22,26 +22,9 @@ from uniserve.distributed.mesh import Communicator
 class SymmetricStorage:
     """Owned allocation with peer views ordered by logical membership."""
 
-    coordinator: Communicator
     local: torch.Tensor
     peers: tuple[torch.Tensor, ...]
     handle: Any
-
-    @property
-    def rank(self) -> int:
-        return self.coordinator.rank
-
-    @property
-    def size(self) -> int:
-        return self.coordinator.size
-
-    def fence(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        """Publish arrival on the allocation's group with stream ordering."""
-        if tuple(input.shape) != (1,) or tuple(output.shape) != (self.size,):
-            raise ValueError(
-                "symmetric-storage fence buffers do not match group membership"
-            )
-        self.coordinator.all_gather_into(output, input)
 
 
 def _peer_identities(
@@ -247,5 +230,5 @@ def allocate_symmetric_storage(
             handle.get_buffer(backend_ranks.index(rank), shape, dtype)
             for rank in group.ranks
         )
-    workspace = SymmetricStorage(group, local, peers, handle)
+    workspace = SymmetricStorage(local, peers, handle)
     return workspace

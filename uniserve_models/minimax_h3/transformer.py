@@ -363,7 +363,7 @@ class Transformer(nn.Module):
                 return Sparse(config, sparsity=attention.sparsity)
             # The sparsity and reference keep rate are request tables of the
             # segment packing (``packing.segment_tables``).
-            return SegmentSparse(config, tile=attention.tile)
+            return SegmentSparse(config)
 
         self.layers = nn.ModuleDict(
             {
