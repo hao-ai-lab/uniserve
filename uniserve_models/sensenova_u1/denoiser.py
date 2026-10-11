@@ -42,6 +42,10 @@ from .transformer import Transformer
 class Denoiser(ImageDenoiser[DenoiserInput]):
     """Predict image velocity from pixels through the shared text/flow backbone."""  # noqa: E501
 
+    # The prompt's ``<img>`` token sits at the position before the image, the
+    # patches share the next one and ``</img>`` takes the one after.
+    rope_advance = 2
+
     @property
     def max_sequence_tokens(self) -> int:
         # ``framing_tokens`` keeps the base default of zero, so this bounds
