@@ -23,8 +23,8 @@
 //! The encoder constructs many records positionally, so its argument order is
 //! coupled to the field order of the Python dataclasses in
 //! `uniserve_worker.protocol` and to the parameters of `batch_from_validated`.
-//! The round-trip test at the bottom of this file checks that each native
-//! batch equals `Batch.from_mapping(batch.to_mapping())`.
+//! The round-trip test at the bottom of this file reads the fields of each
+//! native batch back by name.
 //!
 //! Decoding is strict: integers reject Python `bool`, strings must be `str`,
 //! byte payloads must be `bytes`, and sequences must be `list` (except the
@@ -2605,11 +2605,30 @@ mod tests {
         pythonize(py, &response).unwrap()
     }
 
+    /// Reads `path` from a Python record: attribute names separated by dots,
+    /// where a number indexes a sequence.
+    fn field<'py>(record: &Bound<'py, PyAny>, path: &str) -> Bound<'py, PyAny> {
+        path.split('.').fold(record.clone(), |value, segment| {
+            match segment.parse::<usize>() {
+                Ok(index) => value.get_item(index).unwrap(),
+                Err(_) => value.getattr(segment).unwrap(),
+            }
+        })
+    }
+
+    /// Reads the unsigned integers at `paths` of a Python record.
+    fn uints(record: &Bound<'_, PyAny>, paths: &[&str]) -> Vec<u64> {
+        paths
+            .iter()
+            .map(|path| field(record, path).extract::<u64>().unwrap())
+            .collect()
+    }
+
     /// Drives the four submit requests through a real `PyServer` and back.
     ///
-    /// Each natively constructed batch must equal what the Python codec
-    /// decodes from its own mapping, and the reply to the KV batch must decode
-    /// in Rust to `result_response()`.
+    /// Each natively constructed batch must hold the submitted values under
+    /// the Python records' field names, and the reply to the KV batch must
+    /// decode in Rust to `result_response()`.
     #[test]
     fn native_execute_and_result_round_trip_preserves_values() {
         Python::initialize();
@@ -2666,12 +2685,6 @@ mod tests {
                     .call_method1("insert", (0, source.to_str().unwrap()))
                     .unwrap();
             }
-            let canonical = py
-                .import("uniserve_worker.protocol.batch")
-                .unwrap()
-                .getattr("Batch")
-                .unwrap();
-
             for (index, request) in requests.iter().enumerate() {
                 let native_request = server.recv(py).unwrap();
                 let request_dict = native_request.bind(py).cast::<PyDict>().unwrap();
@@ -2689,25 +2702,109 @@ mod tests {
                 );
                 assert_eq!(native_batch.getattr("calls").unwrap().len().unwrap(), 1);
 
-                // The natively constructed batch must be exactly what the
-                // canonical codec decodes from its own IPC form.
-                let round_tripped = canonical
-                    .call_method1(
-                        "from_mapping",
-                        (native_batch.call_method0("to_mapping").unwrap(),),
-                    )
-                    .unwrap();
-                assert!(
-                    round_tripped.eq(&native_batch).unwrap(),
-                    "native batch construction diverged from the canonical codec"
+                // Records built positionally hold each submitted value under
+                // its own field name.
+                let call = native_batch.getattr("calls").unwrap().get_item(0).unwrap();
+                let submitted = &batch.calls[0];
+                assert_eq!(
+                    uints(
+                        &call,
+                        &[
+                            "request_key.engine_id",
+                            "request_key.request_id",
+                            "request_key.request_epoch",
+                            "call_id.batch_id",
+                            "call_id.request_index",
+                        ],
+                    ),
+                    [
+                        submitted.request_key.engine_id,
+                        submitted.request_key.request_id.0,
+                        submitted.request_key.request_epoch,
+                        submitted.call_id.batch_id,
+                        u64::from(submitted.call_id.request_index),
+                    ]
+                );
+                assert_eq!(
+                    field(&call, "kind.value").extract::<String>().unwrap(),
+                    submitted.code.as_str()
+                );
+                assert_eq!(
+                    field(&call, "component").extract::<String>().unwrap(),
+                    submitted.component
+                );
+                assert_eq!(
+                    uints(
+                        &call,
+                        &[
+                            "bounds.max_tokens",
+                            "bounds.max_kv_units",
+                            "bounds.max_latent_bytes",
+                            "bounds.max_completion_bytes",
+                            "bounds.max_transfer_bytes",
+                        ],
+                    ),
+                    [
+                        u64::from(submitted.bounds.max_tokens),
+                        u64::from(submitted.bounds.max_kv_units),
+                        submitted.bounds.max_latent_bytes,
+                        submitted.bounds.max_completion_bytes,
+                        submitted.bounds.max_transfer_bytes,
+                    ]
+                );
+                for (column, expected) in [
+                    ("forward_call_indices", &batch.forward.call_indices),
+                    ("request_pool_indices", &batch.forward.request_pool_indices),
+                    ("seq_lens", &batch.forward.seq_lens),
+                    ("query_lens", &batch.forward.query_lens),
+                ] {
+                    assert_eq!(
+                        &field(&native_batch, column).extract::<Vec<u32>>().unwrap(),
+                        expected
+                    );
+                }
+                assert_eq!(
+                    field(&native_batch, "write_kv")
+                        .extract::<Vec<bool>>()
+                        .unwrap(),
+                    batch.forward.write_kv
                 );
 
-                let call = native_batch.getattr("calls").unwrap().get_item(0).unwrap();
                 match index {
                     // The token call carries host-staged inputs and the
                     // sampling state the worker reads per call; its
                     // admission carries the request's input image count.
                     0 => {
+                        assert_eq!(
+                            uints(
+                                &native_batch,
+                                &[
+                                    "block_tables.0.request_pool_idx",
+                                    "block_tables.0.group_id",
+                                    "block_tables.0.start_page",
+                                    "block_tables.0.unit_ids.0",
+                                    "block_tables.0.allocated_tokens",
+                                    "new_cache_units.0.request_pool_idx",
+                                    "new_cache_units.0.group_id",
+                                    "new_cache_units.0.unit_ids.0",
+                                    "admissions.0.request_pool_idx",
+                                    "calls.0.token_output.output_index",
+                                    "calls.0.token_output.generation",
+                                ],
+                            ),
+                            [1, 0, 0, 1, 2, 1, 0, 1, 1, 0, 5]
+                        );
+                        assert!(
+                            field(&native_batch, "admissions.0.generation.sampling.ignore_eos")
+                                .extract::<bool>()
+                                .unwrap()
+                        );
+                        assert_eq!(
+                            field(&call, "token_output.dtype.value")
+                                .extract::<String>()
+                                .unwrap(),
+                            "i64"
+                        );
                         assert_eq!(
                             native_batch
                                 .getattr("admissions")
@@ -2785,6 +2882,48 @@ mod tests {
                                 .extract::<Vec<u32>>()
                                 .unwrap(),
                             vec![17, 23, 65_537]
+                        );
+                        assert_eq!(
+                            uints(
+                                &media,
+                                &[
+                                    "request_pool_idx",
+                                    "diffusion.num_frames",
+                                    "diffusion.video_units",
+                                    "diffusion.num_inference_steps",
+                                    "diffusion.seed",
+                                    "diffusion.width",
+                                    "diffusion.height",
+                                ],
+                            ),
+                            [2, 22, 3, 4, 29, 1344, 768]
+                        );
+                        assert_eq!(
+                            field(&media, "video.task.value")
+                                .extract::<String>()
+                                .unwrap(),
+                            "t2va"
+                        );
+                        assert_eq!(
+                            field(&media, "video.text_tags")
+                                .extract::<Vec<u32>>()
+                                .unwrap(),
+                            vec![1; 3]
+                        );
+                        assert_eq!(
+                            uints(
+                                &native_batch,
+                                &[
+                                    "latent_params.0.call_id.batch_id",
+                                    "latent_params.0.page_table.0",
+                                    "latent_params.0.latent_units",
+                                    "latent_params.0.height",
+                                    "latent_params.0.width",
+                                    "latent_params.0.start_step",
+                                    "latent_params.0.step_count",
+                                ],
+                            ),
+                            [12, 1, 64, 768, 1344, 0, 0]
                         );
                         server
                             .respond(py, &acknowledgement(py, batch.batch_id))

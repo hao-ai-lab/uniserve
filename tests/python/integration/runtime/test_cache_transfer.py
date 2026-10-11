@@ -18,7 +18,6 @@ from uniserve_worker.protocol.transfer import (
     MAX_TRANSFER_HANDLE_BYTES,
     KvGroupTransfer,
     KvTransfer,
-    Locator,
     TensorTransfer,
 )
 from uniserve_worker.storage.block_tables import GroupTable
@@ -57,7 +56,7 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
     child.close()
     try:
         assert parent.poll(30), "shared-storage publisher did not start"
-        locator = Locator.from_mapping(parent.recv())
+        locator = parent.recv()
         source = _buffer(1)
         field = TensorTransfer(shape=shape, locations=(locator,))
         publication = KvTransfer(

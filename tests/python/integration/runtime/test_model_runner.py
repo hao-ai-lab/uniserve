@@ -2618,7 +2618,6 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-    from uniserve_worker.protocol.output import BatchOutput
 
     with execution_worker(transfer_backends=("shm",), queue_depth=2) as worker:
         worker.warmup()
@@ -2695,9 +2694,9 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
                     for value in (endpoint.receive(), endpoint.receive())
                 }
                 assert responses[5]["kind"] == "result", responses[5]
-                result = BatchOutput.from_mapping(responses[5]["result"])
-                assert result.completions[0].status is CallStatus.OK
-                assert result.completions[0].num_completed_steps == 3
+                completion = responses[5]["result"]["completions"][0]
+                assert completion["status"] == CallStatus.OK.value
+                assert completion["num_completed_steps"] == 3
                 assert responses[6]["kind"] == "result", responses[6]
             finally:
                 # Failure cleanup sends the same valid release through IPC,

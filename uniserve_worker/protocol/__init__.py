@@ -14,5 +14,5 @@ are imported directly; this package re-exports nothing.
 - `output`: per-batch completion records.
 - `messages`: request decoding and response envelopes.
 - `worker_info`: startup information the worker reports to the scheduler.
-- `validation`: primitive decoders shared by the ``from_mapping`` parsers.
+- `validation`: primitive field checks shared by the records.
 """

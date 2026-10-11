@@ -37,7 +37,6 @@ from uniserve_worker.protocol.call import (
     TransferMode,
 )
 from uniserve_worker.protocol.identity import BufferId, CallId
-from uniserve_worker.protocol.output import BatchOutput
 from uniserve_worker.protocol.transfer import (
     KvTransfer,
     Locator,
@@ -251,8 +250,8 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 try:
                     response = ipc.receive()
                     assert response["message_id"] == 5, response
-                    completed = BatchOutput.from_mapping(response["result"])
-                    assert completed.completions[0].status is CallStatus.OK
+                    completed = response["result"]["completions"][0]
+                    assert completed["status"] == CallStatus.OK.value
 
                     acknowledge_held()
                     reader_held = False
@@ -265,9 +264,9 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     # physical import must wake the sleeping process itself.
                     response = ipc.receive()
                     assert response["message_id"] == 4, response
-                    report = BatchOutput.from_mapping(response["result"])
-                    assert report.completions[0].status is CallStatus.OK
-                    assert report.completions[0].kv_visible_len == 2
+                    installed = response["result"]["completions"][0]
+                    assert installed["status"] == CallStatus.OK.value
+                    assert installed["kv_visible_len"] == 2
                     for layer in worker.kv_cache.cache.config.layers:
                         expected = producer.kv_cache.cache.state(layer).read(
                             (1,), start=0, length=2

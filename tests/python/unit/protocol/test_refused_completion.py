@@ -45,7 +45,7 @@ def test_a_refusal_carries_its_reason_across_the_wire():
     refused.validate()
     mapping = refused.to_mapping()
     assert mapping["error_code"] == "invalid_request"
-    assert RequestOutput.from_mapping(mapping) == refused
+    assert mapping["error_message"] == REASON
 
 
 @pytest.mark.parametrize(

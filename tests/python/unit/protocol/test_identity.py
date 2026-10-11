@@ -21,9 +21,8 @@ def test_buffer_lookup_preserves_identity_across_reconstruction_and_versions():
     entries = {reference.buffer_id: "value"}
     wire = reference.to_mapping()
     restored = (
-        TensorRef.from_mapping(wire),
-        TensorRef.from_mapping(
-            dict(wire, producer_call_id=reference.producer_call_id)
+        TensorRef(
+            RequestKey(2, 7, 3), CallId(11, 4), 0, 5, DType.I64, ShapeBound()
         ),
         pickle.loads(pickle.dumps(reference)),
         replace(reference),
@@ -31,7 +30,7 @@ def test_buffer_lookup_preserves_identity_across_reconstruction_and_versions():
     for item in restored:
         assert entries[item.buffer_id] == "value"
         assert item.to_mapping() == wire
-        assert BufferId.from_mapping(item.buffer_id.to_mapping()) in entries
+        assert BufferId(RequestKey(2, 7, 3), CallId(11, 4), 0, 5) in entries
 
     versions = (
         replace(reference, generation=6),
@@ -58,7 +57,7 @@ def test_computation_order_and_lookup_follow_batch_and_request_coordinates():
     third = CallId(10, 0)
     entries = {second: "second", first: "first", third: "third"}
     reconstructed = [
-        CallId.from_mapping(item.to_mapping())
+        CallId(item.batch_id, item.request_index)
         for item in (third, first, second)
     ]
     assert [entries[item] for item in sorted(reconstructed)] == [

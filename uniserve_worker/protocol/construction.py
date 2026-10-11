@@ -4,9 +4,8 @@ The Rust codec in `uniserve_worker_ipc` decodes a submit frame and runs
 `Batch::validate` on it. The PyO3 transport's `batch_to_py`
 (`crates/worker-ipc-py`) then builds every member record through its ordinary
 constructor and passes them to `batch_from_validated`. Python callers that
-build a batch themselves construct `Batch` directly or use
-`Batch.from_mapping`; both run `Batch.validate`, and `from_mapping` also
-validates every call. Only records decoded by the Rust transport may enter the
+build a batch themselves construct `Batch` directly, which runs
+`Batch.validate`. Only records decoded by the Rust transport may enter the
 factory below.
 """
 

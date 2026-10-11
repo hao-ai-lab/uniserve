@@ -38,7 +38,7 @@ def serve_pending_publication(channel, shape=(1024,)) -> None:
             device="cpu",
         )
         segment.initialize(storage.buf, locator_digest(locator))
-        channel.send(locator.to_mapping())
+        channel.send(locator)
         while True:
             command = channel.recv()
             if command == "settled":

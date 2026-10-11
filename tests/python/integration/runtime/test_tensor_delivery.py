@@ -303,7 +303,7 @@ def _receive_tensor_shards(channel, backends: tuple[str, ...]) -> None:
         backends, byte_capacity=16384, ticket_capacity=4, event_pool=events
     )
     try:
-        tensor = TensorTransfer.from_mapping(channel.recv())
+        tensor = channel.recv()
         destination = torch.empty(tensor.shape, device="cuda:0")
         _consume(
             fetch_tensor(
@@ -336,7 +336,7 @@ def _receive_non_peer_cuda_product(channel, destination_device: str) -> None:
         source=WorkerEndpoint.local("consumer"),
     )
     try:
-        tensor = TensorTransfer.from_mapping(channel.recv())
+        tensor = channel.recv()
         destination = torch.empty(tensor.shape, device=destination_device)
         _consume(
             fetch_tensor(
@@ -364,7 +364,7 @@ def _receive_cuda_products(channel, count: int) -> None:
     )
     try:
         for _ in range(count):
-            tensor = TensorTransfer.from_mapping(channel.recv())
+            tensor = channel.recv()
             destination = torch.empty(tensor.shape, device="cuda:1")
             _consume(
                 fetch_tensor(
@@ -412,9 +412,7 @@ def test_cuda_vmm_rereads_rewritten_storage_with_its_current_values() -> None:
             values = scale * torch.arange(48, device="cuda:0").view(6, 8)
             storage.copy_(values)
             location = producer.publish(storage)
-            parent.send(
-                TensorTransfer(shape=(6, 8), locations=(location,)).to_mapping()
-            )
+            parent.send(TensorTransfer(shape=(6, 8), locations=(location,)))
             assert parent.poll(45), "CUDA VMM product did not arrive"
             assert parent.recv() == values.cpu().tolist()
             producer.release(location)
@@ -468,9 +466,7 @@ def test_cuda_vmm_stages_between_devices_without_peer_access() -> None:
         process.start()
         child.close()
         parent.send(
-            TensorTransfer(
-                shape=tuple(expected.shape), locations=(location,)
-            ).to_mapping()
+            TensorTransfer(shape=tuple(expected.shape), locations=(location,))
         )
         assert parent.poll(45), "non-peer CUDA product did not arrive"
         assert parent.recv() == expected.cpu().tolist()
@@ -521,11 +517,7 @@ def test_tensor_delivery_gathers_shards_across_processes(
     )
     try:
         process.start()
-        parent.send(
-            TensorTransfer(
-                shape=(6, 8), locations=tuple(locations)
-            ).to_mapping()
-        )
+        parent.send(TensorTransfer(shape=(6, 8), locations=tuple(locations)))
         assert parent.poll(45), "cross-process tensor delivery did not complete"
         assert parent.recv() == expected
         process.join(30)
@@ -549,7 +541,7 @@ def _receive_independent_shards(channel) -> None:
         "cuda_vmm", byte_capacity=12 << 20, ticket_capacity=4, event_pool=events
     )
     try:
-        tensor = TensorTransfer.from_mapping(channel.recv())
+        tensor = channel.recv()
         destination = torch.empty(tensor.shape, device="cuda:0")
         independent = torch.cuda.Stream()
         pending = torch.cuda.Event()
@@ -608,11 +600,7 @@ def test_sharded_delivery_progresses_during_independent_device_work() -> None:
     process = context.Process(target=_receive_independent_shards, args=(child,))
     try:
         process.start()
-        parent.send(
-            TensorTransfer(
-                shape=(3, 1024, 1024), locations=locations
-            ).to_mapping()
-        )
+        parent.send(TensorTransfer(shape=(3, 1024, 1024), locations=locations))
         assert parent.poll(45), "cross-process tensor delivery did not complete"
         result = parent.recv()
         process.join(30)
