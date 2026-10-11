@@ -72,15 +72,15 @@ impl SenseNovaProfile {
     /// worker reports and takes its served features from its call kinds.
     pub fn runtime_limits(model_dtype: ModelDtype) -> GenerationLimits {
         let dtype_bytes = model_dtype_bytes(model_dtype);
-        // `GenerationRequest::image_latent_bytes` divides the latent feature
-        // bytes by `max_vae_grid_tokens` to get the bytes per latent unit:
-        // a 3-channel 32x32 pixel patch.
+        // One latent unit is a 3-channel 32x32 pixel patch.
+        let latent_bytes_per_unit = 3 * 32 * 32 * dtype_bytes;
         GenerationLimits {
             max_latent_units: u64::MAX,
             latent_downsample: Self::LATENT_DOWNSAMPLE,
             max_vae_grid_tokens: 4_096,
             max_vit_grid_tokens: 4_900,
-            max_latent_feature_bytes: 4_096 * 3 * 32 * 32 * dtype_bytes,
+            latent_bytes_per_unit,
+            max_latent_feature_bytes: 4_096 * latent_bytes_per_unit,
             max_vision_feature_bytes: 4_900 * 4_096 * dtype_bytes,
             commit_marker_tokens: 0,
             max_cfg_branches: 3,

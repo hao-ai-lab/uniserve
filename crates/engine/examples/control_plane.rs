@@ -75,6 +75,7 @@ fn main() {
             latent_downsample: 16,
             max_vae_grid_tokens: 64,
             max_vit_grid_tokens: 64,
+            latent_bytes_per_unit: (1 << 20) / 64,
             max_latent_feature_bytes: 1 << 20,
             max_vision_feature_bytes: 1 << 20,
             commit_marker_tokens: 2,

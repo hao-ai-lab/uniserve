@@ -98,15 +98,15 @@ impl BagelProfile {
     /// worker reports and takes its served features from its call kinds.
     pub fn runtime_limits(model_dtype: ModelDtype) -> GenerationLimits {
         let dtype_bytes = model_dtype_bytes(model_dtype);
-        // `GenerationRequest::image_latent_bytes` divides the latent feature
-        // bytes by `max_vae_grid_tokens` to get the bytes per latent unit:
-        // 16 VAE latent channels over a 2x2 latent patch.
+        // One latent unit is 16 VAE latent channels over a 2x2 latent patch.
+        let latent_bytes_per_unit = 16 * 2 * 2 * dtype_bytes;
         GenerationLimits {
             max_latent_units: u64::MAX,
             latent_downsample: Self::LATENT_DOWNSAMPLE,
             max_vae_grid_tokens: 1_026,
             max_vit_grid_tokens: 4_902,
-            max_latent_feature_bytes: 1_026 * 16 * 2 * 2 * dtype_bytes,
+            latent_bytes_per_unit,
+            max_latent_feature_bytes: 1_026 * latent_bytes_per_unit,
             max_vision_feature_bytes: 4_902 * 3_584 * dtype_bytes,
             commit_marker_tokens: 2,
             max_cfg_branches: 3,

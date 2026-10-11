@@ -279,6 +279,7 @@ fn runtime_limits() -> GenerationLimits {
         latent_downsample: 16,
         max_vae_grid_tokens: 1_000_000,
         max_vit_grid_tokens: 1_000_000,
+        latent_bytes_per_unit: u64::MAX.div_ceil(1_000_000),
         max_latent_feature_bytes: u64::MAX,
         max_vision_feature_bytes: u64::MAX,
         commit_marker_tokens: 2,

@@ -780,6 +780,9 @@ impl SimEngine {
             latent_downsample: 16,
             max_vae_grid_tokens: u32::MAX,
             max_vit_grid_tokens: u32::MAX,
+            // One latent unit of the simulated image: 256 MiB over the
+            // simulated worker's 65,536 latent units.
+            latent_bytes_per_unit: 4096,
             max_latent_feature_bytes: 256 << 20,
             max_vision_feature_bytes: 256 << 20,
             commit_marker_tokens: 2,
