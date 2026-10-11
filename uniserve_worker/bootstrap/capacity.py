@@ -653,7 +653,6 @@ def model_arena_capacity(
     worker_config: WorkerConfig,
     *,
     queue_depth: int,
-    completion_payload_bytes: int,
     num_units: int,
     request_pool_size: int,
     num_latent_pages: int,
@@ -680,9 +679,8 @@ def model_arena_capacity(
             an image denoiser's ``model_dtype`` is not FP16, BF16 or FP32.
     """
     depth = int(queue_depth)
-    payload_bytes = int(completion_payload_bytes)
     max_calls = int(worker_config.max_batch_calls)
-    if depth < 1 or payload_bytes < 1 or max_calls < 1:
+    if depth < 1 or max_calls < 1:
         raise ValueError("model arena sizing requires positive runtime bounds")
 
     slots = depth * max_calls

@@ -309,7 +309,6 @@ class Worker:
                 if config.expert_parallel is None
                 else config.expert_parallel.attention_ranks,
                 queue_depth=config.ipc.queue_depth,
-                completion_payload_bytes=config.ipc.max_payload_bytes,
                 acknowledgment_slot=config.ipc.acknowledgment_slot,
                 host_slots=config.ipc.host_slots,
                 products_cross_hosts=config.ipc.products_cross_hosts,
@@ -334,7 +333,6 @@ class Worker:
         sampling_group: Communicator | None,
         tokenizer: Any | None,
         queue_depth: int,
-        completion_payload_bytes: int,
         acknowledgment_slot: int = 0,
         host_slots: Sequence[int] = (),
         products_cross_hosts: bool = False,
@@ -478,7 +476,6 @@ class Worker:
                 endpoint=endpoint,
                 bindings=bindings,
                 queue_depth=int(queue_depth),
-                completion_payload_bytes=int(completion_payload_bytes),
                 components=components,
                 # The scheduler's page indices address every rank's resident
                 # layer and head regions, including stages with different

@@ -113,7 +113,6 @@ def _worker(root, queue_depth=1, **settings):
         sampling_group=Communicator(device=torch.device("cpu")),
         tokenizer=None,
         queue_depth=queue_depth,
-        completion_payload_bytes=1 << 16,
         attention="torch",
         host_slots=(0, 1),
     )

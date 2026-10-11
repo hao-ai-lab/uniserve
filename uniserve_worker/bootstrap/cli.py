@@ -31,7 +31,6 @@ REQUIRED_FIELDS = (
     "products_cross_hosts",
     "worker_id",
     "queue_depth",
-    "ipc_payload_cap",
     "model",
     "device",
     "rank",

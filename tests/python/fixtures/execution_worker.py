@@ -93,7 +93,6 @@ def execution_worker(
         host_slots=host_slots,
         worker_id=worker_id,
         queue_depth=queue_depth,
-        completion_payload_bytes=1 << 16,
         components=components,
         flow_prompt=flow_prompt,
     )

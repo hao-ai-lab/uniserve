@@ -156,7 +156,6 @@ def build_worker_layout(
     *,
     image_processor: ImageProcessor | None = None,
     queue_depth: int = 1,
-    completion_payload_bytes: int = 1 << 20,
     endpoint: WorkerEndpoint | None = None,
     capacity_group: Communicator | None = None,
     components: tuple[tuple[str, ComponentConfig], ...] = (),
@@ -177,15 +176,11 @@ def build_worker_layout(
 
     Raises:
         WorkerError: ``queue_depth`` is not positive.
-        ValueError: ``completion_payload_bytes`` is not positive, or the KV
-            pool does not fit the storage grant. Errors from the sizing
-            helpers propagate.
+        ValueError: The KV pool does not fit the storage grant. Errors from
+            the sizing helpers propagate.
     """
     if queue_depth <= 0:
         raise unsupported_setup("worker pipeline depth must be positive")
-
-    if completion_payload_bytes <= 0:
-        raise ValueError("completion payload capacity must be positive")
 
     dedicated = worker_config.role == "experts"
     supported = (
@@ -210,7 +205,6 @@ def build_worker_layout(
             state_buffers=state_buffers,
             bindings=bindings,
             queue_depth=queue_depth,
-            completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
         )
     else:
@@ -219,7 +213,6 @@ def build_worker_layout(
             worker_config,
             image_processor=image_processor,
             queue_depth=queue_depth,
-            completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
             capacity_group=capacity_group,
             bindings=bindings,
@@ -275,7 +268,6 @@ def _token_worker_layout(
     *,
     image_processor: ImageProcessor | None,
     queue_depth: int,
-    completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
     capacity_group: Communicator | None,
     bindings: Mapping[str, ComponentBinding] | None,
@@ -364,7 +356,6 @@ def _token_worker_layout(
 
     arena_args = {
         "queue_depth": int(queue_depth),
-        "completion_payload_bytes": int(completion_payload_bytes),
         "request_pool_size": int(worker_config.max_request_pool_size),
         "num_latent_pages": num_latent_pages,
         "latent_page_units": latent_page_units,
@@ -735,7 +726,6 @@ def _request_tensor_worker_layout(
     *,
     state_buffers: Mapping[str, BufferConfig],
     queue_depth: int,
-    completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
     bindings: Mapping[str, ComponentBinding] | None,
 ) -> WorkerLayout:
@@ -785,7 +775,6 @@ def _request_tensor_worker_layout(
         bindings=bindings,
         state_buffers=state_buffers,
         queue_depth=depth,
-        completion_payload_bytes=completion_payload_bytes,
         num_units=0,
         request_pool_size=slots,
         num_latent_pages=0,

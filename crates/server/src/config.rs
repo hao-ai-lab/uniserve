@@ -143,10 +143,7 @@ impl Default for EngineSettings {
             transfer: TransferConfig::default(),
             data_parallel_size: 1,
             expert_parallel: None,
-            worker_process: WorkerProcessArgs {
-                resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
-                ..WorkerProcessArgs::default()
-            },
+            worker_process: WorkerProcessArgs::default(),
         }
     }
 }
@@ -361,11 +358,6 @@ impl EngineSettings {
     /// model exposes a `max_model_len`.
     pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
 
-    /// Default response-ring slot capacity in bytes for the worker IPC
-    /// transport (64 MiB). `build_state` raises the configured capacity to the
-    /// model's channel payload capacity when that is larger.
-    pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
-
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`
     /// override before it reaches the scheduler or KV sizing math. It also
@@ -403,10 +395,6 @@ impl EngineSettings {
             video_seconds.start(),
             video_seconds.end(),
             self.max_video_seconds
-        );
-        anyhow::ensure!(
-            self.worker_process.resp_slot_cap > 0,
-            "resp_slot_cap must be greater than 0"
         );
         WorkerConfig::validate_all(&self.workers)?;
         Ok(())
@@ -457,13 +445,6 @@ mod tests {
     fn zero_max_model_len_is_rejected() {
         let mut config = Config::default();
         config.engine.max_model_len = Some(0);
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn zero_resp_slot_cap_is_rejected() {
-        let mut config = Config::default();
-        config.engine.worker_process.resp_slot_cap = 0;
         assert!(config.validate().is_err());
     }
 

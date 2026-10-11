@@ -245,9 +245,6 @@ pub(crate) struct SharedRuntimeArgs {
     /// Recompute prompt prefixes instead of reusing or retaining cached KV pages.
     #[arg(long)]
     pub disable_prefix_cache: bool,
-    /// Response-ring slot capacity in bytes for the worker IPC transport.
-    #[arg(long, default_value_t = EngineSettings::DEFAULT_RESP_SLOT_CAP, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
-    pub resp_slot_cap: usize,
     /// Compute device for the forward-only worker.
     #[arg(long, default_value = "cuda")]
     pub device: String,
@@ -496,7 +493,6 @@ impl SharedRuntimeArgs {
         worker_process.model = self.model.clone();
         let queue_depth = self.queue_depth.unwrap_or(DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
-        worker_process.resp_slot_cap = self.resp_slot_cap;
         worker_process.kv_token_capacity = self.kv_token_capacity;
         worker_process.block_size = self.block_size;
         worker_process.attention_backend = self.attention_backend.clone();
@@ -871,8 +867,6 @@ mod tests {
             "1234",
             "--schedule-policy",
             "priority",
-            "--resp-slot-cap",
-            "1048576",
             "--dtype",
             "float16",
             "--mem-fraction-static",

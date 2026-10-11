@@ -231,25 +231,6 @@ impl ModelConfig {
         })
     }
 
-    /// Worker IPC slot capacity this model's messages require in each direction.
-    ///
-    /// A host product stays in a shared-storage segment on its host; across
-    /// hosts its bytes ride the rank channel, in the producing rank's result
-    /// and in the consuming rank's batch, so the capacity admits the largest
-    /// such product a rank publishes at once. A MiniMax H3 decode unit holds
-    /// 22 RGB frames of its canvas. The canvas rule caps a canvas at
-    /// 768x1344 pixels before rounding each side to 32 pixels, which adds at
-    /// most 4% (68,124,672 bytes for 22 frames at the cap), so 72 MiB holds
-    /// the unit and its protocol envelope. The rings grow to what a message
-    /// needs, so the capacity costs nothing until a message uses it.
-    pub(crate) fn channel_payload_capacity(&self) -> usize {
-        if matches!(self.parameters, ModelParameters::MiniMaxH3) {
-            72 << 20
-        } else {
-            1 << 20
-        }
-    }
-
     /// Vocabulary markers used by multimodal scheduling and prompt construction.
     pub(crate) fn generation_controls(&self) -> Option<&crate::profile::omni::GenerationControls> {
         match &self.parameters {

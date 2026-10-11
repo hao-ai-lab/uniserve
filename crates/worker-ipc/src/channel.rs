@@ -93,28 +93,22 @@ pub enum RankChannel {
 impl RankChannel {
     /// Binds the channel a rank named, refusing a mechanism the head cannot bind.
     ///
-    /// `max_payload` bounds every frame's payload in bytes. `depth` is the
-    /// number of outstanding request handles for shared storage and the number
-    /// of queued outgoing frames for a socket. `timeout` bounds only the TCP
-    /// connect; a shared-storage connect does not wait for the rank's server.
+    /// `depth` is the number of outstanding request handles for shared storage
+    /// and the number of queued outgoing frames for a socket. `timeout` bounds
+    /// only the TCP connect; a shared-storage connect does not wait for the
+    /// rank's server.
     pub fn connect(
         transport: &str,
         endpoint: &str,
-        max_payload: usize,
         depth: usize,
         timeout: Duration,
     ) -> IpcResult<Self> {
         match transport {
             SHARED_STORAGE_CHANNEL => Ok(Self::Shared(Box::new(ClientEndpoint::connect(
-                endpoint,
-                max_payload,
-                depth,
+                endpoint, depth,
             )?))),
             SOCKET_CHANNEL => Ok(Self::Socket(Box::new(SocketClient::connect(
-                endpoint,
-                max_payload,
-                depth,
-                timeout,
+                endpoint, depth, timeout,
             )?))),
             other => Err(IpcError::Transport(format!(
                 "unsupported channel transport {other}"
@@ -254,21 +248,14 @@ impl RankServer {
     /// `max_inflight` bounds outstanding requests for shared storage and
     /// queued response frames for a socket. A socket bind does not wait for
     /// the engine to connect.
-    pub fn bind(
-        transport: &str,
-        name: &str,
-        max_payload: usize,
-        max_inflight: usize,
-    ) -> IpcResult<Self> {
+    pub fn bind(transport: &str, name: &str, max_inflight: usize) -> IpcResult<Self> {
         match transport {
             SHARED_STORAGE_CHANNEL => Ok(Self::Shared(Box::new(ServerEndpoint::bind(
                 name,
-                max_payload,
                 max_inflight,
             )?))),
             SOCKET_CHANNEL => Ok(Self::Socket(Box::new(SocketServer::bind(
                 name,
-                max_payload,
                 max_inflight,
             )?))),
             other => Err(IpcError::Transport(format!(

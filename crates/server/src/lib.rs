@@ -107,7 +107,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             })?;
     }
     let max_model_len = model_config.max_model_len;
-    let channel_payload_capacity = model_config.channel_payload_capacity();
     let control_tokens = special_token_ids(&model_config);
     let generation_limits =
         model_config.generation_limits(config.engine.worker_process.model_dtype);
@@ -127,18 +126,8 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let max_batch_tokens = u32::try_from(config.engine.max_num_batched_tokens)
         .context("max_num_batched_tokens exceeds the worker field width")?;
 
-    // The model profile states the IPC payload its products need, and both
-    // directions of the worker channel must carry it: the request slot uses
-    // exactly that capacity, and the response slot uses the configured
-    // `resp_slot_cap` only when it is larger.
     let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
-        req_slot_cap: channel_payload_capacity,
-        resp_slot_cap: config
-            .engine
-            .worker_process
-            .resp_slot_cap
-            .max(channel_payload_capacity),
         max_batch_calls,
         max_batch_tokens,
         max_model_len,

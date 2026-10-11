@@ -19,7 +19,6 @@ def _model_config(directory, **overrides):
     directory.mkdir(parents=True, exist_ok=True)
     return worker_args(
         directory,
-        ipc_payload_cap=65536,
         max_batch_tokens=256,
         device="cpu",
         model=str(directory),
@@ -43,7 +42,7 @@ def _reported_endpoint(listener):
 
 def test_native_endpoint_close_releases_service_and_rejects_io():
     service = f"worker-{uuid4().hex}"
-    endpoint = WorkerIpcEndpoint(service, max_payload=65536)
+    endpoint = WorkerIpcEndpoint(service)
     assert not endpoint.closed
     assert endpoint.try_recv() is None
     endpoint.close()
@@ -56,14 +55,14 @@ def test_native_endpoint_close_releases_service_and_rejects_io():
     with pytest.raises(RuntimeError, match="closed"):
         with endpoint:
             pytest.fail("a closed endpoint cannot enter a service scope")
-    with WorkerIpcEndpoint(service, max_payload=65536) as replacement:
+    with WorkerIpcEndpoint(service) as replacement:
         assert replacement.try_recv() is None
 
 
 @pytest.mark.parametrize("failing_scope", (False, True))
 def test_endpoint_scope_closes_and_preserves_body_error(failing_scope):
     service = f"worker-{uuid4().hex}"
-    endpoint = WorkerIpcEndpoint(service, max_payload=65536)
+    endpoint = WorkerIpcEndpoint(service)
     failure = RuntimeError("service startup failed")
     try:
         with endpoint as bound:
@@ -78,7 +77,7 @@ def test_endpoint_scope_closes_and_preserves_body_error(failing_scope):
             "endpoint scope suppressed the startup exception"
         )
     assert endpoint.closed
-    with WorkerIpcEndpoint(service, max_payload=65536) as replacement:
+    with WorkerIpcEndpoint(service) as replacement:
         assert replacement.try_recv() is None
 
 
@@ -91,7 +90,7 @@ def test_model_loading_failure_releases_the_reported_endpoint(tmp_path):
         with pytest.raises(FileNotFoundError, match="modular_model_index.json"):
             run_worker(config)
         service = _reported_endpoint(listener)
-    with WorkerIpcEndpoint(service, max_payload=65536) as endpoint:
+    with WorkerIpcEndpoint(service) as endpoint:
         assert endpoint.try_recv() is None
 
 
@@ -102,7 +101,6 @@ def _stub_config(
     directory.mkdir(parents=True, exist_ok=True)
     return worker_args(
         directory,
-        ipc_payload_cap=65536,
         max_batch_tokens=256,
         max_batch_calls=2,
         device="cpu",

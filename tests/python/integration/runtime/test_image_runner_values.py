@@ -441,7 +441,6 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         tokenizer=None,
         entry_points=_placed_entries(model, ("cuda:0",)),
         queue_depth=2,
-        completion_payload_bytes=1 << 16,
         components=(("model", placement),),
     ) as worker:
         worker.warmup()
