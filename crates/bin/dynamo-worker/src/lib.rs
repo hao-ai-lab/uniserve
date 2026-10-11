@@ -618,8 +618,13 @@ fn prepare_request(
     let seconds = request
         .seconds
         .map_or_else(|| DEFAULT_SECONDS.min(max_video_seconds), f64::from);
-    let frames = video_frame_count(seconds, max_video_seconds, outputs.frame_rate)
-        .map_err(invalid_argument)?;
+    let frames = video_frame_count(
+        seconds,
+        max_video_seconds,
+        outputs.frame_rate,
+        &outputs.frames,
+    )
+    .map_err(invalid_argument)?;
     let nvext = request.nvext.unwrap_or_default();
     reject_present("nvext.annotations", nvext.annotations.as_ref())?;
     reject_present("nvext.negative_prompt", nvext.negative_prompt.as_ref())?;
@@ -701,6 +706,8 @@ struct Outputs {
     rasters: Vec<Raster>,
     /// Frames per second of every generated video.
     frame_rate: u32,
+    /// How the deployment's VAE chunks a video's frames.
+    frames: uniserve_engine::FrameChunks,
 }
 
 impl Outputs {
@@ -733,9 +740,12 @@ impl Outputs {
             .as_u64()
             .and_then(|fps| u32::try_from(fps).ok())
             .ok_or("the deployment reports no frame rate")?;
+        let frames = serde_json::from_value(capabilities["frames"].clone())
+            .map_err(|error| format!("the deployment reports no frame rule: {error}"))?;
         Ok(Self {
             rasters,
             frame_rate,
+            frames,
         })
     }
 
@@ -773,7 +783,7 @@ impl Outputs {
                 self.aspect_ratios().join(", ")
             ));
         }
-        self.0
+        self.rasters
             .iter()
             .find(|raster| raster.short_edge == short_edge && raster.aspect_ratio == aspect_ratio)
             .ok_or_else(|| format!("no canvas is served for {short_edge}p {aspect_ratio}"))
@@ -781,14 +791,14 @@ impl Outputs {
 
     /// Returns the served raster with exactly these pixel dimensions.
     fn find_size(&self, width: u32, height: u32) -> Option<&Raster> {
-        self.0
+        self.rasters
             .iter()
             .find(|raster| raster.width == width && raster.height == height)
     }
 
     /// Served rasters as `WIDTHxHEIGHT`, the default first.
     fn sizes(&self) -> Vec<String> {
-        self.0
+        self.rasters
             .iter()
             .map(|raster| format!("{}x{}", raster.width, raster.height))
             .collect()
@@ -965,7 +975,17 @@ mod tests {
     }
 
     fn capabilities(tasks: Value, sizes: Value) -> Value {
-        json!({"tasks": tasks, "fps": 24, "canvas": {"sizes": sizes}})
+        json!({
+            "tasks": tasks,
+            "fps": 24,
+            "frames": {
+                "min_frames": 22,
+                "chunk_frames": 17,
+                "chunk_latent_frames": 5,
+                "tail_latent_frames": 2,
+            },
+            "canvas": {"sizes": sizes},
+        })
     }
 
     /// The videos of a deployment preparing 768p 16:9 and 9:16 at 24 fps.

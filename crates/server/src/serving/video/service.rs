@@ -198,6 +198,7 @@ impl VideoService {
                 "canvases": canvases,
             },
             "fps": self.denoiser.frame_rate,
+            "frames": self.denoiser.frames,
             "min_seconds": MIN_VIDEO_SECONDS,
             "max_seconds": self.processor.limits().max_video_seconds,
             "model_max_seconds": MAX_VIDEO_SECONDS,

@@ -103,7 +103,7 @@ curl --fail-with-body http://127.0.0.1:8000/health
 curl --fail-with-body http://127.0.0.1:8000/v1/capabilities | python -m json.tool
 ```
 
-`/v1/capabilities` reports the served tasks and condition rules, canvases, durations, schedule, prompt and condition capacities, and media policy.
+`/v1/capabilities` reports the served tasks and condition rules, canvases, durations, the frame rule of the video VAE (`frames`), schedule, prompt and condition capacities, and media policy.
 
 ### Deployments
 

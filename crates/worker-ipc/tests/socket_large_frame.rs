@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! A frame far larger than any kernel socket buffer crosses a loopback TCP
 //! connection between two processes and arrives byte for byte.
 //!
