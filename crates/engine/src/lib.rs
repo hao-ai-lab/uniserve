@@ -41,9 +41,9 @@ pub use crate::handle::{
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, DomainStats, EncoderStats,
-    ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats, Scheduler, SchedulerConfig,
-    SchedulerStats, SchedulerStatsReporter, SchedulingPolicy, TimingStats, WorkerStats,
+    DEFAULT_MAX_NUM_SEQS, DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats,
+    KvCacheStats, PrefixStats, Scheduler, SchedulerConfig, SchedulerStats, SchedulerStatsReporter,
+    SchedulingPolicy, TimingStats, WorkerStats,
 };
 #[cfg(feature = "testing")]
 pub use crate::sim::{

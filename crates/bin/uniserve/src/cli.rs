@@ -19,8 +19,8 @@ use thiserror_ext::AsReport as _;
 use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::{
     AttentionBackend, DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, FlashInferBackend, LaneConfig,
+    TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::profile::diffusion_gemma::DenoisingOverrides;
 use uniserve_server::profile::omni::resolution::ResolutionName;
@@ -294,10 +294,6 @@ pub(crate) struct SharedRuntimeArgs {
     /// Maximum number of prompt tokens processed per request in one prefill step.
     #[arg(long = "chunked-prefill-size", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub long_prefill_threshold: Option<usize>,
-    /// Per-step budget of text prefill tokens allowed to join a decode batch
-    /// as one mixed extend+decode forward (0 disables mixing).
-    #[arg(long, default_value_t = DEFAULT_MIXED_PREFILL_TOKENS, hide = true)]
-    pub mixed_prefill_tokens: usize,
     /// Waiting queue policy used by the scheduler.
     #[arg(long = "schedule-policy", value_enum, default_value_t = SchedulerPolicyArg::Fcfs)]
     pub scheduler_policy: SchedulerPolicyArg,
@@ -481,7 +477,6 @@ impl SharedRuntimeArgs {
             long_prefill_threshold: self
                 .long_prefill_threshold
                 .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),
-            mixed_prefill_tokens: self.mixed_prefill_tokens,
             prefix_cache: !self.disable_prefix_cache,
             scheduler_policy: self.scheduler_policy.into(),
             // `None` lets `build_state` derive the model's real context length;

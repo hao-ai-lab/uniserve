@@ -43,7 +43,7 @@ pub(crate) use config::MAX_NUM_SEQS;
 use config::MAX_NUM_WAITING;
 pub use config::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulerConfig, SchedulingPolicy,
+    DEFAULT_MAX_NUM_SEQS, SchedulerConfig, SchedulingPolicy,
 };
 pub(crate) use execution::generation_consuming_calls;
 pub(crate) use run::{MAX_FLOW_PREFIX_ROWS, flow_prefix_rows};

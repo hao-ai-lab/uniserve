@@ -13,9 +13,6 @@ pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 pub const DEFAULT_MAX_NUM_SEQS: usize = 128;
 /// Default token threshold above which a prefill is chunked.
 pub const DEFAULT_LONG_PREFILL_THRESHOLD: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
-/// Default token budget for prefill co-scheduled in a decode pass; zero
-/// disables co-scheduling.
-pub const DEFAULT_MIXED_PREFILL_TOKENS: usize = 0;
 /// Default upper bound for queued requests.
 pub(crate) const DEFAULT_MAX_NUM_WAITING: usize = 4096;
 /// Hard upper bound for configured waiting requests.
@@ -38,7 +35,7 @@ pub enum SchedulingPolicy {
 }
 
 #[derive(Clone, Copy, Debug)]
-/// Sequence, token, queue, and mixed-lane limits for scheduling.
+/// Sequence, token, and queue limits for scheduling.
 pub struct SchedulerConfig {
     /// Waiting-queue ordering policy.
     pub policy: SchedulingPolicy,
@@ -57,9 +54,6 @@ pub struct SchedulerConfig {
     /// and media requests together with finished requests whose output
     /// events are still retained.
     pub max_num_waiting: usize,
-    /// Prefill token budget a decode pass may co-schedule; the prefill calls
-    /// still travel as their own batch. Zero disables co-scheduling.
-    pub mixed_prefill_tokens: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -71,7 +65,6 @@ impl Default for SchedulerConfig {
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             max_num_waiting: DEFAULT_MAX_NUM_WAITING,
-            mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
         }
     }
 }

@@ -219,15 +219,6 @@ impl Scheduler {
         // The per-step token budget is the binding limit; individual prefill
         // chunks are clipped to its remaining capacity.
         let mut budget: usize = self.config.max_num_batched_tokens;
-        // A decode pass may also co-schedule text prefill tokens, bounded by
-        // this budget, so a prompt does not wait for a pass of its own. Each
-        // computation still travels as its own batch and its own numerical
-        // call.
-        let mut mixed_left: usize = if lane == Some(BatchKind::Decode) {
-            self.config.mixed_prefill_tokens
-        } else {
-            0
-        };
         // Context calls expand into one forward row per text/image segment.
         // Both staging and the reported prefill graph capacity bound those
         // numerical rows, independently of the number of requests batched.
@@ -276,13 +267,8 @@ impl Scheduler {
             if next_type.is_some_and(|code| full(&code_batches, code)) {
                 continue;
             }
-            // A decode pass may co-schedule text prefill rows. They are
-            // dispatched as their own batch, so the two call kinds remain
-            // separate numerical calls. Only replayable text requests without
-            // prompt logprobs qualify. The lane check rejects only a prefill
-            // call in a decode pass or the reverse; `BatchKind::Media` calls
-            // pass.
-            let mut mixed_prefill = false;
+            // The lane check rejects only a prefill call in a decode pass or
+            // the reverse; `BatchKind::Media` calls pass.
             if let (Some(target), Some(call_variant)) = (lane, next_type)
                 && {
                     let candidate_lane = batch_kind(call_variant);
@@ -290,15 +276,7 @@ impl Scheduler {
                         && candidate_lane != target
                 }
             {
-                mixed_prefill = target == BatchKind::Decode
-                    && call_variant == CallKind::Forward(ForwardMode::Prefill)
-                    && mixed_left > 0
-                    && self.running.get(&id).is_some_and(|st| {
-                        st.is_replayable_text() && !st.req.sampling.prompt_logprobs_requested()
-                    });
-                if !mixed_prefill {
-                    continue;
-                }
+                continue;
             }
             // The denoiser is an exclusive lane: a request holds it while one
             // of its denoising calls is in flight, so denoising steps of
@@ -311,12 +289,7 @@ impl Scheduler {
                 continue;
             }
             // Build one call when its exact resident resources fit.
-            let call_budget = if mixed_prefill {
-                budget.min(mixed_left)
-            } else {
-                budget
-            };
-            if let Some(mut call) = self.next_generation_computation(id, call_budget, rows_left) {
+            if let Some(mut call) = self.next_generation_computation(id, budget, rows_left) {
                 // A planned call joins its computation's batch only while it
                 // has room; otherwise it waits for a later pass, as a call
                 // without resources does below. A context prefill plans
@@ -382,9 +355,6 @@ impl Scheduler {
                     continue;
                 };
                 let cost = self.computation_token_cost(&call);
-                if mixed_prefill {
-                    mixed_left = mixed_left.saturating_sub(cost);
-                }
                 budget = budget.saturating_sub(cost);
                 if call.readout.is_some() {
                     let rows = self.running.get(&id).and_then(|state| {
@@ -547,10 +517,9 @@ impl Scheduler {
     /// step would wait until the running blocks stop instead of joining
     /// their canvas batches.
     ///
-    /// Prefill still shares a decode-lane pass within the mixed-prefill token
-    /// budget. `BatchKind::Media` readiness never selects a lane: with only
-    /// such work ready this returns `None`, and `assemble_batch` then applies
-    /// no lane filter.
+    /// `BatchKind::Media` readiness never selects a lane: with only such work
+    /// ready this returns `None`, and `assemble_batch` then applies no lane
+    /// filter.
     pub(super) fn select_batch_kind(&self, ids: &[RequestId]) -> Option<BatchKind> {
         let mut readout_ready = false;
         let mut decode_ready = false;
