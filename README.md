@@ -133,6 +133,7 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--video-job-retention` | `3600` | Seconds a completed or failed asynchronous video job stays retrievable |
 | `--max-video-job-bytes` | `1073741824` | Bytes of generated video the asynchronous jobs keep, retained artifacts and unfinished downloads together |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
+| `--watchdog-timeout` | `300` | Seconds a batch may run without any rank making progress before the worker group is replaced |
 | `--image-fetch-timeout` | `20` | Seconds allowed to fetch one `http(s)` image URL, including redirects and the complete body |
 | `--image-fetch-max-bytes` | `20000000` | Largest accepted input image in bytes, for fetched URLs and `data:` URLs alike |
 | `--allow-private-image-urls` | Off | Allow image URLs that resolve to loopback, private, link-local, unique-local, or cloud metadata addresses |

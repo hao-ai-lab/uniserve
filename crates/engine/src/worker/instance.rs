@@ -34,13 +34,6 @@ use uniserve_worker_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
 
 use crate::worker::WorkerProcessArgs;
 
-/// Maximum interval without rank progress before an in-flight batch is treated as failed.
-///
-/// Measured from `WorkerGroup::last_progress` and enforced only while a batch
-/// is pending. Expiry is an error that `poll_batch` answers by replacing the
-/// rank group.
-const NEXT_RESULT_DEADLINE: Duration = Duration::from_secs(300);
-
 /// Every rank of one group, with the launchers that started the remote ones.
 type LaunchedGroup = (Vec<RankProcess>, Option<super::launcher::Launchers>);
 
@@ -244,7 +237,8 @@ pub struct WorkerGroup {
     /// whose identifier does not exceed it.
     last_batch_id: Option<u64>,
     /// Time of construction or of the last submission, joined result, or
-    /// group replacement, from which `NEXT_RESULT_DEADLINE` is measured.
+    /// group replacement, from which `WorkerProcessArgs::watchdog_timeout` is
+    /// measured.
     last_progress: Instant,
     /// Admitted batches not yet retired, by batch identifier.
     pending_batches: BTreeMap<u64, PendingBatch>,
@@ -1964,7 +1958,8 @@ impl WorkerGroup {
     /// error that `join_rank_errors` retires with its batch is returned as is
     /// and the group stays usable. Any other error, including rank loss, a
     /// protocol violation, an agreed error `join_rank_errors` does not retire,
-    /// and an expired `NEXT_RESULT_DEADLINE`, replaces the rank group and
+    /// and an expired `WorkerProcessArgs::watchdog_timeout`, replaces the rank
+    /// group and
     /// returns the recovery's `WorkerFailure`.
     pub fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
         if self.closed {
@@ -2009,11 +2004,14 @@ impl WorkerGroup {
         }
     }
 
+    /// Fails when a batch is pending and no rank has made progress within the
+    /// watchdog timeout, measured from `last_progress`. Expiry is an error
+    /// that `poll_batch` answers by replacing the rank group.
     fn check_progress_deadline(&self) -> anyhow::Result<()> {
+        let timeout = self.process_args.watchdog_timeout;
         anyhow::ensure!(
-            self.pending_batches.is_empty() || self.last_progress.elapsed() < NEXT_RESULT_DEADLINE,
-            "cooperative workers produced no progress within {:?}",
-            NEXT_RESULT_DEADLINE
+            self.pending_batches.is_empty() || self.last_progress.elapsed() < timeout,
+            "cooperative workers produced no progress within {timeout:?}"
         );
         Ok(())
     }

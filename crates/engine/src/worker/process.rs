@@ -197,6 +197,7 @@ impl Default for WorkerProcessArgs {
             worker_id: "worker".into(),
             python: "python3".into(),
             launcher_timeout: std::time::Duration::from_secs(120),
+            watchdog_timeout: std::time::Duration::from_secs(300),
             model: String::new(),
             ranks: vec![crate::WorkerRank {
                 node: "localhost".into(),

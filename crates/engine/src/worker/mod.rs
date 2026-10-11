@@ -72,6 +72,11 @@ pub struct WorkerProcessArgs {
     /// Deployments differ in how quickly that happens, so it is a launch value
     /// rather than a constant.
     pub launcher_timeout: std::time::Duration,
+    /// Longest a submitted batch may go without any rank making progress
+    /// before the group is treated as hung and replaced, failing the
+    /// requests it holds. A rank that dies is detected at once; this bounds
+    /// a rank that is alive but stuck, for example in a collective.
+    pub watchdog_timeout: std::time::Duration,
     /// Launch the worker without model weights, using its deterministic test
     /// model. Only the engine's own tests and examples set this; the serving
     /// command line cannot request it.
