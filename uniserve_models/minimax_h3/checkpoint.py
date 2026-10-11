@@ -1,8 +1,9 @@
 """Recognize MiniMax-H3 checkpoints and the DiT partitions they hold.
 
-The base release (``model_index.json`` naming ``MiniMaxH3ModularPipeline``)
-holds every component and two DiT partitions: ``transformer`` serves t2va
-and fl2va, and ``transformer_ref`` serves ref2va. FastH3 is its fast variant:
+The loader's catalog selects this package by the pipeline class the root
+index names. The base release holds every component and two DiT partitions,
+which its ``model_index.json`` lists: ``transformer`` serves t2va and
+fl2va, and ``transformer_ref`` serves ref2va. FastH3 is its fast variant:
 a FastVideo student of one partition, whose ``fastvideo_inference.json``
 states the student's task, schedule and sparse attention. The task selects
 the partition the student replaces. A FastH3 export that omits a component
@@ -51,6 +52,12 @@ def _json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _contract(root: Path) -> dict[str, Any] | None:
+    """Read a FastH3 export's ``fastvideo_inference.json``, or None."""
+    path = root / "fastvideo_inference.json"
+    return _json(path) if path.is_file() else None
+
+
 def detect(root: Path) -> Layout:
     """Classify ``root`` and list the DiT partitions it holds.
 
@@ -58,11 +65,10 @@ def detect(root: Path) -> Layout:
         FileNotFoundError: The root holds neither a FastH3 contract nor a
             pipeline index.
         ValueError: The contract names a task no partition serves, or the
-            index is not a MiniMax-H3 release holding a DiT.
+            index lists no DiT partition the root holds.
     """
-    contract_path = root / "fastvideo_inference.json"
-    if contract_path.is_file():
-        contract = _json(contract_path)
+    contract = _contract(root)
+    if contract is not None:
         stated = contract.get("task", contract.get("model_type"))
         task = _FASTVIDEO_TASKS.get(stated) if isinstance(stated, str) else None
         if task is None:
@@ -82,11 +88,6 @@ def detect(root: Path) -> Layout:
             "model_index.json"
         )
     index = _json(index_path)
-    if index.get("_class_name") != "MiniMaxH3ModularPipeline":
-        raise ValueError(
-            "unsupported MiniMax-H3 checkpoint: model_index.json must name "
-            "MiniMaxH3ModularPipeline"
-        )
     partitions = {
         partition: tuple(
             task
@@ -112,10 +113,10 @@ def base_checkpoint(root: Path) -> tuple[str, str] | None:
     that pins nothing return ``None``.
 
     Raises:
-        FileNotFoundError: As ``detect``.
-        ValueError: As ``detect``, or a pin of another form.
+        ValueError: The contract is not a JSON object, or the pin has another
+            form.
     """
-    contract = detect(root).contract
+    contract = _contract(root)
     pinned = None if contract is None else contract.get("base_model_revision")
     if pinned is None:
         return None
