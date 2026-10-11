@@ -604,18 +604,6 @@ class Worker:
                     self.requests.storage.bank, self.latent_pool
                 )
 
-            # Storage sizing charged the latent pool's planned bytes
-            # (`LatentPoolPlan.capacity_bytes`), so the allocation must
-            # match that plan exactly.
-            if (
-                self.latent_pool is not None
-                and self.latent_pool.persistent_bytes != arena.latent_pool_bytes
-            ):
-                raise RuntimeError(
-                    "latent pool allocation disagrees with its exact "
-                    "capacity plan"
-                )
-
             # These bounded stores own all asynchronous products, copies,
             # CPU tasks, and transfer lifetimes exposed by an in-flight
             # pipeline.

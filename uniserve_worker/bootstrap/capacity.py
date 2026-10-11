@@ -71,6 +71,7 @@ from uniserve_worker.model_executor.resources import (
 from uniserve_worker.protocol.call import MediaCall
 from uniserve_worker.protocol.tensor import OutputInfo
 from uniserve_worker.storage.kv_cache import KVCacheManager
+from uniserve_worker.storage.latent_pool import LatentPool
 from uniserve_worker.storage.tensor_store import (
     TensorStore,
     device_product_capacity_bytes,
@@ -420,47 +421,6 @@ def latent_trajectory_bytes(
     return units * width * element_bytes
 
 
-def latent_pool_capacity_bytes(
-    *,
-    request_pool_size: int,
-    num_pages: int,
-    page_units: int,
-    latent_width: int,
-    dtype_bytes: int,
-    staging: bool = True,
-) -> int:
-    """Calculate double-buffered latent pool storage.
-
-    Covers latent pages, step storage when the pool stages steps, page
-    tables, and timestep metadata. The result must equal the
-    ``persistent_bytes`` of the ``LatentPool`` built from the same
-    arguments: ``Worker.__init__`` refuses a pool whose allocation disagrees
-    with ``ArenaCapacity.latent_pool_bytes``.
-
-    Raises:
-        ValueError: A dimension is below one or ``num_pages`` is below two.
-    """
-    slots = int(request_pool_size)
-    pages = int(num_pages)
-    units = int(page_units)
-    width = int(latent_width)
-    element_bytes = int(dtype_bytes)
-    if min(slots, units, width, element_bytes) < 1 or pages < 2:
-        raise ValueError("latent pool dimensions are invalid")
-
-    # One page stays reserved as the sentinel; only usable pages hold
-    # trajectories.
-    usable_pages = pages - 1
-    # Two banks of every page, sentinel included; one int64 page index per
-    # usable page; one float32 timestep per one-based slot plus an unused
-    # row zero.
-    storage = 2 * pages * units * width * element_bytes
-    step_buffer = usable_pages * units * width * element_bytes if staging else 0
-    page_table = usable_pages * 8
-    timesteps = (slots + 1) * 4
-    return storage + step_buffer + page_table + timesteps
-
-
 @dataclass(frozen=True, slots=True)
 class LatentPoolPlan:
     """The latent pool a worker's denoiser advances its samples in.
@@ -482,15 +442,20 @@ class LatentPoolPlan:
 
     @property
     def capacity_bytes(self) -> int:
-        """Device bytes the ``LatentPool`` of this plan allocates."""
-        return latent_pool_capacity_bytes(
+        """Device bytes the ``LatentPool`` of this plan allocates.
+
+        Raises:
+            ValueError: As ``LatentPool.buffers``.
+        """
+        buffers = LatentPool.buffers(
             request_pool_size=self.request_pool_size,
             num_pages=self.num_pages,
             page_units=self.page_units,
             latent_width=self.latent_width,
-            dtype_bytes=self.dtype.itemsize,
+            dtype=self.dtype,
             staging=self.staging,
         )
+        return sum(config.nbytes for config in buffers.values())
 
 
 def latent_pool_plan(
@@ -759,26 +724,28 @@ def model_arena_capacity(
     latent_pool_bytes = 0
     latent_transfer_bytes = 0
     if flow is not None:
-        dtype_bytes = {
-            "float16": 2,
-            "bfloat16": 2,
-            "float32": 4,
+        dtype = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
         }.get(str(worker_config.model_dtype).removeprefix("torch.").lower())
-        if dtype_bytes is None:
+        if dtype is None:
             raise ValueError(
                 f"unsupported latent dtype {worker_config.model_dtype!r}"
             )
-        latent_pool_bytes = latent_pool_capacity_bytes(
+        # An image denoiser's pool stages each step (``latent_pool_plan``).
+        latent_pool_bytes = LatentPoolPlan(
             request_pool_size=int(request_pool_size),
             num_pages=int(num_latent_pages),
             page_units=int(latent_page_units),
             latent_width=int(latent_width),
-            dtype_bytes=dtype_bytes,
-        )
+            dtype=dtype,
+            staging=True,
+        ).capacity_bytes
         latent_transfer_bytes = latent_trajectory_bytes(
             flow.max_tokens,
             int(latent_width),
-            dtype_bytes,
+            dtype.itemsize,
         )
     # Every ticket is budgeted for the largest single transfer: the whole KV
     # pool, one image's latent trajectory, or one latent or vision feature.
@@ -945,7 +912,6 @@ __all__ = [
     "device_total_bytes",
     "graph_table_widths",
     "LatentPoolPlan",
-    "latent_pool_capacity_bytes",
     "latent_pool_plan",
     "latent_trajectory_bytes",
     "model_arena_capacity",

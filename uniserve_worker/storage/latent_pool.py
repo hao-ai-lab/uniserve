@@ -37,6 +37,7 @@ from dataclasses import dataclass
 import torch
 
 from uniserve.runtime.device import fill_cpu_ints
+from uniserve.tensors import BufferConfig
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.protocol.batch import LatentParams
 from uniserve_worker.protocol.identity import BufferId, RequestKey
@@ -171,19 +172,16 @@ class LatentPool:
         values per row; ``capacity_units`` excludes the sentinel page.
 
         Raises:
-            ValueError: ``request_pool_size``, ``page_units`` or
-                ``latent_width`` is below one, ``num_pages`` is below two, or
-                ``dtype`` is not a floating dtype.
+            ValueError: As `buffers`.
         """
-        if (
-            min(int(request_pool_size), int(page_units), int(latent_width)) < 1
-            or int(num_pages) < 2
-        ):
-            raise ValueError(
-                "latent-pool shape must contain slots, pages, and elements"
-            )
-        if not dtype.is_floating_point:
-            raise ValueError("latent-pool storage must use a floating dtype")
+        buffers = self.buffers(
+            request_pool_size=request_pool_size,
+            num_pages=num_pages,
+            page_units=page_units,
+            latent_width=latent_width,
+            dtype=dtype,
+            staging=staging,
+        )
 
         self.request_pool_size = int(request_pool_size)
         self.num_pages = int(num_pages)
@@ -193,36 +191,16 @@ class LatentPool:
         self.device = torch.device(device)
         self.capacity_units = (self.num_pages - 1) * self.page_units
 
-        # Page zero remains outside scheduler capacity; the two banks alternate
-        # source and destination roles across diffusion steps.
-        # [2, num_pages, page_units, latent_width]
-        self.storage = torch.zeros(
-            (2, self.num_pages, self.page_units, self.latent_width),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        # [capacity_units, latent_width], or no rows without pool staging.
-        # The page at position ``p`` of ``page_table_buffer`` is staged in the
-        # ``page_units`` rows starting at row ``p * page_units``.
-        self.step_buffer = torch.empty(
-            (self.capacity_units if staging else 0, self.latent_width),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        # [num_pages - 1] int64: device page indices of every live staging.
-        self.page_table_buffer = torch.empty(
-            self.num_pages - 1,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        # [request_pool_size + 1, 1] float32, indexed by request slot (row
-        # zero unused): each slot's current network time, the fixed storage
-        # its denoising rows read.
-        self.timesteps = torch.empty(
-            (self.request_pool_size + 1, 1),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        # The banks start zeroed; every other tensor is written before it is
+        # read.
+        def allocate(name: str, fill=torch.empty) -> torch.Tensor:
+            config = buffers[name]
+            return fill(config.shape, dtype=config.dtype, device=self.device)
+
+        self.storage = allocate("storage", torch.zeros)
+        self.step_buffer = allocate("step_buffer")
+        self.page_table_buffer = allocate("page_table_buffer")
+        self.timesteps = allocate("timesteps")
 
         # Host metadata is authoritative for ownership and generation checks.
         # Per-slot rows are indexed by the one-based slot id (row zero unused);
@@ -254,24 +232,59 @@ class LatentPool:
             self.num_pages - 1, dtype=torch.int64, depth=1, device=self.device
         )
 
-    @property
-    def persistent_bytes(self) -> int:
-        """Bytes held persistently on the execution device by this pool.
+    @staticmethod
+    def buffers(
+        *,
+        request_pool_size: int,
+        num_pages: int,
+        page_units: int,
+        latent_width: int,
+        dtype: torch.dtype,
+        staging: bool,
+    ) -> dict[str, BufferConfig]:
+        """Describe the device tensors `__init__` allocates.
 
-        Must equal ``latent_pool_capacity_bytes`` for the same arguments:
-        ``Worker.__init__`` refuses a pool whose allocation disagrees with the
-        bytes storage sizing charged for it, so adding a device tensor here
-        requires the same change there.
+        `__init__` allocates exactly these configurations, and startup
+        memory accounting (`LatentPoolPlan.capacity_bytes`) sums them, so
+        every device tensor the pool owns belongs here.
+
+        Raises:
+            ValueError: ``request_pool_size``, ``page_units`` or
+                ``latent_width`` is below one, ``num_pages`` is below two, or
+                ``dtype`` is not a floating dtype.
         """
-        tensors = (
-            self.storage,
-            self.step_buffer,
-            self.page_table_buffer,
-            self.timesteps,
-        )
-        return sum(
-            int(value.numel()) * int(value.element_size()) for value in tensors
-        )
+        slots = int(request_pool_size)
+        pages = int(num_pages)
+        units = int(page_units)
+        width = int(latent_width)
+        if min(slots, units, width) < 1 or pages < 2:
+            raise ValueError(
+                "latent-pool shape must contain slots, pages, and elements"
+            )
+        if not dtype.is_floating_point:
+            raise ValueError("latent-pool storage must use a floating dtype")
+
+        capacity_units = (pages - 1) * units
+        return {
+            # [2, num_pages, page_units, latent_width]: page zero remains
+            # outside scheduler capacity; the two banks alternate source and
+            # destination roles across diffusion steps.
+            "storage": BufferConfig((2, pages, units, width), dtype),
+            # [capacity_units, latent_width], or no rows without pool
+            # staging. The page at position ``p`` of ``page_table_buffer`` is
+            # staged in the ``page_units`` rows starting at row
+            # ``p * page_units``.
+            "step_buffer": BufferConfig(
+                (capacity_units if staging else 0, width), dtype
+            ),
+            # [num_pages - 1] int64: device page indices of every live
+            # staging.
+            "page_table_buffer": BufferConfig((pages - 1,), torch.int64),
+            # [request_pool_size + 1, 1] float32, indexed by request slot (row
+            # zero unused): each slot's current network time, the fixed
+            # storage its denoising rows read.
+            "timesteps": BufferConfig((slots + 1, 1), torch.float32),
+        }
 
     @contextmanager
     def startup_values(self, rows: int, units: int):
