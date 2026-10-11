@@ -687,10 +687,7 @@ class CudaVmmTransport(Transport):
                     # and producer fence directly; no IPC mapping is needed.
                     with _endpoint_lock:
                         owner = _endpoints.get(handle.endpoint)
-                    if (
-                        not isinstance(owner, CudaVmmTransport)
-                        or owner.source != locator.source
-                    ):
+                    if not isinstance(owner, CudaVmmTransport):
                         raise invalid_descriptor(
                             "CUDA publication has no live local owner"
                         )

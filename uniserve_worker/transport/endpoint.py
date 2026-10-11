@@ -2,10 +2,14 @@
 
 A publication is registered when its producer exposes it and retired when
 the engine releases its buffer. Nothing here talks to a consumer: readiness
-and identity travel inside the published storage, and a consumer says it has
-finished by writing its acknowledgment word there. The producing rank sweeps
-those words when it retires the publication, so a consumer on another host
-retires a product the same way one on this host does.
+travels inside the published storage, and a consumer says it has finished by
+writing its acknowledgment word there. The producing rank sweeps those words
+when it retires the publication, so a consumer on another host retires a
+product the same way one on this host does.
+
+A locator is the engine's word: the engine binds only locators a producing
+rank reported to it, so a publication is found by the key its locator
+carries and the rest of the locator is taken as published.
 
 `Publications` is shared by `ShmTransport` and `CudaVmmTransport`; each
 supplies the callbacks that decide when its storage is settled and how it is
@@ -14,8 +18,6 @@ handed back.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import threading
 import uuid
 import weakref
@@ -46,17 +48,6 @@ _endpoint_lock = threading.Lock()
 Source = TypeVar("Source")
 
 
-def locator_digest(locator: Locator) -> bytes:
-    """Bind a read to the registered view, including its producer fence."""
-    encoded = json.dumps(
-        locator.to_mapping(),
-        sort_keys=True,
-        separators=(",", ":"),
-        default=bytes.hex,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).digest()
-
-
 def publication_key(locator: Locator) -> tuple[str, str]:
     """Identify a publication within its transport's native namespace."""
     handle = locator.transport
@@ -71,9 +62,7 @@ def publication_key(locator: Locator) -> tuple[str, str]:
 class _Publication(Generic[Source]):
     """One registered source and where it stands towards reclamation."""
 
-    locator: Locator
     source: Source
-    digest: bytes
     # The producer may still be writing the published bytes; `ShmTransport`
     # registers a device product pending until its host copy completes.
     pending: bool
@@ -157,12 +146,10 @@ class Publications(Generic[Source]):
                 raise invalid_descriptor(
                     "publication identity is already registered"
                 )
-            self._publications[key] = _Publication(
-                locator, source, locator_digest(locator), pending
-            )
+            self._publications[key] = _Publication(source, pending)
 
     def source(self, locator: Locator, *, reading: bool = False) -> Source:
-        """Borrow a registered source by its exact locator.
+        """Borrow the source registered under a locator's publication key.
 
         The owner borrows its source through retirement; a reader borrows it
         only while the publication is live, and a failed producer refuses the
@@ -170,14 +157,9 @@ class Publications(Generic[Source]):
         """
         with self._lock:
             publication = self._publications.get(publication_key(locator))
-            if (
-                publication is None
-                or publication.digest != locator_digest(locator)
-                or (reading and publication.retired)
-            ):
+            if publication is None or (reading and publication.retired):
                 raise invalid_descriptor(
-                    "publication is retired, invalid, or belongs to another "
-                    "view"
+                    "publication is retired or was never registered"
                 )
             if reading and publication.error is not None:
                 raise resource_error(
@@ -217,10 +199,6 @@ class Publications(Generic[Source]):
         with self._lock:
             publication = self._publications.get(publication_key(locator))
             if publication is not None:
-                if publication.locator != locator:
-                    raise invalid_descriptor(
-                        "publication release changed its registered view"
-                    )
                 publication.retired = True
                 self._reclaim_locked(publication)
                 return publication.retirement
@@ -232,10 +210,8 @@ class Publications(Generic[Source]):
             raise invalid_descriptor("publication belongs to another endpoint")
         with self._lock:
             publication = self._publications.get(publication_key(locator))
-            if publication is None or publication.locator != locator:
-                raise invalid_descriptor(
-                    "publication does not match its registered view"
-                )
+            if publication is None:
+                raise invalid_descriptor("publication is not registered")
             return publication.retirement
 
     def awaiting_acknowledgment(self) -> bool:
