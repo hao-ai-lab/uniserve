@@ -53,7 +53,7 @@ pub struct InputProcessor {
     pub(super) limits: GenerationLimits,
     pub(super) parse_reasoning: bool,
     // Whether a Qwen3-family chat template instructs the tool-call format
-    // `Qwen3XmlToolParser` reads; false for every other family.
+    // `Qwen25ToolParser` reads; false for every other family.
     qwen3_tool_calls: bool,
 }
 

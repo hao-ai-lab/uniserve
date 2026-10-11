@@ -2,13 +2,13 @@
 //!
 //! Decoded text flows through two chained stream stages: the reasoning stage
 //! splits `<think>` sections into reasoning deltas, and the tool stage extracts
-//! Qwen3 XML tool calls from the remaining visible text. A stage without a
+//! Qwen2.5-format tool calls from the remaining visible text. A stage without a
 //! parser forwards text unchanged.
 
 use super::reasoning::reasoning_event_stream;
 use super::tool::tool_event_stream;
 use crate::profile::reasoning::Qwen3ReasoningParser;
-use crate::profile::tools::Qwen3XmlToolParser;
+use crate::profile::tools::Qwen25ToolParser;
 use crate::profile::tools::Tool;
 use crate::serving::chat::{
     ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToolChoice, HfChatRenderer,
@@ -18,12 +18,12 @@ use crate::serving::text::tokenizer::DynTokenizer;
 
 /// The tool-call instruction of Qwen3 chat templates: one JSON object with
 /// `name` and `arguments` inside `<tool_call>` lines, the format
-/// `Qwen3XmlToolParser` reads.
+/// `Qwen25ToolParser` reads.
 const JSON_CALL_INSTRUCTION: &str =
     "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
 
 /// Returns whether `renderer`'s template instructs the model to write tool
-/// calls in the format `Qwen3XmlToolParser` reads.
+/// calls in the format `Qwen25ToolParser` reads.
 ///
 /// Checkpoints of the Qwen3 families share a chat-template contract but not
 /// always its tool-call format: Qwen3-Coder templates instruct XML
@@ -52,7 +52,7 @@ pub fn template_instructs_json_tool_calls(renderer: &HfChatRenderer) -> bool {
 /// Request-scoped Qwen3 reasoning and tool-call processor.
 pub struct Qwen3ChatOutputProcessor {
     reasoning_parser: Option<Qwen3ReasoningParser>,
-    tool_parser: Option<Qwen3XmlToolParser>,
+    tool_parser: Option<Qwen25ToolParser>,
 }
 
 impl Qwen3ChatOutputProcessor {
@@ -77,7 +77,7 @@ impl Qwen3ChatOutputProcessor {
         let tool_parsing_enabled =
             matches!(request.tool_choice, ChatToolChoice::Auto) && !request.tools.is_empty();
         let tool_parser = if tool_parsing_enabled {
-            let parser = Qwen3XmlToolParser::new(&request.tools);
+            let parser = Qwen25ToolParser::new(&request.tools);
             Some(parser)
         } else {
             None
