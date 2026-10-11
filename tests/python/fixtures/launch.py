@@ -32,7 +32,6 @@ DEFAULTS: dict[str, Any] = {
     "world_size": 1,
     "components": {"model": {"ranks": [0]}},
     "deployment_components": ["model"],
-    "supported_calls": None,
     "transfer_backends": "local",
     "publish_backends": "local",
     "rendezvous_address": None,

@@ -221,7 +221,6 @@ impl Default for WorkerProcessArgs {
             max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
                 + crate::scheduler::MAX_FLOW_PREFIX_ROWS) as u32,
             attention_backend: "auto".into(),
-            capability_groups: Vec::new(),
             transfer: Default::default(),
             load_format: "auto".to_string(),
             download_dir: None,
@@ -388,15 +387,6 @@ impl WorkerProcessArgs {
             .chain(self.components.keys())
             .collect::<std::collections::BTreeSet<_>>();
         fields.insert("deployment_components".into(), json!(deployment));
-        // Null lets the worker serve every capability group it implements.
-        fields.insert(
-            "supported_calls".into(),
-            if self.capability_groups.is_empty() {
-                Value::Null
-            } else {
-                json!(self.capability_groups.join(","))
-            },
-        );
         fields.insert("transfer_backends".into(), json!(names(&transfer_backends)));
         fields.insert("publish_backends".into(), json!(names(&publish_backends)));
         // Every rank of a group connects to the collective store at this

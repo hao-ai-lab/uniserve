@@ -3174,7 +3174,6 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
         }
     },
     "deployment_components": ["model"],
-    "supported_calls": null,
     "transfer_backends": "local",
     "publish_backends": "local",
     "rendezvous_address": null,

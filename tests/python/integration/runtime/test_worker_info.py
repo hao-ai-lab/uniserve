@@ -15,7 +15,6 @@ from uniserve_worker.bootstrap.report import build_worker_layout
 from uniserve_worker.config.execution import LaneConfig, WorkerConfig
 from uniserve_worker.protocol.call import CALL_KINDS, ForwardMode
 from uniserve_worker.protocol.worker_info import WorkerInfo
-from uniserve_worker.worker import Worker
 
 pytestmark = pytest.mark.integration
 
@@ -147,34 +146,3 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(
 
     assert info.max_batch_calls == (2 if with_lane_limits else 4)
     assert info.max_batch_tokens == (128 if with_lane_limits else 256)
-
-
-@pytest.mark.parametrize("attention_backend", ("torch", "auto"))
-def test_worker_capabilities_reflect_enabled_calls(attention_backend) -> None:
-    config = replace(
-        stub_worker_config(16, max_batch_tokens=256),
-        graph_policy="off",
-        attention_backend=attention_backend,
-    )
-    for allowed in (
-        frozenset({ForwardMode.PREFILL}),
-        frozenset({ForwardMode.PREFILL, ForwardMode.DECODE}),
-    ):
-        with Worker(
-            Model(),
-            image_processor=image_processor(),
-            worker_config=config,
-            sampling_group=None,
-            tokenizer=None,
-            allowed_calls=allowed,
-            queue_depth=1,
-            completion_payload_bytes=65536,
-        ) as worker:
-            info = worker.info.to_mapping()
-            assert set(info["supported_calls"]) == {
-                code.value for code in allowed
-            }
-            assert worker.supports_computation(ForwardMode.PREFILL)
-            assert worker.supports_computation(ForwardMode.DECODE) == (
-                ForwardMode.DECODE in allowed
-            )

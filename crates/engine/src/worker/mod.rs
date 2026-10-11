@@ -102,9 +102,6 @@ pub struct WorkerProcessArgs {
     /// worker's attention registry owns the names and refuses one it does
     /// not provide; `auto` lets it select per call.
     pub attention_backend: String,
-    /// Optional public worker capability selectors; empty uses the model default.
-    /// Startup resolves each selector to its concrete computation set.
-    pub capability_groups: Vec<String>,
     /// Product transport exposed by the worker pool.
     pub transfer: crate::executor::TransferConfig,
     /// Checkpoint loader format.

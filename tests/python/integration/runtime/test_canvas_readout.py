@@ -112,7 +112,6 @@ def _worker(root, queue_depth=1, **settings):
         image_processor=loaded.image_processor,
         sampling_group=Communicator(device=torch.device("cpu")),
         tokenizer=None,
-        allowed_calls=None,
         queue_depth=queue_depth,
         completion_payload_bytes=1 << 16,
         attention="torch",

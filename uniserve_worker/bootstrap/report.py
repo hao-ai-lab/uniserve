@@ -87,7 +87,7 @@ from uniserve_worker.model_executor.input_buffers import (
     input_buffer_config as call_buffer_config,
 )
 from uniserve_worker.model_executor.resources import media_state_buffers
-from uniserve_worker.protocol.call import CALL_KINDS, CallKind
+from uniserve_worker.protocol.call import CALL_KINDS
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import (
     ComponentInfo,
@@ -163,7 +163,6 @@ def build_worker_layout(
     completion_payload_bytes: int = 1 << 20,
     endpoint: WorkerEndpoint | None = None,
     capacity_group: Communicator | None = None,
-    allowed_calls: frozenset[CallKind] | None = None,
     transfer_backends: tuple[str, ...] = ("local",),
     components: tuple[tuple[str, ComponentConfig], ...] = (),
     attention_backend: str = "",
@@ -173,9 +172,8 @@ def build_worker_layout(
     """Resolve resource dimensions and the capacity report used by the worker.
 
     Model dimensions determine storage reservations. Admission additionally
-    obeys the configured call set and every lane's bounds; these
-    restrictions do not shrink the storage needed by warmup and graph
-    capture.
+    obeys every lane's bounds; these restrictions do not shrink the storage
+    needed by warmup and graph capture.
 
     ``state_buffers`` defaults to the media request state derived from
     ``bindings``; a non-empty value, or a ``VideoPostprocessor`` in the model,
@@ -184,8 +182,7 @@ def build_worker_layout(
     count through a collective, so every member must call this.
 
     Raises:
-        WorkerError: ``queue_depth`` is not positive, or the model serves none
-            of ``allowed_calls``.
+        WorkerError: ``queue_depth`` is not positive.
         ValueError: ``completion_payload_bytes`` is not positive, or the KV
             pool does not fit the storage grant. Errors from the sizing
             helpers propagate.
@@ -202,13 +199,6 @@ def build_worker_layout(
         if dedicated
         else supported_calls(model, (name for name, _ in components))
     )
-    if allowed_calls is not None:
-        supported = supported & allowed_calls
-
-    if not supported and not dedicated:
-        raise unsupported_setup(
-            "worker model implements none of the requested call kinds"
-        )
 
     model_name = (
         f"{type(model).__module__}.{type(model).__qualname__}"
@@ -260,7 +250,7 @@ def build_worker_layout(
 
     # The per-path layouts report every call and media route the model
     # declares; the fields below narrow them to this placement's held
-    # components and allowed calls.
+    # components.
     outputs = resolve_outputs(model, worker_config)
     held = tuple(name for name, _ in components)
     info = replace(
@@ -293,9 +283,8 @@ def build_worker_layout(
             )
         ),
         supported_calls=tuple(code for code in CALL_KINDS if code in supported),
-        # Advertised routing and advertised work describe the same placement,
-        # including a deployment narrowed to a subset of its call kinds: a
-        # call this worker will not accept is a call it does not route.
+        # Advertised routing and advertised work describe the same placement:
+        # a call this worker will not accept is a call it does not route.
         media_components={}
         if dedicated
         else {

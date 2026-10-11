@@ -372,7 +372,6 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         SequenceLengths,
         VarlenInput,
     )
-    from uniserve_worker.bootstrap.components import supported_calls
     from uniserve_worker.model_executor.input_batch import TokenRow
     from uniserve_worker.sampling.metadata import TokenSelection
     from uniserve_worker.worker import Worker
@@ -440,7 +439,6 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         bindings=bindings,
         sampling_group=group,
         tokenizer=None,
-        allowed_calls=supported_calls(model),
         entry_points=_placed_entries(model, ("cuda:0",)),
         queue_depth=2,
         completion_payload_bytes=1 << 16,

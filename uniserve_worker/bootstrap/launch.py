@@ -132,7 +132,7 @@ def run_worker(config: WorkerProcessArgs) -> None:
                     "max_payload_bytes": config.ipc.max_payload_bytes,
                     "max_inflight": config.ipc.queue_depth,
                     "supported_calls": sorted(
-                        value.value for value in config.supported_calls
+                        value.value for value in worker.info.supported_calls
                     ),
                 },
             )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tests.python.fixtures.launch import worker_args
-from uniserve_worker.protocol.call import CALL_KINDS, ForwardMode, MediaCall
+from uniserve_worker.protocol.call import ForwardMode
 
 pytestmark = pytest.mark.unit
 
@@ -200,39 +200,3 @@ def test_execution_lanes_reject_duplicate_domain_bindings(tmp_path) -> None:
                 '{"lane_id":"b","sm_budget":64,"domains":["decode"]}',
             ],
         )
-
-
-@pytest.mark.parametrize(
-    ("selector", "expected"),
-    [
-        ("ar_decode", {ForwardMode.DECODE}),
-        (
-            "diffusion_decode",
-            {MediaCall.VIDEO_DECODING, MediaCall.AUDIO_DECODING},
-        ),
-        (
-            "media_append",
-            {MediaCall.VIDEO_ENCODING, MediaCall.AUDIO_ENCODING},
-        ),
-        (
-            "diffusion_finalize",
-            {MediaCall.IMAGE_DECODING, MediaCall.MUXING},
-        ),
-    ],
-)
-def test_launch_capabilities_select_concrete_computations(
-    selector, expected, tmp_path
-):
-    config = worker_args(
-        tmp_path,
-        max_batch_tokens=8192,
-        supported_calls=selector,
-    )
-    assert config.supported_calls == expected
-
-
-def test_a_launch_without_a_selector_serves_every_call_kind(tmp_path):
-    # The launching side narrows capabilities only when it has a reason to,
-    # so a worker it does not narrow accepts every call kind it implements.
-    config = worker_args(tmp_path, max_batch_tokens=8192)
-    assert config.supported_calls == frozenset(CALL_KINDS)

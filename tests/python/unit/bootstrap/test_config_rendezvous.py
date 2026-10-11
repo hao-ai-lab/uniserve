@@ -184,7 +184,6 @@ def test_disaggregated_workers_keep_local_ranks_and_request_ownership(
     assert args.expert_parallel.rank == union_rank
     assert args.expert_parallel.attention_ranks == 4
     assert args.execution.expert_microbatches == 2
-    assert bool(args.supported_calls) == (role == "model")
 
 
 @pytest.mark.parametrize("count", [0, 5, True, 2])
