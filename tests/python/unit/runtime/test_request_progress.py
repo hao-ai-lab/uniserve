@@ -89,6 +89,6 @@ def test_cancelled_epoch_cannot_change_a_reused_request_slot():
         current = pool.get(successor.request_id)
         assert not current.closed
         assert current.accepted_progress == RequestProgress()
-        assert pool.bind_calls((_call(successor, 2),), (1,)) == (current,)
+        assert pool.bind_calls((_call(successor, 2),)) == (current,)
     finally:
         pool.close()

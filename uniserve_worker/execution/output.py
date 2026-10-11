@@ -236,15 +236,14 @@ def logprob_entries(record: PendingOutput, span: tuple[int, int, int]) -> int:
 def create_outputs(
     requests: RequestPool,
     calls: Sequence[Call],
-    request_pool_indices: Sequence[int],
     buffer: OutputBuffer,
 ) -> tuple[PendingOutput, ...]:
     """Bind output rows to validated, admitted requests for one batch.
 
-    Row `i` of `buffer` belongs to `calls[i]`. Slot and identity validation is
+    Row `i` of `buffer` belongs to `calls[i]`. Request identity validation is
     done by `RequestPool.bind_calls`, whose errors propagate.
     """
-    bindings = requests.bind_calls(calls, request_pool_indices)
+    bindings = requests.bind_calls(calls)
     return tuple(
         PendingOutput(call, request, buffer, index)
         for index, (call, request) in enumerate(

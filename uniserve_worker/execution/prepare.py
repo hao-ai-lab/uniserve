@@ -969,14 +969,6 @@ def reserve_outputs(
             # together: a failure before `state.bind_outputs` abandons any
             # acquired buffer here, and a later one is handled by
             # `discard_batch`.
-            request_pool_indices = tuple(
-                int(
-                    request_pool.get(
-                        call.request_key.request_id
-                    ).request_pool_idx
-                )
-                for call in scheduled
-            )
             completion = output_pool.acquire(
                 len(scheduled),
                 token_capacity=_completion_words(scheduled),
@@ -988,9 +980,7 @@ def reserve_outputs(
                     )
                 ),
             )
-            candidates = create_outputs(
-                request_pool, scheduled, request_pool_indices, completion
-            )
+            candidates = create_outputs(request_pool, scheduled, completion)
         except BaseException:
             if completion is not None:
                 completion.abandon()
