@@ -476,9 +476,9 @@ struct TokenLogprob {
 table PositionLogprobs { entries:[TokenLogprob]; }
 
 /// The completion a worker emits once for every call, checked by
-/// `RequestOutput::validate`. `finish_flags` and `timing_counters` are
+/// `CallOutput::validate`. `finish_flags` and `timing_counters` are
 /// required by the decoder.
-table RequestOutput {
+table CallOutput {
   request_key:RequestKey;
   call_id:CallId;
   status:CallStatus;
@@ -747,7 +747,7 @@ table TensorPublication {
 /// The payload of a Result response, checked by `BatchOutput::validate`.
 table BatchOutput {
   batch_id:ulong;
-  completions:[RequestOutput];
+  completions:[CallOutput];
   products:[TensorPublication];
   worker_exec_us:ulong = null;
   forward_stats:ForwardStats;

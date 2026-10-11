@@ -2396,7 +2396,7 @@ impl Scheduler {
     /// through `Inflight::take_ready_completions`.
     pub(super) fn stage_completion(
         &mut self,
-        mut record: uniserve_worker_ipc::RequestOutput,
+        mut record: uniserve_worker_ipc::CallOutput,
         media: Result<Option<Arc<SharedMedia>>, String>,
     ) {
         let id = record.request_key.request_id;
@@ -2470,7 +2470,7 @@ impl Scheduler {
         &mut self,
         call: Call,
         decode: Option<DecodeRange>,
-        record: uniserve_worker_ipc::RequestOutput,
+        record: uniserve_worker_ipc::CallOutput,
         media: Option<Arc<SharedMedia>>,
     ) {
         let id = record.request_key.request_id;

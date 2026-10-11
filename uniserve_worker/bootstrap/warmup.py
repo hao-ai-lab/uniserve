@@ -60,7 +60,7 @@ from uniserve_worker.protocol.call import (
     TransferMode,
 )
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
-from uniserve_worker.protocol.output import BatchOutput, RequestOutput
+from uniserve_worker.protocol.output import BatchOutput, CallOutput
 from uniserve_worker.protocol.tensor import TensorRef
 
 if TYPE_CHECKING:
@@ -454,7 +454,7 @@ def _execute_warmup(
 
     Raises:
         RuntimeError: A call completed with ``CallStatus.ERROR``, or a
-            completion is not a ``RequestOutput``.
+            completion is not a ``CallOutput``.
     """
     worker = requests.worker
     state = worker.submit(batch, propagate_errors=True)
@@ -485,9 +485,9 @@ def _execute_warmup(
             ),
         )
     )
-    failures: list[RequestOutput] = []
+    failures: list[CallOutput] = []
     for completion in finalized.completions:
-        if not isinstance(completion, RequestOutput):
+        if not isinstance(completion, CallOutput):
             raise RuntimeError(
                 "finalized warmup result retains unresolved device output"
             )

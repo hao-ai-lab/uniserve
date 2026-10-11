@@ -6,7 +6,7 @@
 //! it onto the calls each rank owns (`rank_projection`, which narrows forward
 //! rows with `ForwardBatch::select` and sets each call's `consumer_slots`),
 //! and [`crate::codec`] encodes it as FlatBuffers. A rank answers with one
-//! [`BatchOutput`] of per-call [`RequestOutput`] completions. The Python
+//! [`BatchOutput`] of per-call [`CallOutput`] completions. The Python
 //! worker mirrors these types in the `identity`, `call`, `batch`, and `output`
 //! modules of `uniserve_worker.protocol`.
 //!
@@ -281,7 +281,7 @@ pub struct CanvasStep {
 /// token ids `candidate_ids[candidate_offsets[i]..candidate_offsets[i + 1]]`.
 /// The worker reports, in `candidate_ids` order, each candidate's natural-log
 /// probability under the log-softmax over the full vocabulary of the model's
-/// logits at its slot (`RequestOutput::candidate_logprobs`).
+/// logits at its slot (`CallOutput::candidate_logprobs`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Readout {
     /// Index of each slot's token in the call's concatenated canvas rows.
@@ -854,7 +854,7 @@ pub struct MediaOutput {
 /// The completion record a worker emits once for every call, after its copy
 /// event is query-ready and its pinned fields are validated on the host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RequestOutput {
+pub struct CallOutput {
     /// Request completed by the call.
     pub request_key: RequestKey,
     /// Request-local call identifier.
@@ -894,7 +894,7 @@ pub struct RequestOutput {
     pub kv_output: Option<KvTransfer>,
 }
 
-impl RequestOutput {
+impl CallOutput {
     /// Validates completion identity, status, accepted lengths, and the
     /// ownership of a KV publication.
     ///
@@ -1905,7 +1905,7 @@ pub struct BatchOutput {
     /// Batch identity copied from the submission.
     pub batch_id: u64,
     /// Call completions, one per call the batch carried.
-    pub completions: Vec<RequestOutput>,
+    pub completions: Vec<CallOutput>,
     /// Product values published by completed calls.
     pub products: Vec<TensorPublication>,
     /// Aggregate worker execution time in microseconds, when measured.
@@ -1916,7 +1916,7 @@ pub struct BatchOutput {
 
 impl BatchOutput {
     /// Iterates over call completions in report order.
-    pub fn completions(&self) -> impl Iterator<Item = &RequestOutput> {
+    pub fn completions(&self) -> impl Iterator<Item = &CallOutput> {
         self.completions.iter()
     }
 

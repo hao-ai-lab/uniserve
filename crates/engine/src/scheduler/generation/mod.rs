@@ -29,8 +29,8 @@ use uniserve_core::{
     CanvasSampling, GenerationRequest, ImageEncoderInput, ImageInput, RequestId, SamplingParams,
 };
 use uniserve_worker_ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, Readout,
-    RequestKey, RequestOutput, SamplingState, ShapeBound, TensorRef, VisionInput,
+    Bounds, BufferId, Call, CallId, CallKind, CallOutput, CallStatus, CanvasStep, DType, DimBound,
+    Readout, RequestKey, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
 
 /// Builds an unstamped product reference for a planned call output.
@@ -267,7 +267,7 @@ impl RequestState {
     pub(crate) fn process_generation_result(
         &mut self,
         call: &Call,
-        record: &RequestOutput,
+        record: &CallOutput,
     ) -> Result<(), GenerationResultError> {
         if call.call_id.batch_id == 0 {
             return Err(GenerationResultError::MissingCallId);
@@ -1025,7 +1025,7 @@ pub(crate) fn validate_generation_result(
     call: &Call,
     image_kv: Option<(u32, Option<u32>)>,
     state: &RequestState,
-    record: &RequestOutput,
+    record: &CallOutput,
     canvas: Option<&CanvasSampling>,
 ) -> Result<(), GenerationResultError> {
     let request = &state.req;

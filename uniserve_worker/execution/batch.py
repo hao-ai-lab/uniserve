@@ -39,8 +39,8 @@ from uniserve_worker.protocol.identity import (
 )
 from uniserve_worker.protocol.output import (
     BatchOutput,
+    CallOutput,
     ForwardStats,
-    RequestOutput,
 )
 from uniserve_worker.protocol.transfer import KvTransfer
 from uniserve_worker.storage.cache_imports import CacheImport
@@ -127,8 +127,8 @@ class BatchState:
 
     # Final values addressed by original call index: None until
     # `bind_outputs`, then a `PendingOutput`, then the materialized
-    # `RequestOutput`.
-    outputs: list[PendingOutput | RequestOutput | None] = field(
+    # `CallOutput`.
+    outputs: list[PendingOutput | CallOutput | None] = field(
         default_factory=list
     )
     # Whether every pending output has become its wire value. Retirement may
@@ -525,7 +525,7 @@ class BatchState:
 
     def record_outputs(
         self,
-        outputs: tuple[PendingOutput | RequestOutput, ...],
+        outputs: tuple[PendingOutput | CallOutput, ...],
         *,
         products: tuple[TensorPublication, ...] = (),
         execution_us: int,
@@ -616,9 +616,9 @@ class BatchState:
             raise RuntimeError("batch has no ready output")
         self.result_sent = True
 
-        values: list[RequestOutput] = []
+        values: list[CallOutput] = []
         for value in self.outputs:
-            if not isinstance(value, RequestOutput):
+            if not isinstance(value, CallOutput):
                 raise RuntimeError(
                     "batch delivery encountered an unmaterialized output"
                 )

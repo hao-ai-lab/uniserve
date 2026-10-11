@@ -57,7 +57,7 @@ from uniserve_worker.protocol.call import (
     VisionInput,
 )
 from uniserve_worker.protocol.identity import CallId
-from uniserve_worker.protocol.output import RequestOutput
+from uniserve_worker.protocol.output import CallOutput
 from uniserve_worker.protocol.tensor import (
     DType,
     ShapeBound,
@@ -179,7 +179,7 @@ def _prepare_decode(
     return (decode, observation)
 
 
-def _media_bytes(record: RequestOutput) -> bytes:
+def _media_bytes(record: CallOutput) -> bytes:
     """Claim the public shared-storage output.
 
     The output's encoded image bytes are consumed.
@@ -200,7 +200,7 @@ def _finalized_artifact(
     worker: object,
     admission: NewRequest,
     latent: TensorRef,
-    observation: RequestOutput,
+    observation: CallOutput,
     *,
     call_id: CallId,
     batch_id: int,

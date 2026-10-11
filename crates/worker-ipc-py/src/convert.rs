@@ -45,11 +45,11 @@ use uniserve_core::{
 };
 use uniserve_worker_ipc::{
     ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, BufferAllocation, BufferId,
-    CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType, DecodeRange,
+    CacheUnitAllocation, Call, CallId, CallKind, CallOutput, CallStatus, DType, DecodeRange,
     DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags,
     ForwardStats, GenerationParams, KvGroupTransfer, KvTransfer, LatentParams, Locator,
-    MediaOutput, NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication,
-    TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
+    MediaOutput, NewRequest, RequestKey, RequestKind, ShapeBound, TensorPublication, TensorRef,
+    TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
     WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
@@ -1518,7 +1518,7 @@ fn token_logprobs_from_py(value: &Bound<'_, PyAny>) -> Option<Vec<TokenLogprob>>
 }
 
 /// Decodes one completion with its accepted progress and output fields.
-fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> {
+fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<CallOutput> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
@@ -1572,7 +1572,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
             bytes: u64_of(&get(output, intern!(py, "bytes"))?)?,
         })
     };
-    Some(RequestOutput {
+    Some(CallOutput {
         sampled_logprob: {
             let value = get(dict, intern!(py, "sampled_logprob"))?;
             if value.is_none() {
@@ -2074,7 +2074,7 @@ fn kv_group_transfer_to_py<'py>(
 /// Decodes the KV publication a completion reports in `kv_output`.
 ///
 /// Each tensor is checked by `tensor_transfer_from_py`. `KvTransfer::validate`
-/// runs later, through `RequestOutput::validate`, when the result is
+/// runs later, through `CallOutput::validate`, when the result is
 /// published.
 fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer> {
     let py = value.py();
@@ -2438,13 +2438,13 @@ mod tests {
     ///
     /// It holds a decode completion with sampled, top, and prompt logprobs,
     /// and a KV-publish completion whose publication is owned by that
-    /// completion's own request and call, as `RequestOutput::validate`
+    /// completion's own request and call, as `CallOutput::validate`
     /// requires.
     fn result_response() -> WorkerResponse {
         let request_key = RequestKey::new(1, RequestId(2), 1);
         let mut response = WorkerResponse::result(BatchOutput {
             batch_id: 13,
-            completions: vec![RequestOutput {
+            completions: vec![CallOutput {
                 sampled_logprob: Some(-0.25),
                 top_logprobs: vec![TokenLogprob {
                     token_id: 42,

@@ -46,7 +46,7 @@ from uniserve_worker.protocol.call import (
     VisionInput,
 )
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
-from uniserve_worker.protocol.output import BatchOutput, RequestOutput
+from uniserve_worker.protocol.output import BatchOutput, CallOutput
 from uniserve_worker.protocol.tensor import (
     DeviceDim,
     DType,
@@ -695,7 +695,7 @@ def finalized_report(worker: Worker, state: Submission) -> BatchOutput:
         time.sleep(0.00005)
 
 
-def record_completion(call: Call, report: BatchOutput) -> RequestOutput:
+def record_completion(call: Call, report: BatchOutput) -> CallOutput:
     """Observe accepted output and carry its visible KV extent.
 
     The extent is carried into the next test input.

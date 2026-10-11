@@ -212,7 +212,7 @@ class Readout:
     candidate ids ``candidate_ids[candidate_offsets[i]:candidate_offsets[i +
     1]]``. The call reports each candidate's natural-log probability under
     the log-softmax over the full vocabulary of the logits at its slot, in
-    ``candidate_ids`` order (``RequestOutput.candidate_logprobs``).
+    ``candidate_ids`` order (``CallOutput.candidate_logprobs``).
     """
 
     slot_tokens: tuple[int, ...]

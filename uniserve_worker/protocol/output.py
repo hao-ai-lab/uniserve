@@ -1,6 +1,6 @@
 """Worker completion records and response serialization.
 
-A rank reports each submitted batch as one `BatchOutput`: a `RequestOutput`
+A rank reports each submitted batch as one `BatchOutput`: a `CallOutput`
 per call plus the tensor products successful calls published. The execution
 package builds these records once every call's output has materialized on the
 host; `messages.finalize_response` serializes them with `to_mapping` for the
@@ -76,7 +76,7 @@ class MediaOutput:
 
 
 @dataclass(frozen=True, slots=True)
-class RequestOutput:
+class CallOutput:
     """One call's completion: status, accepted progress, tokens, and products.
 
     A successful call reports the request's coordinates after it ran; a
@@ -275,7 +275,7 @@ class BatchOutput:
     """
 
     batch_id: int
-    completions: tuple[RequestOutput, ...] = ()
+    completions: tuple[CallOutput, ...] = ()
     products: tuple[TensorPublication, ...] = ()
     worker_exec_us: int | None = None
     forward_stats: ForwardStats | None = None

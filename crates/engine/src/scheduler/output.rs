@@ -241,7 +241,7 @@ impl Scheduler {
     pub(super) fn resolve_decode_text(
         &mut self,
         id: RequestId,
-        mut record: uniserve_worker_ipc::RequestOutput,
+        mut record: uniserve_worker_ipc::CallOutput,
     ) {
         self.activate_request_tables(id);
 
@@ -361,7 +361,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         call: Call,
-        mut record: uniserve_worker_ipc::RequestOutput,
+        mut record: uniserve_worker_ipc::CallOutput,
         media: Option<&SharedMedia>,
     ) {
         let call_variant = call.kind;

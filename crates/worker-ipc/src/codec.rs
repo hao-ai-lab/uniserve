@@ -42,14 +42,14 @@ use uniserve_core::{KvCacheGroup, KvGroupKind, RequestId, SamplingParams, TokenL
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
     ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds, BufferAllocation,
-    BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallStatus, CanvasStep,
-    DType, DecodeRange, DiffusionSamplingParams, DimBound, ErrorCallIdentity, ErrorCode,
-    FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats, GenerationParams,
+    BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallOutput, CallStatus,
+    CanvasStep, DType, DecodeRange, DiffusionSamplingParams, DimBound, ErrorCallIdentity,
+    ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats, GenerationParams,
     KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall, MediaOutput,
-    NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind, SamplingState,
-    ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle,
-    TransferMode, TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint, WorkerInfo,
-    WorkerRequest, WorkerResponse, WorkerResponseError,
+    NewRequest, Readout, RequestKey, RequestKind, ResponseKind, SamplingState, ShapeBound,
+    TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferMode,
+    TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint, WorkerInfo, WorkerRequest,
+    WorkerResponse, WorkerResponseError,
 };
 use uniserve_core::{
     AudioClip, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator, VideoClip,
@@ -1018,7 +1018,7 @@ fn batch_output_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOut
 }
 
 /// Decodes one call completion; `BatchOutput::validate` checks it.
-fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<RequestOutput> {
+fn completion_record_from_table(record: fbs::CallOutput<'_>) -> CodecResult<CallOutput> {
     let finish_flags = record
         .finish_flags()
         .context("completion result has no finish flags")?;
@@ -1050,7 +1050,7 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
         .timing_counters()
         .context("completion record has no timing counters")?;
 
-    let record = RequestOutput {
+    let record = CallOutput {
         sampled_logprob: record.sampled_logprob(),
         top_logprobs: record
             .top_logprobs()
@@ -1903,7 +1903,7 @@ fn response_kind_from_fb(kind: fbs::RespKind) -> CodecResult<ResponseKind> {
 ///
 /// Its buffer identities and tensor transfers are validated as they are
 /// decoded; the descriptor as a whole is validated by its container:
-/// `Batch::validate` for `kv_inputs` and `RequestOutput::validate` for a
+/// `Batch::validate` for `kv_inputs` and `CallOutput::validate` for a
 /// completion's `kv_output`.
 fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransfer> {
     Ok(KvTransfer {

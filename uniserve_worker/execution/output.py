@@ -10,7 +10,7 @@ speculative verification coordinates (`TokenResult`), latent trajectory updates
 
 After the batch commits, `uniserve_worker.execution.commit` drops the
 borrowed device references with `release_execution_references`. The executor
-polls `ready`, calls `materialize` once to resolve the wire `RequestOutput`,
+polls `ready`, calls `materialize` once to resolve the wire `CallOutput`,
 and passes `request_result` to `RequestPool.apply_result`. A discarded batch
 calls `abandon` instead. No method here installs request progress itself.
 """
@@ -45,10 +45,10 @@ from uniserve_worker.protocol.call import (
 )
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.output import (
+    CallOutput,
     FinishFlags,
     MediaOutput,
     PosixShmArtifact,
-    RequestOutput,
     TimingCounters,
 )
 from uniserve_worker.protocol.transfer import KvTransfer, Locator
@@ -390,7 +390,7 @@ class PendingOutput:
         self._observed = False
 
         self._reports_output = True
-        self.value: RequestOutput | None = None
+        self.value: CallOutput | None = None
 
     def release_execution_references(self) -> None:
         """Drop borrowed device views once their stores own the lifetimes.
@@ -462,7 +462,7 @@ class PendingOutput:
                 return False
         return True
 
-    def materialize(self) -> RequestOutput:
+    def materialize(self) -> CallOutput:
         """Resolve output fields once.
 
         A call that did not run keeps the request's committed coordinates, so
@@ -648,7 +648,7 @@ class PendingOutput:
             copy_us=self._completion_timing[2],
             host_us=self._completion_timing[3],
         )
-        concrete = RequestOutput(
+        concrete = CallOutput(
             request_key=self.request_key,
             call_id=self.call_id,
             status=status,

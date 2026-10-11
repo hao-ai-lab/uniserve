@@ -140,8 +140,8 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
     }
 }
 
-fn completion_record() -> RequestOutput {
-    RequestOutput {
+fn completion_record() -> CallOutput {
+    CallOutput {
         sampled_logprob: Some(-0.25),
         top_logprobs: vec![
             TokenLogprob {
@@ -475,7 +475,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
 /// overrides `batch_id`.
 fn lane_report(
     batch_id: u64,
-    completions: Vec<RequestOutput>,
+    completions: Vec<CallOutput>,
     products: Vec<TensorPublication>,
     worker_exec_us: Option<u64>,
     forward_stats: Option<ForwardStats>,
@@ -1049,7 +1049,7 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     };
     let mut report = lane_report(
         5,
-        vec![RequestOutput {
+        vec![CallOutput {
             kv_output: Some(KvTransfer {
                 groups: Vec::new(),
                 source,
@@ -1161,7 +1161,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
         }
         let report = lane_report(
             5,
-            vec![RequestOutput {
+            vec![CallOutput {
                 kv_output: Some(KvTransfer {
                     groups: vec![
                         KvGroupTransfer {
@@ -2016,7 +2016,7 @@ fn full_forward_stats() -> ForwardStats {
 }
 
 fn full_run_result() -> BatchOutput {
-    let mut ok_record = RequestOutput {
+    let mut ok_record = CallOutput {
         sampled_logprob: None,
         top_logprobs: Vec::new(),
         prompt_logprobs: Vec::new(),

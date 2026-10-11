@@ -3180,7 +3180,7 @@ fn text_admission(
 
 /// The coordinates a call entering after `output` executes at, for a request
 /// whose completions advance its logical position with its visible KV.
-fn coordinates_after(output: &uniserve_worker_ipc::RequestOutput) -> CallCoordinates {
+fn coordinates_after(output: &uniserve_worker_ipc::CallOutput) -> CallCoordinates {
     CallCoordinates {
         logical_position: output.kv_visible_len,
         kv_visible_len: output.kv_visible_len,

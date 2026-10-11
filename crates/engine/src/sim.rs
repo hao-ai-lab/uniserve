@@ -31,7 +31,7 @@ use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use uniserve_core::{CommandWaker, ImageParams, RequestId, SamplingParams, TokenLogprob};
 use uniserve_worker_ipc::{
-    BatchOutput, Call, CallKind, CallStatus, ErrorCode, FinishFlags, NewRequest, RequestOutput,
+    BatchOutput, Call, CallKind, CallOutput, CallStatus, ErrorCode, FinishFlags, NewRequest,
     SamplingState, TensorRef, TimingCounters, WorkerInfo,
 };
 
@@ -938,7 +938,7 @@ impl SimEngine {
         }
     }
 
-    /// Executes one call against its request and returns its [`RequestOutput`].
+    /// Executes one call against its request and returns its [`CallOutput`].
     ///
     /// Advances the request's positions, KV extent, synthetic text index,
     /// penalty counts, and denoising step as the call kind requires, and
@@ -956,7 +956,7 @@ impl SimEngine {
         canvas_sampling: Option<uniserve_core::CanvasSampling>,
         call: &Call,
         request: &mut SimRequestState,
-    ) -> anyhow::Result<RequestOutput> {
+    ) -> anyhow::Result<CallOutput> {
         // A call states the coordinates it executes at. The simulator holds the
         // same request state a rank does, so a disagreement is a scheduling
         // failure and not a condition it can execute through. A media branch
@@ -977,7 +977,7 @@ impl SimEngine {
                 call.call_id
             );
         }
-        let mut record = RequestOutput {
+        let mut record = CallOutput {
             sampled_logprob: None,
             top_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
@@ -1273,8 +1273,8 @@ impl SimEngine {
     ///
     /// The completion carries no product generations and reports the
     /// request's unchanged progress.
-    fn predicated_completion(call: &Call, request: &SimRequestState) -> RequestOutput {
-        RequestOutput {
+    fn predicated_completion(call: &Call, request: &SimRequestState) -> CallOutput {
+        CallOutput {
             sampled_logprob: None,
             top_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
@@ -1443,7 +1443,7 @@ pub fn sim_candidate_logprob(request_id: RequestId, token: u32) -> f32 {
     -1.0 - ((request_id.0.wrapping_add(u64::from(token))) % 7) as f32
 }
 
-fn set_kv_lengths(lengths: &mut RequestOutput, visible: u32) {
+fn set_kv_lengths(lengths: &mut CallOutput, visible: u32) {
     lengths.kv_visible_len = visible;
     lengths.kv_computed_len = visible;
 }

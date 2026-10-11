@@ -238,8 +238,10 @@ def state_advancing_calls() -> list[str]:
     ...
 
 def product_edges() -> list[tuple[str, str]]:
-    """Return each ``(producer, reader)`` pair of media calls whose products
-    travel through persistent tensor storage, as the schema's graph states them.
+    """Return the persistent-product edges of the video graph.
+
+    Each ``(producer, reader)`` pair names media calls whose products travel
+    through persistent tensor storage, as the schema's graph states them.
     """
     ...
 

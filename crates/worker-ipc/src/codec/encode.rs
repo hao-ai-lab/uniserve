@@ -1050,10 +1050,7 @@ fn media_output<'a>(
     )
 }
 
-fn completion<'a>(
-    b: &mut FlatBufferBuilder<'a>,
-    v: &RequestOutput,
-) -> WIPOffset<fbs::RequestOutput<'a>> {
+fn completion<'a>(b: &mut FlatBufferBuilder<'a>, v: &CallOutput) -> WIPOffset<fbs::CallOutput<'a>> {
     let request_key = Some(request_key(b, &v.request_key));
     let call_id = fbs::CallId::new(v.call_id.batch_id, v.call_id.request_index);
     let status = call_status_to_fb(v.status);
@@ -1080,9 +1077,9 @@ fn completion<'a>(
     let media_output = v.media_output.as_ref().map(|value| media_output(b, value));
     let kv_output = v.kv_output.as_ref().map(|value| kv_transfer(b, value));
     let candidate_logprobs = Some(b.create_vector(&v.candidate_logprobs));
-    fbs::RequestOutput::create(
+    fbs::CallOutput::create(
         b,
-        &fbs::RequestOutputArgs {
+        &fbs::CallOutputArgs {
             request_key,
             call_id: Some(&call_id),
             status,
