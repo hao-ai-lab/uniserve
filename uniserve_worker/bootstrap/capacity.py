@@ -74,12 +74,6 @@ from uniserve_worker.storage.tensor_store import (
     TensorStore,
 )
 
-# Relay-arena bytes budgeted per (request slot, relay lane) row across one
-# device's ``TensorStore`` relay arenas.
-# FIXME: A relay arena exists per (dtype, field) of the scalar outputs the
-# engine's calls declare, which the worker does not learn before its
-# capacity is reported. Derive this row size from those outputs.
-_REQUEST_RELAY_ROW_BYTES = 18
 # Relay lanes beyond the unresolved-call window. ``Worker.__init__`` builds
 # ``TensorStore`` with ``relay_depth = max_unresolved_calls + 1`` to match.
 _REQUEST_RELAY_RETIREMENT_LANES = 1
@@ -573,7 +567,7 @@ def request_tensor_arena_capacity(
     relay_bytes = (
         (state_slots + 1)
         * (max(1, unresolved_window) + _REQUEST_RELAY_RETIREMENT_LANES)
-        * _REQUEST_RELAY_ROW_BYTES
+        * _ipc.relay_row_bytes()
     )
     return ArenaCapacity(
         device_product_bytes=relay_bytes,
@@ -693,7 +687,7 @@ def model_arena_capacity(
     device_product_bytes = (
         (int(worker_config.max_request_pool_size) + 1)
         * (call_window(depth, max_calls) + _REQUEST_RELAY_RETIREMENT_LANES)
-        * _REQUEST_RELAY_ROW_BYTES
+        * _ipc.relay_row_bytes()
         * device_count
     )
 

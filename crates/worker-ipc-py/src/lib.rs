@@ -554,6 +554,13 @@ fn state_advancing_calls() -> Vec<&'static str> {
 }
 
 #[pyfunction]
+/// Returns the bytes one request slot's lane holds of a call's relayed
+/// scalar outputs, from which a worker sizes its relay arenas.
+fn relay_row_bytes() -> u64 {
+    uniserve_worker_ipc::Call::relay_row_bytes()
+}
+
+#[pyfunction]
 /// Returns each `(producer, reader)` pair of media calls whose products travel
 /// through persistent tensor storage: a reader's inputs the producer declares,
 /// excluding the readers of resident denoiser state.
@@ -629,6 +636,7 @@ fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(call_kinds, m)?)?;
     m.add_function(wrap_pyfunction!(state_advancing_calls, m)?)?;
     m.add_function(wrap_pyfunction!(product_edges, m)?)?;
+    m.add_function(wrap_pyfunction!(relay_row_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_store_u32, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_load_u32, m)?)?;
     Ok(())

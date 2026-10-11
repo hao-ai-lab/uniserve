@@ -434,6 +434,22 @@ pub struct Call {
 }
 
 impl Call {
+    /// Element types of the scalar outputs one call relays through its
+    /// request slot's lane: the token (`token_output`), the completion and
+    /// the transition (`completion_output`, `transition_output`), which
+    /// [`Self::validate`] requires of them.
+    pub const RELAY_DTYPES: [DType; 3] = [DType::I64, DType::U8, DType::U8];
+
+    /// Bytes one request slot's lane holds of a call's relayed scalars.
+    ///
+    /// A worker sizes its relay arenas per (request slot, lane) row from it.
+    pub fn relay_row_bytes() -> u64 {
+        Self::RELAY_DTYPES
+            .iter()
+            .map(|dtype| dtype.element_bytes())
+            .sum()
+    }
+
     /// Returns whether the call reads or writes a latent product held in the
     /// scheduler-allocated latent pages of an image trajectory, which its
     /// batch then describes with [`LatentParams`]. A standalone denoiser's

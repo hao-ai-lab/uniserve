@@ -237,6 +237,14 @@ def state_advancing_calls() -> list[str]:
     """Return the spelling of every call kind that advances request state."""
     ...
 
+def relay_row_bytes() -> int:
+    """Return the bytes one request slot's lane holds of relayed scalars.
+
+    A worker sizes its request-relay arenas per (request slot, lane) row
+    from this value.
+    """
+    ...
+
 def product_edges() -> list[tuple[str, str]]:
     """Return the persistent-product edges of the video graph.
 
