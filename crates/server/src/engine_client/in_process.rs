@@ -4,9 +4,9 @@
 //! reserves an engine `RequestId` for an external identifier before
 //! preprocessing, so duplicates are refused early and control commands can
 //! reach a request that is still being prepared. `submit_generation` or
-//! `submit_media` then claims that registration and hands the request to one
-//! engine core; the returned `EventRx` releases the claim when its stream ends
-//! or it is dropped.
+//! `submit_media` then stamps the request with that identifier, claims the
+//! registration and hands the request to one engine core; the returned
+//! `EventRx` releases the claim when its stream ends or it is dropped.
 //!
 //! A data-parallel deployment runs one engine core per replica
 //! (`EngineCore::replicas`), each with its own scheduler, KV cache and
@@ -250,8 +250,10 @@ impl EngineClient {
         self.cores.iter().any(|core| !core.is_dead())
     }
 
-    /// Reserves a unique request ID before preprocessing. The caller must submit
-    /// the returned ID or complete its decoded-response lifecycle on failure.
+    /// Reserves a unique engine request ID for `external_request_id` before
+    /// preprocessing. Submission under the same external identifier stamps the
+    /// request with it; a caller that does not submit completes its
+    /// decoded-response lifecycle instead.
     ///
     /// Returns `Error::DuplicateRequestId` when a live request already holds
     /// `external_request_id`. With `track_lifecycle`, the registration also
@@ -261,7 +263,7 @@ impl EngineClient {
         &self,
         external_request_id: String,
         track_lifecycle: bool,
-    ) -> Result<RequestId> {
+    ) -> Result<()> {
         let rid = self.first().next_request_id();
         if !self
             .requests
@@ -271,15 +273,17 @@ impl EngineClient {
                 request_id: external_request_id,
             });
         }
-        Ok(rid)
+        Ok(())
     }
 
-    /// Submits the owned tokenized request under its previously reserved identity.
+    /// Submits the owned tokenized request under the engine identifier
+    /// reserved for `external_request_id`, which replaces the request's own.
     ///
     /// # Errors
     ///
     /// - `Error::UnknownRequestId` or `Error::DuplicateRequestId` when the
-    ///   registration cannot be claimed (see `RequestRegistry::claim_submission`).
+    ///   registration cannot be claimed (see `RequestRegistry::reserved_id` and
+    ///   `RequestRegistry::claim_submission`).
     /// - `Error::ClientClosed` when the runtime family is `Diffusion`.
     /// - `Error::Submit` when the engine refuses the request.
     ///
@@ -290,9 +294,10 @@ impl EngineClient {
     pub async fn submit_generation(
         &self,
         external_request_id: String,
-        request: uniserve_core::GenerationRequest,
+        mut request: uniserve_core::GenerationRequest,
     ) -> Result<EventRx> {
-        let rid = request.request_id;
+        let rid = self.requests.reserved_id(&external_request_id)?;
+        request.request_id = rid;
         let request = match self.first().runtime_family() {
             RuntimeFamily::Ar => Request::Ar(request),
             RuntimeFamily::Umm => Request::Umm(request),
@@ -315,9 +320,10 @@ impl EngineClient {
     pub async fn submit_media(
         &self,
         external_request_id: String,
-        request: uniserve_core::DiffusionRequest,
+        mut request: uniserve_core::DiffusionRequest,
     ) -> Result<EventRx> {
-        let rid = request.request_id;
+        let rid = self.requests.reserved_id(&external_request_id)?;
+        request.request_id = rid;
         if self.first().runtime_family() != RuntimeFamily::Diffusion {
             self.requests.claim_submission(&external_request_id, rid)?;
             self.requests.release_engine(&external_request_id, rid);
@@ -474,10 +480,11 @@ mod tests {
 
         let constraint = GenerationConstraint::UndOnly;
         let policy = ImageGenerationConfig::default();
+        client
+            .register_request("req-text".to_string(), false)
+            .expect("reserve request");
         let generation = GenerationRequest {
-            request_id: client
-                .register_request("req-text".to_string(), false)
-                .expect("reserve request"),
+            request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: Default::default(),
             negative_prompt_token_ids: Vec::new(),
@@ -530,10 +537,10 @@ mod tests {
         client.shutdown().await.expect("shutdown engine");
     }
 
-    /// A text request of `rid` that generates until the simulator's EOS.
-    fn text_request(rid: uniserve_core::RequestId) -> GenerationRequest {
+    /// A text request that generates until the simulator's EOS.
+    fn text_request() -> GenerationRequest {
         GenerationRequest {
-            request_id: rid,
+            request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: Default::default(),
             negative_prompt_token_ids: Vec::new(),
@@ -571,15 +578,13 @@ mod tests {
         // Both requests are submitted before either stream is read, so the
         // first is still in flight when the second is routed.
         let mut streams = Vec::new();
-        let mut ids = Vec::new();
         for name in ["first", "second"] {
-            let rid = client
+            client
                 .register_request(name.to_string(), false)
                 .expect("reserve request");
-            ids.push(rid);
             streams.push(
                 client
-                    .submit_generation(name.to_string(), text_request(rid))
+                    .submit_generation(name.to_string(), text_request())
                     .await
                     .expect("submit request"),
             );
@@ -610,10 +615,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(served.iter().map(|ids| ids.len()).sum::<usize>(), 2);
         assert!(served.iter().all(|ids| ids.len() == 1));
-        assert!(
-            ids.iter()
-                .all(|id| served.iter().any(|ids| ids.contains(id)))
-        );
     }
 
     #[tokio::test]
@@ -640,10 +641,11 @@ mod tests {
             }],
             sample_feedback_continuation: true,
         };
+        client
+            .register_request("req-image".to_string(), false)
+            .expect("reserve request");
         let request = GenerationRequest {
-            request_id: client
-                .register_request("req-image".to_string(), false)
-                .expect("reserve request"),
+            request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3],
             multimodal_inputs: Default::default(),
             negative_prompt_token_ids: Vec::new(),

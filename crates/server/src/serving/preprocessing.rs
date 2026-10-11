@@ -68,10 +68,6 @@ impl crate::serving::InputProcessor {
     /// `image_url` part, whose URL is not read again. Pass no images for a
     /// model without image input, which rejects image parts.
     ///
-    /// The returned request carries a placeholder engine identifier that the
-    /// caller must replace before submission (see
-    /// `InputProcessor::preprocess_generation`).
-    ///
     /// # Errors
     ///
     /// Returns an `ApiError` when route validation (served model name,
@@ -396,9 +392,7 @@ impl crate::serving::InputProcessor {
     /// Validates and tokenizes an image API request into its final engine input.
     ///
     /// The request is served as an image-only generation of exactly one image
-    /// with the default shared cache policy and default text sampling. As with
-    /// [`Self::preprocess_chat_request`], the returned engine identifier is a
-    /// placeholder.
+    /// with the default shared cache policy and default text sampling.
     ///
     /// # Errors
     ///

@@ -452,9 +452,6 @@ impl InputProcessor {
     /// Validates a video request, fetches, probes and plans its media, presents its prompt,
     /// and sizes it for direct engine submission.
     ///
-    /// The returned request carries a placeholder `RequestId(0)`; the caller must replace it
-    /// with the identifier reserved by `EngineClient::register_request` before submission.
-    ///
     /// # Errors
     ///
     /// Returns an API error when the model serves no video, the request names another model,
@@ -598,9 +595,6 @@ impl InputProcessor {
     }
 
     /// Preprocesses a programmatic text prompt without a chat-template conversion.
-    ///
-    /// The returned request carries a placeholder engine identifier (see
-    /// `InputProcessor::preprocess_generation`).
     pub fn preprocess_text_request(
         &self,
         request: TextPromptRequest,
@@ -648,10 +642,6 @@ impl InputProcessor {
     /// `images` are the prompt's input images: the top-level images of a text prompt, or the
     /// resolved `image_url` parts of a chat prompt in `chat_image_urls` order.
     ///
-    /// The returned `GenerationRequest::request_id` is a placeholder derived from the external
-    /// identifier. `EngineClient::submit_generation` accepts only the identifier reserved by
-    /// `EngineClient::register_request`, so the caller must replace it before submission.
-    ///
     /// # Errors
     ///
     /// Returns `ServeError::UnsupportedFeature` from feature validation and
@@ -686,7 +676,8 @@ impl InputProcessor {
         let constraint = crate::serving::omni::generation_constraint(modalities);
 
         let mut generation = GenerationRequest {
-            request_id: RequestId(stable_hash(request_id.as_ref())),
+            // `EngineClient` stamps the identifier it reserved for the request at submission.
+            request_id: RequestId::default(),
             prompt_token_ids: Vec::new(),
             negative_prompt_token_ids: Vec::new(),
             multimodal_inputs: Default::default(),
@@ -1007,19 +998,6 @@ impl InputProcessor {
 
         Ok((core, max_tokens, stop_token_ids))
     }
-}
-
-/// Computes a deterministic identifier for a preprocessed request (64-bit FNV-1a).
-///
-/// The value is a placeholder: `ServingRuntime` replaces it with the engine-reserved
-/// identifier before submission.
-fn stable_hash(value: &str) -> u64 {
-    value
-        .as_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        })
 }
 
 #[cfg(test)]

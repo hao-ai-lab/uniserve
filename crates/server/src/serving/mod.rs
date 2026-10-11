@@ -313,9 +313,9 @@ fn malformed_output(
 /// Folds cache namespace/salt into a stable isolation key.
 ///
 /// Returns `None` when both are absent, which leaves the request in the shared cache
-/// partition. Otherwise the key is a 64-bit FNV-1a hash (the same function as
-/// `model::stable_hash`) over length-prefixed material, so `("ab", "c")` and `("a", "bc")`
-/// hash different bytes. The hash is deterministic across processes.
+/// partition. Otherwise the key is a 64-bit FNV-1a hash over length-prefixed material, so
+/// `("ab", "c")` and `("a", "bc")` hash different bytes. The hash is deterministic across
+/// processes.
 pub(crate) fn cache_isolation_key(namespace: Option<&str>, salt: Option<&str>) -> Option<u64> {
     (namespace.is_some() || salt.is_some()).then(|| {
         let namespace = namespace.unwrap_or_default();
@@ -551,8 +551,7 @@ impl ServingRuntime {
         // compilation.
         let compile_started = Instant::now();
 
-        let engine_request_id = self
-            .engine
+        self.engine
             .register_request(request_id.to_string(), true)
             .map_err(|error| {
                 self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
@@ -585,7 +584,7 @@ impl ServingRuntime {
             }
             tokenized = preprocess(Arc::clone(&self.model)) => tokenized,
         };
-        let mut tokenized = match tokenize_result {
+        let tokenized = match tokenize_result {
             Ok(tokenized) => tokenized,
             Err(error) => {
                 lifecycle.terminal(
@@ -600,12 +599,6 @@ impl ServingRuntime {
             .requests
             .mark_submitting(&request_id, compile_duration_us);
 
-        // Preprocessing fills a placeholder engine identifier. `EngineClient::submit_generation`
-        // and `submit_media` accept only the identifier reserved at registration.
-        match &mut tokenized {
-            Prepared::Generation(prepared) => prepared.0.request_id = engine_request_id,
-            Prepared::Diffusion(request) => request.request_id = engine_request_id,
-        }
         self.submit_and_stream(tokenized, compile_duration_us, lifecycle)
             .await
             .map_err(crate::openai::serve_error_to_api)

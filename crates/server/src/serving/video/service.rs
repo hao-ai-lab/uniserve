@@ -39,8 +39,8 @@ pub(crate) const REQUEST_FIELDS: [&str; 6] =
 /// A video request ready for submission.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessedVideo {
-    /// The engine request; its identifier is a placeholder the runtime
-    /// replaces with the one it reserves.
+    /// The engine request. `EngineClient` stamps the identifier it reserved
+    /// for the request at submission.
     pub request: DiffusionRequest,
     /// The requested duration in seconds, before frame alignment.
     pub duration_seconds: f64,
@@ -269,7 +269,7 @@ impl VideoService {
         }
         Ok(ProcessedVideo {
             request: DiffusionRequest {
-                request_id: RequestId(0),
+                request_id: RequestId::default(),
                 task: plan.task,
                 prompt_token_ids,
                 text_tags: processed.presentation.tags,

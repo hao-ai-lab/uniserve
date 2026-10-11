@@ -4,7 +4,8 @@
 //! two parts that have independent lifetimes:
 //!
 //! - The engine side (`engine_request_id`, `engine_pending`) is reserved by
-//!   `register`, claimed once by `claim_submission`, and released by
+//!   `register`, read by `reserved_id` to stamp the submitted request,
+//!   claimed once by `claim_submission`, and released by
 //!   `release_engine`, which `EngineClient::submit_generation` and
 //!   `submit_media` run when submission fails after the claim, or when the
 //!   engine event stream ends or its receiver is dropped.
@@ -146,7 +147,28 @@ impl RequestRegistry {
         true
     }
 
+    /// Returns the engine identifier reserved for `request_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::UnknownRequestId` when no active record holds
+    /// `request_id` or its engine side was already released.
+    pub(crate) fn reserved_id(
+        &self,
+        request_id: &str,
+    ) -> crate::engine_client::Result<uniserve_core::RequestId> {
+        self.lock()
+            .get(request_id)
+            .and_then(|record| record.engine_request_id)
+            .ok_or_else(|| crate::engine_client::Error::UnknownRequestId {
+                request_id: request_id.to_string(),
+            })
+    }
+
     /// Attaches exactly one engine receiver to the reserved request incarnation.
+    ///
+    /// `engine_request_id` is the identifier `reserved_id` returned; a record
+    /// that no longer holds it was released or replaced since.
     ///
     /// # Errors
     ///

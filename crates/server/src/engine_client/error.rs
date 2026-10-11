@@ -19,9 +19,8 @@ pub enum Error {
         request_id: String,
     },
     /// Submission names an identifier that is not registered, or whose
-    /// registration does not hold the engine `RequestId` the submitted request
-    /// carries (a different incarnation, or one whose engine side was already
-    /// released).
+    /// registration was released or replaced before the submission claimed
+    /// it.
     #[error("request `{request_id}` has no matching registration")]
     UnknownRequestId {
         /// External identity supplied by the caller.
