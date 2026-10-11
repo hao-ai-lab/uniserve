@@ -487,9 +487,9 @@ impl std::fmt::Display for GenerationFeatures {
 
 /// Worker and scheduler limits needed to compile a bounded generation graph.
 ///
-/// The server supplies the loaded model's requirements, and the engine's
-/// `resolve_generation_limits` intersects them with the capacities the worker
-/// reports. Zero in any numeric field other than `commit_marker_tokens`
+/// The server supplies the loaded model's sizing facts, and the engine's
+/// `resolve_generation_limits` takes the served features from the workers'
+/// call kinds and clamps the capacities to what they report. Zero in any numeric field other than `commit_marker_tokens`
 /// declares no capacity for that resource;
 /// [`GenerationRequest::validate_resources`] rejects requests that need it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -242,14 +242,14 @@ impl ModelConfig {
         }
     }
 
-    /// Model requirements used at startup before intersecting loaded worker capacity.
+    /// Model facts used at startup before the loaded workers' capacities and
+    /// served features are applied (`resolve_generation_limits`).
     pub(crate) fn generation_limits(
         &self,
         model_dtype: uniserve_core::ModelDtype,
     ) -> uniserve_core::GenerationLimits {
         match &self.parameters {
             ModelParameters::Qwen3 => uniserve_core::GenerationLimits {
-                features: uniserve_core::GenerationFeatures::UNDERSTANDING,
                 latent_downsample: 1,
                 max_cfg_branches: 1,
                 ..Default::default()
@@ -267,8 +267,6 @@ impl ModelConfig {
             // the number of cached encodings, so the model states no bound of
             // its own for either.
             ModelParameters::DiffusionGemma(profile) => uniserve_core::GenerationLimits {
-                features: uniserve_core::GenerationFeatures::TOKEN_DENOISING
-                    | uniserve_core::GenerationFeatures::VISION_ENCODE,
                 latent_downsample: 1,
                 max_vit_grid_tokens: profile.images.max_soft_tokens,
                 max_vision_feature_bytes: u64::MAX,

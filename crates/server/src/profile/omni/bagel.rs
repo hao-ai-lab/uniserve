@@ -8,8 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
-    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationFeatures, GenerationLimits,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageTrigger, ModelDtype,
+    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, ImageEncoderInput,
+    ImageGenerationConfig, ImageIngestStep, ImageTrigger, ModelDtype,
 };
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
@@ -89,23 +89,20 @@ impl BagelProfile {
             })
     }
 
-    /// Returns bounded runtime capabilities for the selected dtype.
+    /// Returns the profile's runtime sizing for the selected dtype.
     ///
-    /// These are profile ceilings. The engine scheduler's
-    /// `resolve_generation_limits` clamps the latent, grid-token, feature-byte,
-    /// and encoder-cache limits to the capacities the loaded worker reports and
-    /// drops features whose calls the worker does not support.
+    /// The latent capacity is not stated here: the checkpoint's latent grid
+    /// bounds a canvas's sides (`ResolutionPolicy::max_side`), and the engine
+    /// scheduler's `resolve_generation_limits` clamps the latent, grid-token,
+    /// feature-byte and encoder-cache limits to the capacities the loaded
+    /// worker reports and takes its served features from its call kinds.
     pub fn runtime_limits(model_dtype: ModelDtype) -> GenerationLimits {
         let dtype_bytes = model_dtype_bytes(model_dtype);
         // `GenerationRequest::image_latent_bytes` divides the latent feature
         // bytes by `max_vae_grid_tokens` to get the bytes per latent unit:
         // 16 VAE latent channels over a 2x2 latent patch.
         GenerationLimits {
-            features: GenerationFeatures::UNDERSTANDING
-                | GenerationFeatures::VISION_ENCODE
-                | GenerationFeatures::LATENT_ENCODE
-                | GenerationFeatures::IMAGE_GENERATION,
-            max_latent_units: 1_024,
+            max_latent_units: u64::MAX,
             latent_downsample: Self::LATENT_DOWNSAMPLE,
             max_vae_grid_tokens: 1_026,
             max_vit_grid_tokens: 4_902,
@@ -114,6 +111,7 @@ impl BagelProfile {
             commit_marker_tokens: 2,
             max_cfg_branches: 3,
             encoder_cache_entries: Self::ENCODER_CACHE_ENTRIES as u32,
+            ..GenerationLimits::default()
         }
     }
 

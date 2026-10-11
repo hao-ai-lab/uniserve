@@ -11,10 +11,11 @@ use uniserve_worker_ipc::{ForwardMode, MediaCall};
 
 /// Intersects model requirements with capacities actually loaded by the worker.
 ///
-/// A generation feature survives only when every call kind it needs is in the
-/// aggregate `supported_calls`; numeric limits are clamped to the reported
-/// latent, batch-token, encoder-entry, buffer-pool, and encoder-cache
-/// capacities.
+/// The workers state which generation features are served: a feature is
+/// available when every call kind it needs is in the aggregate
+/// `supported_calls`, whatever the model description lists. Numeric limits
+/// are clamped to the reported latent, batch-token, encoder-entry,
+/// buffer-pool, and encoder-cache capacities.
 fn resolve_generation_limits(
     mut limits: uniserve_core::GenerationLimits,
     info: &WorkerInfo,
@@ -44,7 +45,7 @@ fn resolve_generation_limits(
     {
         available.insert(uniserve_core::GenerationFeatures::TOKEN_DENOISING);
     }
-    limits.features &= available;
+    limits.features = available;
 
     limits.max_latent_units = limits.max_latent_units.min(info.latent_capacity_units());
     let latent_bound = limits.max_latent_units.min(u64::from(u32::MAX)) as u32;
