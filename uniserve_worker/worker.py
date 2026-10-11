@@ -505,7 +505,7 @@ class Worker:
                     continue
 
                 available, _free = device_storage_budget(
-                    device, worker_config.kv_storage_fraction
+                    device, worker_config.mem_fraction_static
                 )
                 reserved = fixed_bytes + graph_storage_budget_bytes(
                     device_total_bytes(device)
@@ -565,7 +565,7 @@ class Worker:
                     request_pool_size=int(info.request_slots),
                     table_width=resident_width(
                         planes,
-                        max_sequence_tokens=worker_config.max_sequence_tokens,
+                        max_sequence_tokens=worker_config.max_model_len,
                     ),
                     staging_depth=int(queue_depth),
                 )
@@ -887,7 +887,7 @@ class Worker:
                 if target.type != "cuda":
                     continue
                 available, _free = device_storage_budget(
-                    target, self.worker_config.kv_storage_fraction
+                    target, self.worker_config.mem_fraction_static
                 )
                 pending = max(
                     0, products - self.tensor_store.resident_bytes(target)

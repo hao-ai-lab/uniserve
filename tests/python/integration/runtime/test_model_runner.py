@@ -30,10 +30,11 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.model import Logits
 from uniserve_models.stub import Model
 from uniserve_models.stub import entry_points as entry_points
-from uniserve_worker.config.execution import LaneConfig, WorkerConfig
+from uniserve_worker.config.execution import LaneConfig
 from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.batch import (
     BlockTable,
@@ -454,7 +455,7 @@ def test_lane_and_graph_binding_preserve_token_and_flow_results(
             ),
         ),
     }[binding]
-    policy = WorkerConfig(
+    policy = cpu_worker_config(
         generation_device=generation_device,
         prefill_cuda_graph=graphs,
         graph_policy="full" if graphs else "off",
@@ -744,7 +745,7 @@ def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> (
     worker = execution_worker(
         model,
         device="cuda:0",
-        execution=WorkerConfig(
+        execution=cpu_worker_config(
             graph_policy="off",
             prefill_cuda_graph=False,
             lanes=(LaneConfig("compute", 64, CALL_KINDS),),
@@ -1134,8 +1135,8 @@ def test_non_power_of_two_context_capacity_accepts_prefill_and_decode(
         model,
         block_size=4,
         device=device,
-        execution=WorkerConfig(
-            max_sequence_tokens=20,
+        execution=cpu_worker_config(
+            max_model_len=20,
             graph_policy="off",
             prefill_cuda_graph=False,
             flow_graph_batch_sizes=(1,),
@@ -2442,7 +2443,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
 def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_independent_work(  # noqa: E501
     device,
 ):
-    policy = WorkerConfig(
+    policy = cpu_worker_config(
         prefill_cuda_graph=False,
         graph_policy="off",
         lanes=(
@@ -2697,7 +2698,7 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
 @pytest.mark.gpu
 @pytest.mark.parametrize("warmup", [False, True])
 def test_full_binding_returns_current_decode_tokens(warmup):
-    policy = WorkerConfig(
+    policy = cpu_worker_config(
         graph_policy="full",
         prefill_cuda_graph=True,
         decode_graph_batch_sizes=(1, 2),
@@ -2739,7 +2740,7 @@ def test_failed_capture_preserves_error_through_worker_scope_and_reconstruction(
 ):
     from uniserve.runtime.cuda_graph import CUDAGraphError
 
-    policy = WorkerConfig(
+    policy = cpu_worker_config(
         graph_policy="full",
         prefill_cuda_graph=True,
         decode_graph_batch_sizes=(1, 2),

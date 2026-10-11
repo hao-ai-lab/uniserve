@@ -10,9 +10,9 @@ import torch
 from torch import nn
 
 from tests.python.fixtures.execution_worker import execution_worker
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
 from uniserve.runtime import CUDAStream, ExecutionContext
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.kernel_table import KERNEL_TABLE_TAG
 
 pytestmark = pytest.mark.integration
@@ -41,7 +41,7 @@ def test_worker_startup_logs_one_table_of_every_call_site(device, caplog):
     portable provider by name; on CUDA the table also lists every prepared
     one among the portable call sites so that no such call site is silent.
     """
-    policy = WorkerConfig(
+    policy = cpu_worker_config(
         graph_policy="off",
         prefill_cuda_graph=False,
         flow_graph_batch_sizes=(1,),

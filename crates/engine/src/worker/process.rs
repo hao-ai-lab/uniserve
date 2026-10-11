@@ -190,8 +190,43 @@ impl std::str::FromStr for FlashInferBackend {
 /// Error returned for an unsupported FlashInfer backend name.
 pub struct FlashInferBackendParseError(String);
 
+impl WorkerProcessArgs {
+    /// Call batches kept in flight against a rank unless a launch sets its
+    /// queue depth.
+    pub const DEFAULT_QUEUE_DEPTH: usize = 2;
+    /// Checkpoint loader format that detects the files' own format.
+    pub const DEFAULT_LOAD_FORMAT: &'static str = "auto";
+    /// Share of device memory a rank may hold for weights and KV cache.
+    pub const DEFAULT_MEM_FRACTION_STATIC: f64 = 0.70;
+    /// Attention provider selection: the worker picks one per call.
+    pub const DEFAULT_ATTENTION_BACKEND: &'static str = "auto";
+    /// CUDA graph policy that captures what the deployment's calls need.
+    pub const DEFAULT_GRAPH_POLICY: &'static str = "auto";
+    /// FlashInfer workspace capacity in bytes.
+    pub const DEFAULT_FLASHINFER_WORKSPACE_SIZE: u64 = 512 * 1024 * 1024;
+    /// FlashInfer backend of decode attention.
+    pub const DEFAULT_FLASHINFER_DECODE_BACKEND: FlashInferBackend = FlashInferBackend::Fa2;
+    /// FlashInfer backend of prefill attention.
+    pub const DEFAULT_FLASHINFER_PREFILL_BACKEND: FlashInferBackend = FlashInferBackend::Auto;
+    /// The `ffmpeg` executable a media reader decodes reference videos with.
+    pub const DEFAULT_FFMPEG: &'static str = "ffmpeg";
+    /// Longest admitted video duration, in seconds.
+    pub const DEFAULT_MAX_VIDEO_SECONDS: f64 = 15.0;
+    /// Independent microbatches of attention and remote experts.
+    pub const DEFAULT_EXPERT_MICROBATCHES: u32 = 1;
+    /// Numeric data type of model parameters and activations.
+    pub const DEFAULT_MODEL_DTYPE: uniserve_core::ModelDtype = uniserve_core::ModelDtype::BFloat16;
+    /// Whether every prefill call replays a CUDA graph.
+    pub const DEFAULT_PREFILL_CUDA_GRAPH: bool = true;
+    /// Whether image denoising calls replay CUDA graphs.
+    pub const DEFAULT_FLOW_CUDA_GRAPH: bool = true;
+}
+
 impl Default for WorkerProcessArgs {
     /// Returns worker launch settings suitable for a single local rank.
+    ///
+    /// The tuning values are the `DEFAULT_*` constants of this type, which
+    /// the `uniserve` command line also takes as its option defaults.
     fn default() -> Self {
         Self {
             worker_id: "worker".into(),
@@ -209,10 +244,10 @@ impl Default for WorkerProcessArgs {
             role: crate::WorkerRole::Model,
             peers: Default::default(),
             stub: false,
-            queue_depth: 2,
+            queue_depth: Self::DEFAULT_QUEUE_DEPTH,
             req_slot_cap: 1 << 20,
             resp_slot_cap: 8 << 20,
-            kv_token_capacity: None,
+            max_total_tokens: None,
             block_size: None,
             max_batch_calls: 128,
             max_batch_tokens: 16_384,
@@ -220,44 +255,43 @@ impl Default for WorkerProcessArgs {
             // row reserve a runtime keeps outside it.
             max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
                 + crate::scheduler::MAX_FLOW_PREFIX_ROWS) as u32,
-            attention_backend: "auto".into(),
+            attention_backend: Self::DEFAULT_ATTENTION_BACKEND.into(),
             transfer: Default::default(),
-            load_format: "auto".to_string(),
+            load_format: Self::DEFAULT_LOAD_FORMAT.to_string(),
             download_dir: None,
             load_threads: None,
-            checksum_manifest: None,
-            model_dtype: uniserve_core::ModelDtype::BFloat16,
+            model_dtype: Self::DEFAULT_MODEL_DTYPE,
             quantization_config: serde_json::json!({}),
             kv_cache_dtype: None,
-            kv_storage_fraction: 0.70,
+            mem_fraction_static: Self::DEFAULT_MEM_FRACTION_STATIC,
             mesh: None,
             distributed_backend: None,
             lanes: Vec::new(),
-            graph_policy: "auto".into(),
+            graph_policy: Self::DEFAULT_GRAPH_POLICY.into(),
             decode_graph_batch_sizes: None,
-            prefill_cuda_graph: true,
+            prefill_cuda_graph: Self::DEFAULT_PREFILL_CUDA_GRAPH,
             prefill_outputs: true,
             prefill_graph_token_sizes: None,
-            flow_cuda_graph: true,
+            flow_cuda_graph: Self::DEFAULT_FLOW_CUDA_GRAPH,
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
             video_text_capacities: None,
             video_frame_sizes: None,
             canvas_sampling: None,
-            flashinfer_workspace_size: 512 * 1024 * 1024,
+            flashinfer_workspace_size: Self::DEFAULT_FLASHINFER_WORKSPACE_SIZE,
             flashinfer_use_tensor_core: None,
-            flashinfer_decode_backend: FlashInferBackend::Fa2,
-            flashinfer_prefill_backend: FlashInferBackend::Auto,
+            flashinfer_decode_backend: Self::DEFAULT_FLASHINFER_DECODE_BACKEND,
+            flashinfer_prefill_backend: Self::DEFAULT_FLASHINFER_PREFILL_BACKEND,
             flashinfer_decode_split_tile_size: None,
             flashinfer_prefill_split_tile_size: None,
             flashinfer_disable_split_kv: false,
             max_model_len: 8192,
-            max_video_seconds: 15.0,
+            max_video_seconds: Self::DEFAULT_MAX_VIDEO_SECONDS,
             max_condition_rows: None,
-            ffmpeg: "ffmpeg".into(),
+            ffmpeg: Self::DEFAULT_FFMPEG.into(),
             min_video_seconds: None,
             expert_parallel: None,
-            expert_microbatches: 1,
+            expert_microbatches: Self::DEFAULT_EXPERT_MICROBATCHES,
         }
     }
 }
@@ -304,12 +338,11 @@ impl WorkerProcessArgs {
 
     /// Builds the typed launch descriptor the worker process consumes.
     ///
-    /// Every tuning value is stated explicitly, so the launching side is the
+    /// Every launch value is stated explicitly, so the launching side is the
     /// single source of defaults and the worker never re-derives one. The keys
     /// become attributes of the namespace `WorkerProcessArgs.from_namespace`
-    /// reads, and the worker refuses a descriptor missing any key listed in
-    /// `REQUIRED_FIELDS` (`uniserve_worker.bootstrap.cli`). Only the process
-    /// identity and the descriptor's path travel on argv.
+    /// reads (`uniserve_worker.bootstrap.cli`), which needs every one of them.
+    /// Only the process identity and the descriptor's path travel on argv.
     ///
     /// `rank` must index `self.ranks`. Fails when a host-relative rank value
     /// does not fit `u32` or the component configuration does not serialize.
@@ -439,7 +472,6 @@ impl WorkerProcessArgs {
         fields.insert("load_format".into(), json!(self.load_format));
         fields.insert("download_dir".into(), json!(self.download_dir));
         fields.insert("load_threads".into(), json!(self.load_threads));
-        fields.insert("checksum_manifest".into(), json!(self.checksum_manifest));
         fields.insert("model_dtype".into(), json!(self.model_dtype.as_str()));
         fields.insert(
             "quantization_config".into(),
@@ -449,8 +481,11 @@ impl WorkerProcessArgs {
             "kv_cache_dtype".into(),
             json!(self.kv_cache_dtype.as_ref().map(|value| value.as_str())),
         );
-        fields.insert("kv_memory_fraction".into(), json!(self.kv_storage_fraction));
-        fields.insert("kv_token_capacity".into(), json!(self.kv_token_capacity));
+        fields.insert(
+            "mem_fraction_static".into(),
+            json!(self.mem_fraction_static),
+        );
+        fields.insert("max_total_tokens".into(), json!(self.max_total_tokens));
         fields.insert("attention_backend".into(), json!(self.attention_backend));
         fields.insert("block_size".into(), json!(self.block_size));
         fields.insert("max_batch_calls".into(), json!(self.max_batch_calls));

@@ -14,12 +14,44 @@ from uniserve.nn.attention.inputs import (
     VarlenInput,
     VisibleInput,
 )
-from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
 
 from . import Backend as _Backend
+from . import CachePages
 from . import Operator as _Operator
 from ._sequences import causal_runs
+
+
+def unsupported(
+    *,
+    head_dim,
+    dtype,
+    pages: CachePages | None,
+    window: int | None,
+    architecture: int | None,
+) -> str | None:
+    """Return why FlashAttention-4 cannot serve a layer, or None.
+
+    ``pages`` describes the layer's bound prefix cache, or is None for a
+    layer without one. ``architecture`` is the CUDA major compute capability
+    of the layer's device, or None off CUDA.
+    """
+    if dtype not in {torch.float16, torch.bfloat16}:
+        return "requires FP16 or BF16 computation"
+    if window is not None:
+        return "does not take history windows"
+    if pages is not None and pages.quantized:
+        return "does not consume per-block FP8 prefix scales"
+
+    # The CuTe kernels cover multiples of 8 up to 128, the dedicated 256
+    # kernel, and on SM90 the widths between.
+    if head_dim % 8 or not (
+        head_dim <= 128
+        or head_dim == 256
+        or (architecture == 9 and head_dim <= 256)
+    ):
+        return f"does not serve head dimension {head_dim} on this device"
+    return None
 
 
 def available() -> bool:
@@ -121,20 +153,18 @@ class _FlashAttentionOperator(_Operator):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         flash_attn_fwd = _flash_attn_forward()
-        if self.dtype not in {torch.float16, torch.bfloat16}:
-            raise ValueError(
-                "FlashAttention-4 requires FP16 or BF16 computation"
-            )
-        if self.window is not None:
-            raise ValueError(
-                "FlashAttention-4 attention does not take history windows"
-            )
-        if self.cache is not None and isinstance(
-            self.cache.key, QuantizedTensor
-        ):
-            raise ValueError(
-                "FlashAttention-4 does not consume per-block FP8 prefix scales"
-            )
+        device = self.workspace["lengths"].device
+        problem = unsupported(
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            pages=None if self.cache is None else CachePages.of(self.cache),
+            window=self.window,
+            architecture=torch.cuda.get_device_capability(device)[0]
+            if device.type == "cuda"
+            else None,
+        )
+        if problem is not None:
+            raise ValueError(f"FlashAttention-4 {problem}")
         # Partial channel tiles use the ordinary epilogue: the packed-GQA
         # store predicate does not match its vector fragment for these widths.
         # Grouped attention remains native, with explicit query-head traversal.

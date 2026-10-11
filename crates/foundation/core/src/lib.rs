@@ -33,10 +33,6 @@ pub use video::{
 };
 /// Multimodal generation descriptors, resource bounds, and validation.
 pub mod generation;
-/// Counter-based Philox random-number generation.
-pub mod philox;
-/// Deterministic token sampling and log-probability scoring.
-pub mod sampling;
 pub use codec::stats::ForwardStats;
 pub use events::{
     ArtifactEvent, Canvas, DiffusionRequest, DiffusionRequestError, DiffusionSamplingParams,
@@ -50,7 +46,6 @@ pub use generation::{
     ImageIngestStep, ImageInput, ImageTrigger, MultimodalInputs, ReadoutRow, ReadoutSlot,
     encoder_cache_key,
 };
-pub use sampling::{SampleOutput, score_token_logprobs, try_apply_sampling_counts};
 
 /// Thread-safe notification used to wake an engine after command enqueue.
 ///
@@ -318,8 +313,7 @@ pub struct KvCacheDtypeParseError(String);
 ///
 /// Worker-side math (temperature, top_k, top_p, min_p, typical_p, penalties,
 /// logit_bias, allowed and forced tokens) operates on the logits tensor inside
-/// the worker, and the engine simulator applies the same math through
-/// [`sampling::try_apply_sampling_counts`]. The engine scheduler enforces the
+/// the worker. The engine scheduler enforces the
 /// control-flow fields on the host: `min_tokens` and `bad_words_ids` become
 /// per-step suppression masks, and `ignore_eos` decides whether a sampled EOS
 /// finishes the request. Fields are scalars or small id/weight lists — never

@@ -3,6 +3,7 @@
 import pytest
 
 from tests.python.fixtures.hybrid import hybrid_model
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve_worker.bootstrap.cache import (
     cache_info,
     group_layers,
@@ -11,7 +12,6 @@ from uniserve_worker.bootstrap.cache import (
     table_widths,
 )
 from uniserve_worker.bootstrap.capacity import derive_runtime_kv_capacity
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.protocol.worker_info import KvGroupKind
 
 pytestmark = pytest.mark.unit
@@ -21,8 +21,8 @@ FULL = (5, 11)
 
 
 def _config(**options):
-    return WorkerConfig(
-        device="cpu", block_size=16, max_sequence_tokens=256, **options
+    return cpu_worker_config(
+        device="cpu", block_size=16, max_model_len=256, **options
     )
 
 
@@ -70,7 +70,7 @@ def test_hybrid_capacity_counts_units_of_every_group():
         pages=tuple(
             (group.page_tokens, group.units_per_page) for group in planes.groups
         ),
-        kv_token_capacity=256,
+        max_total_tokens=256,
         unit_bytes=planes.unit_bytes,
     )
     # 16 windowed pages of five units and 8 full pages of one unit.

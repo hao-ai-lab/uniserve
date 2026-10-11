@@ -33,7 +33,7 @@ def _startup(monkeypatch: pytest.MonkeyPatch, *, held: int, reserved: int):
     config = replace(
         stub_worker_config(max_batch_tokens=8),
         device="cuda:0",
-        kv_storage_fraction=FRACTION,
+        mem_fraction_static=FRACTION,
     )
     # No product is resident yet, so every product byte is still pending.
     store = TensorStore(

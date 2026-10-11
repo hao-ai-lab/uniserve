@@ -12,9 +12,9 @@ import torch
 
 from tests.python.fixtures.hybrid import hybrid_model, hybrid_pool
 from tests.python.fixtures.transport import make_transport
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.runtime import EventPool
 from uniserve_worker.bootstrap.cache import plan_cache, table_widths
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import (
     TokenBufferConfig,
@@ -39,7 +39,7 @@ CONSUMER = ((1, 2, (21, 22, 23, 24, 25), 48), (1, 0, (3, 4), 64))
 
 
 def _config(device):
-    return WorkerConfig(device=device, block_size=16, max_sequence_tokens=128)
+    return cpu_worker_config(device=device, block_size=16, max_model_len=128)
 
 
 def _install(pool, tables):

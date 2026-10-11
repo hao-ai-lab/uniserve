@@ -4,12 +4,12 @@ import pytest
 import torch
 
 from tests.python.fixtures.checkpoints import bagel_checkpoint
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.media import image
 from uniserve.runtime import PrefixCache
 from uniserve_models import bagel
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.capacity import input_buffer_config
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
 from uniserve_worker.protocol.call import (
@@ -29,12 +29,12 @@ pytestmark = pytest.mark.integration
 def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
     _, _, architecture = bagel_checkpoint(tmp_path)
     model = bagel.Model(architecture).eval()
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
         attention_backend="torch",
         model_dtype="float32",
         block_size=16,
-        max_sequence_tokens=32,
+        max_model_len=32,
         max_batch_calls=3,
         max_request_pool_size=3,
         max_batch_tokens=64,

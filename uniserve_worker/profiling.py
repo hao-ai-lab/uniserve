@@ -392,31 +392,11 @@ def _cuda_profiler_stop() -> None:
 def _profiler_table(profiler, *, prefer_cuda: bool) -> str:
     """Render the key-averages table for the summary file.
 
-    Sort keys are tried in order, CUDA totals first when ``prefer_cuda``;
-    a key that ``table`` rejects falls through to the next, and the unsorted
-    table is the last resort.
+    Operators sort by total device time when ``prefer_cuda``, by total CPU
+    time otherwise.
     """
-    sort_keys = (
-        (
-            "cuda_time_total",
-            "self_cuda_time_total",
-            "cpu_time_total",
-            "self_cpu_time_total",
-        )
-        if prefer_cuda
-        else (
-            "cpu_time_total",
-            "self_cpu_time_total",
-            "cuda_time_total",
-            "self_cuda_time_total",
-        )
-    )
-    for sort_by in sort_keys:
-        try:
-            return profiler.key_averages().table(sort_by=sort_by, row_limit=120)
-        except Exception:
-            continue
-    return profiler.key_averages().table(row_limit=120)
+    sort_by = "device_time_total" if prefer_cuda else "cpu_time_total"
+    return profiler.key_averages().table(sort_by=sort_by, row_limit=120)
 
 
 def record_component(

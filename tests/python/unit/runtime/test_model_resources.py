@@ -7,7 +7,10 @@ from dataclasses import replace
 import pytest
 import torch
 
-from tests.python.fixtures.worker_config import stub_worker_config
+from tests.python.fixtures.worker_config import (
+    cpu_worker_config,
+    stub_worker_config,
+)
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.tensors import BufferConfig
@@ -184,7 +187,7 @@ def test_worker_info_reports_capabilities_and_cache_limits():
 def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
     worker_config = replace(
         TEST_WORKER_CONFIG,
-        kv_token_capacity=1024 + 1,
+        max_total_tokens=1024 + 1,
     )
 
     layout = build_worker_layout(
@@ -250,7 +253,6 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
         lambda: replace(TEST_WORKER_CONFIG, rank=1, world_size=1),
         lambda: replace(TEST_WORKER_CONFIG, world_size=0),
         lambda: replace(TEST_WORKER_CONFIG, block_size=0),
-        lambda: replace(TEST_WORKER_CONFIG, model_dtype="bf16"),
     ],
 )
 def test_worker_worker_config_rejects_invalid_runtime_geometry(worker_config):
@@ -269,7 +271,6 @@ def test_result_publication_rejects_unrepresentable_numerical_outputs(
     from uniserve.model import TextEncoder
     from uniserve.tensors import OutputLayout
     from uniserve_worker.bootstrap.outputs import resolve_outputs
-    from uniserve_worker.config.execution import WorkerConfig
 
     class FeatureEncoder(TextEncoder):
         def output_layout(self, num_tokens, _deployment_dtype):
@@ -285,13 +286,12 @@ def test_result_publication_rejects_unrepresentable_numerical_outputs(
     model = EncodedModel()
     model.text_encoder = FeatureEncoder(model.text_encoder.network, (0,))
     with pytest.raises(ValueError, match=message):
-        resolve_outputs(model, WorkerConfig())
+        resolve_outputs(model, cpu_worker_config())
 
 
 def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     from tests.python.fixtures.encoding import Config
     from tests.python.fixtures.encoding import Model as EncodedModel
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.protocol.batch import BufferAllocation
     from uniserve_worker.protocol.identity import CallId, RequestKey
     from uniserve_worker.protocol.tensor import StaticDim, TensorRef
@@ -300,9 +300,9 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     model = EncodedModel(Config(hidden_size=7))
     # The fixture's encoder is built at the default float dtype, which is
     # what a deployment running it would declare.
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
-        max_sequence_tokens=3,
+        max_model_len=3,
         max_request_pool_size=2,
         model_dtype="float32",
     )

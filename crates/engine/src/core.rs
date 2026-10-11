@@ -80,26 +80,26 @@ pub struct WorkerConfig {
     /// Maximum number of physical runs in flight per rank, launched as
     /// `WorkerProcessArgs::queue_depth`.
     pub queue_depth: usize,
-    /// Per-rank share of device storage available to this worker process.
+    /// Per-rank share of device memory available to this worker process for
+    /// static allocations (weights and KV cache).
     ///
     /// When set, `EngineCore::new` launches the group's ranks with it as
-    /// `WorkerProcessArgs::kv_storage_fraction` instead of the engine-wide
-    /// default. Deployment files spell the field `memory_fraction`.
+    /// `WorkerProcessArgs::mem_fraction_static` instead of the engine-wide
+    /// default, which `--mem-fraction-static` sets.
     ///
     /// Distinct WorkerGroups may share one physical GPU. Their configured
     /// shares must leave enough aggregate headroom for the device runtime;
     /// validation checks each group alone, never the sum across groups, and
-    /// accepts the range [`WorkerConfig::validate_storage_fraction`] states.
+    /// accepts the range [`WorkerConfig::validate_mem_fraction_static`] states.
     #[serde(default)]
-    #[serde(rename = "memory_fraction")]
-    pub storage_fraction: Option<f64>,
+    pub mem_fraction_static: Option<f64>,
 }
 
 impl WorkerConfig {
     /// Validates one WorkerGroup in isolation.
     ///
     /// Fails when the identity is not a valid `WorkerId`, `queue_depth` is
-    /// zero, `validate_storage_fraction` refuses a set `storage_fraction`, or
+    /// zero, `validate_mem_fraction_static` refuses a set `mem_fraction_static`, or
     /// `validate_members` rejects the ranks and components.
     pub fn validate(&self) -> anyhow::Result<()> {
         WorkerId::new(self.id.0.clone())?;
@@ -108,8 +108,8 @@ impl WorkerConfig {
             "worker {} queue depth must be positive",
             self.id
         );
-        if let Some(fraction) = self.storage_fraction {
-            Self::validate_storage_fraction(fraction)
+        if let Some(fraction) = self.mem_fraction_static {
+            Self::validate_mem_fraction_static(fraction)
                 .map_err(|error| anyhow::anyhow!("worker {}: {error}", self.id))?;
         }
         Self::validate_members(&self.ranks, &self.components)?;
@@ -120,19 +120,19 @@ impl WorkerConfig {
         Ok(())
     }
 
-    /// Checks a per-process device storage fraction: a group's
-    /// `storage_fraction` or the engine-wide
-    /// `WorkerProcessArgs::kv_storage_fraction` default.
+    /// Checks a per-process static memory fraction: a group's
+    /// `mem_fraction_static` or the engine-wide
+    /// `WorkerProcessArgs::mem_fraction_static` default.
     ///
     /// Each rank grants itself this share of every device's total storage,
     /// less what its process already holds and never more than the device
     /// has free, so any finite value in (0, 1] is meaningful, 1 granting the
     /// whole device. The worker refuses any other value at startup; checking
     /// here refuses it before a rank is launched.
-    pub fn validate_storage_fraction(fraction: f64) -> anyhow::Result<()> {
+    pub fn validate_mem_fraction_static(fraction: f64) -> anyhow::Result<()> {
         anyhow::ensure!(
             fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
-            "storage fraction {fraction} must be finite and in (0, 1]"
+            "mem_fraction_static {fraction} must be finite and in (0, 1]"
         );
         Ok(())
     }
@@ -249,7 +249,7 @@ impl WorkerConfig {
     ///
     /// `components` must already be resolved for `rank_count`; this assigns
     /// rank identity and nothing else. The group is named `model` and has no
-    /// storage fraction of its own. Nothing is validated here, and an empty
+    /// `mem_fraction_static` of its own. Nothing is validated here, and an empty
     /// `hosts` yields no ranks.
     pub fn placed(
         hosts: &[String],
@@ -284,7 +284,7 @@ impl WorkerConfig {
             ranks: placement,
             components,
             queue_depth,
-            storage_fraction: None,
+            mem_fraction_static: None,
         }
     }
 
@@ -324,7 +324,7 @@ impl WorkerConfig {
                 ranks: ranks.to_vec(),
                 components: placed.components.clone(),
                 queue_depth,
-                storage_fraction: None,
+                mem_fraction_static: None,
             })
             .collect()
     }
@@ -505,7 +505,7 @@ impl EngineCore {
     ///
     /// Fails when the size is zero or does not divide the groups, when the
     /// replicas are not the same deployment on different ranks (group count,
-    /// rank counts, components, queue depth and storage fraction must match
+    /// rank counts, components, queue depth and mem_fraction_static must match
     /// position by position), when a configured edge crosses replicas or
     /// names an unconfigured worker, or for any reason `EngineCore::new`
     /// names.
@@ -530,7 +530,7 @@ impl EngineCore {
                     group.ranks.len() == first.ranks.len()
                         && group.components == first.components
                         && group.queue_depth == first.queue_depth
-                        && group.storage_fraction == first.storage_fraction,
+                        && group.mem_fraction_static == first.mem_fraction_static,
                     "data-parallel replicas must place the same groups: worker {} \
                      differs from worker {}",
                     group.id,
@@ -635,7 +635,7 @@ impl EngineCore {
             .context("max_num_seqs exceeds the worker request-pool field")?;
 
         // Each group launches from the shared defaults with its own identity,
-        // placement, components, queue depth, and storage fraction, plus its
+        // placement, components, queue depth, and mem_fraction_static, plus its
         // replica's resolved transfer edges and the components of every group
         // of its replica (`peers`), from which the group resolves the ranks,
         // possibly in other groups, that read its products.
@@ -655,9 +655,9 @@ impl EngineCore {
                     peers: peers.clone(),
                     queue_depth: worker.queue_depth,
                     max_request_pool_size,
-                    kv_storage_fraction: worker
-                        .storage_fraction
-                        .unwrap_or(config.worker_process.kv_storage_fraction),
+                    mem_fraction_static: worker
+                        .mem_fraction_static
+                        .unwrap_or(config.worker_process.mem_fraction_static),
                     transfer: transfer.clone(),
                     expert_parallel: config.expert_parallel.map(|exchange| {
                         crate::worker::ExpertParallelPlacement {
@@ -682,9 +682,9 @@ impl EngineCore {
                 peers: BTreeMap::new(),
                 queue_depth: worker.queue_depth,
                 max_request_pool_size,
-                kv_storage_fraction: worker
-                    .storage_fraction
-                    .unwrap_or(config.worker_process.kv_storage_fraction),
+                mem_fraction_static: worker
+                    .mem_fraction_static
+                    .unwrap_or(config.worker_process.mem_fraction_static),
                 transfer: transfers[0].clone(),
                 expert_parallel: config.expert_parallel.map(|exchange| {
                     crate::worker::ExpertParallelPlacement {

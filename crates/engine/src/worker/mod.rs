@@ -83,7 +83,7 @@ pub struct WorkerProcessArgs {
     /// Response IPC slot capacity in bytes.
     pub resp_slot_cap: usize,
     /// Optional KV cache capacity expressed in tokens.
-    pub kv_token_capacity: Option<u64>,
+    pub max_total_tokens: Option<u64>,
     /// Tokens per KV page of the cache group with the widest token rows;
     /// the worker derives every other group's page size from it. `None`
     /// lets the worker choose it from its cache layers and attention
@@ -110,18 +110,16 @@ pub struct WorkerProcessArgs {
     pub download_dir: Option<std::path::PathBuf>,
     /// Optional number of concurrent checkpoint reader threads.
     pub load_threads: Option<u32>,
-    /// Optional manifest of checkpoint file checksums.
-    pub checksum_manifest: Option<std::path::PathBuf>,
     /// Numeric data type used by model parameters and activations.
     pub model_dtype: uniserve_core::ModelDtype,
     /// WorkerGroup-specific quantization policy.
     pub quantization_config: serde_json::Value,
     /// Numeric data type used by the KV cache, when explicitly selected.
     pub kv_cache_dtype: Option<uniserve_core::KvCacheDtype>,
-    /// Each rank's share of its device's total storage, which bounds the
-    /// process's static allocations; `WorkerConfig::validate_storage_fraction`
-    /// states its range.
-    pub kv_storage_fraction: f64,
+    /// Each rank's share of its device's total memory, which bounds the
+    /// process's static allocations, weights and KV cache;
+    /// `WorkerConfig::validate_mem_fraction_static` states its range.
+    pub mem_fraction_static: f64,
     /// Optional device mesh specification for staged model components.
     pub mesh: Option<String>,
     /// Optional process-world communication backend.

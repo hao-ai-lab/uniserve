@@ -1,6 +1,5 @@
 """Checkpoint readers expose source values and preserve pre-encoded scales."""
 
-import hashlib
 import json
 
 import pytest
@@ -114,22 +113,15 @@ def test_modelopt_nvfp4_source_preserves_packed_values_and_scales(tmp_path):
         assert weight.input_scale() == 0.5
 
 
-def test_index_and_checksum_enforce_declared_file_set(tmp_path):
+def test_index_enforces_declared_file_set(tmp_path):
     path = tmp_path / "model.safetensors"
     save_file({"weight": torch.ones(2)}, path)
     index = tmp_path / "model.safetensors.index.json"
     index.write_text(json.dumps({"weight_map": {"weight": path.name}}))
-    manifest = tmp_path / "sha256.json"
-    manifest.write_text(
-        json.dumps({path.name: hashlib.sha256(path.read_bytes()).hexdigest()})
-    )
-    io = Config(checksum_manifest=manifest)
+    io = Config()
     source = checkpoint.Config().resolve(tmp_path, io=io)
     with source.open(io=io) as reader:
         torch.testing.assert_close(reader.get("weight").read(), torch.ones(2))
-    manifest.write_text(json.dumps({path.name: "0" * 64}))
-    with pytest.raises(ValueError, match="checksum mismatch"):
-        source.open(io=io)
     index.write_text(
         json.dumps({"weight_map": {"weight": "absent.safetensors"}})
     )

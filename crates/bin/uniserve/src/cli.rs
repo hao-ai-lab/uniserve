@@ -35,10 +35,6 @@ use uniserve_server::{
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
 
-/// Call batches kept in flight against a worker when neither the command
-/// line nor the deployment file sets its queue depth.
-const DEFAULT_QUEUE_DEPTH: usize = 2;
-
 /// Top-level parser for the `uniserve` binary.
 #[derive(Debug, Parser)]
 #[command(
@@ -166,7 +162,7 @@ pub(crate) struct SharedRuntimeArgs {
     /// Longest video duration, in seconds, a media deployment provisions and
     /// admits: a capacity within the video API's [4, 15] second range,
     /// advertised as `max_seconds`.
-    #[arg(long = "max-video-seconds", default_value_t = 15.0)]
+    #[arg(long = "max-video-seconds", default_value_t = WorkerProcessArgs::DEFAULT_MAX_VIDEO_SECONDS)]
     pub max_video_seconds: f64,
     /// Comma-separated video resolution classes (`768p`, `480p`) a video
     /// deployment prepares, each at every `--video-aspect-ratios` entry. A
@@ -229,8 +225,8 @@ pub(crate) struct SharedRuntimeArgs {
     )]
     pub mm_processor_kwargs: serde_json::Map<String, Value>,
     /// Optional explicit KV token capacity override for the worker.
-    #[arg(long = "max-total-tokens")]
-    pub kv_token_capacity: Option<u64>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_total_tokens: Option<u64>,
     /// Recompute prompt prefixes instead of reusing or retaining cached KV pages.
     #[arg(long)]
     pub disable_prefix_cache: bool,
@@ -242,7 +238,7 @@ pub(crate) struct SharedRuntimeArgs {
     pub device: String,
     /// Attention provider the Python worker uses for every call, by the
     /// name its attention registry gives it; `auto` selects per call.
-    #[arg(long, default_value = "auto")]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_ATTENTION_BACKEND)]
     pub attention_backend: String,
     /// Python interpreter used to launch the forward-only worker.
     #[arg(long, default_value_os_t = default_worker_python(), hide = true)]
@@ -281,7 +277,7 @@ pub(crate) struct SharedRuntimeArgs {
     /// power of two; every other group's page holds as many tokens as fit
     /// the same unit plane. Unset, the worker chooses the largest size, at
     /// most 64, whose pages its attention kernels read in every cache group.
-    #[arg(long = "page-size", value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: Option<u32>,
     /// This instance's host identity. Ranks are placed on it by name, and the
     /// engine owns exactly the ranks whose node matches it.
@@ -478,10 +474,12 @@ impl SharedRuntimeArgs {
         worker_process.host = self.host_identity.clone();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
-        let queue_depth = self.queue_depth.unwrap_or(DEFAULT_QUEUE_DEPTH);
+        let queue_depth = self
+            .queue_depth
+            .unwrap_or(WorkerProcessArgs::DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
         worker_process.resp_slot_cap = self.resp_slot_cap;
-        worker_process.kv_token_capacity = self.kv_token_capacity;
+        worker_process.max_total_tokens = self.max_total_tokens;
         worker_process.block_size = self.block_size;
         worker_process.attention_backend = self.attention_backend.clone();
 
@@ -577,10 +575,10 @@ impl SharedRuntimeArgs {
 #[educe(Debug)]
 pub(crate) struct WorkerProcessOptions {
     /// Independent microbatches overlapping attention and disaggregated experts.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, default_value_t = WorkerProcessArgs::DEFAULT_EXPERT_MICROBATCHES, value_parser = clap::value_parser!(u32).range(1..))]
     pub expert_microbatches: u32,
     /// Checkpoint loader format used by every model worker.
-    #[arg(long, default_value = "auto", value_parser = ["auto", "safetensors", "pt", "dummy", "layered"])]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_LOAD_FORMAT, value_parser = ["auto", "safetensors", "pt", "dummy", "layered"])]
     pub load_format: String,
     /// Hugging Face cache root for repository model paths.
     #[arg(long)]
@@ -588,10 +586,7 @@ pub(crate) struct WorkerProcessOptions {
     /// Concurrent checkpoint file readers.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub load_threads: Option<u32>,
-    /// JSON map of checkpoint-relative paths to SHA-256 checksums.
-    #[arg(long)]
-    pub checksum_manifest: Option<std::path::PathBuf>,
-    #[arg(long = "dtype", default_value = "bfloat16")]
+    #[arg(long = "dtype", default_value_t = WorkerProcessArgs::DEFAULT_MODEL_DTYPE)]
     pub model_dtype: ModelDtype,
     /// JSON quantization policy, for example {"mode":"balanced"}.
     /// An empty object selects the model-owned default.
@@ -604,16 +599,18 @@ pub(crate) struct WorkerProcessOptions {
     pub quantization_config: serde_json::Value,
     #[arg(long)]
     pub kv_cache_dtype: Option<KvCacheDtype>,
-    /// Each worker rank's share of its device's total storage, in (0, 1].
-    /// A deployment file's `memory_fraction` overrides it for one worker.
+    /// Each worker rank's share of its device's total memory for static
+    /// allocations, weights and KV cache, in (0, 1]. A deployment file's
+    /// `mem_fraction_static` overrides it for one worker.
     #[arg(
-        long = "mem-fraction-static",
-        default_value = "0.70",
-        value_parser = parse_storage_fraction
+        long,
+        default_value_t = WorkerProcessArgs::DEFAULT_MEM_FRACTION_STATIC,
+        value_parser = parse_mem_fraction_static
     )]
-    pub kv_storage_fraction: f64,
-    /// Parallelism mesh forwarded to the Python worker, e.g.
-    /// `tower=text:cuda:0;gen:cuda:1`.
+    pub mem_fraction_static: f64,
+    /// Parallelism mesh forwarded to the Python worker: `tower=gen:<device>`
+    /// places the generation tower's modules on a second device, e.g.
+    /// `tower=gen:cuda:1`.
     #[arg(long, hide = true)]
     pub worker_mesh: Option<String>,
     #[arg(long, hide = true)]
@@ -622,20 +619,20 @@ pub(crate) struct WorkerProcessOptions {
     #[arg(long = "lane")]
     pub lanes: Vec<LaneConfig>,
     /// GPU computation capture policy. Full rejects unavailable capture; off disables all graphs.
-    #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_GRAPH_POLICY, value_parser = ["off", "auto", "full"])]
     pub graph_policy: String,
     #[arg(long, hide = true)]
     pub decode_graph_batch_sizes: Option<String>,
     /// Replay a startup-captured CUDA graph for every prefill call
     /// (default). `false` runs prefill eagerly, for debugging only.
-    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
+    #[arg(long, action = ArgAction::Set, default_value_t = WorkerProcessArgs::DEFAULT_PREFILL_CUDA_GRAPH, hide = true)]
     pub prefill_cuda_graph: bool,
     #[arg(long, hide = true)]
     pub prefill_graph_token_sizes: Option<String>,
     /// Capture image denoising calls at the configured flow shapes and
     /// replay those whose exact input signature was captured (default).
     /// `false` runs image denoising eagerly, for debugging only.
-    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
+    #[arg(long, action = ArgAction::Set, default_value_t = WorkerProcessArgs::DEFAULT_FLOW_CUDA_GRAPH, hide = true)]
     pub flow_cuda_graph: bool,
     #[arg(long, hide = true)]
     pub flow_graph_batch_sizes: Option<String>,
@@ -653,15 +650,20 @@ pub(crate) struct WorkerProcessOptions {
     /// `ffmpeg` executable the media reader decodes reference videos with.
     /// The reference conditioning decodes with FFmpeg 8.1.2, whose LANCZOS
     /// scaler a reference video's pixels depend on.
-    #[arg(long, default_value = "ffmpeg", value_name = "PATH")]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_FFMPEG, value_name = "PATH")]
     pub ffmpeg: std::path::PathBuf,
-    #[arg(long, default_value_t = 512 * 1024 * 1024, hide = true)]
+    #[arg(
+        long,
+        default_value_t = WorkerProcessArgs::DEFAULT_FLASHINFER_WORKSPACE_SIZE,
+        value_parser = clap::value_parser!(u64).range(1..),
+        hide = true
+    )]
     pub flashinfer_workspace_size: u64,
     #[arg(long, hide = true)]
     pub flashinfer_use_tensor_core: Option<String>,
-    #[arg(long, default_value = "fa2", hide = true)]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_FLASHINFER_DECODE_BACKEND.as_str(), hide = true)]
     pub flashinfer_decode_backend: FlashInferBackend,
-    #[arg(long, default_value = "auto", hide = true)]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_FLASHINFER_PREFILL_BACKEND.as_str(), hide = true)]
     pub flashinfer_prefill_backend: FlashInferBackend,
     #[arg(long, hide = true)]
     pub flashinfer_decode_split_tile_size: Option<u32>,
@@ -679,11 +681,10 @@ impl WorkerProcessOptions {
             load_format: self.load_format.clone(),
             download_dir: self.download_dir.clone(),
             load_threads: self.load_threads,
-            checksum_manifest: self.checksum_manifest.clone(),
             model_dtype: self.model_dtype,
             quantization_config: self.quantization_config.clone(),
             kv_cache_dtype: self.kv_cache_dtype,
-            kv_storage_fraction: self.kv_storage_fraction,
+            mem_fraction_static: self.mem_fraction_static,
             mesh: self.worker_mesh.clone(),
             distributed_backend: self.distributed_backend.clone(),
             lanes: self.lanes.clone(),
@@ -727,13 +728,13 @@ fn parse_json_object(value: &str) -> Result<Value, String> {
     }
 }
 
-/// Parses a device storage fraction for clap, refusing a value outside the
-/// range `WorkerConfig::validate_storage_fraction` accepts.
-fn parse_storage_fraction(value: &str) -> Result<f64, String> {
+/// Parses a static memory fraction for clap, refusing a value outside the
+/// range `WorkerConfig::validate_mem_fraction_static` accepts.
+fn parse_mem_fraction_static(value: &str) -> Result<f64, String> {
     let fraction = value
         .parse::<f64>()
-        .map_err(|error| format!("invalid storage fraction {value:?}: {error}"))?;
-    WorkerConfig::validate_storage_fraction(fraction).map_err(|error| error.to_string())?;
+        .map_err(|error| format!("invalid mem_fraction_static {value:?}: {error}"))?;
+    WorkerConfig::validate_mem_fraction_static(fraction).map_err(|error| error.to_string())?;
     Ok(fraction)
 }
 
@@ -796,12 +797,12 @@ mod tests {
     }
 
     #[test]
-    fn serve_rejects_zero_page_size() {
+    fn serve_rejects_zero_block_size() {
         let result = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
             "serve",
             "model",
-            "--page-size",
+            "--block-size",
             "0",
         ]);
         assert!(result.is_err());
@@ -824,7 +825,7 @@ mod tests {
     #[test]
     fn serve_accepts_runtime_configuration() {
         let configuration = written_configuration(
-            r#"[{"id":"text","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"components":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1,"memory_fraction":0.25}]"#,
+            r#"[{"id":"text","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"components":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1,"mem_fraction_static":0.25}]"#,
         );
         let parsed = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
@@ -834,7 +835,7 @@ mod tests {
             "cpu",
             "--worker-ranks",
             "2",
-            "--page-size",
+            "--block-size",
             "128",
             "--queue-depth",
             "3",
@@ -862,14 +863,12 @@ mod tests {
             "/models/cache",
             "--load-threads",
             "4",
-            "--checksum-manifest",
-            "/models/checksums.json",
             "--graph-policy",
             "off",
             "--prefill-cuda-graph",
             "true",
             "--worker-mesh",
-            "tower=text:cpu",
+            "tower=gen:cpu",
             "--lane",
             r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]}"#,
             "--workers",
@@ -881,8 +880,7 @@ mod tests {
         let workers = args.runtime.workers.expect("the configuration was read");
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].id.0, "text");
-        // The file's `memory_fraction` key deserializes into `storage_fraction`.
-        assert_eq!(workers[0].storage_fraction, Some(0.25));
+        assert_eq!(workers[0].mem_fraction_static, Some(0.25));
         assert_eq!(workers[0].components["model"].ranks, vec![0, 1]);
         assert_eq!(
             workers[0].components["model"]
@@ -893,10 +891,10 @@ mod tests {
     }
 
     /// `--mem-fraction-static` is each rank's share of its device's total
-    /// storage, so the parser accepts exactly the finite values in (0, 1]
-    /// that the worker accepts, and refuses the rest before any rank starts.
+    /// memory, so the parser accepts exactly the finite values in (0, 1]
+    /// and refuses the rest before any rank starts.
     #[test]
-    fn serve_accepts_only_a_storage_fraction_in_the_unit_interval() {
+    fn serve_accepts_only_a_mem_fraction_static_in_the_unit_interval() {
         let serve = |fraction: &str| {
             <Cli as clap::Parser>::try_parse_from([
                 "uniserve",

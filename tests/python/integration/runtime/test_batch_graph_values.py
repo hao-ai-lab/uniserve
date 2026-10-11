@@ -6,6 +6,7 @@ import pytest
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve import loading
 from uniserve.loading import weights
 from uniserve.model import CausalLM
@@ -14,7 +15,6 @@ from uniserve_models import loading as models
 from uniserve_models.stub import image_processor as stub_image_processor
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.inputs import capability
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import TokenBufferConfig
@@ -68,7 +68,7 @@ def _text_runner(model, provider, decode_capacity=2, image_processor=None):
     captures prefill graphs for non-causal rows that replace their
     embeddings, as image feature rows do.
     """
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         model_dtype="bfloat16",
         block_size=16,
@@ -76,7 +76,7 @@ def _text_runner(model, provider, decode_capacity=2, image_processor=None):
         max_batch_calls=4,
         max_request_pool_size=4,
         max_batch_tokens=64,
-        max_sequence_tokens=64,
+        max_model_len=64,
         prefill_cuda_graph=True,
         prefill_graph_token_sizes=(16,),
         decode_graph_batch_sizes=(1, decode_capacity),
@@ -392,14 +392,14 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
         device="cuda:0",
         weights=weights.Config(dtype=torch.bfloat16),
     ).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         model_dtype="bfloat16",
         block_size=16,
         max_request_pool_size=2,
         max_batch_calls=2,
         max_batch_tokens=32,
-        max_sequence_tokens=32,
+        max_model_len=32,
         prefill_cuda_graph=True,
         prefill_graph_token_sizes=(16, 32),
         decode_graph_batch_sizes=(1, 2),
@@ -498,11 +498,11 @@ def test_loaded_worker_warmup_retires_its_request_resources(tmp_path):
     model = models.load_model(
         models.read_config(tmp_path), device="cuda:0"
     ).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         block_size=16,
-        kv_token_capacity=128,
-        max_sequence_tokens=32,
+        max_total_tokens=128,
+        max_model_len=32,
         max_batch_calls=2,
         max_batch_tokens=32,
         max_request_pool_size=2,

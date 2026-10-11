@@ -10,9 +10,9 @@ import torch
 
 from tests.python.fixtures.diffusion import LinearDenoiser, Size
 from tests.python.fixtures.encoding import Model
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.model import DenoiserInput, EntryPoint, LatentInput
 from uniserve.runtime import CUDAStream, partition_streams
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.component_binding import Call
 from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
@@ -29,7 +29,7 @@ def test_initial_inputs_are_ready_for_consumption_after_preparation(
 ):
     device = torch.device("cuda", 0)
     model = Model().to(device)
-    runner = ModelExecutor(model, WorkerConfig(device=str(device)))
+    runner = ModelExecutor(model, cpu_worker_config(device=str(device)))
     source = torch.empty(
         4 * 1024 * 1024, dtype=torch.float32, pin_memory=True
     ).fill_(7)

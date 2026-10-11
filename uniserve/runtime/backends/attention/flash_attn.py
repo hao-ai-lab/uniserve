@@ -3,14 +3,34 @@
 import torch
 
 from uniserve.nn.attention.inputs import DenseInput, PagedInput, VarlenInput
-from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
 
 from . import Backend as _Backend
+from . import CachePages
 from . import Operator as _Operator
 from ._sequences import causal_runs
 
-__all__ = ["Backend"]
+__all__ = ["Backend", "unsupported"]
+
+
+def unsupported(
+    *, head_dim, dtype, pages: CachePages | None, window: int | None
+) -> str | None:
+    """Return why the FlashAttention kernels cannot serve a layer, or None.
+
+    The FlashAttention-2 and SGL builds share these limits. ``pages``
+    describes the layer's bound prefix cache, or is None for a layer without
+    one.
+    """
+    if dtype not in {torch.float16, torch.bfloat16}:
+        return "requires FP16 or BF16 computation"
+    if head_dim > 256 or head_dim % 8:
+        return "requires a head dimension that is a multiple of 8, at most 256"
+    if window is not None:
+        return "does not take history windows"
+    if pages is not None and (pages.quantized or pages.page_tokens % 256):
+        return "requires dense 256-token cache blocks"
+    return None
 
 
 class _FlashOperator(_Operator):
@@ -31,18 +51,14 @@ class _FlashOperator(_Operator):
         self._validate_representation()
 
     def _validate_representation(self):
-        if self.dtype not in {torch.float16, torch.bfloat16}:
-            raise ValueError("FlashAttention requires FP16 or BF16 computation")
-        if self.window is not None:
-            raise ValueError("FlashAttention does not take history windows")
-        if self.cache is not None and (
-            isinstance(self.cache.key, QuantizedTensor)
-            or self.cache.block_size % 256
-        ):
-            raise ValueError(
-                "this FlashAttention kernel requires dense 256-token cache "
-                "blocks"
-            )
+        problem = unsupported(
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            pages=None if self.cache is None else CachePages.of(self.cache),
+            window=self.window,
+        )
+        if problem is not None:
+            raise ValueError(f"FlashAttention {problem}")
 
     def requires_host_lengths(self, batch):
         return (

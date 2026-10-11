@@ -119,10 +119,10 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities prepared at startup |
 | `--max-running-requests` | `128`, clamped to worker capacity | Scheduler active-request bound |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
-| `--page-size` | Chosen by the worker | Base KV page size supported by every cache group's attention readers. |
+| `--block-size` | Chosen by the worker | Tokens per KV page of the widest cache group, supported by every cache group's attention readers |
 | `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |
 | `--chunked-prefill-size` | `8192` | Per-request prefill bound |
-| `--mem-fraction-static` | `0.70` | Each rank's share of device storage |
+| `--mem-fraction-static` | `0.70` | Each rank's share of device memory for weights and KV cache |
 | `--graph-policy` | `auto` | CUDA graph policy: `auto`, `full`, or `off` |
 | `--quantization-config` | `{}`, the `quality` preset | Precision preset or per-component overrides |
 | `--attention-backend` | `auto` | Attention provider for every call: `torch`, `flash_attn`, `flash_attn_4`, `flashinfer`, `trtllm`, `sgl_kernel` or `prefix_block`; `auto` selects a native kernel per call |

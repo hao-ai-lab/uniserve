@@ -7,6 +7,7 @@ import torch
 
 from tests.python.fixtures.h3 import fasth3_config
 from tests.python.fixtures.launch import worker_args
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.media import image
 from uniserve_models.minimax_h3 import Model
 from uniserve_worker.bootstrap.inputs import media_builder
@@ -22,9 +23,9 @@ def model():
 
 
 def _config(*sizes: tuple[int, int]) -> WorkerConfig:
-    return WorkerConfig(
+    return cpu_worker_config(
         device="cpu",
-        max_sequence_tokens=1024,
+        max_model_len=1024,
         max_video_seconds=5.0,
         video_frame_sizes=sizes,
     )

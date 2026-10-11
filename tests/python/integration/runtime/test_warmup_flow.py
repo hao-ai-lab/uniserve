@@ -9,9 +9,9 @@ from __future__ import annotations
 import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.processing import FlowPrompt
 from uniserve_worker.bootstrap.warmup import _warmup_flow, _WarmupRequests
-from uniserve_worker.config.execution import WorkerConfig
 
 pytestmark = pytest.mark.integration
 
@@ -44,7 +44,7 @@ def test_guided_flow_warmup_completes_within_the_request_slots(
 ):
     worker = execution_worker(
         max_request_pool_size=request_slots,
-        execution=WorkerConfig(
+        execution=cpu_worker_config(
             graph_policy="off",
             prefill_cuda_graph=False,
             flow_graph_batch_sizes=batch_sizes,

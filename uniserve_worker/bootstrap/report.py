@@ -10,7 +10,7 @@ the allocation sizes the worker then reserves.
 Two sizing paths exist. A token worker (no ``VideoPostprocessor`` and no
 media request state) sizes paged KV, latent pages and text input staging;
 given a storage grant, its KV pool is sized from, or with a configured
-``kv_token_capacity`` checked against, the grant left after its fixed
+``max_total_tokens`` checked against, the grant left after its fixed
 allocations. A request-tensor worker (media) holds fixed per-request state
 and products and has no KV cache.
 """
@@ -282,7 +282,7 @@ def _token_worker_layout(
 ) -> WorkerLayout:
     """Size token inputs, paged KV, and latent storage before admission.
 
-    Without a configured ``kv_token_capacity``, the KV pool takes the whole
+    Without a configured ``max_total_tokens``, the KV pool takes the whole
     pages of its storage grant (``pool_storage_bytes``) left after every
     fixed allocation on the primary device: the buffer pool and its share of
     the device products, the latent pool and input staging placed there,
@@ -561,7 +561,7 @@ def _token_worker_layout(
                 request_pool_size=worker_config.max_request_pool_size,
                 width=resident_width(
                     planes,
-                    max_sequence_tokens=worker_config.max_sequence_tokens,
+                    max_sequence_tokens=worker_config.max_model_len,
                 ),
             ),
             DecodeState.buffers(
@@ -599,7 +599,7 @@ def _token_worker_layout(
         )
         capacity = derive_runtime_kv_capacity(
             pages=page_shapes,
-            kv_token_capacity=worker_config.kv_token_capacity,
+            max_total_tokens=worker_config.max_total_tokens,
             unit_bytes=unit_bytes,
             device=worker_config.device,
             available_bytes=worker_config.pool_storage_bytes,

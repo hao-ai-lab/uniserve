@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<()> {
         queue_depth: 2,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
-        kv_token_capacity: None,
+        max_total_tokens: None,
         block_size: Some(256),
         max_batch_calls: 32,
         max_batch_tokens: 8192,

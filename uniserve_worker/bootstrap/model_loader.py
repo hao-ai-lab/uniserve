@@ -54,7 +54,7 @@ from uniserve_worker.config.deployment import (
     WorkerProcessArgs,
 )
 from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.errors import unsupported_setup
 from uniserve_worker.model_executor.component_binding import (
     Call,
     ComponentBinding,
@@ -72,8 +72,7 @@ class WorkerModel:
             components have no numerical calls, it is the weight-less
             meta-device description.
         config: The execution configuration. For a checkpoint model it is
-            resolved by ``loaded_worker_config``, and a numerical worker also
-            applies the launch's ``kv_cache_dtype`` override.
+            resolved by ``loaded_worker_config``.
         tokenizer: The loaded tokenizer; ``None`` for the stub model, on a
             host worker, or for a checkpoint without one.
         image_processor: The model's image preprocessing, if any.
@@ -195,12 +194,12 @@ def _weight_config(source, options, execution) -> weights.Config:
     ``options`` is the launch's ``quantization_config``. Exactly one source
     selects the base weight configuration: ``components`` selectors passed to
     the model package's ``weight_config`` factory (with ``mode`` or
-    ``quant_method`` as its preset, ``default`` without one); a named
-    precision in ``source.precisions``; a ``quant_method`` among the generic
-    formats, applied to every module; or, with no selector, the checkpoint's
-    own weights. ``ignored_layers`` then maps each listed module path to no
-    quantization, and the dtype comes from ``execution.model_dtype``.
-    ``kv_cache_dtype`` is accepted here but applied by ``load_worker_model``.
+    ``quant_method`` as its preset, the factory's own default without one); a
+    named precision in ``source.precisions``; a ``quant_method`` among the
+    generic formats, applied to every module; or, with no selector, the
+    checkpoint's own weights. ``ignored_layers`` then maps each listed module
+    path to no quantization, and the dtype comes from
+    ``execution.model_dtype``.
 
     Raises:
         ValueError: An unknown key, both ``mode`` and ``quant_method``,
@@ -215,7 +214,6 @@ def _weight_config(source, options, execution) -> weights.Config:
         "quant_method",
         "components",
         "ignored_layers",
-        "kv_cache_dtype",
     }
     if unknown:
         raise ValueError(
@@ -252,11 +250,9 @@ def _weight_config(source, options, execution) -> weights.Config:
                 "this model exposes complete precision presets "
                 "without component selectors"
             )
-        result = factory(
-            source.model,
-            preset="default" if selected is None else selected,
-            **components,
-        )
+        # Without a selector the factory applies its own default preset.
+        preset = {} if selected is None else {"preset": selected}
+        result = factory(source.model, **preset, **components)
     elif selected is None:
         result = source.weights
     elif selected in source.precisions:
@@ -448,14 +444,6 @@ def load_worker_model(
         model, config.execution, config.ipc.queue_depth
     )
 
-    # ``kv_cache_dtype`` in the launch's quantization_config overrides the
-    # KV storage dtype; ``_weight_config`` accepts the key but ignores it.
-    override = config.model.quantization_config.get("kv_cache_dtype")
-    if override is not None:
-        if not isinstance(override, str):
-            raise invalid_descriptor("worker KV dtype is unsupported")
-        worker_config = replace(worker_config, kv_cache_dtype=override)
-
     logger.info("loaded numerical model %s", type(model).__qualname__)
     return WorkerModel(
         model,
@@ -573,7 +561,7 @@ def loaded_worker_config(
             )
         config = replace(
             config,
-            kv_token_capacity=None,
+            max_total_tokens=None,
             attention_backend=None,
             max_batch_calls=state_slots,
             max_batch_tokens=state_slots,

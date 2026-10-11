@@ -17,6 +17,7 @@ from transformers import (
     Qwen3VLVideoProcessor,
 )
 
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve import loading
 from uniserve.loading import checkpoint, weights
 from uniserve.model import VisionInput
@@ -351,7 +352,6 @@ def entry_points(config):
 
 
 def test_worker_vision_and_text_path_follows_the_reference(models):
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
 
     reference, model = models
@@ -375,7 +375,7 @@ def test_worker_vision_and_text_path_follows_the_reference(models):
             output_hidden_states=True,
         ).hidden_states[len(_RETAINED)][0]
 
-    runner = ModelExecutor(_Conditioner(model), WorkerConfig(device="cpu"))
+    runner = ModelExecutor(_Conditioner(model), cpu_worker_config(device="cpu"))
     try:
         rows = runner.encode_vision(
             VisionInput(

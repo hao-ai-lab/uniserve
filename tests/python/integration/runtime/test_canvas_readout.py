@@ -103,7 +103,7 @@ def _worker(root, queue_depth=1, **settings):
     config = replace(
         stub_worker_config(PAGE, max_batch_tokens=256),
         model_dtype="float32",
-        max_sequence_tokens=128,
+        max_model_len=128,
         **settings,
     )
     return Worker(

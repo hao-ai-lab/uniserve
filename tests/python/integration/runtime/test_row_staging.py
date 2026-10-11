@@ -18,9 +18,9 @@ import pytest
 import torch
 
 from tests.python.fixtures.hybrid import hybrid_model, hybrid_pool
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.math import ceil_div
 from uniserve.nn.attention import PagedInput
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.model_executor.attention import (
     first_page,
     from_tables,
@@ -185,7 +185,7 @@ def test_rows_stage_the_columns_their_host_layout_describes(
     device, write, causal
 ):
     model = hybrid_model()
-    config = WorkerConfig(device=device, block_size=16, max_sequence_tokens=128)
+    config = cpu_worker_config(device=device, block_size=16, max_model_len=128)
     manager = hybrid_pool(
         model, config, num_units=UNITS, request_pool_size=SLOTS
     )
