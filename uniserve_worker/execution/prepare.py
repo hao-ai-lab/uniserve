@@ -3,9 +3,9 @@
 The executor (`uniserve_worker.execution.executor`) drives a batch through
 these stages, in order:
 
-1. `validate_batch` checks batch-level bounds, routing, and call support
-   after the batch's `Start` commands and before its other commands are
-   applied.
+1. `validate_batch` checks the batch's routing, call count, forward-row
+   request slots and video admission order after the batch's `Start`
+   commands and before its other commands are applied.
 2. `prepare_batch` runs after the batch's commands are applied. It adds cache
    publications for KV installations and collects the futures
    (`BatchState.storage_dependencies`) that must resolve before this batch's
@@ -43,7 +43,6 @@ from uniserve.media import image as media_image
 from uniserve_worker.errors import (
     invalid_descriptor,
     resource_error,
-    unsupported_call,
     unsupported_setup,
 )
 from uniserve_worker.execution import calls as calls
@@ -52,9 +51,6 @@ from uniserve_worker.execution.commit import discard_batch
 from uniserve_worker.execution.host_media import (
     BORROWED_INPUT_CALLS,
     encoded_unit_positions,
-)
-from uniserve_worker.execution.media import (
-    validate_batch as validate_video_batch,
 )
 from uniserve_worker.execution.output import PendingOutput, create_outputs
 from uniserve_worker.profiling import record_component
@@ -1199,33 +1195,18 @@ def validate_batch(
     config: WorkerConfig,
     predecessors: Mapping[CallId, CallId | None],
 ) -> None:
-    """Validate batch resources, routing, and call support before staging.
+    """Validate the batch's routing and ordering before staging.
 
     Runs before the batch's `Finish` and `Free` commands are applied; `Start`
     commands are applied first so that `predecessors` covers requests the
-    batch admits. Checks that buffer allocations fit the worker buffer pool,
-    that every call targets a component placed on this rank (when the worker
-    declares components) and a supported call kind, the batch call limit,
-    the upper bound of request-slot indices, and the video preparation
-    ordering checked by `uniserve_worker.execution.media.validate_batch`.
-    Violations raise `invalid_descriptor` or `unsupported_call` errors.
+    batch admits. Checks that every call targets a component placed on this
+    rank (when the worker declares components), the batch call limit, the
+    upper bound of forward rows' request slots, and that latent preparation
+    follows its request's admission root. Buffer allocations, block tables
+    and call kinds are refused by their owners (`BufferPool.bind`,
+    `BlockTables.install` and `Worker.supports_computation`).
+    Violations raise `invalid_descriptor` errors.
     """
-    invalid_buffer = next(
-        (
-            params
-            for params in batch.buffer_allocations
-            if params.offset + params.bytes > worker_info.buffer_pool_bytes
-        ),
-        None,
-    )
-    if invalid_buffer is not None:
-        raise invalid_descriptor(
-            "batch buffer params exceeds the worker buffer pool: "
-            f"offset={invalid_buffer.offset}, bytes={invalid_buffer.bytes}, "
-            f"capacity={worker_info.buffer_pool_bytes}, "
-            f"buffer={invalid_buffer.buffer}"
-        )
-
     if worker_info.components:
         for call in batch.calls:
             entry = next(
@@ -1247,27 +1228,25 @@ def validate_batch(
             "execution batch exceeds the worker_config call limit"
         )
 
-    for call in batch.calls:
-        variant = call.kind
-        if variant not in worker_info.supported_calls:
-            raise unsupported_call(variant.value, call.request_key.request_id)
-
     if any(
         index > config.max_request_pool_size
-        for index in (
-            *(table.request_pool_idx for table in batch.block_tables),
-            *batch.request_pool_indices,
-        )
+        for index in batch.request_pool_indices
     ):
         raise invalid_descriptor(
             "execution batch exceeds request-slot capacity"
         )
 
-    validate_video_batch(
-        batch,
-        postprocessor=model_runner.video_postprocessor,
-        predecessors=predecessors,
-    )
+    # Latent preparation opens a request's trajectory, so it must be the first
+    # state-advancing call of its request: the call it follows is the
+    # admission root, not an earlier step.
+    if model_runner.video_postprocessor is not None:
+        for call in batch.calls:
+            if call.kind is MediaCall.LATENT_PREPARATION and predecessors.get(
+                call.call_id
+            ) != CallId(0, 0):
+                raise invalid_descriptor(
+                    "video preparation does not follow its request root"
+                )
 
 
 def _reserve_outputs(
