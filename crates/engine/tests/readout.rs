@@ -78,6 +78,7 @@ fn readout_request(
         constraint: GenerationConstraint::Default,
         sampling: SamplingParams::default(),
         image: ImageParams::default(),
+        max_images: 1,
         max_und_tokens: 0,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),

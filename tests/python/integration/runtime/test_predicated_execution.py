@@ -185,10 +185,8 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         ),
     )
     completion = successor_report.completions[0]
-    completion.validate()
     assert completion.status is CallStatus.PREDICATED
     descendant_completion = descendant_report.completions[0]
-    descendant_completion.validate()
     assert descendant_completion.status is CallStatus.PREDICATED
     parent_report = finalized_report(worker, parent_report)
     parent_completion = parent_report.completions[0]

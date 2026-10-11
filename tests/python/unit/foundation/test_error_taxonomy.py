@@ -33,7 +33,6 @@ def test_runtime_error_with_oom_marker_classifies_as_resource_error(message):
     err = classify(RuntimeError(message))
 
     assert err.code == ErrorCode.RESOURCE_ERROR
-    assert err.code == "resource_error"
     assert err.fatal is False
 
 
@@ -68,7 +67,6 @@ def test_generic_runtime_error_classifies_as_compute_error():
     err = classify(RuntimeError("kaboom: tensor shape mismatch in layer 3"))
 
     assert err.code == ErrorCode.COMPUTE_ERROR
-    assert err.code == "compute_error"
     assert err.fatal is False
 
 
@@ -128,7 +126,7 @@ def test_to_mapping_emits_canonical_error_context():
     snapshot = err.to_mapping()
 
     assert snapshot["kind"] == "error"
-    assert snapshot["code"] == "resource_error"
+    assert snapshot["code"] is ErrorCode.RESOURCE_ERROR
     assert snapshot["message"] == "CUDA out of memory"
     assert snapshot["fatal"] is False
     assert snapshot["phase"] == "run"

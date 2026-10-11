@@ -21,7 +21,6 @@ FLOW_PROMPT = FlowPrompt(
     user_prefix="<user>",
     user_suffix="</user>",
     assistant_suffix="<assistant>",
-    conditioned_append="<image>",
     unconditional_append="<image>",
 )
 

@@ -47,7 +47,7 @@ from uniserve.runtime.resources import close_resources
 from uniserve_worker.bootstrap.cache import (
     group_layers,
     resident_width,
-    resolve_page_size,
+    resolve_block_size,
 )
 from uniserve_worker.bootstrap.capacity import (
     check_startup_storage,
@@ -432,10 +432,10 @@ class Worker:
 
             self.attention = runner.attention
 
-            # The KV page size follows from the cache layers and the
+            # The KV block size follows from the cache layers and the
             # attention kernels that read them when the operator set none;
             # everything planned from here on uses the resolved size.
-            worker_config = resolve_page_size(
+            worker_config = resolve_block_size(
                 model,
                 worker_config,
                 runner.attention,

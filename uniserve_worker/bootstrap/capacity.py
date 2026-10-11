@@ -49,7 +49,7 @@ from uniserve.runtime.device import (
 )
 from uniserve.runtime.kv_cache import Planes
 from uniserve.tensors import BufferConfig
-from uniserve_worker.bootstrap.cache import page_size, table_widths
+from uniserve_worker.bootstrap.cache import resolved_block_size, table_widths
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import (
     capability,
@@ -490,7 +490,7 @@ def latent_pool_plan(
             raise unsupported_setup(
                 f"unsupported latent dtype {worker_config.model_dtype!r}"
             )
-        page_units = page_size(worker_config)
+        page_units = resolved_block_size(worker_config)
         units = active_latent_capacity_tokens(
             flow.max_tokens, worker_config.max_total_tokens
         )

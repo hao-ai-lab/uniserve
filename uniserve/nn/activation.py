@@ -20,13 +20,11 @@ __all__ = [
 class SiLUAndMul(nn.Module):
     """Apply SiLU gating to equal channel halves of a packed tensor.
 
-    ``rounding`` selects whether the activated gate rounds to the input dtype
+    ``rounding`` states whether the activated gate rounds to the input dtype
     before the product (see ``functional.Rounding``).
     """
 
-    def __init__(
-        self, rounding: functional.Rounding = functional.Rounding.ONCE
-    ) -> None:
+    def __init__(self, rounding: functional.Rounding) -> None:
         super().__init__()
         self.rounding = rounding
 

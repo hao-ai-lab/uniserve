@@ -7,6 +7,7 @@ from torch import nn
 
 from uniserve.model import TransformerDecoder
 from uniserve.nn.attention import Attention, AttentionBatch, RotaryQKVProjection
+from uniserve.nn.functional import Rounding
 from uniserve.nn.linear import (
     QKVParallelLinear,
     RowParallelLinear,
@@ -60,7 +61,14 @@ class TransformerLayer(nn.Module):
             self.post_attention_norms[route] = RMSNorm(
                 hidden, config.rms_norm_eps
             )
-            self.mlps[route] = GatedMLP(hidden, config.intermediate_size)
+            # The reference's eager MLP and vLLM-Omni's BAGEL (vLLM's gating
+            # kernel) both round the activated gate to the activation dtype
+            # before the product.
+            self.mlps[route] = GatedMLP(
+                hidden,
+                config.intermediate_size,
+                rounding=Rounding.STEPWISE,
+            )
         # The denoiser shares this layer with the text LM, so both address the
         # K/V cache entry named here.
         self.attention = Attention(

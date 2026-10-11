@@ -106,15 +106,21 @@ impl std::str::FromStr for LaneConfig {
     /// Parses one JSON lane descriptor, as the `--lane` option passes it.
     ///
     /// Refuses invalid JSON, a field outside the lane schema, an empty
-    /// `lane_id`, a zero `sm_budget`, and an empty domain list or one with an
-    /// unknown or repeated selector. The worker validates the remaining
-    /// constraints, such as positive batch and in-flight limits, when it
-    /// reads the lane.
+    /// `lane_id`, a zero `sm_budget`, a zero batch or in-flight limit, and an
+    /// empty domain list or one with an unknown or repeated selector. The
+    /// worker checks only what spans lanes: that lane ids are distinct and
+    /// that no call kind binds to two lanes.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let lane: Self = serde_json::from_str(value)
             .map_err(|error| format!("invalid execution lane JSON: {error}"))?;
         if lane.lane_id.is_empty()
             || lane.sm_budget == 0
+            || [
+                lane.max_batch_calls,
+                lane.max_batch_tokens,
+                lane.max_inflight,
+            ]
+            .contains(&Some(0))
             || lane.domains.is_empty()
             || lane
                 .domains
@@ -210,7 +216,8 @@ impl WorkerProcessArgs {
     pub const DEFAULT_FLASHINFER_PREFILL_BACKEND: FlashInferBackend = FlashInferBackend::Auto;
     /// The `ffmpeg` executable a media reader decodes reference videos with.
     pub const DEFAULT_FFMPEG: &'static str = "ffmpeg";
-    /// Longest admitted video duration, in seconds.
+    /// Longest video duration, in seconds, a worker sizes its resident media
+    /// state for.
     pub const DEFAULT_MAX_VIDEO_SECONDS: f64 = 15.0;
     /// Independent microbatches of attention and remote experts.
     pub const DEFAULT_EXPERT_MICROBATCHES: u32 = 1;
@@ -1552,6 +1559,20 @@ mod tests {
         for misspelled in [r#""max_batch_token":4096"#, r#""max_inflght":2"#] {
             let parsed = format!("{lane},{misspelled}}}").parse::<LaneConfig>();
             assert!(parsed.is_err(), "{misspelled} must be refused");
+        }
+    }
+
+    /// A configured batch or in-flight limit is positive: zero would leave
+    /// the lane unable to run any call.
+    #[test]
+    fn a_lane_with_a_zero_limit_is_refused() {
+        let lane = r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]"#;
+
+        for limit in ["max_batch_calls", "max_batch_tokens", "max_inflight"] {
+            let zero = format!(r#"{lane},"{limit}":0}}"#).parse::<LaneConfig>();
+            assert!(zero.is_err(), "{limit} of zero must be refused");
+            let positive = format!(r#"{lane},"{limit}":1}}"#).parse::<LaneConfig>();
+            assert!(positive.is_ok(), "{limit} of one must be accepted");
         }
     }
 

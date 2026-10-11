@@ -31,6 +31,7 @@
 //! logprob iterables). Any mismatch rejects the whole response with one
 //! generic `ValueError` that does not name the offending field.
 
+use crate::error_code::PyErrorCode;
 use std::collections::{BTreeMap, HashMap};
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
@@ -1093,10 +1094,6 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
         intern!(py, "negative_prompt"),
         image.negative_prompt.as_str(),
     )?;
-    dict.set_item(
-        intern!(py, "image_prompts"),
-        PyTuple::new(py, image.image_prompts.iter().map(|prompt| prompt.as_str()))?,
-    )?;
     construct(py, "ImageParams", &dict)
 }
 
@@ -1329,7 +1326,7 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     let identities = error_calls_from_py(dict)?;
     if !identities.is_empty()
         || opt_string(dict, intern!(py, "message"))?.is_some()
-        || opt_string(dict, intern!(py, "code"))?.is_some()
+        || !absent_or_none(dict, intern!(py, "code"))?
         || opt_bool(dict, intern!(py, "fatal"))?.is_some()
         || opt_string(dict, intern!(py, "phase"))?.is_some()
         || opt_string(dict, intern!(py, "route"))?.is_some()
@@ -1518,8 +1515,8 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
-    // Status and error code are closed string enums; an unknown spelling
-    // rejects the record.
+    // The status is a closed string enum; an unknown spelling rejects the
+    // record.
     let status = str_field(dict, intern!(py, "status"))?;
     let status = match status.to_str().ok()? {
         "ok" => CallStatus::Ok,
@@ -1971,13 +1968,10 @@ fn opt_bool(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Optio
     }
 }
 
-/// Reads a failure class by the snake_case name `ErrorCode::as_str` spells;
-/// an unknown name rejects the record.
+/// Reads a failure class, which the worker spells as the extension's
+/// `ErrorCode`; any other value rejects the record.
 fn error_code_of(value: &Bound<'_, PyAny>) -> Option<ErrorCode> {
-    let name = value.cast::<PyString>().ok()?.to_str().ok()?.to_owned();
-    ErrorCode::ALL
-        .into_iter()
-        .find(|code| code.as_str() == name)
+    value.extract::<PyErrorCode>().ok().map(ErrorCode::from)
 }
 
 /// Decodes an absent, `None`, or strict string mapping field.

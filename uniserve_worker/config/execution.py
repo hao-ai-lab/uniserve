@@ -25,7 +25,6 @@ from uniserve.runtime.backends.attention.flashinfer import (
 )
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.call import (
-    CALL_KINDS,
     CallKind,
     ForwardMode,
     MediaCall,
@@ -276,31 +275,6 @@ class LaneConfig:
     max_batch_tokens: int | None = None
     max_inflight: int | None = None
 
-    def __post_init__(self) -> None:
-        """Validate lane call kinds, the SM budget and the batch limits."""
-        if not self.lane_id or any(
-            character.isspace() for character in self.lane_id
-        ):
-            raise ValueError("lane id must be a non-empty token")
-        if int(self.sm_budget) < 1:
-            raise ValueError("lane SM budget must be positive")
-        if not self.call_kinds or len(set(self.call_kinds)) != len(
-            self.call_kinds
-        ):
-            raise ValueError("lane call kinds must be non-empty and unique")
-        if any(kind not in CALL_KINDS for kind in self.call_kinds):
-            raise ValueError("lane must bind concrete call kinds")
-        for name in (
-            "max_batch_calls",
-            "max_batch_tokens",
-            "max_inflight",
-        ):
-            value = getattr(self, name)
-            if value is not None and int(value) < 1:
-                raise ValueError(
-                    f"lane {name} must be positive when configured"
-                )
-
 
 @dataclass(frozen=True, slots=True)
 class CanvasSampling:
@@ -385,7 +359,7 @@ class WorkerConfig:
     CUDA device sets ``pool_storage_bytes`` from the device storage grant and
     may shrink the request-slot and batch bounds; and an unset
     ``block_size`` is resolved from the model's cache layers and attention
-    kernels (``bootstrap.cache.resolve_page_size``) before the unit pool is
+    kernels (``bootstrap.cache.resolve_block_size``) before the unit pool is
     planned.
 
     Graphs: ``graph_policy`` ``"off"`` disables every graph. Otherwise every
@@ -710,7 +684,9 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
 
     Each item is one JSON object string whose ``domains`` list names selectors
     from ``LANE_COMPUTATION_GROUPS``; the selectors expand to concrete call
-    kinds.
+    kinds. The engine's launch option has already refused empty ids, zero
+    budgets and limits, and unknown or repeated selectors; this checks what
+    spans lanes.
 
     Raises:
         ValueError: If a descriptor is malformed, a lane id repeats, or a call
@@ -756,8 +732,8 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
 
         result.append(
             LaneConfig(
-                lane_id=str(data.get("lane_id", "")),
-                sm_budget=int(data.get("sm_budget", 0)),
+                lane_id=str(data["lane_id"]),
+                sm_budget=int(data["sm_budget"]),
                 call_kinds=tuple(
                     kind
                     for name in domains

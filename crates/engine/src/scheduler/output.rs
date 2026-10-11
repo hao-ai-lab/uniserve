@@ -306,7 +306,7 @@ impl Scheduler {
                 (
                     st.can_open_gen_branch(),
                     st.num_generated_images,
-                    st.req.image.max_images as usize,
+                    st.req.max_images as usize,
                 )
             };
             // A direct trigger token opens the image branch without being
@@ -473,7 +473,7 @@ impl Scheduler {
                         let (can_open_gen_branch, images_done, max_images) = (
                             st.can_open_gen_branch(),
                             st.num_generated_images,
-                            st.req.image.max_images as usize,
+                            st.req.max_images as usize,
                         );
 
                         let direct_trigger = self
@@ -610,7 +610,7 @@ impl Scheduler {
                     return;
                 };
                 let (images_done, max_images) =
-                    (st.num_generated_images, st.req.image.max_images as usize);
+                    (st.num_generated_images, st.req.max_images as usize);
 
                 // A direct trigger token opens the image branch without being
                 // published as text.

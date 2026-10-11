@@ -125,18 +125,6 @@ class Communicator:
             )
         return communication.start_all_gather(output, value, self._require())
 
-    def start_all_to_all(
-        self, output: torch.Tensor, value: torch.Tensor
-    ) -> communication.Transfer:
-        """Publish equal backend-ordered peer payloads of ``value``.
-
-        Leading-axis partitions follow :attr:`backend_order`; read ``output``
-        after the returned transfer's ``wait``.
-        """
-        if output.shape != value.shape:
-            raise ValueError("exchange output must match the input payloads")
-        return communication.start_all_to_all(output, value, self._require())
-
     def all_reduce(
         self,
         value: torch.Tensor,

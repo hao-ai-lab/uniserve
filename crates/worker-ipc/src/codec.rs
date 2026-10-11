@@ -1300,11 +1300,6 @@ fn image_from_table(image: fbs::ImageParams<'_>) -> CodecResult<uniserve_core::I
             .negative_prompt()
             .map(str::to_string)
             .unwrap_or_default(),
-        max_images: 1,
-        image_prompts: image
-            .image_prompts()
-            .map(|items| items.iter().map(str::to_string).collect())
-            .unwrap_or_default(),
     })
 }
 

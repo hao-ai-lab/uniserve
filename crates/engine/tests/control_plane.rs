@@ -232,6 +232,7 @@ fn generation_request(
         constraint,
         sampling,
         image,
+        max_images: 1,
         max_und_tokens,
         include_stop_token: false,
         stop_strings: Vec::new(),
@@ -1986,14 +1987,13 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
 
-        let req = with_trigger(
+        let mut req = with_trigger(
             generation_request(
                 RequestId(1),
                 text_input(vec![1, 2, 3]),
                 SamplingParams::default(),
                 ImageParams {
                     steps: 3,
-                    max_images: 4,
                     ..Default::default()
                 },
                 GenerationConstraint::Default,
@@ -2001,6 +2001,7 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
             ),
             ImageTrigger::Token { token_id: 1008 },
         );
+        req.max_images = 4;
         let mut erx = handle.submit(req).unwrap();
 
         let mut signature: Vec<(char, u32)> = Vec::new();
@@ -2078,7 +2079,6 @@ fn interleave_c4_generated_images_complete() {
                 SamplingParams::default(),
                 ImageParams {
                     steps: 2,
-                    max_images: 1,
                     ..Default::default()
                 },
                 GenerationConstraint::Default,
@@ -2155,7 +2155,6 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
             },
             ImageParams {
                 steps: 2,
-                max_images: 1,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2214,14 +2213,13 @@ fn gen_branch_waits_for_model_image_starts() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
-        let request = with_trigger(
+        let mut request = with_trigger(
             generation_request(
                 RequestId(1),
                 text_input(vec![1, 2, 3]),
                 SamplingParams::default(),
                 ImageParams {
                     steps: 3,
-                    max_images: 3,
                     ..Default::default()
                 },
                 GenerationConstraint::Default,
@@ -2229,6 +2227,7 @@ fn gen_branch_waits_for_model_image_starts() {
             ),
             ImageTrigger::Token { token_id: 2222 },
         );
+        request.max_images = 3;
         let mut events = handle.submit(request).unwrap();
         let mut tokens = Vec::new();
         let mut images = 0;
@@ -2278,7 +2277,6 @@ fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
         },
         ImageParams {
             steps: 2,
-            max_images: 1,
             ..ImageParams::default()
         },
         GenerationConstraint::GenOnly,
@@ -2327,7 +2325,6 @@ fn und_only_round_close_trigger_cannot_open_gen() {
             SamplingParams::default(),
             ImageParams {
                 steps: 2,
-                max_images: 1,
                 ..ImageParams::default()
             },
             GenerationConstraint::UndOnly,
@@ -2376,7 +2373,7 @@ fn gen_branch_model_image_starts_spend_budget() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let req = with_trigger(
+    let mut req = with_trigger(
         generation_request(
             RequestId(1),
             text_input(vec![1, 2, 3]),
@@ -2386,7 +2383,6 @@ fn gen_branch_model_image_starts_spend_budget() {
             },
             ImageParams {
                 steps: 3,
-                max_images: 4,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2394,6 +2390,7 @@ fn gen_branch_model_image_starts_spend_budget() {
         ),
         ImageTrigger::Token { token_id: 2222 },
     );
+    req.max_images = 4;
     let mut erx = handle.submit(req).unwrap();
 
     let mut seq = Vec::new();
@@ -2454,7 +2451,6 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
         SamplingParams::default(),
         ImageParams {
             steps: 3,
-            max_images: 1,
             ..Default::default()
         },
         GenerationConstraint::Default,
@@ -2509,7 +2505,6 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
             },
             ImageParams {
                 steps: 3,
-                max_images: 3,
                 ..Default::default()
             },
             GenerationConstraint::GenOnly,
@@ -2517,6 +2512,7 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
         ),
         ImageTrigger::Token { token_id: 2222 },
     );
+    req.max_images = 3;
     req.image_generation.requires_text_for_image = true;
 
     let mut erx = handle.submit(req).unwrap();
@@ -2576,14 +2572,13 @@ fn gen_branch_literal_trigger_starts_images() {
     // Request 1 emits 1007, 1008, 1009, ... so the suffix [1008, 1009] matches
     // on its third token. Once the generated image is fed back into context,
     // the simulator restarts its sequence from 1007 and the suffix recurs.
-    let req = with_trigger(
+    let mut req = with_trigger(
         generation_request(
             RequestId(1),
             text_input(vec![1, 2, 3]),
             SamplingParams::default(),
             ImageParams {
                 steps: 3,
-                max_images: 2,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2593,6 +2588,7 @@ fn gen_branch_literal_trigger_starts_images() {
             token_ids: vec![1008, 1009],
         },
     );
+    req.max_images = 2;
     let mut erx = handle.submit(req).unwrap();
 
     let mut seq: Vec<char> = Vec::new();
@@ -2653,7 +2649,6 @@ fn image_start_logit_bias_steers_gen_branch() {
                 },
                 ImageParams {
                     steps: 3,
-                    max_images: 1,
                     ..Default::default()
                 },
                 GenerationConstraint::Default,
@@ -2716,7 +2711,6 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
             SamplingParams::default(),
             ImageParams {
                 steps: 3,
-                max_images: 1,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2772,7 +2766,6 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
             SamplingParams::default(),
             ImageParams {
                 steps: 2,
-                max_images: 1,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2827,7 +2820,7 @@ fn image_budget_suppresses_biased_image_start() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let req = with_trigger(
+    let mut req = with_trigger(
         generation_request(
             RequestId(1),
             text_input(vec![1, 2, 3]),
@@ -2837,7 +2830,6 @@ fn image_budget_suppresses_biased_image_start() {
             },
             ImageParams {
                 steps: 3,
-                max_images: 2,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2845,6 +2837,7 @@ fn image_budget_suppresses_biased_image_start() {
         ),
         ImageTrigger::Token { token_id: 2222 },
     );
+    req.max_images = 2;
     let mut erx = handle.submit(req).unwrap();
 
     let mut images = 0usize;
@@ -2910,7 +2903,6 @@ fn kv_resources_return_after_completion() {
             SamplingParams::default(),
             ImageParams {
                 steps: 4,
-                max_images: 1,
                 ..Default::default()
             },
             *mode,

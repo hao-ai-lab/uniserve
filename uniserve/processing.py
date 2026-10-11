@@ -394,32 +394,24 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FlowPrompt:
-    """Immutable caller-owned framing for one classifier-free-guidance prefix."""  # noqa: E501
+    """Immutable caller-owned framing of the unconditional guidance prefix."""
 
     user_prefix: str
     user_suffix: str
     assistant_suffix: str
-    conditioned_append: str
     unconditional_append: str
     system_prefix: str = ""
     system_message: str = ""
     system_suffix: str = ""
     add_special_tokens: bool = True
 
-    def encode(
-        self, tokenizer: Any, *, text: str, conditioned: bool
-    ) -> tuple[int, ...]:
-        """Frame and tokenize either the conditioned or unconditional diffusion prompt."""  # noqa: E501
+    def encode(self, tokenizer: Any, *, text: str) -> tuple[int, ...]:
+        """Frame and tokenize the unconditional diffusion prompt."""
         if tokenizer is None:
             raise ValueError(
                 "the configured generation prompt requires a tokenizer"
             )
 
-        append = (
-            self.conditioned_append
-            if conditioned
-            else self.unconditional_append
-        )
         framed = (
             self.system_prefix
             + self.system_message
@@ -428,7 +420,7 @@ class FlowPrompt:
             + text
             + self.user_suffix
             + self.assistant_suffix
-            + append
+            + self.unconditional_append
         )
         return tuple(
             int(value)

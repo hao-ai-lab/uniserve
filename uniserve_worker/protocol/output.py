@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-from uniserve_worker.errors import ErrorCode, invalid_descriptor
+from uniserve_worker.errors import ErrorCode
 from uniserve_worker.protocol import identity, transfer
 from uniserve_worker.protocol.batch import TensorPublication
 from uniserve_worker.protocol.call import CallStatus
@@ -58,13 +58,6 @@ class PosixShmArtifact:
 
     name: str
 
-    def __post_init__(self) -> None:
-        """Require a non-empty object name without a path separator."""
-        if not self.name or "/" in self.name:
-            raise invalid_descriptor(
-                "POSIX shared-storage artifact name is invalid"
-            )
-
     def to_mapping(self) -> dict[str, object]:
         """Serialize the shared-storage handle as a tagged transport value."""
         return {"transport": "posix_shm", "value": {"name": self.name}}
@@ -77,11 +70,6 @@ class MediaOutput:
     handle: PosixShmArtifact
     bytes: int
 
-    def __post_init__(self) -> None:
-        """Require a positive byte length."""
-        if self.bytes < 1:
-            raise invalid_descriptor("media output locator is invalid")
-
     def to_mapping(self) -> dict[str, object]:
         """Serialize a completed media artifact for IPC."""
         return {"handle": self.handle.to_mapping(), "bytes": self.bytes}
@@ -93,7 +81,8 @@ class RequestOutput:
 
     A successful call reports the request's coordinates after it ran; a
     predicated call did not run and reports the request's accepted
-    coordinates.
+    coordinates. The record is built to satisfy the wire's completion rules,
+    which the engine-side decoder checks once, with the call that answered.
     """
 
     request_key: identity.RequestKey
@@ -127,83 +116,6 @@ class RequestOutput:
     # Why the worker refused the request; set exactly when error_code is
     # INVALID_REQUEST.
     error_message: str | None = None
-
-    def validate(self) -> None:
-        """Check that identity, status, coordinates, and outputs agree.
-
-        `PendingOutput.materialize` in `uniserve_worker.execution.output`
-        calls this on every completion it builds.
-
-        Raises:
-            WorkerError: The call id is not positive; a KV publication is
-                attached to anything but a successful completion of its own
-                call; the visible KV extent exceeds the computed one; a
-                coordinate is negative; the error code does not match the
-                status; a refused request's completion states no reason, or
-                another completion does; a completion other than a successful
-                one carries candidate log-probabilities; or a predicated
-                completion carries tokens, logprobs, or finish flags.
-        """
-        if self.call_id.batch_id < 1:
-            raise invalid_descriptor("completion call id must be positive")
-
-        if self.candidate_logprobs and self.status is not CallStatus.OK:
-            raise invalid_descriptor(
-                "candidate log-probabilities belong to a successful completion"
-            )
-
-        if self.kv_output is not None and (
-            self.status is not CallStatus.OK
-            or self.kv_output.source.owner != self.request_key
-            or self.kv_output.source.producer_call_id != self.call_id
-        ):
-            raise invalid_descriptor(
-                "KV publication does not belong to its successful completion"
-            )
-
-        if self.kv_visible_len > self.kv_computed_len:
-            raise invalid_descriptor(
-                "completion selected KV length exceeds computed length"
-            )
-        if (
-            min(
-                self.kv_visible_len,
-                self.kv_computed_len,
-                self.num_completed_steps,
-            )
-            < 0
-        ):
-            raise invalid_descriptor(
-                "completion execution coordinates must be non-negative"
-            )
-        if self.status is CallStatus.ERROR:
-            if self.error_code is None:
-                raise invalid_descriptor(
-                    "an error completion must carry an error code"
-                )
-        elif self.error_code is not None:
-            raise invalid_descriptor(
-                "a non-error completion must not carry an error code"
-            )
-        if (self.error_message is not None) != (
-            self.error_code is ErrorCode.INVALID_REQUEST
-        ):
-            raise invalid_descriptor(
-                "a refused request's completion, and only one, states why"
-            )
-        if self.status is CallStatus.PREDICATED and (
-            self.committed_tokens
-            or self.sampled_logprob is not None
-            or self.top_logprobs
-            or self.prompt_logprobs
-            or self.finish_flags.eos
-            or self.finish_flags.length
-            or self.finish_flags.stop
-        ):
-            raise invalid_descriptor(
-                "a predicated completion must select its parent without "
-                "semantic output"
-            )
 
     def to_mapping(self) -> dict[str, object]:
         """Encode the completion into the wire mapping the transport decodes.
@@ -251,7 +163,7 @@ class RequestOutput:
             "kv_output": None
             if self.kv_output is None
             else self.kv_output.to_mapping(),
-            "error_code": None if error_code is None else error_code.value,
+            "error_code": error_code,
             "error_message": self.error_message,
             "timing_counters": {
                 "queued_us": timing.queued_us,

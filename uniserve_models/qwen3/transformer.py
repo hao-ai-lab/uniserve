@@ -17,7 +17,7 @@ from uniserve.nn.attention import (
     AttentionBatch,
     RotaryQKVProjection,
 )
-from uniserve.nn.functional import add_rms_norm
+from uniserve.nn.functional import Rounding, add_rms_norm
 from uniserve.nn.linear import (
     Linear,
     QKVParallelLinear,
@@ -146,6 +146,12 @@ class TransformerLayer(nn.Module):
                 config.hidden_size,
                 config.intermediate_size,
                 activation=config.hidden_act,
+                # SGLang's fused kernel evaluates SiLU gating in FP32 and
+                # rounds once, as this layer's fused residual normalization
+                # does; vLLM's kernel and Transformers' module round per
+                # operation. The references disagree, so the recipe is the
+                # fused one this model's other kernels share.
+                rounding=Rounding.ONCE if config.hidden_act == "silu" else None,
             )
         )
 

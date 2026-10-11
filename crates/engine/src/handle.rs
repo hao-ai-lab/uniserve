@@ -553,6 +553,7 @@ mod tests {
             constraint,
             sampling: SamplingParams::default(),
             image: ImageParams::default(),
+            max_images: 1,
             max_und_tokens: 32,
             include_stop_token: false,
             stop_strings: Vec::new(),

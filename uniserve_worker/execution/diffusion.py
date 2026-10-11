@@ -436,9 +436,6 @@ def prepare_step(
             kv.prefixes[source] = resolve_prefix(
                 model_runner.flow_prompt,
                 source,
-                image_prompt=image.image_prompts[0]
-                if image.image_prompts
-                else "",
                 negative_prompt=image.negative_prompt,
                 negative_token_ids=request.request.negative_token_ids,
                 tokenizer=tokenizer,
@@ -447,8 +444,8 @@ def prepare_step(
         descriptor = denoise_descriptors[branch_index]
 
         # ``resolve_prefix`` sets ``copy_conditioning`` for the conditioning
-        # source when the image prompt is blank; the branch then reads the
-        # request's own conditioning KV in place.
+        # source; the branch then reads the request's own conditioning KV in
+        # place.
         if copy_conditioning:
             entry = kv.cache
         else:

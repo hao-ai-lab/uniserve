@@ -245,11 +245,11 @@ def test_text_fp8_swiglu_matches_unfused_boundary() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    expected_activated = silu_and_mul(gate_up)
+    expected_activated = silu_and_mul(gate_up, rounding=Rounding.ONCE)
     encoded = Quantizer("fp8", axis=0).quantize(
         torch.zeros_like(expected_activated)
     )
-    silu_and_mul(gate_up, out=encoded)
+    silu_and_mul(gate_up, out=encoded, rounding=Rounding.ONCE)
     buffers = encoded.buffers()
     actual_activated_fp8, actual_activated_scale = (
         buffers["values"],
@@ -298,7 +298,7 @@ def test_text_fp8_swiglu_kernel_matches_reference(rows) -> None:
 
     # Inference mode admits the fused kernel; the first and last rows bound
     # every row offset the launch computes.
-    silu_and_mul(gate_up, out=encoded)
+    silu_and_mul(gate_up, out=encoded, rounding=Rounding.ONCE)
     buffers = encoded.buffers()
     for checked in (slice(0, 8), slice(rows - 8, rows)):
         gate, value = gate_up[checked].double().chunk(2, dim=-1)
@@ -426,7 +426,9 @@ def test_stepwise_swiglu_rounds_the_activated_gate(device) -> None:
     gate = torch.randn(32, 2048, device=device).to(torch.bfloat16)
     value = torch.randn(32, 2048, device=device).to(torch.bfloat16)
 
-    activated = silu_and_mul(torch.cat((gate, torch.ones_like(value)), -1))
+    activated = silu_and_mul(
+        torch.cat((gate, torch.ones_like(value)), -1), rounding=Rounding.ONCE
+    )
     actual = silu_and_mul(
         torch.cat((gate, value), -1), rounding=Rounding.STEPWISE
     )

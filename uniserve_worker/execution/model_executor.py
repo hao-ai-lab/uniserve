@@ -2203,7 +2203,7 @@ class ModelExecutor:
         if aborted:
             from uniserve.runtime.resources import retain_until_exit
 
-            # Each stream owner retains its communicators, windows and native
+            # Each stream owner retains its communicators and native
             # stream without waiting for peers or the device.
             retain_until_exit(self)
             close_resources(

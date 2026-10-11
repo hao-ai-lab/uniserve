@@ -119,7 +119,6 @@ table ImageParams {
   width:uint;
   seed:ulong = null;
   negative_prompt:string;
-  image_prompts:[string];
 }
 
 /// One cache group of a worker's unit pool, decoded into

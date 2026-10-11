@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve.nn.functional import gelu_and_mul, silu_and_mul
+from uniserve.nn.functional import Rounding, gelu_and_mul, silu_and_mul
 from uniserve.quantization import Quantizer
 
 pytestmark = pytest.mark.unit
@@ -22,7 +22,9 @@ _TOLERANCES = {
 
 def _gate(activation):
     if activation == "silu":
-        return lambda x, **options: silu_and_mul(x, **options)
+        return lambda x, **options: silu_and_mul(
+            x, **options, rounding=Rounding.ONCE
+        )
     return lambda x, **options: gelu_and_mul(
         x,
         approximate="tanh" if activation == "gelu_tanh" else "none",

@@ -39,6 +39,7 @@ fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<
         constraint,
         sampling: SamplingParams::default(),
         image: ImageParams::default(),
+        max_images: 1,
         max_und_tokens: 16,
         include_stop_token: false,
         stop_strings: Vec::new(),
