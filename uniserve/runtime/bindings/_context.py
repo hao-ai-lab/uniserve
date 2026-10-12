@@ -137,7 +137,7 @@ class _ContextPlan:
             # The gather writes each owner's window in topology order, and
             # within a window the Ulysses members' tokens follow their own
             # order, so the map is built by walking owners then head fibers.
-            members = self.parallel.key_group.ranks
+            members = self.parallel.context_group.ranks
             owner_capacity = self.keys.capacity * layer.exchange.group.size
             # Walk owners in topology order, pairing each physical slot with
             # the logical token index it carries.
@@ -331,13 +331,13 @@ class _ContextPlan:
 
         if (
             isinstance(batch, (PagedInput, SegmentedInput))
-            and batch.write_indices is not None
+            and batch.slot_mapping is not None
         ):
             if self.cache is None:
                 raise RuntimeError(
                     "context cache writes require bound prefix state"
                 )
-            self.cache.update(k, v, indices=batch.write_indices)
+            self.cache.update(k, v, slot_mapping=batch.slot_mapping)
 
         if isinstance(batch, SegmentedInput):
             if self.cache is None:

@@ -4,7 +4,7 @@ The transport package moves a rank's published products (tensors) to the
 ranks that read them. Each backend is one physical mechanism:
 
 - `local`: a publication read within the producer's own address space.
-- `shm`: host bytes in a POSIX shared-memory segment, for readers on the
+- `posix_shm`: host bytes in a POSIX shared-memory segment, for readers on the
   producer's host.
 - `cuda_vmm`: device storage exported as a CUDA VMM shareable handle, either
   where it lies or copied into the device's pool.
@@ -81,7 +81,7 @@ def make_transports(
     endpoint = source or WorkerEndpoint.local()
     constructors: Mapping[str, Callable[..., Transport]] = {
         "local": LocalTransport,
-        "shm": ShmTransport,
+        "posix_shm": ShmTransport,
         "cuda_vmm": CudaVmmTransport,
         "channel": ChannelTransport,
     }
@@ -96,7 +96,7 @@ def make_transports(
             if name == "cuda_vmm":
                 arguments["acknowledgment_slot"] = acknowledgment_slot
                 arguments["cross_host_consumers"] = cross_host_consumers
-            if name == "shm":
+            if name == "posix_shm":
                 arguments["acknowledgment_slot"] = acknowledgment_slot
                 arguments["host_slots"] = host_slots
             if name == "channel":

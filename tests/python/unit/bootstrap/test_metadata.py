@@ -11,6 +11,7 @@ import torch
 from safetensors.torch import save_file
 
 from tests.python.fixtures.model_metadata import neo_metadata
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.loading import Config as IOConfig
 from uniserve_models import bagel
 from uniserve_worker.protocol.worker_info import KvGroupKind
@@ -58,12 +59,18 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
     path = tmp_path / "ema.safetensors"
     save_file({"latent_pos_embed.pos_embed": torch.zeros(9, 16)}, path)
 
-    raw = {
-        **(towers if inline else {}),
-        "start_of_image_id": 62,
-        "end_of_image_id": 63,
-    }
+    raw = towers if inline else {}
     (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "added_tokens": [
+                    {"id": 62, "content": "<|vision_start|>"},
+                    {"id": 63, "content": "<|vision_end|>"},
+                ]
+            }
+        )
+    )
     config = _bagel_config(tmp_path)
 
     assert config.text.hidden_size == 16
@@ -74,6 +81,7 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
     assert config.vae.latent_channels == 4
     assert config.vae.downsample * config.latent_patch_size == 4
     assert config.max_latent_size == 3
+    assert (config.start_of_image_id, config.end_of_image_id) == (62, 63)
 
     # Released checkpoints may serialize a constructor default; actual learned
     # positions determine both numerical packing and allocation bounds.
@@ -102,19 +110,18 @@ def test_h3_worker_advertises_bounded_media_products():
         supported_calls,
     )
     from uniserve_worker.bootstrap.outputs import resolve_outputs
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.protocol.call import MediaCall, TransferMode
 
     with torch.device("meta"):
         model = Model(fasth3_config())
     # The deployment serves 768p 16:9 and 9:16.
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
-        max_sequence_tokens=65,
+        max_model_len=65,
         max_video_seconds=1.0,
         max_request_pool_size=2,
-        min_request_pool_size=2,
-        video_frame_sizes=((768, 1344), (1344, 768)),
+        video_resolutions=("768p",),
+        video_aspect_ratios=("16:9", "9:16"),
     )
     outputs = resolve_outputs(model, config)
     assert set(supported_calls(model)) == {
@@ -137,8 +144,8 @@ def test_h3_worker_advertises_bounded_media_products():
         MediaCall.VISION_ENCODING: "text_encoder",
         MediaCall.LATENT_ENCODING: "latent_encoder",
         MediaCall.TEXT_ENCODING: "text_encoder",
-        MediaCall.LATENT_PREPARATION: "denoiser",
-        MediaCall.DENOISING: "denoiser",
+        MediaCall.LATENT_PREPARATION: "transformer",
+        MediaCall.DENOISING: "transformer",
         MediaCall.VIDEO_DECODING: "video_decoder",
         MediaCall.AUDIO_DECODING: "audio_decoder",
         # The host components own no numerical method: the media reader
@@ -224,23 +231,22 @@ def test_h3_worker_advertises_bounded_media_products():
     from uniserve_worker.bootstrap.report import build_worker_layout
 
     info = build_worker_layout(model, config, queue_depth=6).info
-    assert info.num_inference_steps == 4
+    assert info.video_denoiser.schedule_points == 5
     assert info.request_slots == 2
     assert info.kv_cache is None
     assert info.max_batch_calls == 2
 
 
-def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes(tmp_path):
+def test_sensenova_reader_resolves_aliases(tmp_path):
     from uniserve_models.sensenova_u1 import read_config
 
+    # A checkpoint may carry window fields with windowing disabled.
     raw = neo_metadata()
     raw["llm_config"].update(
         use_sliding_window=False, sliding_window=64, max_window_layers=1
     )
     (tmp_path / "config.json").write_text(json.dumps(raw))
     config = read_config(tmp_path, IOConfig(), sources={})
-    assert config.text.layer_types == ("full_attention",) * 3
-    assert config.text.sliding_window == 64
     assert config.text.pad_token_id == 3
     assert config.vision.output_size == 16
     assert config.vision.downsample_ratio == 0.5
@@ -257,9 +263,18 @@ def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes(tmp_path):
             {"rope_theta": 20000.0},
             "conflicting aliases for rope_theta",
         ),
-        ("layer_types", ["full_attention"], "every decoder layer"),
+        (
+            "layer_types",
+            ["full_attention", "sliding_attention", "full_attention"],
+            "sliding-window attention is not supported",
+        ),
         ("num_key_value_heads", 3, "divisible by KV heads"),
         ("num_experts", 8, "sparse MoE is not supported"),
+        (
+            "rope_scaling",
+            {"rope_type": "yarn", "factor": 2.0},
+            "default rotary recipe",
+        ),
     ],
 )
 def test_sensenova_reader_rejects_inconsistent_checkpoint_math(
@@ -274,6 +289,16 @@ def test_sensenova_reader_rejects_inconsistent_checkpoint_math(
         read_config(tmp_path, IOConfig(), sources={})
 
 
+def test_sensenova_reader_requires_the_image_sequence_limit(tmp_path):
+    from uniserve_models.sensenova_u1 import read_config
+
+    raw = neo_metadata()
+    del raw["max_image_seq_len"]
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="max_image_seq_len"):
+        read_config(tmp_path, IOConfig(), sources={})
+
+
 def test_sensenova_direct_config_rejects_mismatched_vision_features(tmp_path):
     from dataclasses import replace
 
@@ -285,7 +310,7 @@ def test_sensenova_direct_config_rejects_mismatched_vision_features(tmp_path):
         replace(config, vision=replace(config.vision, output_size=32))
 
 
-def test_sensenova_reader_rejects_unimplemented_sliding_attention(tmp_path):
+def test_sensenova_reader_rejects_sliding_window_attention(tmp_path):
     from uniserve_models.sensenova_u1 import read_config
 
     raw = neo_metadata()
@@ -293,7 +318,9 @@ def test_sensenova_reader_rejects_unimplemented_sliding_attention(tmp_path):
         use_sliding_window=True, sliding_window=64, max_window_layers=1
     )
     (tmp_path / "config.json").write_text(json.dumps(raw))
-    with pytest.raises(ValueError, match="sliding_attention is not supported"):
+    with pytest.raises(
+        ValueError, match="sliding-window attention is not supported"
+    ):
         read_config(tmp_path, IOConfig(), sources={})
 
 
@@ -301,7 +328,6 @@ def test_sensenova_reader_rejects_unimplemented_sliding_attention(tmp_path):
 def test_text_worker_reports_exact_cache_capacity(storage):
     from uniserve_models.qwen3 import Config, Model
     from uniserve_worker.bootstrap.report import build_worker_layout
-    from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
         model = Model(
@@ -328,12 +354,12 @@ def test_text_worker_reports_exact_cache_capacity(storage):
                 mlp_only_layers=(),
             )
         ).to(dtype=torch.bfloat16)
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
         block_size=64,
-        kv_token_capacity=256,
+        max_total_tokens=256,
         kv_cache_dtype=storage,
-        max_sequence_tokens=128,
+        max_model_len=128,
     )
     info = build_worker_layout(model, config).info
     cache = info.kv_cache
@@ -342,18 +368,12 @@ def test_text_worker_reports_exact_cache_capacity(storage):
     assert cache.num_units == 4
     (group,) = cache.groups
     assert group.kind is KvGroupKind.FULL
-    assert (group.page_tokens, group.units_per_page) == (64, 1)
+    assert (group.block_size, group.units_per_page) == (64, 1)
     assert group.layer_ids == (0, 1)
     assert group.total_kv_heads == group.num_kv_heads == 2
     assert group.kv_head_offset == 0
     assert group.head_dim == 8
     assert cache.dtype == storage
-    # A unit holds both fields of both layers for a page, with one
-    # initialization flag and, for FP8, one scale per layer and field.
-    payload = 2 * 2 * 2 * 8 * (1 if storage == "float8_e4m3fn" else 2) * 64
-    scales = 2 * 2 * 4 if storage == "float8_e4m3fn" else 0
-    initialization = 2 * 2
-    assert cache.unit_bytes == payload + scales + initialization
 
 
 def test_h3_media_units_follow_each_request_canvas():
@@ -373,22 +393,24 @@ def test_h3_media_units_follow_each_request_canvas():
         ComponentConfig,
         ParallelConfig,
     )
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.model_executor.component_binding import (
         ComponentBinding,
     )
-    from uniserve_worker.protocol.batch import DecodeRange, DiffusionParams
+    from uniserve_worker.protocol.batch import (
+        DecodeRange,
+        DiffusionSamplingParams,
+    )
     from uniserve_worker.protocol.identity import CallId, RequestKey
     from uniserve_worker.protocol.tensor import StaticDim
 
     with torch.device("meta"):
         model = Model(base_config())
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
-        max_sequence_tokens=65,
+        max_model_len=65,
         max_video_seconds=5.0,
-        deployment_components=("denoiser", "video_decoder", "video_codec"),
+        deployment_components=("transformer", "video_decoder", "video_codec"),
     )
     products = {
         value.name: value
@@ -429,7 +451,9 @@ def test_h3_media_units_follow_each_request_canvas():
             RequestKey(1, 0, 0), CallId(1, 0), cursor=0, max_units=1
         )
         for width, height in ((1536, 672), (1344, 768), (768, 1344)):
-            media = DiffusionParams(124, 7, 50, 1, width=width, height=height)
+            media = DiffusionSamplingParams(
+                124, 7, 1, width=width, height=height
+            )
             assert runner.output_layout(
                 "video_decoder", 0, media, round_, 10
             ).shape == (1, 22, height, width, 3)
@@ -455,16 +479,14 @@ def test_h3_audio_product_holds_the_decoded_track(seconds, frames):
     from uniserve_models.minimax_h3 import Model
     from uniserve_models.minimax_h3.packing import audio_latent_frames
     from uniserve_worker.bootstrap.outputs import resolve_outputs
-    from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
         model = Model(fasth3_config())
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
-        max_sequence_tokens=65,
+        max_model_len=65,
         max_video_seconds=seconds,
         max_request_pool_size=2,
-        min_request_pool_size=2,
     )
     products = {
         value.name: value
@@ -487,16 +509,14 @@ def test_h3_video_capacity_rounds_half_frames_to_even():
     from uniserve_models.minimax_h3 import Model
     from uniserve_models.minimax_h3.packing import video_latent_frames
     from uniserve_worker.bootstrap.outputs import resolve_outputs
-    from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
         model = Model(fasth3_config())
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
-        max_sequence_tokens=65,
+        max_model_len=65,
         max_video_seconds=5.1875,
         max_request_pool_size=2,
-        min_request_pool_size=2,
     )
     products = {
         value.name: value
@@ -506,3 +526,79 @@ def test_h3_video_capacity_rounds_half_frames_to_even():
     assert products["video_latents"].shape_bound.max_elements == (
         video_latent_frames(124) * 24 * 42 * 96
     )
+
+
+def test_a_deployment_without_condition_capacity_serves_the_largest_set():
+    """An unstated condition capacity refuses no request for its conditions.
+
+    The loaded configuration states the rows of the largest condition set
+    the placed denoiser admits, so the input builder sizes that set; a
+    stated capacity stands, and a deployment whose denoiser takes no
+    condition provisions none.
+    """
+    from dataclasses import replace
+
+    from tests.python.fixtures.h3 import WIDE, base_config, fasth3_config
+    from uniserve_models.minimax_h3 import Model
+    from uniserve_worker.bootstrap.inputs import media_builder
+    from uniserve_worker.bootstrap.model_loader import loaded_worker_config
+
+    with torch.device("meta"):
+        model = Model(base_config())
+        text_only = Model(fasth3_config())
+    config = cpu_worker_config(
+        device="cpu",
+        max_model_len=4096,
+        max_video_seconds=5.0,
+        max_batch_calls=2,
+        max_request_pool_size=2,
+        video_resolutions=("768p",),
+        video_aspect_ratios=("16:9",),
+        deployment_components=("transformer_ref",),
+    )
+    assert config.max_condition_rows is None
+
+    open_capacity = loaded_worker_config(model, config, 6)
+    builder = media_builder(model, open_capacity)
+    frames = builder.frame_counts[-1]
+    largest = builder.denoiser.max_conditions(frames, WIDE)
+    size = builder.size(frames, 100, WIDE, conditions=largest)
+    assert size.condition_rows == open_capacity.max_condition_rows > 0
+
+    stated = loaded_worker_config(
+        model, replace(config, max_condition_rows=2048), 6
+    )
+    assert stated.max_condition_rows == 2048
+    with pytest.raises(ValueError, match="more than the 2048 this deployment"):
+        media_builder(model, stated).size(frames, 100, WIDE, conditions=largest)
+
+    plain = replace(config, deployment_components=("transformer",))
+    assert loaded_worker_config(text_only, plain, 6).max_condition_rows == 0
+
+
+def test_a_media_worker_keeps_a_request_slot_for_every_three_queue_positions():
+    from tests.python.fixtures.h3 import base_config
+    from tests.python.fixtures.worker_config import cpu_worker_config
+    from uniserve_models.minimax_h3 import Model
+    from uniserve_worker.bootstrap.model_loader import loaded_worker_config
+    from uniserve_worker.errors import WorkerError
+
+    with torch.device("meta"):
+        model = Model(base_config())
+    config = cpu_worker_config(
+        max_model_len=4096,
+        max_video_seconds=5.0,
+        max_batch_calls=8,
+        max_request_pool_size=8,
+        video_resolutions=("768p",),
+        video_aspect_ratios=("16:9",),
+        deployment_components=("transformer_ref",),
+    )
+
+    for queue_depth, slots in ((3, 1), (6, 2), (8, 2), (24, 8)):
+        resolved = loaded_worker_config(model, config, queue_depth)
+        assert resolved.max_request_pool_size == slots
+        assert resolved.max_batch_calls == slots
+    # Fewer than three positions cannot pipeline one request.
+    with pytest.raises(WorkerError):
+        loaded_worker_config(model, config, 2)

@@ -37,6 +37,7 @@ from dataclasses import dataclass
 import torch
 
 from uniserve.runtime.device import fill_cpu_ints
+from uniserve.tensors import BufferConfig
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.protocol.batch import LatentParams
 from uniserve_worker.protocol.identity import BufferId, RequestKey
@@ -59,11 +60,11 @@ class LatentUpdate:
             means the call changes no trajectory, and the pool skips it.
         expected_generation: Generation of the committed trajectory a
             publication advances; zero initializes an empty slot.
-        expected_step: Committed step a publication advances.
+        expected_step_index: Committed step a publication advances.
         generation: The successor's generation for a publication, or the
             committed generation being released for a release.
-        step: The successor's step for a publication, or the committed step
-            being released for a release.
+        step_index: The successor's step index for a publication, or the
+            committed step index being released for a release.
         release: Release the slot's committed trajectory and pages instead of
             publishing a successor.
     """
@@ -71,9 +72,9 @@ class LatentUpdate:
     request_pool_idx: int
     params: LatentParams | None = None
     expected_generation: int = 0
-    expected_step: int = 0
+    expected_step_index: int = 0
     generation: int = 0
-    step: int = 0
+    step_index: int = 0
     release: bool = False
 
 
@@ -171,19 +172,16 @@ class LatentPool:
         values per row; ``capacity_units`` excludes the sentinel page.
 
         Raises:
-            ValueError: ``request_pool_size``, ``page_units`` or
-                ``latent_width`` is below one, ``num_pages`` is below two, or
-                ``dtype`` is not a floating dtype.
+            ValueError: As `buffers`.
         """
-        if (
-            min(int(request_pool_size), int(page_units), int(latent_width)) < 1
-            or int(num_pages) < 2
-        ):
-            raise ValueError(
-                "latent-pool shape must contain slots, pages, and elements"
-            )
-        if not dtype.is_floating_point:
-            raise ValueError("latent-pool storage must use a floating dtype")
+        buffers = self.buffers(
+            request_pool_size=request_pool_size,
+            num_pages=num_pages,
+            page_units=page_units,
+            latent_width=latent_width,
+            dtype=dtype,
+            staging=staging,
+        )
 
         self.request_pool_size = int(request_pool_size)
         self.num_pages = int(num_pages)
@@ -193,36 +191,16 @@ class LatentPool:
         self.device = torch.device(device)
         self.capacity_units = (self.num_pages - 1) * self.page_units
 
-        # Page zero remains outside scheduler capacity; the two banks alternate
-        # source and destination roles across diffusion steps.
-        # [2, num_pages, page_units, latent_width]
-        self.storage = torch.zeros(
-            (2, self.num_pages, self.page_units, self.latent_width),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        # [capacity_units, latent_width], or no rows without pool staging.
-        # The page at position ``p`` of ``page_table_buffer`` is staged in the
-        # ``page_units`` rows starting at row ``p * page_units``.
-        self.step_buffer = torch.empty(
-            (self.capacity_units if staging else 0, self.latent_width),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        # [num_pages - 1] int64: device page indices of every live staging.
-        self.page_table_buffer = torch.empty(
-            self.num_pages - 1,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        # [request_pool_size + 1, 1] float32, indexed by request slot (row
-        # zero unused): each slot's current network time, the fixed storage
-        # its denoising rows read.
-        self.timesteps = torch.empty(
-            (self.request_pool_size + 1, 1),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        # The banks start zeroed; every other tensor is written before it is
+        # read.
+        def allocate(name: str, fill=torch.empty) -> torch.Tensor:
+            config = buffers[name]
+            return fill(config.shape, dtype=config.dtype, device=self.device)
+
+        self.storage = allocate("storage", torch.zeros)
+        self.step_buffer = allocate("step_buffer")
+        self.page_table_buffer = allocate("page_table_buffer")
+        self.timesteps = allocate("timesteps")
 
         # Host metadata is authoritative for ownership and generation checks.
         # Per-slot rows are indexed by the one-based slot id (row zero unused);
@@ -254,24 +232,59 @@ class LatentPool:
             self.num_pages - 1, dtype=torch.int64, depth=1, device=self.device
         )
 
-    @property
-    def persistent_bytes(self) -> int:
-        """Bytes held persistently on the execution device by this pool.
+    @staticmethod
+    def buffers(
+        *,
+        request_pool_size: int,
+        num_pages: int,
+        page_units: int,
+        latent_width: int,
+        dtype: torch.dtype,
+        staging: bool,
+    ) -> dict[str, BufferConfig]:
+        """Describe the device tensors `__init__` allocates.
 
-        Must equal ``latent_pool_capacity_bytes`` for the same arguments:
-        ``Worker.__init__`` refuses a pool whose allocation disagrees with the
-        bytes storage sizing charged for it, so adding a device tensor here
-        requires the same change there.
+        `__init__` allocates exactly these configurations, and startup
+        memory accounting (`LatentPoolPlan.capacity_bytes`) sums them, so
+        every device tensor the pool owns belongs here.
+
+        Raises:
+            ValueError: ``request_pool_size``, ``page_units`` or
+                ``latent_width`` is below one, ``num_pages`` is below two, or
+                ``dtype`` is not a floating dtype.
         """
-        tensors = (
-            self.storage,
-            self.step_buffer,
-            self.page_table_buffer,
-            self.timesteps,
-        )
-        return sum(
-            int(value.numel()) * int(value.element_size()) for value in tensors
-        )
+        slots = int(request_pool_size)
+        pages = int(num_pages)
+        units = int(page_units)
+        width = int(latent_width)
+        if min(slots, units, width) < 1 or pages < 2:
+            raise ValueError(
+                "latent-pool shape must contain slots, pages, and elements"
+            )
+        if not dtype.is_floating_point:
+            raise ValueError("latent-pool storage must use a floating dtype")
+
+        capacity_units = (pages - 1) * units
+        return {
+            # [2, num_pages, page_units, latent_width]: page zero remains
+            # outside scheduler capacity; the two banks alternate source and
+            # destination roles across diffusion steps.
+            "storage": BufferConfig((2, pages, units, width), dtype),
+            # [capacity_units, latent_width], or no rows without pool
+            # staging. The page at position ``p`` of ``page_table_buffer`` is
+            # staged in the ``page_units`` rows starting at row
+            # ``p * page_units``.
+            "step_buffer": BufferConfig(
+                (capacity_units if staging else 0, width), dtype
+            ),
+            # [num_pages - 1] int64: device page indices of every live
+            # staging.
+            "page_table_buffer": BufferConfig((pages - 1,), torch.int64),
+            # [request_pool_size + 1, 1] float32, indexed by request slot (row
+            # zero unused): each slot's current network time, the fixed
+            # storage its denoising rows read.
+            "timesteps": BufferConfig((slots + 1, 1), torch.float32),
+        }
 
     @contextmanager
     def startup_values(self, rows: int, units: int):
@@ -458,6 +471,16 @@ class LatentPool:
             -1, self.latent_width
         )
 
+    def committed_step_index(self, request_pool_idx: int) -> int:
+        """Return the solver step of the slot's committed trajectory.
+
+        The pool is the worker's ledger of completed steps: a publication
+        advances it at its batch commit and an adopted import sets it, so a
+        call reads the step it advances here. An empty slot is at step zero.
+        """
+        slot = self._validate_slot(int(request_pool_idx))
+        return int(self._steps[slot].item())
+
     def initial_bank(
         self,
         request_pool_idx: int,
@@ -485,7 +508,7 @@ class LatentPool:
         request_pool_idx: int,
         page_table: Sequence[int],
         *,
-        step: int,
+        step_index: int,
         generation: int,
         latent_units: int,
         height: int,
@@ -503,7 +526,7 @@ class LatentPool:
         pages = self._validate_page_table(page_table, int(latent_units))
         self._require_current(
             slot,
-            step=int(step),
+            step_index=int(step_index),
             generation=int(generation),
             latent_units=int(latent_units),
             height=int(height),
@@ -521,7 +544,7 @@ class LatentPool:
         request_pool_idx: int,
         staging: LatentStaging,
         *,
-        step: int,
+        step_index: int,
         generation: int,
         latent_units: int,
         height: int,
@@ -538,7 +561,7 @@ class LatentPool:
         pages = self._validate_staging(staging, int(latent_units))
         self._require_current(
             slot,
-            step=int(step),
+            step_index=int(step_index),
             generation=int(generation),
             latent_units=int(latent_units),
             height=int(height),
@@ -563,7 +586,7 @@ class LatentPool:
         request_pool_idx: int,
         staging: LatentStaging,
         *,
-        expected_step: int,
+        expected_step_index: int,
         expected_generation: int,
         latent_units: int,
         height: int,
@@ -580,7 +603,7 @@ class LatentPool:
         pages = self._validate_staging(staging, int(latent_units))
         self._require_current(
             slot,
-            step=int(expected_step),
+            step_index=int(expected_step_index),
             generation=int(expected_generation),
             latent_units=int(latent_units),
             height=int(height),
@@ -628,7 +651,7 @@ class LatentPool:
         request_pool_idx: int,
         page_table: Sequence[int],
         generation: int,
-        step: int,
+        step_index: int,
         latent_units: int,
         height: int,
         width: int,
@@ -650,7 +673,7 @@ class LatentPool:
         self._require_current(
             slot,
             generation=generation,
-            step=step,
+            step_index=step_index,
             latent_units=latent_units,
             height=height,
             width=width,
@@ -837,7 +860,7 @@ class LatentPool:
             )
             self._validate_metadata(
                 generation=int(publication.generation),
-                step=int(publication.step),
+                step_index=int(publication.step_index),
                 latent_units=int(params.latent_units),
                 height=int(params.height),
                 width=int(params.width),
@@ -851,8 +874,8 @@ class LatentPool:
             expected = int(publication.expected_generation)
             if expected == 0:
                 if (
-                    int(publication.expected_step) != 0
-                    or int(publication.step) != 0
+                    int(publication.expected_step_index) != 0
+                    or int(publication.step_index) != 0
                 ):
                     raise invalid_descriptor(
                         "latent initialization must publish step zero"
@@ -862,7 +885,7 @@ class LatentPool:
             else:
                 self._require_current(
                     slot,
-                    step=int(publication.expected_step),
+                    step_index=int(publication.expected_step_index),
                     generation=expected,
                     latent_units=int(params.latent_units),
                     height=int(params.height),
@@ -870,7 +893,9 @@ class LatentPool:
                 )
                 self._require_slot_pages(slot, pages)
                 self._require_page_owners(pages, slot)
-                if int(publication.step) <= int(publication.expected_step):
+                if int(publication.step_index) <= int(
+                    publication.expected_step_index
+                ):
                     raise invalid_descriptor(
                         "latent successor does not advance its step"
                     )
@@ -893,7 +918,7 @@ class LatentPool:
             )
             self._require_current(
                 slot,
-                step=int(release.step),
+                step_index=int(release.step_index),
                 generation=int(release.generation),
                 latent_units=int(params.latent_units),
                 height=int(params.height),
@@ -936,7 +961,7 @@ class LatentPool:
             # The successor was written to the inactive bank; flip it active.
             bank = 1 - int(self._active[slot].item())
             self._active[slot] = bank
-            self._steps[slot] = int(publication.step)
+            self._steps[slot] = int(publication.step_index)
             self._generations[slot] = int(publication.generation)
             self._units[slot] = int(params.latent_units)
             self._heights[slot] = int(params.height)
@@ -963,7 +988,7 @@ class LatentPool:
 
         The slot must be empty and the pages free; the slot owns them from
         this call. The returned first-axis spans exclude page padding. They
-        address bank zero directly and remain invisible to computation until
+        address bank zero directly and remain invisible to call until
         adoption, which makes bank zero the slot's active bank.
         """
         self._reap_imports()
@@ -1010,7 +1035,7 @@ class LatentPool:
         write: LatentImport,
         *,
         generation: int,
-        step: int,
+        step_index: int,
         height: int,
         width: int,
     ) -> None:
@@ -1034,7 +1059,7 @@ class LatentPool:
         units = sum(int(span.shape[0]) for span in write.spans)
         self._validate_metadata(
             generation=generation,
-            step=step,
+            step_index=step_index,
             latent_units=units,
             height=height,
             width=width,
@@ -1049,7 +1074,7 @@ class LatentPool:
         slot = write.request_pool_idx
         self._slot_pages[slot] = write.page_table
         self._active[slot] = 0
-        self._steps[slot] = step
+        self._steps[slot] = step_index
         self._generations[slot] = generation
         self._units[slot] = units
         self._heights[slot] = height
@@ -1303,7 +1328,7 @@ class LatentPool:
         self,
         slot: int,
         *,
-        step: int,
+        step_index: int,
         generation: int,
         latent_units: int,
         height: int,
@@ -1322,7 +1347,7 @@ class LatentPool:
             int(self._widths[slot].item()),
         )
         expected = (
-            int(step),
+            int(step_index),
             int(generation),
             int(latent_units),
             int(height),
@@ -1358,7 +1383,7 @@ class LatentPool:
         self,
         *,
         generation: int,
-        step: int,
+        step_index: int,
         latent_units: int,
         height: int,
         width: int,
@@ -1366,7 +1391,7 @@ class LatentPool:
         """Validate generation, step, unit count, and raster dimensions."""
         if (
             min(int(generation), int(latent_units), int(height), int(width)) < 1
-            or int(step) < 0
+            or int(step_index) < 0
         ):
             raise invalid_descriptor("latent publication metadata is invalid")
         if int(latent_units) > self.capacity_units:

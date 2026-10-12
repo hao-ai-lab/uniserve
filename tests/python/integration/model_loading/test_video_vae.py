@@ -15,6 +15,7 @@ from diffusers.modular_pipelines.minimax_h3.encoders import (
 )
 from safetensors.torch import save_file
 
+from tests.python.fixtures.h3 import video_vae_config
 from uniserve import loading
 from uniserve.loading import checkpoint, weights
 from uniserve.media import image, video
@@ -34,7 +35,7 @@ FP16_ULP = 2**-10
 def test_video_reconstruction_matches_independent_transformer_and_crop(
     tmp_path,
 ):
-    config = video_vae.Config(
+    config = video_vae_config(
         latent_channels=2,
         block_out_channels=(8,),
         layers_per_block=1,
@@ -107,7 +108,7 @@ def test_video_reconstruction_matches_independent_transformer_and_crop(
 def test_unit_encoding_assembles_the_native_whole_video_conditioning(
     tmp_path, num_frames
 ):
-    config = video_vae.Config(
+    config = video_vae_config(
         latent_channels=2,
         block_out_channels=(8, 8),
         layers_per_block=1,
@@ -186,9 +187,9 @@ def test_unit_encoding_assembles_the_native_whole_video_conditioning(
         video.Config(num_frames, image.Config(272, 20))
     )["video"]
     assembled = torch.full(layout.shape, torch.nan)
-    for unit in reversed(model.frame_slices(num_frames)):
+    for clip in reversed(model.clips(num_frames)):
         (result,) = model.encode(
-            (pixels[unit],), frames=(unit,), num_frames=(num_frames,)
+            (pixels[clip],), clips=(clip,), num_frames=(num_frames,)
         )
         assembled[result.layout.local_slice] = result.tensor
     torch.testing.assert_close(

@@ -7,11 +7,11 @@
 //!
 //! The head decides the mechanism from the placement and passes it to the rank
 //! in its launch descriptor (`channel_transport`); the rank binds a
-//! [`RankServer`] for it, names the endpoint, and reports both at registration.
-//! The engine's registration refuses any mechanism other than
-//! [`SHARED_STORAGE_CHANNEL`] and [`SOCKET_CHANNEL`], and `PendingRank::adopt`
-//! then connects a [`RankChannel`] to whatever the report named. On the rank
-//! side the PyO3 `Server` in `worker-ipc-py` owns the [`RankServer`].
+//! [`RankServer`] for it, names the endpoint, and reports the endpoint at
+//! registration. `PendingRank::adopt` then connects a [`RankChannel`] of that
+//! mechanism to the reported endpoint, refusing any mechanism other than
+//! [`SHARED_STORAGE_CHANNEL`] and [`SOCKET_CHANNEL`]. On the rank side the
+//! PyO3 `Server` in `worker-ipc-py` owns the [`RankServer`].
 //!
 //! The two mechanisms differ in ways the enums do not hide: a shared-storage
 //! request can be sent before any server exists (see
@@ -37,8 +37,8 @@ pub const SHARED_STORAGE_CHANNEL: &str = "iceoryx2";
 /// The mechanism name of a channel over a TCP stream, served by a rank off the
 /// head's host.
 ///
-/// `uniserve_worker.bootstrap.launch` defines its own `SOCKET_CHANNEL` with
-/// this value; the two must stay equal.
+/// The Python extension exposes it as `SOCKET_CHANNEL`, which the worker's
+/// launch compares with the descriptor's `channel_transport`.
 pub const SOCKET_CHANNEL: &str = "tcp";
 
 /// A wake raised inside one process for that process's own service loop,
@@ -93,31 +93,25 @@ pub enum RankChannel {
 impl RankChannel {
     /// Binds the channel a rank named, refusing a mechanism the head cannot bind.
     ///
-    /// `max_payload` bounds every frame's payload in bytes. `depth` is the
-    /// number of outstanding request handles for shared storage and the number
-    /// of queued outgoing frames for a socket. `timeout` bounds only the TCP
-    /// connect; a shared-storage connect does not wait for the rank's server.
+    /// `depth` is the number of outstanding request handles for shared storage
+    /// and the number of queued outgoing frames for a socket. `timeout` bounds
+    /// only the TCP connect; a shared-storage connect does not wait for the
+    /// rank's server.
     pub fn connect(
         transport: &str,
         endpoint: &str,
-        max_payload: usize,
         depth: usize,
         timeout: Duration,
     ) -> IpcResult<Self> {
         match transport {
             SHARED_STORAGE_CHANNEL => Ok(Self::Shared(Box::new(ClientEndpoint::connect(
-                endpoint,
-                max_payload,
-                depth,
+                endpoint, depth,
             )?))),
             SOCKET_CHANNEL => Ok(Self::Socket(Box::new(SocketClient::connect(
-                endpoint,
-                max_payload,
-                depth,
-                timeout,
+                endpoint, depth, timeout,
             )?))),
             other => Err(IpcError::Transport(format!(
-                "rank offers the unsupported channel transport {other}"
+                "unsupported channel transport {other}"
             ))),
         }
     }
@@ -254,21 +248,14 @@ impl RankServer {
     /// `max_inflight` bounds outstanding requests for shared storage and
     /// queued response frames for a socket. A socket bind does not wait for
     /// the engine to connect.
-    pub fn bind(
-        transport: &str,
-        name: &str,
-        max_payload: usize,
-        max_inflight: usize,
-    ) -> IpcResult<Self> {
+    pub fn bind(transport: &str, name: &str, max_inflight: usize) -> IpcResult<Self> {
         match transport {
             SHARED_STORAGE_CHANNEL => Ok(Self::Shared(Box::new(ServerEndpoint::bind(
                 name,
-                max_payload,
                 max_inflight,
             )?))),
             SOCKET_CHANNEL => Ok(Self::Socket(Box::new(SocketServer::bind(
                 name,
-                max_payload,
                 max_inflight,
             )?))),
             other => Err(IpcError::Transport(format!(

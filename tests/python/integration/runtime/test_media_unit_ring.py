@@ -20,16 +20,16 @@ pytestmark = pytest.mark.integration
 UNITS = 6
 EXTENT = 2
 BODY = 3
-WINDOW = 6
+CLIP_FRAMES = 6
 HEIGHT, WIDTH = 2, 3
 FRAME = image.Config(HEIGHT, WIDTH)
 
 
 class _Blend(VideoPostprocessor):
-    """Three body frames and a two-frame successor overlap per window."""
+    """Three body frames and a two-frame successor overlap per clip."""
 
-    def reconstruction_slices(self, frames, num_frames):
-        return slice(0, BODY), slice(WINDOW - EXTENT, WINDOW)
+    def reconstruction_slices(self, clip, num_frames):
+        return slice(0, BODY), slice(CLIP_FRAMES - EXTENT, CLIP_FRAMES)
 
 
 def _postprocessor() -> _Blend:
@@ -39,7 +39,7 @@ def _postprocessor() -> _Blend:
     )
 
 
-def _windows() -> tuple[slice, ...]:
+def _clips() -> tuple[slice, ...]:
     return tuple(
         slice(
             index * BODY,
@@ -49,11 +49,11 @@ def _windows() -> tuple[slice, ...]:
     )
 
 
-def _segment(unit: int) -> torch.Tensor:
-    values = torch.arange(WINDOW, dtype=torch.float16) / WINDOW + unit
+def _decoded_clip(unit: int) -> torch.Tensor:
+    values = torch.arange(CLIP_FRAMES, dtype=torch.float16) / CLIP_FRAMES + unit
     return (
-        values.reshape(1, 1, WINDOW, 1, 1)
-        .expand(1, 3, WINDOW, HEIGHT, WIDTH)
+        values.reshape(1, 1, CLIP_FRAMES, 1, 1)
+        .expand(1, 3, CLIP_FRAMES, HEIGHT, WIDTH)
         .contiguous()
     )
 
@@ -80,8 +80,8 @@ def _resources():
 
 
 def _output(unit: int, total: int) -> TensorOutput:
-    """One decoded native window, as the decoder hands it to this rank."""
-    value = _segment(unit)
+    """One decoded native clip, as the decoder hands it to this rank."""
+    value = _decoded_clip(unit)
     return TensorOutput(
         value,
         OutputLayout(
@@ -96,12 +96,12 @@ def _serial() -> list[torch.Tensor]:
     """Reconstruct every media unit on one rank, in order."""
     model = _postprocessor()
     constants, workspace, state = _resources()
-    frames = _windows()
-    total = frames[-1].stop
+    clips = _clips()
+    total = clips[-1].stop
     return [
         model(
             (_output(unit, total),),
-            frames=(frames[unit],),
+            clips=(clips[unit],),
             sizes=(video.Config(total, FRAME),),
             state=state,
             constants=constants,
@@ -127,8 +127,8 @@ def _ring(rank: int, expected_bytes: bytes, device: torch.device) -> None:
         {name: value.to(device) for name, value in values.items()}
         for values in (constants, workspace, state)
     )
-    frames = _windows()
-    total = frames[-1].stop
+    clips = _clips()
+    total = clips[-1].stop
     ranks = tuple(range(dist.get_world_size()))
     model.units = Communicator(
         ranks=ranks,
@@ -159,7 +159,7 @@ def _ring(rank: int, expected_bytes: bytes, device: torch.device) -> None:
                 output = TensorOutput(output.tensor.to(device), output.layout)
                 produced = model(
                     (output,),
-                    frames=(frames[unit],),
+                    clips=(clips[unit],),
                     sizes=(video.Config(total, FRAME),),
                     state=state,
                     constants=constants,

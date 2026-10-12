@@ -36,7 +36,6 @@ from uniserve_worker.model_executor.input_batch import InputRow, TokenRow
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
-    DrawLayout,
     ForwardMode,
     SamplingState,
     VisionInput,
@@ -96,7 +95,7 @@ def prepare_forward(
     state: BatchState,
     tensor_store: TensorStore,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     decode_state: DecodeState | None,
 ) -> TokenRow | DiffusionRow:
     """Pack one prefill, decode or verify call into a model-forward row.
@@ -128,7 +127,7 @@ def prepare_forward(
             request,
             tensor_store=tensor_store,
             request_tables=request_tables,
-            model_runner=model_runner,
+            model_executor=model_executor,
             state=state,
         )
 
@@ -484,7 +483,7 @@ def _prepare_visual(
     state: BatchState,
     tensor_store: TensorStore,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> TokenRow | DiffusionRow:
     """Build a visual-state row from a prefill's image features.
 
@@ -508,7 +507,7 @@ def _prepare_visual(
     read = tensor_store.consume(
         reference,
         consumer_call_id=call.call_id,
-        device=model_runner.call_devices(call)[0],
+        device=model_executor.call_devices(call)[0],
     )
     request.feature_reads.append(read)
     metadata = read.metadata
@@ -531,7 +530,7 @@ def _prepare_visual(
             close_image=True,
             logits=sample_token,
             request_tables=request_tables,
-            model_runner=model_runner,
+            model_executor=model_executor,
             state=state,
         )
     else:
@@ -542,7 +541,7 @@ def _prepare_visual(
             metadata.width,
             position,
             request_tables=request_tables,
-            model_runner=model_runner,
+            model_executor=model_executor,
             state=state,
         )
 
@@ -654,7 +653,7 @@ def prepare_context(
     state: BatchState,
     tensor_store: TensorStore,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> tuple[TokenRow, ...]:
     """Pack a context prefill into one row per segment, in context order.
 
@@ -709,7 +708,7 @@ def prepare_context(
         request, tables=request_tables
     )
     position = int(calls.require_progress(request).logical_position)
-    device = model_runner.call_devices(call)[0]
+    device = model_executor.call_devices(call)[0]
     rows: list[TokenRow] = []
     for index, segment in enumerate(segments):
         last = index == len(segments) - 1
@@ -734,7 +733,7 @@ def prepare_context(
                 logits=scores_prompt
                 or (last and call.token_output is not None),
                 request_tables=request_tables,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
         else:
@@ -769,7 +768,6 @@ def prepare_context(
         or any(
             inputs.request_pool_indices[descriptor] != slot
             or inputs.query_lens[descriptor] != row.query_tokens
-            or inputs.seq_lens[descriptor] != row.seq_len + row.query_tokens
             for descriptor, row in zip(descriptors, rows, strict=True)
         )
     ):
@@ -1147,7 +1145,6 @@ def token_outcome(
 
     request.status = CallStatus.OK
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.token.committed_tokens = committed_tokens
     return request
 
@@ -1159,7 +1156,6 @@ def token_task(
     positions: tuple[int, ...] | torch.Tensor | None,
     selection: TokenSelection,
     *,
-    seq_len: int | None = None,
     request_indexed_decode: bool = False,
     request_tables: BlockTables | None,
 ) -> TokenRow:
@@ -1168,8 +1164,7 @@ def token_task(
     With ``request_indexed_decode``, ``token_ids`` and ``positions`` must be
     None because the row borrows both from ``DecodeState``. Otherwise they
     must be non-empty and equally long; a single tensor token keeps its
-    device view. ``seq_len``, when given, must equal the request's accepted
-    visible KV length.
+    device view.
 
     Raises:
         WorkerError: ``invalid_descriptor`` when any of these checks fails,
@@ -1214,11 +1209,7 @@ def token_task(
 
     # (request slot, accepted visible length, capacity).
     cache = calls.cache_coordinates(request, tables=request_tables)
-    visible = cache[1] if seq_len is None else int(seq_len)
-    if visible != cache[1]:
-        raise invalid_descriptor(
-            "token row visibility disagrees with call metadata"
-        )
+    visible = cache[1]
     return TokenRow(
         forward_mode=cast(ForwardMode, call.kind),
         token_ids=token_values,
@@ -1406,14 +1397,13 @@ def build_sampling_metadata(
     ``logits`` holds one row per entry of ``positions``; a single row may be
     1-D. Each row receives its allowed or forced tokens, its penalty counts
     when penalties are enabled and, when sampling is stochastic, a Philox
-    uniform draw. A device-greedy call
-    without drafts or allowed or forced tokens carries no draw or parameter
-    tensors.
+    uniform draw keyed by the admitted seed and the row's position. A
+    device-greedy call without drafts or allowed or forced tokens carries no
+    draw or parameter tensors.
 
     Raises:
         WorkerError: ``invalid_descriptor`` when the request has no admitted
-            sampling parameters, stochastic sampling lacks matching
-            target-sampling RNG coordinates, or the logits do not align with
+            sampling parameters or the logits do not align with
             ``positions``; ``unsupported_setup`` when penalties
             are enabled and ``DecodeState`` disagrees with the vocabulary or
             device.
@@ -1441,36 +1431,11 @@ def build_sampling_metadata(
         )
 
     # Draws are addressed by request lineage and semantic position
-    # (`uniserve.nn.rng`), so the call's registered RNG coordinates must
-    # describe exactly these rows: the target-sampling layout, the admitted
-    # seed, and semantic indexes equal to `positions`.
-    rng = call.rng
-    if float(parameters.temperature) > 0.0:
-        if rng is None or rng.draw_layout is not DrawLayout.TARGET_SAMPLING:
-            raise invalid_descriptor(
-                "stochastic sampling requires target-sampling RNG coordinates"
-            )
-        if int(rng.seed) != int(parameters.seed or 0):
-            raise invalid_descriptor(
-                "call RNG seed disagrees with admitted sampling"
-            )
-        expected_positions = tuple(
-            range(
-                int(rng.semantic_index_base),
-                int(rng.semantic_index_base) + len(positions),
-            )
-        )
-        if positions != expected_positions:
-            raise invalid_descriptor(
-                "sampling positions disagree with registered semantic RNG "
-                "coordinates"
-            )
-
-    rng_seed = 0 if rng is None else int(rng.seed)
+    # (`uniserve.nn.rng`): the admitted seed and the row's position.
     stochastic = float(parameters.temperature) > 0.0
     draw_key = (
         sampling_key(
-            rng_seed,
+            int(parameters.seed or 0),
             int(call.request_key.engine_id),
             int(call.request_key.request_id),
             int(call.request_key.request_epoch),

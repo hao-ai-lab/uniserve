@@ -42,24 +42,18 @@ if TYPE_CHECKING:
 class RequestProgress:
     """Accepted or projected coordinates for a state-consuming call.
 
-    KV lengths count tokens, and `flow_step` counts the completed solver
-    steps of a diffusion trajectory. Construction rejects negative
-    coordinates and a visible KV length outside `[0, kv_computed_len]`.
+    KV lengths count tokens. Construction rejects negative coordinates and a
+    visible KV length outside `[0, kv_computed_len]`.
     """
 
     logical_position: int = 0
     rng_counter: int = 0
-    flow_step: int = 0
     kv_visible_len: int = 0
     kv_computed_len: int = 0
     prompt_logits_ready: bool = False
 
     def __post_init__(self) -> None:
-        if (
-            self.logical_position < 0
-            or self.rng_counter < 0
-            or self.flow_step < 0
-        ):
+        if self.logical_position < 0 or self.rng_counter < 0:
             raise invalid_descriptor(
                 "request execution coordinates are negative"
             )
@@ -103,9 +97,7 @@ class RequestState:
     state_call_id: CallId = CallId(0, 0)
     # State one call produces and a later call reads, which the engine does not
     # track: it lives with the request rather than in a call's stated
-    # coordinates. rng_counter is the request's sampling position and is not
-    # the wire's Rng.semantic_index_base, which the engine derives per call
-    # from the logical position, the scheduled span or the image identity.
+    # coordinates. rng_counter is the request's sampling position.
     prompt_logits_ready: bool = False
     rng_counter: int = 0
     diffusion: DiffusionState | None = None
@@ -118,6 +110,10 @@ class RequestState:
     # evicts it or `RequestPool.drop` removes it.
     closed: bool = False
     retired: bool = False
+    # Why this rank's model refuses the request, decided from its admitted
+    # size when its `Start` is applied (`media.begin_noise`); each of its
+    # calls then reports the refusal instead of running.
+    refusal: str | None = None
 
     @property
     def request_id(self) -> int:
@@ -191,52 +187,30 @@ class RequestPool:
             for row in self._rows
         )
 
-    def bind_calls(
-        self,
-        calls: Sequence[Call],
-        request_pool_indices: Sequence[int],
-    ) -> tuple[RequestState, ...]:
-        """Resolve admitted requests after validating their slot ownership.
+    def bind_calls(self, calls: Sequence[Call]) -> tuple[RequestState, ...]:
+        """Resolve the admitted request of each call.
 
         Returns:
             The request of each call, in call order.
 
         Raises:
-            WorkerError: From `invalid_descriptor` when the indices are not
-                aligned with the calls, a request or slot repeats, a slot is
-                out of range, a call names an unknown, stale, or closed
-                request or a slot the request does not hold, or a call is
-                already pending.
+            WorkerError: From `invalid_descriptor` when a call names an
+                unknown, stale, or closed request, or is already pending. A
+                refused request's calls still in flight when its refusal
+                closed it bind, and report the refusal.
             RuntimeError: The pool is closed.
         """
-        if len(calls) != len(request_pool_indices):
-            raise invalid_descriptor(
-                "request-pool indices are not aligned with calls"
-            )
-        if len({call.request_key for call in calls}) != len(calls):
-            raise invalid_descriptor("a batch repeats a request")
-
-        slots = tuple(
-            self._validate_slot(value) for value in request_pool_indices
-        )
-        if len(set(slots)) != len(slots):
-            raise invalid_descriptor("a batch repeats a request-pool index")
+        if self._closed:
+            raise RuntimeError("request pool is closed")
 
         requests = []
-        for call, slot in zip(calls, slots, strict=True):
+        for call in calls:
             request = self.get(call.request_key.request_id)
             if request.request_key != call.request_key:
                 raise invalid_descriptor(
                     f"call {call.call_id} has a stale request key"
                 )
-            if (
-                self._rows[slot] is not request
-                or request.request_pool_idx != slot
-            ):
-                raise invalid_descriptor(
-                    f"call {call.call_id} has a stale request slot"
-                )
-            if request.closed:
+            if request.closed and request.refusal is None:
                 raise invalid_descriptor(
                     f"call {call.call_id} targets a closed request"
                 )

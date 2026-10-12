@@ -8,14 +8,15 @@ import pytest
 from torch import nn
 
 from tests.python.fixtures.execution_worker import execution_worker
-from tests.python.fixtures.worker_config import stub_worker_config
+from tests.python.fixtures.worker_config import (
+    cpu_worker_config,
+    stub_worker_config,
+)
 from uniserve.nn.moe import FusedMoE
 from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.report import build_worker_layout
-from uniserve_worker.config.execution import LaneConfig, WorkerConfig
+from uniserve_worker.config.execution import LaneConfig
 from uniserve_worker.protocol.call import CALL_KINDS, ForwardMode
-from uniserve_worker.protocol.worker_info import WorkerInfo
-from uniserve_worker.worker import Worker
 
 pytestmark = pytest.mark.integration
 
@@ -24,29 +25,21 @@ def test_expert_participant_advertises_no_request_work() -> None:
     """A collective peer is distinct from a request admission target."""
     model = nn.ModuleList([FusedMoE(4, 256, 128, top_k=2, activation="silu")])
     info = build_worker_layout(
-        model,
-        WorkerConfig(role="experts", graph_policy="off"),
-        model_name="uniserve_models.qwen3.Model",
+        model, cpu_worker_config(role="experts", graph_policy="off")
     ).info
-    reported = WorkerInfo.from_mapping(info.to_mapping())
-    assert reported.supported_calls == ()
-    assert reported.components == ()
-    assert reported.kv_cache is None
-    assert reported.latent_pages == 0
+    assert info.supported_calls == ()
+    assert info.components == ()
+    assert info.kv_cache is None
+    assert info.latent_pages == 0
 
 
-@pytest.mark.parametrize("backends", (("local",), ("local", "shm")))
-def test_worker_info_reports_schedulable_work_and_bounds(
-    backends: tuple[str, ...],
-) -> None:
-    worker = execution_worker(transfer_backends=backends)
+def test_worker_info_reports_schedulable_work_and_bounds() -> None:
+    worker = execution_worker()
     try:
         info = worker.info.to_mapping()
     finally:
         worker.close()
 
-    assert info["device"] == "cpu"
-    assert tuple(info["transfer_backends"]) == backends
     assert set(info["supported_calls"]) == {
         "prefill",
         "decode",
@@ -61,7 +54,6 @@ def test_worker_info_reports_schedulable_work_and_bounds(
         "kv_install",
     }
     assert info["kv_cache"]["num_units"] > 1
-    assert info["kv_cache"]["unit_bytes"] > 0
     assert all(
         group["layer_ids"]
         and group["num_kv_heads"] > 0
@@ -71,7 +63,6 @@ def test_worker_info_reports_schedulable_work_and_bounds(
     assert info["max_batch_calls"] > 0
     assert info["max_unresolved_calls"] > 0
     assert info["request_slots"] > 0
-    assert info["model_name"]
 
 
 def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (
@@ -80,8 +71,7 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (
     snapshots = []
     for grant in (None, 1 << 40):
         worker = execution_worker(
-            worker_id="encoder-0",
-            execution=WorkerConfig(
+            execution=cpu_worker_config(
                 graph_policy="off",
                 prefill_cuda_graph=False,
                 flow_graph_batch_sizes=(1,),
@@ -94,13 +84,6 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (
         finally:
             worker.close()
     first, second = snapshots
-    assert (
-        first["endpoint"]["worker_id"]
-        == second["endpoint"]["worker_id"]
-        == "encoder-0"
-    )
-    assert first["endpoint"]["rank"] == second["endpoint"]["rank"] == 0
-    assert first["world_size"] == second["world_size"] == 1
     assert first["endpoint"]["node"] == second["endpoint"]["node"]
     assert (
         first["endpoint"]["address_space"]
@@ -147,34 +130,3 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(
 
     assert info.max_batch_calls == (2 if with_lane_limits else 4)
     assert info.max_batch_tokens == (128 if with_lane_limits else 256)
-
-
-@pytest.mark.parametrize("attention_backend", ("torch", "auto"))
-def test_worker_capabilities_reflect_enabled_calls(attention_backend) -> None:
-    config = replace(
-        stub_worker_config(16, max_batch_tokens=256),
-        graph_policy="off",
-        attention_backend=attention_backend,
-    )
-    for allowed in (
-        frozenset({ForwardMode.PREFILL}),
-        frozenset({ForwardMode.PREFILL, ForwardMode.DECODE}),
-    ):
-        with Worker(
-            Model(),
-            image_processor=image_processor(),
-            worker_config=config,
-            sampling_group=None,
-            tokenizer=None,
-            allowed_calls=allowed,
-            queue_depth=1,
-            completion_payload_bytes=65536,
-        ) as worker:
-            info = worker.info.to_mapping()
-            assert set(info["supported_calls"]) == {
-                code.value for code in allowed
-            }
-            assert worker.supports_computation(ForwardMode.PREFILL)
-            assert worker.supports_computation(ForwardMode.DECODE) == (
-                ForwardMode.DECODE in allowed
-            )

@@ -8,7 +8,8 @@ import torch
 
 from uniserve.cache import Config, mha
 from uniserve.quantization import Quantizer
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
+from uniserve.runtime.kv_cache import plan_units
 from uniserve_worker.protocol.worker_info import (
     KVCacheInfo,
     KvGroup,
@@ -26,7 +27,7 @@ def mha_pool(
     total_layers,
     total_kv_heads,
     num_pages,
-    page_size,
+    block_size,
     device,
     request_pool_size=1,
     table_width=None,
@@ -48,24 +49,26 @@ def mha_pool(
     quantization = (
         {name: Quantizer("fp8", axis=0) for name in layers} if encoded else None
     )
-    cache = PrefixCache(
-        Config(layers),
+    config = Config(layers)
+    cache = KVCache(
+        config,
+        plan_units(
+            config,
+            block_size=block_size,
+            dtype=dtype if encoded else store_dtype or dtype,
+            quantization=quantization,
+        ),
         num_units=num_pages,
-        block_size=page_size,
-        dtype=dtype if encoded else store_dtype or dtype,
-        quantization=quantization,
         device=device,
     )
     info = KVCacheInfo(
         num_units=num_pages,
-        unit_bytes=cache.planes.unit_bytes,
         dtype=str(store_dtype or dtype).removeprefix("torch."),
         groups=(
             KvGroup(
                 kind=KvGroupKind.FULL,
                 window=0,
-                sink=0,
-                page_tokens=page_size,
+                block_size=block_size,
                 units_per_page=1,
                 layer_ids=tuple(range(layer_offset, layer_offset + num_layers)),
                 num_kv_heads=num_kv_heads,

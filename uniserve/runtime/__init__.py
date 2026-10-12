@@ -8,8 +8,8 @@ if TYPE_CHECKING:
     from .cuda_graph import CUDAGraph, CUDAGraphError
     from .events import EventPool, EventPoolError
     from .execution import ExecutionContext, Scratch
+    from .kv_cache import KVCache
     from .microbatches import Microbatches
-    from .prefix_cache import PrefixCache
     from .process_groups import (
         ProcessGroups,
         Rendezvous,
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "TensorBuffers",
-    "PrefixCache",
+    "KVCache",
     "ProcessGroups",
     "Rendezvous",
     "initialize_process_groups",
@@ -42,7 +42,7 @@ def __getattr__(name):
     # constructing the storage/resource owner dependency graph.
     modules = {
         "TensorBuffers": "tensor_buffers",
-        "PrefixCache": "prefix_cache",
+        "KVCache": "kv_cache",
         "ProcessGroups": "process_groups",
         "Rendezvous": "process_groups",
         "initialize_process_groups": "process_groups",

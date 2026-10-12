@@ -3,8 +3,7 @@
 Only embedded images are accepted: a ``b64_json`` field or a base64 ``data:``
 URL. Validation failures raise ``ImageOutputError``;
 ``uniserve_eval.transport.client`` records its ``classifier`` as the request's
-failure classifier. ``uniserve_eval.artifacts`` also calls
-``inspect_image_bytes`` to re-verify image samples before writing them.
+failure classifier.
 """
 
 from __future__ import annotations

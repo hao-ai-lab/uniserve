@@ -63,3 +63,9 @@ vsa: ContextVar[Mapping[int, VsaBinding]] = ContextVar(
 moe: ContextVar[Mapping[int, MoEBinding]] = ContextVar(
     "uniserve_moe_operators", default={}
 )
+
+# TiledEncoder module id -> borrowed operator returning exactly the
+# encoder's ``encode_tile`` of one tile, such as a captured graph's replay
+tile_operators: ContextVar[
+    Mapping[int, Callable[[torch.Tensor], torch.Tensor]]
+] = ContextVar("uniserve_tile_operators", default={})

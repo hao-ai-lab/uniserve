@@ -2,11 +2,10 @@
 
 Each computation stream owns the communicators that enqueue its collectives,
 so captured graphs replay without host dispatch. The stream's
-:class:`StreamCommunication` also owns every window registered on those
-communicators and the storage behind it; execution contexts borrow them.
+:class:`StreamCommunication` owns those communicators and the transport
+buffers its gathers borrow; execution contexts borrow them.
 
-Peers address a rank's storage directly only through those windows. Every
-other buffer a collective receives is borrowed, typically caching-allocator
+Every buffer a collective receives is borrowed, typically caching-allocator
 storage, and NCCL moves it through its own buffers. NCCL would otherwise
 register such a buffer for direct peer access when a collective is captured
 in a CUDA graph; see :func:`_forbid_implicit_registration`.
@@ -15,11 +14,10 @@ in a CUDA graph; see :func:`_forbid_implicit_registration`.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Hashable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from ctypes import addressof, c_void_p
 from types import MappingProxyType
-from typing import Protocol
 
 import torch
 import torch.distributed as dist
@@ -45,8 +43,7 @@ def _forbid_implicit_registration() -> None:
     to other tensors, so no registration of it stays valid for the graphs
     that replay it. Where NCCL can import those chunks (fabric handles across
     GB200 hosts, POSIX handles on PCIe hosts), captured collectives on such
-    registrations write outside mapped memory. Only ``register_buffers``
-    windows, whose storage the stream owns, are addressed by peers.
+    registrations write outside mapped memory.
 
     NCCL reads the setting when it first enqueues a captured collective, so
     setting it before any capture governs the whole process. The setting is
@@ -95,7 +92,6 @@ class NcclCommunicator:
         self._raw_transfer = None
         self._pending: _CollectiveWork | None = None
         self._comm = c_void_p()
-        self._windows: dict[tuple[int, int], tuple[c_void_p, torch.Tensor]] = {}
         self._rank = dist.get_rank(group)
         self._size = dist.get_world_size(group)
         self._ranks = tuple(dist.get_process_group_ranks(group))
@@ -239,22 +235,6 @@ class NcclCommunicator:
             value.data_ptr(),
             output.data_ptr(),
             value.numel(),
-            self._dtype(value),
-            *self._arguments(value, output, asynchronous=True),
-        )
-
-    def start_all_to_all(
-        self, output: torch.Tensor, value: torch.Tensor
-    ) -> _CollectiveWork:
-        if output.numel() != value.numel() or value.numel() % self._size:
-            raise ValueError(
-                "asynchronous exchange requires equal peer payloads"
-            )
-        return self._start(
-            self._nccl.allto_all,
-            value.data_ptr(),
-            output.data_ptr(),
-            value.numel() // self._size,
             self._dtype(value),
             *self._arguments(value, output, asynchronous=True),
         )
@@ -419,32 +399,6 @@ class NcclCommunicator:
         finally:
             self._nccl.group_end()
 
-    def register_buffers(self, *buffers: torch.Tensor) -> None:
-        """Register matching VMM allocations.
-
-        Register matching VMM allocations collectively before their first use.
-
-        Every rank supplies the same buffer sequence and byte capacities. Both
-        sides of a symmetric exchange must use registered allocations; mixing
-        these with ordinary CUDA allocations is unsafe under graph replay.
-        Registrations retain their backing until the communicator is closed.
-        """
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "register communication buffers before CUDA graph capture"
-            )
-
-        for value in buffers:
-            self._arguments(value)
-            key = (value.data_ptr(), value.numel() * value.element_size())
-            if key in self._windows:
-                continue
-            window = c_void_p()
-            self._nccl.comm_window_register(
-                self._comm.value, key[0], key[1], addressof(window), 0x01
-            )  # NCCL_WIN_COLL_SYMMETRIC
-            self._windows[key] = window, value
-
     def close(self) -> None:
         """Destroy the communicator.
 
@@ -457,11 +411,6 @@ class NcclCommunicator:
             self._transfer.synchronize()
 
         if self._comm.value:
-            for window, _ in self._windows.values():
-                self._nccl.comm_window_deregister(
-                    self._comm.value, window.value
-                )
-            self._windows.clear()
             communicator, self._comm = self._comm.value, c_void_p()
             self._nccl.comm_destroy(communicator)
 
@@ -477,8 +426,8 @@ class NcclCommunicator:
         from .resources import retain_until_exit
 
         if self._comm.value:
-            # Retain the handle, registered tensors and streams together. No
-            # failed access is acknowledged as completed or safe to reuse.
+            # Retain the handle and streams together. No failed access is
+            # acknowledged as completed or safe to reuse.
             retain_until_exit((self, self._comm))
             self._comm = c_void_p()
 
@@ -555,30 +504,21 @@ class GatherPool:
             self.borrowed.remove(id(buffer))
 
 
-class _Allocation(Protocol):
-    """Backing storage that its owner retires exactly once."""
-
-    def close(self) -> None: ...
-
-
 class StreamCommunication:
-    """Own the communicators, windows and window storage of one stream.
+    """Own the communicators and gather pools of one stream.
 
     Every execution context running on the stream borrows these resources.
-    Binding a communicator, registering a window and retiring either are
-    collective over the group, so they live as long as the stream rather than
-    any one context: ranks may prepare different numbers of contexts, in
-    different orders, but each rank binds a stream's groups in one order and
-    closes the stream on a path all members reach.
+    Binding and retiring a communicator are collective over the group, so
+    they live as long as the stream rather than any one context: ranks may
+    prepare different numbers of contexts, in different orders, but each rank
+    binds a stream's groups in one order and closes the stream on a path all
+    members reach.
     """
 
     def __init__(self, stream: torch.cuda.Stream) -> None:
         self.stream = stream
         self._communicators: dict[str, NcclCommunicator] = {}
         self._gather_pools: dict[object, GatherPool] = {}
-        self._windows: dict[
-            Hashable, tuple[object, tuple[_Allocation, ...]]
-        ] = {}
         self._closed = False
 
     @property
@@ -636,45 +576,8 @@ class StreamCommunication:
             self._gather_pools[group] = pool
         return pool
 
-    def windows(
-        self,
-        key: Hashable,
-        group,
-        allocate: Callable[
-            [], tuple[object, tuple[_Allocation, ...], tuple[torch.Tensor, ...]]
-        ],
-    ) -> object:
-        """Borrow storage whose tensors are registered on ``group``'s windows.
-
-        ``allocate`` returns the borrowed value, the allocations that own its
-        backing, and the tensors to register. It runs once per ``key``; later
-        contexts borrow the same registered storage, so re-preparation neither
-        registers new windows nor retains retired backing.
-        """
-        self._open()
-        if key not in self._windows:
-            if _capturing(self.stream.device):
-                raise RuntimeError(
-                    "prepare registered communication storage before capture"
-                )
-            communicator = self._communicators.get(group._require().group_name)
-            if communicator is None:
-                raise RuntimeError(
-                    "bind a group's communicator before registering windows"
-                )
-            value, allocations, tensors = allocate()
-            try:
-                communicator.register_buffers(*tensors)
-            except BaseException:
-                close_resources(
-                    *(allocation.close for allocation in allocations)
-                )
-                raise
-            self._windows[key] = value, allocations
-        return self._windows[key][0]
-
     def close(self, *, aborted: bool = False) -> None:
-        """Retire communicators, then the storage their windows registered.
+        """Retire the stream's communicators.
 
         Normal retirement is collective over every bound group; call it on a
         path all members reach after every context and graph on the stream
@@ -698,13 +601,7 @@ class StreamCommunication:
                     communicator.close
                     for communicator in self._communicators.values()
                 ),
-                *(
-                    allocation.close
-                    for _, allocations in self._windows.values()
-                    for allocation in allocations
-                ),
             )
         finally:
             self._communicators.clear()
             self._gather_pools.clear()
-            self._windows.clear()

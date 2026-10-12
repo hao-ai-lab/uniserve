@@ -15,22 +15,26 @@ from tests.python.fixtures.checkpoints import (
     load_bagel,
     sensenova_checkpoint,
 )
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image
 from uniserve.model import TextSize
-from uniserve.nn.attention import AttentionBatch
-from uniserve.runtime import ExecutionContext, PrefixCache
-from uniserve_worker.bootstrap.cache import cache_info
+from uniserve.nn.attention import (
+    AttentionBatch,
+    BlockTable,
+    SegmentedInput,
+    SequenceLengths,
+)
+from uniserve.runtime import ExecutionContext, KVCache
+from uniserve_worker.bootstrap.cache import cache_info, plan_cache
 from uniserve_worker.bootstrap.capacity import input_buffer_config
 from uniserve_worker.config.deployment import ComponentConfig
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.diffusion import (
     flow_rows,
     image_state,
     prefix_row,
 )
 from uniserve_worker.execution.model_executor import ModelExecutor
-from uniserve_worker.model_executor.attention import TablePages, from_tables
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.protocol.call import (
     Bounds,
@@ -138,12 +142,12 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             torch.device("cuda:0"),
         )
     }
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         generation_device=generation_device,
         attention_backend="torch",
         block_size=16,
-        max_sequence_tokens=32,
+        max_model_len=32,
         max_batch_calls=3,
         max_request_pool_size=3,
         max_batch_tokens=64,
@@ -165,12 +169,16 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
     size = image.Config(16, 16)
     factory = runner.image_builder
     shape = factory.denoiser.latent_shape("image", size)
-    cache = PrefixCache(
-        model.text.cache_config, num_units=8, block_size=16, device="cuda:0"
+    planes = plan_cache(model.text, config)
+    cache = KVCache(
+        model.text.cache_config,
+        planes,
+        num_units=8,
+        device="cuda:0",
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model.text, config, num_units=8),
+        info=cache_info(model.text, planes, num_units=8),
         request_pool_size=3,
         table_width=2,
     )
@@ -185,7 +193,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
     oracle = ExecutionContext(model.denoiser, cache=cache, attention="torch")
     try:
         runner.configure_inputs(
-            input_config=input_buffer_config(model, config),
+            input_config=input_buffer_config(model, config, planes=planes),
             kv_cache=manager,
             latent_pool=latents,
             decode_predicates=torch.tensor(
@@ -273,29 +281,33 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 for _ in branches
             )
             # The model's one cache group has one-unit pages, so its single
-            # table holds each branch's prefix pages.
-            attention = from_tables(
-                (
-                    TablePages(
-                        16,
-                        False,
-                        (0,) * len(branches),
-                        tuple(
-                            (slot * 2 + 1, slot * 2 + 2)
-                            for slot in range(len(branches))
-                        ),
-                    ),
-                ),
-                query_lengths=(factory.sequence_length(size),) * len(branches),
-                prefix_lengths=(prefix_length,) * len(branches),
-                causal=(False,) * len(branches),
-                write=(False,) * len(branches),
+            # table holds each branch's prefix pages. Each branch's queries
+            # see its prefix and the whole image sequence, and write nothing.
+            queries = SequenceLengths.from_lengths(
+                (factory.sequence_length(size),) * len(branches),
+                device="cuda:0",
             )
-            from uniserve_worker.model_executor.cuda_graph import map_tensors
-
+            prefixes = SequenceLengths.from_lengths(
+                (prefix_length,) * len(branches), device="cuda:0"
+            )
             attention = AttentionBatch.single(
-                map_tensors(
-                    attention.entries[0], lambda value: value.to("cuda:0")
+                SegmentedInput(
+                    queries,
+                    prefixes,
+                    BlockTable(
+                        torch.tensor(
+                            [
+                                (slot * 2 + 1, slot * 2 + 2)
+                                for slot in range(len(branches))
+                            ],
+                            dtype=torch.int32,
+                            device="cuda:0",
+                        ),
+                        16,
+                    ),
+                    None,
+                    queries.values[:, None].expand(-1, queries.maximum),
+                    True,
                 )
             )
             inputs = factory.bind(
@@ -372,7 +384,6 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         SequenceLengths,
         VarlenInput,
     )
-    from uniserve_worker.bootstrap.components import supported_calls
     from uniserve_worker.model_executor.input_batch import TokenRow
     from uniserve_worker.sampling.metadata import TokenSelection
     from uniserve_worker.worker import Worker
@@ -399,12 +410,12 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             "model", placement, group, mesh, torch.device("cuda:0")
         )
     }
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         attention_backend="torch",
         block_size=16,
-        kv_token_capacity=128,
-        max_sequence_tokens=32,
+        max_total_tokens=128,
+        max_model_len=32,
         max_batch_calls=2,
         max_request_pool_size=2,
         max_batch_tokens=64,
@@ -440,10 +451,8 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         bindings=bindings,
         sampling_group=group,
         tokenizer=None,
-        allowed_calls=supported_calls(model),
         entry_points=_placed_entries(model, ("cuda:0",)),
         queue_depth=2,
-        completion_payload_bytes=1 << 16,
         components=(("model", placement),),
     ) as worker:
         worker.warmup()

@@ -23,26 +23,26 @@ def prepare(
     Other numerical representations use the state's ordinary write call.
     The outputs borrow context workspace and are valid until its next use.
     """
-    indices = batch.write_indices
+    slot_mapping = batch.slot_mapping
     fused = False
 
-    if indices is not None:
+    if slot_mapping is not None:
         if state is None:
             raise RuntimeError(
                 "attention cache update requires bound prefix state"
             )
-        state._validate_update(key, value, indices)
+        state._validate_update(key, value, slot_mapping)
         # The fused launch writes plain same-dtype rows; conversions and
         # encoded representations take the state's own write call.
         fused = (
-            indices.numel() > 0
+            slot_mapping.numel() > 0
             and cache.unsupported_paged_kv_write(
-                state.key, state.value, indices.reshape(-1), key, value
+                state.key, state.value, slot_mapping.reshape(-1), key, value
             )
             is None
         )
         if not fused:
-            state.update(key, value, indices=indices)
+            state.update(key, value, slot_mapping=slot_mapping)
 
     paged.prepare(
         (
@@ -62,7 +62,7 @@ def prepare(
         write=(
             state.key,
             state.value,
-            indices,
+            slot_mapping,
             key,
             value,
             state.initialized["key"],

@@ -48,7 +48,6 @@ def test_logprob_observation_preserves_filtered_selection(
         {},
         {"return_logprobs": True},
         {"n_logprobs": 2},
-        {"logprob_token_ids": (0, 3)},
     ):
         params = replace(parameters, **observations)
         greedy = device_greedy_parameters(params)

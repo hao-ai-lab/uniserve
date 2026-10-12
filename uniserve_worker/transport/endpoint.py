@@ -2,10 +2,14 @@
 
 A publication is registered when its producer exposes it and retired when
 the engine releases its buffer. Nothing here talks to a consumer: readiness
-and identity travel inside the published storage, and a consumer says it has
-finished by writing its acknowledgment word there. The producing rank sweeps
-those words when it retires the publication, so a consumer on another host
-retires a product the same way one on this host does.
+travels inside the published storage, and a consumer says it has finished by
+writing its acknowledgment word there. The producing rank sweeps those words
+when it retires the publication, so a consumer on another host retires a
+product the same way one on this host does.
+
+A locator is the engine's word: the engine binds only locators a producing
+rank reported to it, so a publication is found by the key its locator
+carries and the rest of the locator is taken as published.
 
 `Publications` is shared by `ShmTransport` and `CudaVmmTransport`; each
 supplies the callbacks that decide when its storage is settled and how it is
@@ -14,8 +18,6 @@ handed back.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import threading
 import uuid
 import weakref
@@ -46,24 +48,13 @@ _endpoint_lock = threading.Lock()
 Source = TypeVar("Source")
 
 
-def locator_digest(locator: Locator) -> bytes:
-    """Bind a read to the registered view, including its producer fence."""
-    encoded = json.dumps(
-        locator.to_mapping(),
-        sort_keys=True,
-        separators=(",", ":"),
-        default=bytes.hex,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).digest()
-
-
 def publication_key(locator: Locator) -> tuple[str, str]:
     """Identify a publication within its transport's native namespace."""
     handle = locator.transport
     if isinstance(handle, CudaVmmTransfer):
         return "cuda_vmm", handle.publication_id
     if isinstance(handle, PosixShmTransfer):
-        return "shm", handle.name
+        return "posix_shm", handle.name
     raise invalid_descriptor("process publication requires a shared transport")
 
 
@@ -71,9 +62,7 @@ def publication_key(locator: Locator) -> tuple[str, str]:
 class _Publication(Generic[Source]):
     """One registered source and where it stands towards reclamation."""
 
-    locator: Locator
     source: Source
-    digest: bytes
     # The producer may still be writing the published bytes; `ShmTransport`
     # registers a device product pending until its host copy completes.
     pending: bool
@@ -95,8 +84,6 @@ class Publications(Generic[Source]):
     a device may still be writing.
 
     Args:
-        capacity: Maximum number of registered publications, retired ones
-            still awaiting hand-back included.
         reclaim: Hands a source back to its owner and completes the given
             retirement future, possibly later. Called under this table's lock.
         drain: Blocks until an in-flight reclamation completes; used by
@@ -109,19 +96,14 @@ class Publications(Generic[Source]):
     def __init__(
         self,
         *,
-        capacity: int,
         reclaim: Callable[[Source, Future[None]], None],
         drain: Callable[[Source], None],
         settled: Callable[[Source], bool],
     ) -> None:
-        if capacity < 1:
-            raise ValueError("publication capacity must be positive")
-
         # A fresh name per table, carried as the endpoint of every locator it
         # publishes, so a locator from another or earlier table is refused
         # rather than resolved against the wrong owner.
         self.name = f"uniserve-publications-{uuid.uuid4().hex}"
-        self._capacity = capacity
         self._reclaim = reclaim
         self._drain = drain
         self._settled = settled
@@ -140,8 +122,8 @@ class Publications(Generic[Source]):
         `complete` must follow before the source can be handed back.
 
         Raises:
-            WorkerError: `resource_error` when the table is closing or full,
-                and `invalid_descriptor` when the locator names no shared
+            WorkerError: `resource_error` when the table is closing, and
+                `invalid_descriptor` when the locator names no shared
                 transport or its identity is already registered.
         """
         key = publication_key(locator)
@@ -149,20 +131,16 @@ class Publications(Generic[Source]):
             self._reap_locked()
             if self._error is not None:
                 raise self._error
-            if self._closing or len(self._publications) >= self._capacity:
-                raise resource_error(
-                    "transport publication capacity is unavailable"
-                )
+            if self._closing:
+                raise resource_error("transport publication table is closing")
             if key in self._publications:
                 raise invalid_descriptor(
                     "publication identity is already registered"
                 )
-            self._publications[key] = _Publication(
-                locator, source, locator_digest(locator), pending
-            )
+            self._publications[key] = _Publication(source, pending)
 
     def source(self, locator: Locator, *, reading: bool = False) -> Source:
-        """Borrow a registered source by its exact locator.
+        """Borrow the source registered under a locator's publication key.
 
         The owner borrows its source through retirement; a reader borrows it
         only while the publication is live, and a failed producer refuses the
@@ -170,14 +148,9 @@ class Publications(Generic[Source]):
         """
         with self._lock:
             publication = self._publications.get(publication_key(locator))
-            if (
-                publication is None
-                or publication.digest != locator_digest(locator)
-                or (reading and publication.retired)
-            ):
+            if publication is None or (reading and publication.retired):
                 raise invalid_descriptor(
-                    "publication is retired, invalid, or belongs to another "
-                    "view"
+                    "publication is retired or was never registered"
                 )
             if reading and publication.error is not None:
                 raise resource_error(
@@ -217,10 +190,6 @@ class Publications(Generic[Source]):
         with self._lock:
             publication = self._publications.get(publication_key(locator))
             if publication is not None:
-                if publication.locator != locator:
-                    raise invalid_descriptor(
-                        "publication release changed its registered view"
-                    )
                 publication.retired = True
                 self._reclaim_locked(publication)
                 return publication.retirement
@@ -232,10 +201,8 @@ class Publications(Generic[Source]):
             raise invalid_descriptor("publication belongs to another endpoint")
         with self._lock:
             publication = self._publications.get(publication_key(locator))
-            if publication is None or publication.locator != locator:
-                raise invalid_descriptor(
-                    "publication does not match its registered view"
-                )
+            if publication is None:
+                raise invalid_descriptor("publication is not registered")
             return publication.retirement
 
     def awaiting_acknowledgment(self) -> bool:

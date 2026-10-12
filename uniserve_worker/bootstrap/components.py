@@ -435,9 +435,9 @@ def validate_components(
             for call in calls
         ):
             # An audio media unit is a span of the latent timeline rather than
-            # a native window, and a condition's encoding unit is one of its
-            # encoder windows, so a rank may take several of them, but the
-            # division is still by media unit.
+            # a native clip, and a condition's encoding unit is one of its
+            # clips, so a rank may take several of them, but the division is
+            # still by media unit.
             if component.distribution not in (None, "temporal_units") or (
                 component.distribution is not None
                 and component.units_per_rank < 1

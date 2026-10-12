@@ -15,5 +15,5 @@ class DenoiserInput(NumericalDenoiserInput[image.Config]):
 
     # ``Denoiser.forward`` rejects a dense batch or one without host query
     # lengths, and writes zero K/V at the cache layer's table entry's
-    # ``write_indices`` when it carries them.
+    # ``slot_mapping`` when it carries them.
     attention: AttentionBatch

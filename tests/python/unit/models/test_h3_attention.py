@@ -3,10 +3,10 @@
 import pytest
 import torch
 
+from tests.python.fixtures.h3 import transformer_config
 from uniserve.distributed import Communicator
 from uniserve.nn.attention import SequenceLengths, VisibleInput
 from uniserve_models.minimax_h3.attention import Dense
-from uniserve_models.minimax_h3.config import TransformerConfig
 from uniserve_models.minimax_h3.inputs import SequenceInput
 
 pytestmark = pytest.mark.unit
@@ -14,7 +14,7 @@ pytestmark = pytest.mark.unit
 
 @torch.inference_mode()
 def test_dense_attention_averages_only_visible_values():
-    config = TransformerConfig(
+    config = transformer_config(
         hidden_size=64,
         num_attention_heads=2,
         num_hidden_layers=1,
@@ -51,8 +51,6 @@ def test_dense_attention_averages_only_visible_values():
         torch.empty(0, dtype=torch.int64),
     )
     cosine = torch.ones(8, 3 * config.rope_frequency_dim)
-    actual = layer(
-        hidden, cosine, torch.zeros_like(cosine), inputs, workspace={}
-    )
+    actual = layer(hidden, cosine, torch.zeros_like(cosine), inputs)
     expected = hidden[:6].mean(0).expand_as(hidden)
     torch.testing.assert_close(actual, expected)

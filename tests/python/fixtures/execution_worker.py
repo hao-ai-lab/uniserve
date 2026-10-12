@@ -8,7 +8,10 @@ from typing import Any
 
 import torch
 
-from tests.python.fixtures.worker_config import stub_worker_config
+from tests.python.fixtures.worker_config import (
+    cpu_worker_config,
+    stub_worker_config,
+)
 from uniserve.distributed.mesh import Communicator
 from uniserve.processing import FlowPrompt
 from uniserve_models.stub import Model, image_processor
@@ -25,7 +28,6 @@ def execution_worker(
     device: str = "cpu",
     queue_depth: int = 1,
     transfer_backends: tuple[str, ...] = ("local",),
-    worker_id: str = "worker",
     execution: WorkerConfig | None = None,
     max_batch_tokens: int = 8192,
     max_request_pool_size: int = 128,
@@ -54,7 +56,7 @@ def execution_worker(
             encoder_cache_entries=int(encoder_cache_entries),
         )
     policy = (
-        WorkerConfig(
+        cpu_worker_config(
             graph_policy="off",
             prefill_cuda_graph=False,
             flow_graph_batch_sizes=(1,),
@@ -71,7 +73,7 @@ def execution_worker(
         policy,
         device=worker_config.device,
         block_size=worker_config.block_size,
-        kv_token_capacity=worker_config.kv_token_capacity,
+        max_total_tokens=worker_config.max_total_tokens,
         attention_backend=worker_config.attention_backend,
         max_request_pool_size=worker_config.max_request_pool_size,
         encoder_cache_entries=worker_config.encoder_cache_entries,
@@ -86,15 +88,12 @@ def execution_worker(
         worker_config=worker_config,
         attention="torch",
         tokenizer=tokenizer,
-        allowed_calls=None,
         transfer_backends=transfer_backends,
         publication_backends=transfer_backends,
         # The fixture's deployment is one host: the worker's own slot and the
         # external consumer slot a test names both read over shared storage.
         host_slots=host_slots,
-        worker_id=worker_id,
         queue_depth=queue_depth,
-        completion_payload_bytes=1 << 16,
         components=components,
         flow_prompt=flow_prompt,
     )
@@ -122,7 +121,7 @@ def execution_worker(
         request_pool_size=worker.info.request_slots,
         block_size=block_size
         if kv_cache is None
-        else kv_cache.groups[0].page_tokens,
+        else kv_cache.groups[0].block_size,
         commit_marker_tokens=0 if flow is None else flow.framing,
         max_cfg_branches=1 if flow is None else 3,
         latent_page_units=worker.info.latent_page_units,

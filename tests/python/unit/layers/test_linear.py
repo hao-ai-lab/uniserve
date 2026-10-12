@@ -6,6 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.nn.functional import Rounding
 from uniserve.nn.linear import (
     ColumnParallelLinear,
     Linear,
@@ -184,6 +185,29 @@ def test_named_branches_preserve_independent_weights_and_bias(quantized, rows):
         )
 
 
+@torch.inference_mode()
+def test_merged_chunks_project_into_caller_rows():
+    """Chunks write every branch into its rows of caller storage.
+
+    Each yielded value is those rows of the caller's branch, and the filled
+    storage equals one complete call.
+    """
+    torch.manual_seed(5)
+    layer = MergedColumnParallelLinear(8, {"q": 4, "k": 4, "gate": 2})
+    source = torch.randn(9, 8)
+    expected = layer(source)
+    out = layer.output_buffers(9, dtype=source.dtype, device=source.device)
+    chunks = ((slice(0, 4), source[:4]), (slice(4, 9), source[4:]))
+
+    for interval, values in layer.forward_chunks(
+        iter(chunks), token_slice=slice(0, 9), num_tokens=9, out=out
+    ):
+        for name, value in values.items():
+            assert value.data_ptr() == out[name][interval].data_ptr()
+    for name, value in expected.items():
+        torch.testing.assert_close(out[name], value, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("heads,kv_heads", [(4, 2), (4, 1), (8, 8)])
 def test_query_shards_select_their_grouped_kv_heads(heads, kv_heads):
     head_dim, width = 4, 8
@@ -255,7 +279,7 @@ def test_merged_projection_rejects_bias_outside_its_branch_channels():
 
 
 def test_gated_mlp_uses_named_gate_and_up_branches():
-    model = GatedMLP(4, 8, bias=True)
+    model = GatedMLP(4, 8, bias=True, rounding=Rounding.ONCE)
     source = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4) / 16
     gate = model.gate_up.projections["gate"]
     up = model.gate_up.projections["up"]

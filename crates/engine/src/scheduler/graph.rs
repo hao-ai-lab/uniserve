@@ -3,7 +3,7 @@
 //! Admission builds a [`VideoGraph`] from the request's task and conditions:
 //! which media calls the request runs, the products each one publishes with
 //! their exact leading extents, and which calls read them. A `t2va` request
-//! is text encoding, latent preparation, the denoising ladder, both decoders,
+//! is text encoding, latent preparation, denoising, both decoders,
 //! both encoders and the muxer. A conditioned request first reads its
 //! condition media on a host rank (`MediaReading`), encodes the vision blocks
 //! the presentation names (`VisionEncoding`) ahead of the text encoding that
@@ -76,32 +76,6 @@ pub(crate) struct VideoGraph {
     /// Whether any condition carries an audio track to encode.
     condition_audio: bool,
 }
-
-/// The calls whose consumption order is fixed by kind, as one request's
-/// graph connects them: each producing call with its reading calls.
-const EDGES: [(MediaCall, &[MediaCall]); 11] = [
-    (
-        MediaCall::MediaReading,
-        &[MediaCall::VisionEncoding, MediaCall::LatentEncoding],
-    ),
-    (MediaCall::VisionEncoding, &[MediaCall::TextEncoding]),
-    (MediaCall::TextEncoding, &[MediaCall::LatentPreparation]),
-    (MediaCall::LatentEncoding, &[MediaCall::LatentPreparation]),
-    (MediaCall::LatentPreparation, &[MediaCall::Denoising]),
-    (
-        MediaCall::Denoising,
-        &[
-            MediaCall::Denoising,
-            MediaCall::VideoDecoding,
-            MediaCall::AudioDecoding,
-        ],
-    ),
-    (MediaCall::VideoDecoding, &[MediaCall::VideoEncoding]),
-    (MediaCall::VideoEncoding, &[MediaCall::Muxing]),
-    (MediaCall::AudioDecoding, &[MediaCall::AudioEncoding]),
-    (MediaCall::AudioEncoding, &[]),
-    (MediaCall::Muxing, &[]),
-];
 
 /// The media calls every video request runs, whatever its task.
 const GENERATION_CALLS: [MediaCall; 8] = [
@@ -274,17 +248,11 @@ impl VideoGraph {
         if !self.runs(call) {
             return Vec::new();
         }
-        EDGES
+        call.readers()
             .iter()
-            .find(|(producer, _)| *producer == call)
-            .map(|(_, readers)| {
-                readers
-                    .iter()
-                    .copied()
-                    .filter(|reader| self.runs(*reader))
-                    .collect()
-            })
-            .unwrap_or_default()
+            .copied()
+            .filter(|reader| self.runs(*reader))
+            .collect()
     }
 
     /// Every product the request reserves at admission.
@@ -346,7 +314,6 @@ mod tests {
             sampling: DiffusionSamplingParams {
                 num_frames: 124,
                 video_units: 7,
-                num_inference_steps: 49,
                 seed: 42,
                 width: 1344,
                 height: 768,

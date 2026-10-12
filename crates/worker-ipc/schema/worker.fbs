@@ -17,8 +17,7 @@
 //   other scalar reads its schema default when absent.
 // - Most absent vectors decode as empty. `allowed_token_ids` in
 //   SamplingParams and SamplingState decodes absence as no whitelist, and
-//   `WorkerInfo.transfer_backends` and `ComponentInfo.outputs` are rejected
-//   when absent.
+//   `ComponentInfo.outputs` is rejected when absent.
 // - Few fields carry `(required)`, which the FlatBuffers verifier enforces.
 //   The decoders reject the absence of many other fields and tables (for
 //   example `Call.coordinates` and `Locator.source`), so a field without
@@ -37,7 +36,7 @@ enum MediaCall : ubyte { None, MediaReading, VisionEncoding, LatentEncoding, Tex
 enum TransferMode : ubyte { None, Tensor, KvPublish, KvInstall }
 
 /// Inline encoding of the Rust `CallKind` sum: exactly one of the three tags
-/// is not `None`. `computation_from_fb` rejects zero or several set tags.
+/// is not `None`. `call_kind_from_fb` rejects zero or several set tags.
 struct CallKind {
   forward_mode:ForwardMode;
   media:MediaCall;
@@ -50,15 +49,19 @@ enum FeatureKind : ubyte { Vision, Latent }
 /// `Predicated` reports a call skipped because its predicate was false.
 enum CallStatus : ubyte { Ok, Predicated, Error }
 
+/// The failure classes of a worker, carried by a call's completion and by an
+/// error response alike.
 enum ErrorCode : ubyte {
-  InvalidCall,
-  ResourceExhausted,
+  UnsupportedCall,
+  InvalidDescriptor,
+  UnsupportedSetup,
+  InputError,
   ComputeError,
-  Cancelled,
-  Internal
+  ResourceError,
+  InvariantViolation,
+  FatalWorkerFailure,
+  InvalidRequest
 }
-
-enum DrawLayout : ubyte { TargetSampling, SpeculativeProposal, FlowNoise }
 
 enum ReqKind : ubyte { Info, Submit, Close }
 
@@ -94,7 +97,6 @@ table SamplingParams {
   return_logprobs:bool;
   return_prompt_logprobs:bool;
   n_prompt_logprobs:uint;
-  logprob_token_ids:[uint];
   typical_p:float = 1.0;
   forced_token_ids:[uint];
 }
@@ -116,9 +118,6 @@ table ImageParams {
   width:uint;
   seed:ulong = null;
   negative_prompt:string;
-  max_images:ushort;
-  image_prompts:[string];
-  retain_images:bool = true;
 }
 
 /// One cache group of a worker's unit pool, decoded into
@@ -127,9 +126,7 @@ table KvGroup {
   kind:KvGroupKind;
   /// Read only when `kind` is `SlidingWindow`.
   window:uint;
-  /// Read only when `kind` is `SlidingWindow`.
-  sink:uint;
-  page_tokens:uint;
+  block_size:uint;
   units_per_page:uint;
   /// Global cache-layer ids of this rank's layers, in column order.
   layer_ids:[uint];
@@ -139,39 +136,19 @@ table KvGroup {
   head_dim:uint;
 }
 
-/// Paged KV unit pool of one rank: `num_units` units of `unit_bytes` each,
-/// shared by every group's pages.
+/// Paged KV unit pool of one rank: `num_units` units shared by every
+/// group's pages.
 table KVCacheInfo {
   num_units:uint;
-  unit_bytes:ulong;
   dtype:string;
   groups:[KvGroup];
 }
 
 table WorkerEndpoint {
-  worker_id:string;
-  rank:uint;
   node:string;
   address_space:string;
   incarnation:string;
 }
-
-// Sequence-parallel strategy of a component. The decoder requires the payload
-// table of every variant except LocalSequence, and GatherSequence decodes to
-// `SequenceParallel::Allgather`.
-table LocalSequence {}
-table UlyssesSequence { ulysses_degree:uint = 1; }
-table GatherSequence { allgather_degree:uint = 1; }
-table HybridSequence { ulysses_degree:uint = 1; allgather_degree:uint = 1; }
-union SequenceParallel { LocalSequence, UlyssesSequence, GatherSequence, HybridSequence }
-table ParallelConfig {
-  tensor_parallel_size:uint = 1;
-  pipeline_parallel_size:uint = 1;
-  sequence_parallel:SequenceParallel;
-}
-/// `Local` decodes to no distribution: the component runs as one
-/// model-parallel group.
-enum ComponentDistribution:ubyte { Local, TemporalUnits }
 
 /// One declared tensor result of a component; its position in
 /// `ComponentInfo.outputs` is the product output index.
@@ -191,36 +168,63 @@ table OutputInfo {
   width_axis:int = -1;
 }
 
+/// A loaded component and its declared results. The engine owns the
+/// component's placement.
 table ComponentInfo {
   name:string;
-  ranks:[ulong];
-  parallel_config:ParallelConfig;
-  distribution:ComponentDistribution;
-  units_per_rank:uint = 1;
   outputs:[OutputInfo];
 }
 
 /// A video raster in pixels.
 struct Canvas { width:uint; height:uint; }
 
-/// Whole tiles of `rows` rows a multi-region denoiser packs each condition
-/// into; a video's token grid is cut into tiles of `frames x height x width`
-/// tokens.
-struct ConditionTiles { rows:uint; frames:uint; height:uint; width:uint; }
+/// A canvas a deployment serves with the request fields that select it:
+/// `target.short_edge`, the resolution class in pixels, and
+/// `target.aspect_ratio`, the display ratio as `W:H`. `width` and `height`
+/// are the raster of that pair.
+table ServedCanvas {
+  short_edge:uint;
+  aspect_ratio:string;
+  width:uint;
+  height:uint;
+}
+
+/// Most references of each kind one request may carry. `total` bounds all
+/// kinds together, keyframes not counted; a video's soundtrack counts with
+/// the video and `audios` bounds the audio references that are not one. A
+/// denoiser that takes no references declares zeros.
+table ReferenceLimits {
+  images:uint;
+  videos:uint;
+  audios:uint;
+  total:uint;
+}
+
+/// How the video VAE divides a video's frames into clips (`FrameClips`).
+table FrameClips {
+  min_frames:uint;
+  clip_frames:uint;
+  clip_latent_frames:uint;
+  tail_latent_frames:uint;
+}
 
 /// What a deployment's video denoiser serves: its tasks, its fixed schedule
-/// (sigma points including the clean endpoint, and the per-modality shifts)
-/// and the canvases and packed rows it accepts. An empty canvas list is the
-/// model's canvas rule; an absent capacity is unbounded by the checkpoint;
-/// absent condition tiles pack conditions densely, one row per token.
+/// (sigma points including the clean endpoint, and the per-modality shifts),
+/// the frame rate of every video it generates, in frames per second, the
+/// sample rate of the audio it generates with a video (zero when it generates
+/// none), how the VAE divides a video's frames into clips, the canvases it
+/// prepares and accepts, in the order the deployment selected them, and the
+/// references a request may carry.
 table VideoDenoiserInfo {
   tasks:[string];
   schedule_points:uint;
   video_shift:double;
   audio_shift:double;
-  canvases:[Canvas];
-  max_sequence_rows:uint = null;
-  condition_tiles:ConditionTiles;
+  frame_rate:uint;
+  audio_sample_rate:uint;
+  frames:FrameClips (required);
+  canvases:[ServedCanvas];
+  references:ReferenceLimits;
 }
 
 /// Binds a media call to the component that runs it; the decoder rejects a
@@ -228,25 +232,29 @@ table VideoDenoiserInfo {
 table MediaComponent { call:MediaCall; component:string; }
 
 /// A loaded rank's identity and capabilities, answered to an Info request.
-/// `WorkerInfo::validate` checks internal consistency; the engine checks it
-/// against the launch.
+/// `WorkerInfo::validate` checks internal consistency; launch values such as
+/// placement and queue depth are the engine's and are not reported.
+/// One image shape the worker prepared its flow runtime for: a request of
+/// `height` by `width` pixels at the guidance scales that realize one of its
+/// captured branch counts.
+table ImageWarmup {
+  height:uint;
+  width:uint;
+  cfg_text_scale:float;
+  cfg_img_scale:float;
+  /// Token ids of the alternative guidance prefix the worker encodes for an
+  /// empty negative prompt, which the request carries as its negative prompt.
+  negative_token_ids:[uint];
+}
+
 table WorkerInfo {
-  model_name:string;
   endpoint:WorkerEndpoint;
-  device:string;
-  transfer_backends:[string];
   /// Whether this rank's device exports a fabric handle. A descriptor handle
   /// reaches only this host, so an edge that must cross hosts is refused at
   /// startup rather than failing on its first publication.
   fabric_handles:bool = false;
-  world_size:uint = 1;
-  model_dtype:string;
-  attention_backend:string;
-  weight_formats:[string];
-  activation_formats:[string];
   components:[ComponentInfo];
   supported_calls:[CallKind];
-  queue_depth:uint;
   max_batch_calls:uint;
   max_batch_tokens:uint;
   request_slots:uint;
@@ -258,20 +266,17 @@ table WorkerInfo {
   encoder_entry_bytes:ulong;
   max_unresolved_calls:uint = 1;
   media_components:[MediaComponent];
-  num_inference_steps:uint;
   host_lane_capacity:uint = 1;
-  /// Identity of the loaded checkpoint files. Empty only for the weightless
-  /// stub model; the engine refuses ranks or pools that report different
-  /// values.
-  checkpoint_identity:string;
+  /// Transfer entries the rank's transport holds in flight at once; the
+  /// engine's window of calls that move bytes is the narrowest rank's.
+  transfer_tickets:uint;
   video_denoiser:VideoDenoiserInfo;
-  /// Maximum calls in one prefill run, the rows the rank's captured prefill
-  /// graphs hold; zero leaves prefill runs bounded by `max_batch_calls`.
-  max_prefill_calls:uint;
-  /// Maximum calls in one decode run, the rows the rank's largest captured
-  /// decode graph holds; zero leaves decode runs bounded by
-  /// `max_batch_calls`.
-  max_decode_calls:uint;
+  /// Image shapes the worker's flow runtime is prepared for, which the engine
+  /// runs one request batch of at startup.
+  image_warmups:[ImageWarmup];
+  /// Canvas rows one sampler chunk of the worker's token denoiser covers;
+  /// zero when it generates no canvases.
+  canvas_step_rows:uint;
 }
 
 // Request identities and call records.
@@ -312,12 +317,6 @@ table TensorRef {
   dynamic_axis:int = -1;
 }
 
-table Rng {
-  seed:ulong;
-  semantic_index_base:ulong;
-  draw_layout:DrawLayout;
-}
-
 /// Per-call token-processor inputs. Every list is strictly increasing, which
 /// `Call::validate` checks.
 table SamplingState {
@@ -347,12 +346,11 @@ table Readout {
 
 /// The coordinates a call carries so a rank does not derive them from the
 /// calls that preceded it. The engine holds the request state they come
-/// from; the rank asserts its own ledger agrees.
+/// from.
 table CallCoordinates {
   logical_position:uint;
   kv_visible_len:uint;
   kv_computed_len:uint;
-  flow_step:uint;
 }
 
 /// One image block of a context prefill, decoded into `VisionInput`: the
@@ -363,7 +361,7 @@ table VisionInput {
   feature:TensorRef (required);
 }
 
-/// One planned computation, decoded into `Call` and checked by
+/// One planned call, decoded into `Call` and checked by
 /// `Call::validate`; relationships to other calls and to the batch's tables
 /// are checked by `Batch::validate`.
 table Call {
@@ -371,14 +369,11 @@ table Call {
   call_id:CallId;
   coordinates:CallCoordinates;
   component:string (required);
-  code:CallKind (required);
-  // Scheduler-reserved maxima, decoded into `Bounds`. `max_tokens` and
-  // `max_latent_bytes` are checked by `Call::validate` and
-  // `max_transfer_bytes` by `Batch::validate`; neither validator checks
-  // `max_kv_units` or `max_completion_bytes`.
+  kind:CallKind (required);
+  // Scheduler-reserved maxima, decoded into `Bounds`. `max_tokens` is
+  // checked by `Call::validate` and `max_transfer_bytes` by
+  // `Batch::validate`; neither validator checks `max_completion_bytes`.
   max_tokens:uint;
-  max_kv_units:uint;
-  max_latent_bytes:ulong;
   max_completion_bytes:ulong;
   max_transfer_bytes:ulong;
   inputs:[TensorRef];
@@ -398,7 +393,10 @@ table Call {
   /// continuation scalar. A false predicate completes the call as
   /// `Predicated`.
   predicate:TensorRef;
-  rng:Rng;
+  /// Index of the image a latent preparation initializes; zero when the call
+  /// initializes none. The engine assigns it, and the noise seed derives from
+  /// the request's image seed and this index.
+  image_index:uint;
   sampling_state:SamplingState;
   /// Host-known input tokens; empty when a continuation reads its
   /// predecessor's token on the device.
@@ -442,8 +440,6 @@ table LatentParams {
   latent_units:uint;
   height:uint;
   width:uint;
-  start_step:uint;
-  step_count:uint;
 }
 
 table DecodeRange {
@@ -451,6 +447,9 @@ table DecodeRange {
   call_id:CallId;
   cursor:uint;
   max_units:uint;
+  /// Component ranks holding the round's units, in unit order; empty deals
+  /// them in the component's configured rank order.
+  ranks:[uint];
 }
 
 /// A byte span of the rank's persistent-buffer arena reserved for one buffer.
@@ -496,22 +495,18 @@ struct TokenLogprob {
 table PositionLogprobs { entries:[TokenLogprob]; }
 
 /// The completion a worker emits once for every call, checked by
-/// `RequestOutput::validate`. `finish_flags` and `timing_counters` are
+/// `CallOutput::validate`. `finish_flags` and `timing_counters` are
 /// required by the decoder.
-table RequestOutput {
+table CallOutput {
   request_key:RequestKey;
   call_id:CallId;
   status:CallStatus;
-  product_generations:[uint];
   /// Present exactly when `status` is `Error`.
   error_code:ErrorCode = null;
   timing_counters:TimingCounters;
-  /// Must match the submitted call's kind.
-  code:CallKind (required);
-  position:uint;
   kv_visible_len:uint;
   kv_computed_len:uint;
-  num_completed_steps:uint;
+  step_index:uint;
   committed_tokens:[uint];
   sampled_logprob:float = null;
   top_logprobs:[TokenLogprob];
@@ -522,6 +517,9 @@ table RequestOutput {
   /// Natural-log probability of every readout candidate of a successful
   /// token-denoising call, in the call's `Readout.candidate_ids` order.
   candidate_logprobs:[float];
+  /// Why the worker refused the request; present exactly when `error_code`
+  /// is `InvalidRequest`.
+  error_message:string;
 }
 
 table StartCommand { request:NewRequest; }
@@ -538,7 +536,7 @@ union BatchCommand { StartCommand, FinishCommand, FreeCommand }
 /// One entry of `Batch.commands`; the decoder rejects an empty union.
 table BatchCommandEnvelope { command:BatchCommand; }
 
-// Static request admission and physical run binding.
+// Static request admission and physical batch binding.
 
 // A video request's task, presentation tags and conditions, decoded into
 // `VideoAdmission` and its `uniserve_core::VideoCondition` values, which
@@ -550,7 +548,7 @@ enum ConditionRole : ubyte { FirstFrame, LastFrame, Reference }
 /// A still image resized to `resized`, then the `size` window at (`left`,
 /// `top`) kept.
 struct ImageFit { resized:Canvas; left:uint; top:uint; size:Canvas; }
-/// A reference video's frames on the 24 fps timeline.
+/// A reference video's frames on the output-rate timeline.
 struct VideoClip { canvas:Canvas; start_frame:uint; frames:uint; vae_frames:uint; }
 /// An audio track's native samples and their count at the model rate.
 struct AudioClip {
@@ -588,30 +586,16 @@ table VideoAdmission {
   conditions:[VideoCondition];
 }
 
-/// Block-diffusion sampling of a canvas-generating request, decoded into
-/// `CanvasSampling`.
-table CanvasSampling {
-  canvas_length:uint;
-  max_steps:uint;
-  entropy_bound:float;
-  t_min:float;
-  t_max:float;
-  confidence_threshold:float;
-  stability_threshold:uint;
-}
-
-table ArRequestParams {
+table GenerationParams {
   sampling:SamplingParams;
   negative_token_ids:[uint];
   finish_token_ids:[uint];
   initial_position:uint;
-  canvas:CanvasSampling;
 }
 
 table DiffusionSamplingParams {
   num_frames:uint;
   video_units:uint;
-  num_inference_steps:uint;
   seed:ulong;
   /// Output raster in pixels: the request's canvas.
   width:uint;
@@ -621,7 +605,7 @@ table DiffusionSamplingParams {
 table NewRequest {
   request_key:RequestKey;
   request_pool_idx:uint;
-  ar:ArRequestParams;
+  generation:GenerationParams;
   image:ImageParams;
   diffusion:DiffusionSamplingParams;
   prompt_token_ids:[uint];
@@ -745,7 +729,7 @@ table DeviceProductTransfer {
 /// keys, values, and, for quantized storage, scales.
 table KvGroupTransfer {
   start:uint;
-  page_tokens:uint;
+  block_size:uint;
   tensors:[TensorTransfer];
 }
 
@@ -766,7 +750,7 @@ table LatentTransfer {
   height:uint;
   width:uint;
   latent_units:uint;
-  step:uint;
+  step_index:uint;
   tensor:TensorTransfer;
 }
 
@@ -782,7 +766,7 @@ table TensorPublication {
 /// The payload of a Result response, checked by `BatchOutput::validate`.
 table BatchOutput {
   batch_id:ulong;
-  completions:[RequestOutput];
+  completions:[CallOutput];
   products:[TensorPublication];
   worker_exec_us:ulong = null;
   forward_stats:ForwardStats;
@@ -840,15 +824,14 @@ table ErrorCallIdentity {
 /// Rank-to-engine envelope. `response_from_table` enforces the legal field
 /// set per kind: `Info` carries only `info`, `Result` only `result`, and `Ok`
 /// nothing. `Error` carries no success payload and requires a non-empty
-/// `message` and `fatal`; the remaining error fields are optional, and an
-/// empty `code` reads as absent.
+/// `message`, a `code` and `fatal`; the remaining error fields are optional.
 table WorkerResponse {
   kind:RespKind;
   message_id:ulong = null;
   info:WorkerInfo;
   result:BatchOutput;
   message:string;
-  code:string;
+  code:ErrorCode = null;
   /// Whether the worker is unsafe to serve further requests.
   fatal:bool = null;
   phase:string;

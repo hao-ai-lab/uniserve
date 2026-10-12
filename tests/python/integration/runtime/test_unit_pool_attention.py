@@ -37,9 +37,11 @@ from uniserve.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve.runtime import PrefixCache, TensorBuffers
+from uniserve.quantization import Quantizer
+from uniserve.runtime import KVCache, TensorBuffers
 from uniserve.runtime.backends.attention import resolve
 from uniserve.runtime.backends.attention.torch import Backend as TorchBackend
+from uniserve.runtime.kv_cache import plan_units
 
 pytestmark = [
     pytest.mark.integration,
@@ -81,8 +83,11 @@ def _pool(block_size, window):
             "full": mha.Config(2, 512, (0, 1), torch.bfloat16),
         }
     )
-    with PrefixCache(
-        layers, num_units=_UNITS, block_size=block_size, device="cuda"
+    with KVCache(
+        layers,
+        plan_units(layers, block_size=block_size),
+        num_units=_UNITS,
+        device="cuda",
     ) as cache:
         yield cache
 
@@ -240,9 +245,9 @@ def _call(state, rows, *, kind, window, units, generator, padding):
         device="cuda",
         start_pages=None if window is None else starts,
     )
-    writes = paged.write_indices.clone()
-    writes[live:] = -1
-    return replace(paged, write_indices=writes), live
+    slot_mapping = paged.slot_mapping.clone()
+    slot_mapping[live:] = -1
+    return replace(paged, slot_mapping=slot_mapping), live
 
 
 def _widen(batch, width):
@@ -275,7 +280,7 @@ def _projections(tokens, layer, generator):
 def _reference(reference, q, k, v, batch, out):
     """Evaluate ``batch`` portably over the cache the native call wrote."""
     if isinstance(batch, PagedInput):
-        batch = replace(batch, write_indices=None)
+        batch = replace(batch, slot_mapping=None)
     return reference(q, k, v, batch, scale=1.0, out=out)
 
 
@@ -436,8 +441,8 @@ def _assign(target, source):
     ]
     if table.start_page is not None:
         pairs.append((table.start_page, values.start_page))
-    if getattr(target, "write_indices", None) is not None:
-        pairs.append((target.write_indices, source.write_indices))
+    if getattr(target, "slot_mapping", None) is not None:
+        pairs.append((target.slot_mapping, source.slot_mapping))
     for destination, value in pairs:
         destination.copy_(value)
 
@@ -489,3 +494,30 @@ def test_windowed_layers_without_native_storage_raise_when_prepared():
             workspace={},
             window=1023,
         )
+
+
+def test_a_per_block_fp8_cache_has_no_native_kernel_and_raises_when_prepared():
+    # Native kernels read half-precision pages only.
+    config = Config({"attention": mha.Config(2, 128, (0,), torch.bfloat16)})
+    planes = plan_units(
+        config,
+        block_size=64,
+        quantization={"attention": Quantizer("fp8", axis=0)},
+    )
+    with KVCache(config, planes, num_units=4, device="cuda") as cache:
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"no native attention kernel.*dimension 128.*"
+                r"per-block FP8 cache of 64-token pages"
+            ),
+        ):
+            resolve("auto", device=torch.device("cuda", 0)).prepare(
+                num_heads=8,
+                num_kv_heads=2,
+                head_dim=128,
+                dtype=torch.bfloat16,
+                size=TextSize(8, 1),
+                cache=cache.state("attention"),
+                workspace={},
+            )

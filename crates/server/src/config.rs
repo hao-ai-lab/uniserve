@@ -20,8 +20,8 @@ use serde::Serialize;
 use serde_json::Value;
 use uniserve_engine::{
     DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    SchedulingPolicy, TransferConfig, WorkerConfig, WorkerProcessArgs,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, SchedulingPolicy, TransferConfig,
+    WorkerConfig, WorkerProcessArgs,
 };
 
 /// How the HTTP server obtains its listening socket.
@@ -55,16 +55,20 @@ pub enum HttpListenerMode {
 pub struct EngineSettings {
     /// Maximum calls assembled into one forward batch.
     pub max_batch: usize,
-    /// Maximum number of tokens scheduled in one engine step.
-    pub max_num_batched_tokens: usize,
+    /// Maximum number of tokens scheduled in one engine step; `None` is
+    /// [`DEFAULT_MAX_NUM_BATCHED_TOKENS`]. A video pipeline schedules no
+    /// token batches and refuses a value.
+    pub max_num_batched_tokens: Option<usize>,
     /// Maximum number of concurrently running requests.
     pub max_num_seqs: usize,
-    /// Per-request token ceiling for one prefill chunk.
-    pub long_prefill_threshold: usize,
-    /// Per-step budget of text prefill tokens a decode pass may co-schedule.
-    /// The prefill tokens still travel as their own batch and numerical call.
-    /// `0` disables co-scheduling.
-    pub mixed_prefill_tokens: usize,
+    /// Most requests the scheduler holds waiting, or finished with
+    /// undelivered events, before it rejects a submission as overloaded;
+    /// `None` queues without bound.
+    pub max_num_waiting: Option<usize>,
+    /// Per-request token ceiling for one prefill chunk; `None` is
+    /// [`DEFAULT_LONG_PREFILL_THRESHOLD`]. A video pipeline prefills no
+    /// prompt chunks and refuses a value.
+    pub long_prefill_threshold: Option<usize>,
     /// Reuse and retain prompt KV prefixes across requests. Per-request cache
     /// policy can further restrict this deployment-wide setting.
     pub prefix_cache: bool,
@@ -77,22 +81,21 @@ pub struct EngineSettings {
     /// of a diffusers pipeline.
     pub max_model_len: Option<u32>,
     /// Largest request duration, in seconds, resident media state is sized to
-    /// serve. The video service rejects longer video requests.
+    /// serve, between `crate::serving::MIN_VIDEO_SECONDS` and
+    /// `MAX_VIDEO_SECONDS`, the range the video API admits. The video service
+    /// rejects longer video requests.
     pub max_video_seconds: f64,
-    /// Video resolution classes a video deployment prepares. Crossed with
-    /// `video_aspect_ratios`, they name the canvases its workers prepare and
-    /// report as the only canvases requests may target.
-    pub video_resolutions: Vec<crate::profile::video::VideoResolution>,
-    /// Video aspect ratios a video deployment prepares.
-    pub video_aspect_ratios: Vec<crate::profile::omni::resolution::ResolutionName>,
     /// Most denoiser rows a video request's conditions may take
     /// (`--max-condition-rows`). Video workers provision their condition
-    /// products for it, and the video service rejects requests above it.
-    pub max_condition_rows: u32,
+    /// products for it, and the worker that packs a request's conditions
+    /// refuses one above it.
+    /// `None` provisions the largest condition set the deployment's
+    /// denoiser admits, so no request is refused for its conditions.
+    pub max_condition_rows: Option<u32>,
     /// Static Worker configurations with ordered ranks and named computation components.
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
-    /// `encoder->prefill=shm,prefill->decode=cuda_vmm`.
+    /// `encoder->prefill=posix_shm,prefill->decode=cuda_vmm`.
     pub transfer: TransferConfig,
     /// Number of independent replicas `workers` forms, as equal consecutive
     /// blocks of groups. Each replica runs its own scheduler and KV pool, and
@@ -110,21 +113,15 @@ impl Default for EngineSettings {
     fn default() -> Self {
         Self {
             max_batch: DEFAULT_MAX_BATCH,
-            max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
+            max_num_batched_tokens: None,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
-            long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
-            mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
+            max_num_waiting: None,
+            long_prefill_threshold: None,
             prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
-            max_video_seconds: 15.0,
-            video_resolutions: crate::profile::video::VideoRasters::default()
-                .resolutions()
-                .to_vec(),
-            video_aspect_ratios: crate::profile::video::VideoRasters::default()
-                .aspect_ratios()
-                .to_vec(),
-            max_condition_rows: EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
+            max_video_seconds: crate::serving::MAX_VIDEO_SECONDS,
+            max_condition_rows: None,
             // One local CUDA rank running `DEFAULT_COMPONENT`. The `uniserve`
             // CLI and the Dynamo worker binary both replace this with a
             // placement built from their own arguments.
@@ -132,16 +129,13 @@ impl Default for EngineSettings {
                 &["localhost".to_owned()],
                 "cuda",
                 1,
-                2,
+                WorkerProcessArgs::DEFAULT_QUEUE_DEPTH,
                 WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
             )],
             transfer: TransferConfig::default(),
             data_parallel_size: 1,
             expert_parallel: None,
-            worker_process: WorkerProcessArgs {
-                resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
-                ..WorkerProcessArgs::default()
-            },
+            worker_process: WorkerProcessArgs::default(),
         }
     }
 }
@@ -155,12 +149,6 @@ pub struct Config {
     /// repository ID or a local model directory. Empty by default; callers
     /// must set it.
     pub model: String,
-    /// Local copy of the base checkpoint that a component export (such as
-    /// FastH3 OmniRef) pins for its other components, verified against the
-    /// pinned revision by its Hugging Face download records. Without it the
-    /// server and the workers read the pinned revision from the Hugging Face
-    /// cache. Only a component export takes a base.
-    pub base_model: Option<PathBuf>,
     /// Single model name exposed to clients via the OpenAI API. When absent,
     /// the resolved model identifier is used.
     pub served_model_name: Option<String>,
@@ -187,9 +175,8 @@ pub struct Config {
     /// Optional timeout until a request's response head is returned; streamed
     /// response bodies (chat SSE and video downloads) are not bounded by it.
     pub request_timeout: Option<Duration>,
-    /// Optional HTTP admission limit for in-flight chat completion and image
-    /// generation requests. Video requests are bounded by the video job slots
-    /// instead.
+    /// Optional HTTP admission limit for in-flight chat completion, image
+    /// generation, System One and synchronous video requests.
     pub max_concurrent_requests: Option<u64>,
     /// Maximum time to wait for active HTTP requests to drain on shutdown.
     /// Zero aborts the server as soon as shutdown begins.
@@ -201,12 +188,45 @@ pub struct Config {
     /// Where video-request condition media may come from, and how large it
     /// may be.
     pub video_media: VideoMediaSettings,
+    /// How long, and how much, the asynchronous video jobs keep.
+    pub video_jobs: VideoJobSettings,
     /// Time, size, and destination limits for request image references.
     pub image_fetch: ImageFetchPolicy,
     /// How System One questions are divided among readout prompts and canvases.
     pub readout: ReadoutOptions,
     /// Block-diffusion sampler overrides applied to every generated reply.
     pub diffusion_generation: DenoisingOverrides,
+    /// Options of the served model's multimodal processor
+    /// (`--mm-processor-kwargs`), by name. The model's processor reads the
+    /// ones it takes and refuses any other at startup; MiniMax H3's reads
+    /// its reference sizing (`serving::video::plan::ReferenceConfig`).
+    pub mm_processor_kwargs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Retention and memory policy of the video job store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct VideoJobSettings {
+    /// How long a completed or failed job is retained before it is deleted.
+    pub retention: Duration,
+    /// Bytes of generated video the store keeps: retained artifacts and
+    /// artifacts an unfinished download still holds.
+    pub max_retained_bytes: usize,
+}
+
+impl VideoJobSettings {
+    /// The default retention, one hour, in seconds.
+    pub const DEFAULT_RETENTION_SECONDS: u64 = 3600;
+    /// The default retained-video budget, 1 GiB.
+    pub const DEFAULT_MAX_RETAINED_BYTES: usize = 1 << 30;
+}
+
+impl Default for VideoJobSettings {
+    fn default() -> Self {
+        Self {
+            retention: Duration::from_secs(Self::DEFAULT_RETENTION_SECONDS),
+            max_retained_bytes: Self::DEFAULT_MAX_RETAINED_BYTES,
+        }
+    }
 }
 
 /// Sources and limits of the condition media of video requests.
@@ -263,7 +283,6 @@ impl Default for Config {
         Self {
             engine: EngineSettings::default(),
             model: String::new(),
-            base_model: None,
             served_model_name: None,
             listener_mode: HttpListenerMode::BindTcp {
                 host: "127.0.0.1".to_string(),
@@ -281,9 +300,11 @@ impl Default for Config {
             shutdown_timeout: Duration::from_secs(0),
             reasoning_parsing: true,
             video_media: VideoMediaSettings::default(),
+            video_jobs: VideoJobSettings::default(),
             image_fetch: ImageFetchPolicy::default(),
             readout: ReadoutOptions::default(),
             diffusion_generation: DenoisingOverrides::default(),
+            mm_processor_kwargs: serde_json::Map::new(),
         }
     }
 }
@@ -324,31 +345,54 @@ impl Config {
     }
 }
 
+/// The token bounds of a deployment's scheduler, resolved for its model
+/// family by [`EngineSettings::token_budgets`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokenBudgets {
+    pub(crate) max_num_batched_tokens: usize,
+    pub(crate) long_prefill_threshold: usize,
+}
+
 impl EngineSettings {
     /// Final fallback context length used when neither the CLI nor the loaded
     /// model exposes a `max_model_len`.
     pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
 
-    /// Default response-ring slot capacity in bytes for the worker IPC
-    /// transport (64 MiB). `build_state` raises the configured capacity to the
-    /// model's channel payload capacity when that is larger.
-    pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
-
-    /// Default condition capacity in denoiser rows: two keyframes on the
-    /// largest named canvas, 1008 rows each, so every `fl2va` request fits.
-    /// The capacity sizes each request slot's retained conditioning and the
-    /// denoiser's largest layout, so a deployment that also serves `ref2va`
-    /// states the capacity its references need (a five-second reference
-    /// video with its soundtrack takes about 38,000 rows). A checkpoint's own
-    /// sequence capacity bounds requests independently.
-    pub const DEFAULT_MAX_CONDITION_ROWS: u32 = 2048;
+    /// Resolves the token budgets of a token model or, with `pipeline`, a
+    /// video pipeline.
+    ///
+    /// A video pipeline schedules requests, not token batches, and its worker
+    /// reads no token budget, so a configured one is refused instead of
+    /// being ignored.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `pipeline` is set and a token budget or prefill chunk size
+    /// is configured.
+    pub(crate) fn token_budgets(&self, pipeline: bool) -> Result<TokenBudgets> {
+        anyhow::ensure!(
+            !pipeline
+                || (self.max_num_batched_tokens.is_none() && self.long_prefill_threshold.is_none()),
+            "--max-num-batched-tokens and --chunked-prefill-size bound token batches, \
+             which a video pipeline does not schedule; remove them"
+        );
+        Ok(TokenBudgets {
+            max_num_batched_tokens: self
+                .max_num_batched_tokens
+                .unwrap_or(DEFAULT_MAX_NUM_BATCHED_TOKENS),
+            long_prefill_threshold: self
+                .long_prefill_threshold
+                .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),
+        })
+    }
 
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`
     /// override before it reaches the scheduler or KV sizing math. It also
     /// rejects a `max_video_seconds` outside the video API's [4, 15] second
-    /// range (`validate_video_capacity`) and any
-    /// worker placement `WorkerConfig::validate_all` refuses.
+    /// range, since a smaller capacity admits no request and a larger one
+    /// exceeds what the API accepts, and any worker placement
+    /// `WorkerConfig::validate_all` refuses.
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.worker_process.block_size.is_none_or(|size| size > 0),
@@ -360,19 +404,25 @@ impl EngineSettings {
         );
         anyhow::ensure!(self.max_batch > 0, "max_batch must be greater than 0");
         anyhow::ensure!(
-            self.max_num_batched_tokens > 0,
+            self.max_num_batched_tokens != Some(0),
             "max_num_batched_tokens must be greater than 0"
         );
         anyhow::ensure!(self.max_num_seqs > 0, "max_num_seqs must be greater than 0");
         anyhow::ensure!(
+            self.max_num_waiting != Some(0),
+            "max_num_waiting must be greater than 0"
+        );
+        anyhow::ensure!(
             self.max_model_len.map(|len| len > 0).unwrap_or(true),
             "max_model_len must be greater than 0"
         );
-        crate::serving::validate_video_capacity(self.max_video_seconds)
-            .map_err(anyhow::Error::msg)?;
+        let video_seconds = crate::serving::MIN_VIDEO_SECONDS..=crate::serving::MAX_VIDEO_SECONDS;
         anyhow::ensure!(
-            self.worker_process.resp_slot_cap > 0,
-            "resp_slot_cap must be greater than 0"
+            video_seconds.contains(&self.max_video_seconds),
+            "max_video_seconds must lie in [{}, {}], got {}",
+            video_seconds.start(),
+            video_seconds.end(),
+            self.max_video_seconds
         );
         WorkerConfig::validate_all(&self.workers)?;
         Ok(())
@@ -387,6 +437,37 @@ mod tests {
     fn default_config_validates() {
         let config = Config::default();
         assert!(config.validate().is_ok());
+    }
+
+    /// Token budgets bound token batches, which a video pipeline never forms.
+    #[test]
+    fn a_video_pipeline_refuses_token_budgets() {
+        for settings in [
+            EngineSettings {
+                max_num_batched_tokens: Some(2),
+                ..EngineSettings::default()
+            },
+            EngineSettings {
+                long_prefill_threshold: Some(1),
+                ..EngineSettings::default()
+            },
+        ] {
+            assert!(settings.token_budgets(true).is_err());
+            assert!(settings.token_budgets(false).is_ok());
+        }
+    }
+
+    #[test]
+    fn unset_token_budgets_take_the_engine_defaults() {
+        for pipeline in [true, false] {
+            assert_eq!(
+                EngineSettings::default().token_budgets(pipeline).unwrap(),
+                TokenBudgets {
+                    max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
+                    long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
+                }
+            );
+        }
     }
 
     #[test]
@@ -423,13 +504,6 @@ mod tests {
     fn zero_max_model_len_is_rejected() {
         let mut config = Config::default();
         config.engine.max_model_len = Some(0);
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn zero_resp_slot_cap_is_rejected() {
-        let mut config = Config::default();
-        config.engine.worker_process.resp_slot_cap = 0;
         assert!(config.validate().is_err());
     }
 

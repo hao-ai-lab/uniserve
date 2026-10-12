@@ -10,7 +10,6 @@ import torch
 
 from uniserve.model.logits import Logits, VocabShard
 from uniserve.tensors import OutputLayout, adjacent_view
-from uniserve_worker.model_executor.input_batch import InputBatch
 from uniserve_worker.protocol.output import ForwardStats
 
 if TYPE_CHECKING:
@@ -21,14 +20,14 @@ if TYPE_CHECKING:
 class ExecutionOutput:
     """Row-aligned numerical results with execution observations and fences.
 
-    For a staged batch ``values`` holds one tensor per row, which
-    ``validate_for`` checks; for a standalone call it holds the module
-    call's tensors. A value with a ``VocabShard`` in ``vocabularies`` holds
-    logits over this rank's vocabulary columns; ``materialize`` gathers them
-    into the full vocabulary. ``layouts`` optionally describes each value as
-    an ``OutputLayout``. For a staged batch, ``ModelExecutor`` sets
-    ``request_pool_indices`` and ``output_event``, which is recorded on the
-    lane stream after the forward and is None without a lane stream.
+    For a staged batch ``values`` holds one tensor per row; for a standalone
+    call it holds the module call's tensors. A value with a ``VocabShard``
+    in ``vocabularies`` holds logits over this rank's vocabulary columns;
+    ``materialize`` gathers them into the full vocabulary. ``layouts``
+    optionally describes each value as an ``OutputLayout``. For a staged
+    batch, ``ModelExecutor`` sets ``request_pool_indices`` and
+    ``output_event``, which is recorded on the lane stream after the forward
+    and is None without a lane stream.
     ``greedy`` is the greedy decode a replayed text graph computed. It is
     None whenever ``graph_inputs.greedy_decode`` declines the batch, after
     eager execution, and for a batch staged without a force-finish column.
@@ -223,10 +222,3 @@ class ExecutionOutput:
             if self.request_pool_indices is None
             else self.request_pool_indices.clone(),
         )
-
-    def validate_for(self, batch: InputBatch) -> None:
-        """Require one tensor result for every row in the originating batch."""
-        if len(self.values) != batch.row_count:
-            raise ValueError("model output count does not match forward rows")
-        if any(not isinstance(value, torch.Tensor) for value in self.values):
-            raise TypeError("model output values must be tensors")

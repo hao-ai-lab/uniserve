@@ -40,6 +40,7 @@ import torch
 from uniserve.cache import mha
 from uniserve.cache.state import decode_region
 from uniserve.quantization import QuantizedTensor, Quantizer
+from uniserve.tensors import BufferConfig
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.execution.host import HostLane
 from uniserve_worker.protocol.identity import BufferId, RequestKey
@@ -53,50 +54,43 @@ from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.ticket import TransferTicket
 
 if TYPE_CHECKING:
+    from uniserve.runtime.kv_cache import CacheGroup
     from uniserve_worker.storage.block_tables import GroupTable
     from uniserve_worker.storage.kv_cache import KVCacheManager
 
 
-def cache_transfer_workspace_bytes(
-    *,
-    page_elements: int,
-    page_scales: int,
-    capacity: int,
-) -> int:
-    """Return the startup bytes for every bounded import workspace.
-
-    Startup memory accounting (`bootstrap.report`) reserves this amount, so it
-    must match the `TransferBuffer` allocation in `CacheImports.__init__`.
-    ``page_elements`` is the largest ``page_tokens * layers * kv_heads *
-    head_dim`` of any cache group and ``page_scales`` the largest
-    ``page_tokens * layers * kv_heads``. Each import thread has two raw pages
-    (one per K/V field) large enough for float64 elements, one FP32
-    conversion page, and an FP32 scale buffer of ``[page_tokens, 2, layers,
-    kv_heads]``: a destination span touches at most one source page per
-    token and one source scale group per head. The tail of a raw page serves
-    as rounding scratch while it holds an FP8 input. No prefix-sized
-    conversion allocation is needed.
-    """
-    workers = min(4, int(capacity))
-    # 20 bytes per element: two raw float64 pages (2 x 8) plus one FP32
-    # conversion page (4). Scale entries are FP32 (4 bytes each), two per
-    # token, layer and head.
-    return workers * (20 * int(page_elements) + 8 * int(page_scales))
+def import_workers(capacity: int) -> int:
+    """Return the threads, each with its own workspace, that run imports."""
+    return min(4, int(capacity))
 
 
-def import_page_sizes(pool: KVCacheManager) -> tuple[int, int]:
-    """Return the largest group page's elements and scale entries.
+def import_workspace(groups: Sequence[CacheGroup]) -> dict[str, BufferConfig]:
+    """Describe one import worker's page buffers for a pool's cache groups.
 
-    The pair sizes `cache_transfer_workspace_bytes` for ``pool``: elements
-    are ``page_tokens * layers * kv_heads * head_dim`` and scale entries
-    ``page_tokens * layers * kv_heads``, each the largest over the groups.
+    One page of the largest group suffices: elements are ``block_size *
+    layers * kv_heads * head_dim`` and scale entries ``block_size * layers *
+    kv_heads``, each the largest over the groups.
     """
     elements = scales = 0
-    for group in pool.cache.groups:
-        rows = group.page_tokens * len(group.layers) * group.num_kv_heads
+    for group in groups:
+        rows = group.block_size * len(group.layers) * group.num_kv_heads
         elements = max(elements, rows * group.head_dim)
         scales = max(scales, rows)
-    return elements, scales
+    return TransferBuffer.buffers(page_elements=elements, page_scales=scales)
+
+
+def cache_transfer_workspace_bytes(
+    groups: Sequence[CacheGroup], *, capacity: int
+) -> int:
+    """Return the startup bytes of every import workspace.
+
+    Startup memory accounting (`bootstrap.report`) reserves this amount:
+    one workspace per import worker, as `CacheImports.__init__` allocates
+    them.
+    """
+    return import_workers(capacity) * sum(
+        config.nbytes for config in import_workspace(groups).values()
+    )
 
 
 @dataclass(slots=True)
@@ -141,7 +135,7 @@ class TransferBuffer:
 
     With ``elements`` the element count of the largest group page (``page
     tokens * layers * kv_heads * head_dim``) and ``scales`` its scale
-    entries (``page tokens * layers * kv_heads``), ``raw`` is uint8
+    entries (``block size * layers * kv_heads``), ``raw`` is uint8
     ``[2, elements * 8]``: one staging page per K/V field, sized for float64
     source elements. ``values`` is a flat FP32 ``[elements]`` conversion
     page and ``scales`` a flat FP32 ``[2 * scales]`` buffer for the source
@@ -153,6 +147,26 @@ class TransferBuffer:
     values: torch.Tensor
     scales: torch.Tensor
     stream: torch.cuda.Stream | None
+
+    @staticmethod
+    def buffers(
+        *, page_elements: int, page_scales: int
+    ) -> dict[str, BufferConfig]:
+        """Describe one workspace's page buffers by field.
+
+        `CacheImports.__init__` allocates exactly these for each import
+        worker, and `cache_transfer_workspace_bytes` sums them. A destination
+        span touches at most one source page per token and one source scale
+        group per head, so one page of the largest group suffices and no
+        prefix-sized conversion storage is needed. The tail of a raw page
+        serves as rounding scratch while it holds an FP8 input.
+        """
+        elements = int(page_elements)
+        return {
+            "raw": BufferConfig((2, elements * 8), torch.uint8),
+            "values": BufferConfig((elements,), torch.float32),
+            "scales": BufferConfig((2 * int(page_scales),), torch.float32),
+        }
 
 
 class CacheImports:
@@ -169,29 +183,24 @@ class CacheImports:
 
     def __init__(self, pool: KVCacheManager, *, capacity: int) -> None:
         self.pool = pool
-        # `cache_transfer_workspace_bytes` accounts for one workspace per
-        # thread with the same bound.
-        workers = min(4, int(capacity))
+        workers = import_workers(capacity)
         self._tasks = HostLane(max_inflight=capacity, workers=workers)
 
         # One conversion page holds the largest group's full page, which
         # every group views as its [tokens, layers, heads, dim].
-        elements, scale_entries = import_page_sizes(pool)
+        buffers = import_workspace(pool.cache.groups)
 
         # Idle workspaces. A task leases one in `_acquire`; `_reclaim` returns
         # it only after the task's physical access has retired.
         device = pool.cache.device
         self._available = deque(
             TransferBuffer(
-                raw=torch.empty(
-                    (2, elements * 8), dtype=torch.uint8, device=device
-                ),
-                values=torch.empty(
-                    elements, dtype=torch.float32, device=device
-                ),
-                scales=torch.empty(
-                    2 * scale_entries, dtype=torch.float32, device=device
-                ),
+                **{
+                    name: torch.empty(
+                        config.shape, dtype=config.dtype, device=device
+                    )
+                    for name, config in buffers.items()
+                },
                 stream=torch.cuda.Stream(device=device)
                 if device.type == "cuda"
                 else None,
@@ -581,7 +590,7 @@ class CacheImports:
         """Whether a group's source bytes can land in destination units as is.
 
         The direct path needs an identical page representation. For FP8 the
-        page scales must also transfer unchanged: equal page sizes, a
+        page scales must also transfer unchanged: equal block sizes, a
         page-aligned carried interval, the same compute dtype, and all of
         this rank's heads in one source scale group, because each
         destination unit holds one scale per column and K/V field.
@@ -592,12 +601,12 @@ class CacheImports:
             return False
         if info.dtype != "float8_e4m3fn":
             return True
-        page_tokens = self.pool.shapes[index].page_tokens
+        block_size = self.pool.shapes[index].block_size
         return (
-            group.page_tokens == page_tokens
+            group.block_size == block_size
             # A partial installed page owns its destination scale. Its base
             # may have arrived through another TP layout.
-            and group.start % page_tokens == 0
+            and group.start % block_size == 0
             and publication.compute_dtype
             == str(self.pool.compute_dtypes[index]).removeprefix("torch.")
             and advertised.kv_head_offset // group.scale_head_size
@@ -625,14 +634,14 @@ class CacheImports:
         axis = self.pool.axes[index]
         cache_group = self.pool.cache.groups[index]
         columns = self.pool.cache.planes.columns
-        page_tokens = table.shape.page_tokens
+        block_size = table.shape.block_size
         # Pages the carried tokens touch, as (absolute page, offset, count).
         pages = []
         position = group.start
         while position < publication.published_extent:
-            page, offset = divmod(position, page_tokens)
+            page, offset = divmod(position, block_size)
             count = min(
-                publication.published_extent - position, page_tokens - offset
+                publication.published_extent - position, block_size - offset
             )
             pages.append((page, offset, count))
             position += count
@@ -679,7 +688,7 @@ class CacheImports:
                     )
                 )
                 if isinstance(tensor, QuantizedTensor):
-                    # Page-aligned intervals and equal page sizes make source
+                    # Page-aligned intervals and equal block sizes make source
                     # page ``i`` of the carried tokens destination span ``i``.
                     scales = tensor.buffers()["scale"]
                     destination = tuple(
@@ -749,7 +758,7 @@ class CacheImports:
         axis = self.pool.axes[index]
         cache_group = self.pool.cache.groups[index]
         columns = self.pool.cache.planes.columns
-        page_tokens = table.shape.page_tokens
+        block_size = table.shape.block_size
         num_layers = len(cache_group.layers)
         num_heads = advertised.num_kv_heads
         head_dim = advertised.head_dim
@@ -762,8 +771,8 @@ class CacheImports:
 
         while logical < carried:
             position = start + logical
-            page, offset = divmod(position, page_tokens)
-            count = min(carried - logical, page_tokens - offset)
+            page, offset = divmod(position, block_size)
+            count = min(carried - logical, block_size - offset)
             elements = count * num_layers * num_heads * head_dim
             # Raw staging views per K/V field: [tokens, layers, kv heads, dim].
             raw = tuple(
@@ -792,7 +801,7 @@ class CacheImports:
             )
 
             # Token offset of this span within its first source page.
-            source_offset = position % group.page_tokens
+            source_offset = position % group.block_size
             if quantized:
                 head_start = advertised.kv_head_offset // group.scale_head_size
                 head_end = (
@@ -802,11 +811,11 @@ class CacheImports:
                 # touches, counted from the source page holding the first
                 # carried token.
                 scale_start = (
-                    position // group.page_tokens - start // group.page_tokens
+                    position // group.block_size - start // group.block_size
                 )
                 scale_count = (
-                    source_offset + count + group.page_tokens - 1
-                ) // group.page_tokens
+                    source_offset + count + group.block_size - 1
+                ) // group.block_size
                 scales = workspace.scales[
                     : scale_count * 2 * num_layers * (head_end - head_start)
                 ].view(scale_count, 2, num_layers, head_end - head_start)
@@ -847,7 +856,7 @@ class CacheImports:
                     cursor, scale_index, token_offset = 0, 0, source_offset
                     while cursor < count:
                         length = min(
-                            group.page_tokens - token_offset, count - cursor
+                            group.block_size - token_offset, count - cursor
                         )
                         head, head_group = 0, 0
                         while head < num_heads:

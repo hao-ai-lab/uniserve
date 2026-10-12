@@ -60,7 +60,7 @@ name = "tokenizer_hf"
 harness = false
 
 [[bench]]
-name = "qwen3_xml"
+name = "qwen25_tools"
 harness = false
 required-features = ["test-util"]
 

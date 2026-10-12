@@ -46,9 +46,9 @@ def _consume(tickets) -> None:
     "backend,device",
     (
         ("local", "cpu"),
-        ("shm", "cpu"),
+        ("posix_shm", "cpu"),
         ("local", "cuda:0"),
-        ("shm", "cuda:0"),
+        ("posix_shm", "cuda:0"),
         ("cuda_vmm", "cuda:0"),
     ),
 )
@@ -58,9 +58,7 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
     backend: str, device: str, shard_axis: int
 ) -> None:
     events = [EventPool() for _ in range(3)]
-    endpoints = [
-        WorkerEndpoint.local("encoder", rank=rank) for rank in range(2)
-    ]
+    endpoints = [WorkerEndpoint.local() for rank in range(2)]
     producers = [
         make_transport(
             backend,
@@ -76,7 +74,7 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
         byte_capacity=16384,
         ticket_capacity=4,
         event_pool=events[2],
-        source=WorkerEndpoint.local("denoiser"),
+        source=WorkerEndpoint.local(),
     )
     expected = torch.arange(48, dtype=torch.float32, device=device).reshape(
         6, 8
@@ -99,9 +97,7 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
         for piece in pieces
     ]
     stores = [
-        TensorStore(
-            capacity=1, byte_capacity=16, buffer_pool=arena, event_pool=event
-        )
+        TensorStore(byte_capacity=16, buffer_pool=arena, event_pool=event)
         for arena, event in zip(arenas, events[:2], strict=True)
     ]
     locations = []
@@ -230,18 +226,18 @@ def test_explicit_replica_binding_can_use_an_independent_live_publication() -> (
 ):
     events = EventPool()
     first = make_transport(
-        "shm",
+        "posix_shm",
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
-        source=WorkerEndpoint.local("encoder", rank=0),
+        source=WorkerEndpoint.local(),
     )
     second = make_transport(
-        "shm",
+        "posix_shm",
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
-        source=WorkerEndpoint.local("encoder", rank=1),
+        source=WorkerEndpoint.local(),
     )
     expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     unavailable, available = first.publish(expected), second.publish(expected)
@@ -269,7 +265,7 @@ def test_explicit_replica_binding_can_use_an_independent_live_publication() -> (
 def test_shm_cuda_region_fits_its_reserved_device_allocation() -> None:
     events = EventPool()
     transport = make_transport(
-        "shm", byte_capacity=16384, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=16384, ticket_capacity=2, event_pool=events
     )
     source = torch.arange(24, dtype=torch.float32).reshape(4, 6)
     location = transport.publish(source)
@@ -303,7 +299,7 @@ def _receive_tensor_shards(channel, backends: tuple[str, ...]) -> None:
         backends, byte_capacity=16384, ticket_capacity=4, event_pool=events
     )
     try:
-        tensor = TensorTransfer.from_mapping(channel.recv())
+        tensor = channel.recv()
         destination = torch.empty(tensor.shape, device="cuda:0")
         _consume(
             fetch_tensor(
@@ -333,10 +329,10 @@ def _receive_non_peer_cuda_product(channel, destination_device: str) -> None:
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
-        source=WorkerEndpoint.local("consumer"),
+        source=WorkerEndpoint.local(),
     )
     try:
-        tensor = TensorTransfer.from_mapping(channel.recv())
+        tensor = channel.recv()
         destination = torch.empty(tensor.shape, device=destination_device)
         _consume(
             fetch_tensor(
@@ -350,6 +346,81 @@ def _receive_non_peer_cuda_product(channel, destination_device: str) -> None:
         consumer.close()
         events.close()
         channel.close()
+
+
+def _receive_cuda_products(channel, count: int) -> None:
+    """Read ``count`` CUDA VMM products through one consumer endpoint."""
+    events = EventPool()
+    consumer = make_transport(
+        "cuda_vmm",
+        byte_capacity=16384,
+        ticket_capacity=2,
+        event_pool=events,
+        source=WorkerEndpoint.local(),
+    )
+    try:
+        for _ in range(count):
+            tensor = channel.recv()
+            destination = torch.empty(tensor.shape, device="cuda:1")
+            _consume(
+                fetch_tensor(
+                    tensor,
+                    destination,
+                    bindings={
+                        (tensor.locations[0].source, "cuda_vmm"): consumer
+                    },
+                )
+            )
+            channel.send(destination.cpu().tolist())
+    finally:
+        consumer.close()
+        events.close()
+        channel.close()
+
+
+def test_cuda_vmm_rereads_rewritten_storage_with_its_current_values() -> None:
+    """Successive products of one exported storage arrive as last written.
+
+    A producer publishes the same long-lived storage, rewrites it once the
+    first read has completed and publishes it again; the consumer, reading
+    both through one endpoint, receives each publication's own values.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("cross-device VMM reads need two CUDA devices")
+    from uniserve_kernels.peer_storage import empty
+
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    events = EventPool()
+    producer = make_transport(
+        "cuda_vmm",
+        byte_capacity=16384,
+        ticket_capacity=2,
+        event_pool=events,
+        source=WorkerEndpoint.local(),
+    )
+    storage = empty((6, 8), dtype=torch.float32, device=torch.device("cuda:0"))
+    process = context.Process(target=_receive_cuda_products, args=(child, 2))
+    try:
+        process.start()
+        child.close()
+        for scale in (1.0, -3.0):
+            values = scale * torch.arange(48, device="cuda:0").view(6, 8)
+            storage.copy_(values)
+            location = producer.publish(storage)
+            parent.send(TensorTransfer(shape=(6, 8), locations=(location,)))
+            assert parent.poll(45), "CUDA VMM product did not arrive"
+            assert parent.recv() == values.cpu().tolist()
+            producer.release(location)
+        process.join(30)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(30)
+        producer.close()
+        events.close()
+        parent.close()
 
 
 def test_cuda_vmm_stages_between_devices_without_peer_access() -> None:
@@ -377,7 +448,7 @@ def test_cuda_vmm_stages_between_devices_without_peer_access() -> None:
         byte_capacity=16384,
         ticket_capacity=2,
         event_pool=events,
-        source=WorkerEndpoint.local("producer"),
+        source=WorkerEndpoint.local(),
     )
     expected = torch.arange(
         48, dtype=torch.float32, device=f"cuda:{source_device}"
@@ -391,9 +462,7 @@ def test_cuda_vmm_stages_between_devices_without_peer_access() -> None:
         process.start()
         child.close()
         parent.send(
-            TensorTransfer(
-                shape=tuple(expected.shape), locations=(location,)
-            ).to_mapping()
+            TensorTransfer(shape=tuple(expected.shape), locations=(location,))
         )
         assert parent.poll(45), "non-peer CUDA product did not arrive"
         assert parent.recv() == expected.cpu().tolist()
@@ -411,7 +480,7 @@ def test_cuda_vmm_stages_between_devices_without_peer_access() -> None:
 
 
 @pytest.mark.parametrize("fragmented", (False, True))
-@pytest.mark.parametrize("backends", (("cuda_vmm",), ("shm", "cuda_vmm")))
+@pytest.mark.parametrize("backends", (("cuda_vmm",), ("posix_shm", "cuda_vmm")))
 def test_tensor_delivery_gathers_shards_across_processes(
     fragmented: bool, backends: tuple[str, ...]
 ) -> None:
@@ -444,11 +513,7 @@ def test_tensor_delivery_gathers_shards_across_processes(
     )
     try:
         process.start()
-        parent.send(
-            TensorTransfer(
-                shape=(6, 8), locations=tuple(locations)
-            ).to_mapping()
-        )
+        parent.send(TensorTransfer(shape=(6, 8), locations=tuple(locations)))
         assert parent.poll(45), "cross-process tensor delivery did not complete"
         assert parent.recv() == expected
         process.join(30)
@@ -472,7 +537,7 @@ def _receive_independent_shards(channel) -> None:
         "cuda_vmm", byte_capacity=12 << 20, ticket_capacity=4, event_pool=events
     )
     try:
-        tensor = TensorTransfer.from_mapping(channel.recv())
+        tensor = channel.recv()
         destination = torch.empty(tensor.shape, device="cuda:0")
         independent = torch.cuda.Stream()
         pending = torch.cuda.Event()
@@ -531,11 +596,7 @@ def test_sharded_delivery_progresses_during_independent_device_work() -> None:
     process = context.Process(target=_receive_independent_shards, args=(child,))
     try:
         process.start()
-        parent.send(
-            TensorTransfer(
-                shape=(3, 1024, 1024), locations=locations
-            ).to_mapping()
-        )
+        parent.send(TensorTransfer(shape=(3, 1024, 1024), locations=locations))
         assert parent.poll(45), "cross-process tensor delivery did not complete"
         result = parent.recv()
         process.join(30)
@@ -561,22 +622,25 @@ def test_backends_share_the_rank_byte_budget_until_publications_retire() -> (
 ):
     events = EventPool()
     transports = make_transports(
-        ("local", "shm"), byte_capacity=64, ticket_capacity=2, event_pool=events
+        ("local", "posix_shm"),
+        byte_capacity=64,
+        ticket_capacity=2,
+        event_pool=events,
     )
     source = torch.arange(8, dtype=torch.float32)
     local = transports["local"].publish(source)
-    shared = transports["shm"].publish(source)
+    shared = transports["posix_shm"].publish(source)
     try:
         with pytest.raises(WorkerError, match="byte capacity is exhausted"):
             transports["local"].publish(source)
-        retired = transports["shm"].release(shared)
+        retired = transports["posix_shm"].release(shared)
         assert retired is not None
         retired.result(timeout=10)
         replacement = transports["local"].publish(source)
         transports["local"].release(replacement)
     finally:
         transports["local"].release(local)
-        transports["shm"].release(shared)
+        transports["posix_shm"].release(shared)
         for transport in transports.values():
             transport.close()
         events.close()
@@ -585,26 +649,26 @@ def test_backends_share_the_rank_byte_budget_until_publications_retire() -> (
 def test_read_ticket_capacity_is_shared_across_backends() -> None:
     events = EventPool()
     transports = make_transports(
-        ("local", "shm"),
+        ("local", "posix_shm"),
         byte_capacity=1024,
         ticket_capacity=1,
         event_pool=events,
     )
     source = torch.arange(8, dtype=torch.float32)
     local = transports["local"].publish(source)
-    shared = transports["shm"].publish(source)
+    shared = transports["posix_shm"].publish(source)
     borrowed = transports["local"].fetch(local, device=torch.device("cpu"))
     destination = torch.full_like(source, -1)
     try:
         with pytest.raises(WorkerError, match="ticket capacity is exhausted"):
-            transports["shm"].fetch(
+            transports["posix_shm"].fetch(
                 shared, device=destination.device, destination=destination
             )
         assert bool(torch.all(destination == -1))
         borrowed.close()
         _consume(
             (
-                transports["shm"].fetch(
+                transports["posix_shm"].fetch(
                     shared, device=destination.device, destination=destination
                 ),
             )
@@ -623,9 +687,9 @@ def test_read_ticket_capacity_is_shared_across_backends() -> None:
     "backend,device",
     (
         ("local", "cpu"),
-        ("shm", "cpu"),
+        ("posix_shm", "cpu"),
         ("local", "cuda:0"),
-        ("shm", "cuda:0"),
+        ("posix_shm", "cuda:0"),
         ("cuda_vmm", "cuda:0"),
     ),
 )
@@ -681,7 +745,8 @@ def test_fragmented_layer_pages_use_one_read_into_reserved_pages(
 
 
 @pytest.mark.parametrize(
-    "backend,device", (("local", "cpu"), ("shm", "cpu"), ("cuda_vmm", "cuda:0"))
+    "backend,device",
+    (("local", "cpu"), ("posix_shm", "cpu"), ("cuda_vmm", "cuda:0")),
 )
 @pytest.mark.parametrize("shard_axis", (0, 1))
 @torch.inference_mode()
@@ -695,7 +760,7 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
         byte_capacity=4096,
         ticket_capacity=4,
         event_pool=events,
-        source=WorkerEndpoint.local("denoiser", rank=1),
+        source=WorkerEndpoint.local(),
     )
     expected = torch.arange(48, dtype=torch.float32, device=device).reshape(
         6, 8
@@ -717,7 +782,6 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
     allocation = BufferAllocation(reference.buffer_id, 0, reference.max_bytes)
     arena = BufferPool(byte_capacity=reference.max_bytes, devices=(device,))
     store = TensorStore(
-        capacity=1,
         byte_capacity=16,
         max_entry_bytes=reference.max_bytes,
         devices=(device,),
@@ -814,7 +878,7 @@ def test_full_region_publishes_complete_bounded_tensor() -> None:
     )
     allocation = BufferAllocation(reference.buffer_id, 0, reference.max_bytes)
     arena = BufferPool(byte_capacity=reference.max_bytes, devices=("cpu",))
-    store = TensorStore(capacity=1, byte_capacity=16, buffer_pool=arena)
+    store = TensorStore(byte_capacity=16, buffer_pool=arena)
     try:
         (write,) = store.bind_outputs(
             ((reference, "cpu"),),
@@ -840,10 +904,10 @@ def test_shm_allocation_failure_preserves_publication_capacity(
 ) -> None:
     events = EventPool()
     transport = make_transport(
-        "shm", byte_capacity=16, ticket_capacity=1, event_pool=events
+        "posix_shm", byte_capacity=16, ticket_capacity=1, event_pool=events
     )
     consumer = make_transport(
-        "shm", byte_capacity=16, ticket_capacity=1, event_pool=events
+        "posix_shm", byte_capacity=16, ticket_capacity=1, event_pool=events
     )
     source = torch.arange(4, dtype=torch.float32)
     locator = None
@@ -872,7 +936,7 @@ def test_shm_allocation_failure_preserves_publication_capacity(
         events.close()
 
 
-@pytest.mark.parametrize("backend", ("shm", "cuda_vmm"))
+@pytest.mark.parametrize("backend", ("posix_shm", "cuda_vmm"))
 def test_transfer_orders_destination_writes_before_its_copy(
     backend: str,
 ) -> None:
@@ -881,7 +945,9 @@ def test_transfer_orders_destination_writes_before_its_copy(
         backend, byte_capacity=4096, ticket_capacity=1, event_pool=events
     )
     source = torch.arange(
-        12, dtype=torch.float32, device="cpu" if backend == "shm" else "cuda:0"
+        12,
+        dtype=torch.float32,
+        device="cpu" if backend == "posix_shm" else "cuda:0",
     )
     locator = transport.publish(source)
     destination = torch.empty(12, device="cuda:0")

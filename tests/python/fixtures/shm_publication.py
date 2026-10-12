@@ -10,16 +10,15 @@ from uniserve_worker.protocol.transfer import (
     WorkerEndpoint,
 )
 from uniserve_worker.transport import segment
-from uniserve_worker.transport.endpoint import locator_digest
 
 
 def serve_pending_publication(channel, shape=(1024,)) -> None:
     """Publish a segment that never becomes ready, then fail it on command.
 
-    The segment carries the header a consumer reads: the locator's digest and
-    a readiness word left pending. On "exit" the producer marks the
-    publication failed and unlinks the segment, which is what a consumer of a
-    failing producer observes.
+    The segment carries the header a consumer reads, with its readiness word
+    left pending. On "exit" the producer marks the publication failed and
+    unlinks the segment, which is what a consumer of a failing producer
+    observes.
     """
     nbytes = 4096
     storage = shared_memory.SharedMemory(
@@ -27,7 +26,7 @@ def serve_pending_publication(channel, shape=(1024,)) -> None:
     )
     try:
         locator = Locator(
-            source=WorkerEndpoint.local("publisher"),
+            source=WorkerEndpoint.local(),
             transport=PosixShmTransfer(
                 endpoint="uniserve-test-pending", name=storage.name
             ),
@@ -37,8 +36,8 @@ def serve_pending_publication(channel, shape=(1024,)) -> None:
             offset=(0,) * len(shape),
             device="cpu",
         )
-        segment.initialize(storage.buf, locator_digest(locator))
-        channel.send(locator.to_mapping())
+        segment.initialize(storage.buf)
+        channel.send(locator)
         while True:
             command = channel.recv()
             if command == "settled":

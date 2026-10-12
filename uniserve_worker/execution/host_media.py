@@ -68,19 +68,20 @@ def encoded_unit_positions(
 ) -> tuple[int, ...]:
     """Return the positions within the decode round this rank encodes.
 
-    A round's units are dealt to the encoder's ranks in order, each taking
-    ``units_per_rank`` consecutive positions, the same order the engine used
+    A round's units are dealt to the ranks the call names, or to the
+    encoder's ranks in configured order when it names none, each taking
+    ``units_per_rank`` consecutive positions: the same order the engine used
     to project the call onto its ranks. The result is empty for a rank whose
     first position is at or past the round's ``max_units``.
 
     Raises:
-        ValueError: When ``rank`` is not one of the component's ranks.
+        ValueError: When ``rank`` is not one of the round's ranks.
     """
     from uniserve_worker.execution.media import decode_range
 
     params = decode_range(call, state=state)
     per_rank = max(1, int(component.units_per_rank))
-    position = component.ranks.index(rank)
+    position = (params.ranks or component.ranks).index(rank)
     first = position * per_rank
     return tuple(range(first, min(first + per_rank, int(params.max_units))))
 
@@ -99,10 +100,10 @@ def _input_publication(
 
 
 def _shm(transports: Mapping[str, Transport]) -> ShmTransport:
-    """Return the rank's shared-storage transport, bound under ``"shm"``."""
+    """Return the rank's shared-storage transport, bound as ``"posix_shm"``."""
     from uniserve_worker.transport.shm import ShmTransport
 
-    transport = transports.get("shm")
+    transport = transports.get("posix_shm")
     if not isinstance(transport, ShmTransport):
         raise unsupported_setup(
             "host media inputs are borrowed over shared storage, which this "
@@ -182,7 +183,7 @@ def read_encoded_units(
     if len(tensor.shape) != 2 or tensor.dtype != "uint8":
         raise invalid_descriptor("encoded units require byte rows")
     units: dict[int, bytes] = {}
-    shm = transports.get("shm")
+    shm = transports.get("posix_shm")
     for location in tensor.locations:
         handle = location.transport
         if isinstance(handle, PosixShmTransfer):
@@ -266,7 +267,7 @@ def execute(
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
     transports: Mapping[str, Transport],
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> PendingOutput:
     """Schedule one host media call on the rank's lane.
 
@@ -299,12 +300,12 @@ def execute(
     tasks: tuple[HostTask, ...] = ()
     finish: Callable[[tuple[object, ...]], None] | None = None
     if call.kind is MediaCall.VIDEO_ENCODING:
-        binding = model_runner.bindings[call.component]
+        binding = model_executor.bindings[call.component]
         positions = encoded_unit_positions(
             call,
             state=state,
             component=binding.config,
-            rank=model_runner.worker_config.rank,
+            rank=model_executor.worker_config.rank,
         )
         if len(positions) != len(reservations):
             raise invalid_descriptor(
@@ -314,7 +315,7 @@ def execute(
         from uniserve_worker.execution.media import decode_range
 
         cursor = int(decode_range(call, state=state).cursor)
-        config = mux_config(model_runner, media)
+        config = mux_config(model_executor, media)
         publication = _input_publication(call, state)
         # Batch preparation borrows the round only when it is published over
         # shared storage on this node; otherwise the tensor store holds it.
@@ -325,7 +326,7 @@ def execute(
             imported_read = tensor_store.consume(
                 call.inputs[0],
                 consumer_call_id=call.call_id,
-                device=model_runner.call_devices(call)[0],
+                device=model_executor.call_devices(call)[0],
             )
             request.device_reads.append(imported_read)
             if imported_read.region is not None or imported_read.tensor is None:
@@ -333,7 +334,7 @@ def execute(
                     "video encoding requires the complete decoded unit round"
                 )
             imported_units = imported_read.tensor
-        encoder = MediaEncoder(rank=model_runner.worker_config.rank)
+        encoder = MediaEncoder(rank=model_executor.worker_config.rank)
         scheduled: list[HostTask] = []
         borrows: list[HostBorrow] = []
         try:
@@ -437,7 +438,7 @@ def execute(
     elif call.kind is MediaCall.AUDIO_ENCODING:
         if media_mux is None:
             raise unsupported_setup("audio encoding has no muxer resources")
-        config = mux_config(model_runner, media)
+        config = mux_config(model_executor, media)
         media_mux.open(call.request_key, config=config)
         if len(call.inputs) != 1:
             raise invalid_descriptor("audio encoding requires one PCM input")
@@ -447,7 +448,7 @@ def execute(
         read = tensor_store.consume(
             call.inputs[0],
             consumer_call_id=call.call_id,
-            device=model_runner.call_devices(call)[0],
+            device=model_executor.call_devices(call)[0],
         )
         request.device_reads.append(read)
         if read.region is not None or read.tensor is None:
@@ -464,7 +465,9 @@ def execute(
     elif call.kind is MediaCall.MUXING:
         if media_mux is None:
             raise unsupported_setup("artifact assembly has no muxer resources")
-        media_mux.open(call.request_key, config=mux_config(model_runner, media))
+        media_mux.open(
+            call.request_key, config=mux_config(model_executor, media)
+        )
         # A muxing call carries the encode rounds completed since the last
         # one, one product per round in media unit order, and the muxer
         # appends them to the request's container. The final call carries
@@ -488,7 +491,7 @@ def execute(
             read = tensor_store.consume(
                 product,
                 consumer_call_id=call.call_id,
-                device=model_runner.call_devices(call)[0],
+                device=model_executor.call_devices(call)[0],
             )
             request.device_reads.append(read)
             if read.region is not None or read.tensor is None:
@@ -520,7 +523,6 @@ def execute(
     # Host media calls consume products without advancing any trajectory.
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.host.tasks = tasks
     request.host.finish = finish
     # The call has no product at commit; a video encode's ``finish`` sets

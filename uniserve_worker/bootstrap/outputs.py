@@ -137,7 +137,7 @@ def resolve_outputs(
         config,
         max_condition_rows=0
         if denoiser is None
-        else condition_capacity(denoiser, config),
+        else condition_capacity(model, denoiser, config),
     )
 
     builder = media_builder(model, config)

@@ -42,6 +42,11 @@ pub use events::{EVT_COMPLETION, EVT_DEATH, EVT_REQUEST, EVT_RESULT, WakeEvents,
 /// Default namespace prefix for per-worker iceoryx2 services.
 pub const DEFAULT_SERVICE_PREFIX: &str = "uniserve/worker";
 
+/// Length in bytes of the slices a port first loans; a larger frame grows the
+/// slice by powers of two, so frame size is bounded by the header's `u32`
+/// length alone.
+const INITIAL_SLICE_LEN: usize = 64 * 1024;
+
 /// Result type returned by worker transport calls.
 pub type IpcResult<T> = std::result::Result<T, IpcError>;
 
@@ -133,7 +138,7 @@ macro_rules! ipc_error {
 /// A wire-protocol change bumps this value. Receivers accept only this exact
 /// version, so the engine and the Python worker extension must be built with
 /// the same value.
-pub const IPC_VERSION: u16 = 76;
+pub const IPC_VERSION: u16 = 103;
 
 /// Returns whether this build can decode a peer-advertised IPC `version`.
 pub fn is_supported_ipc_version(version: u16) -> bool {
@@ -182,9 +187,9 @@ const _: () = assert!(std::mem::size_of::<Header>() == 16);
 impl Header {
     /// Checks framing before allocating or decoding a payload on either transport.
     ///
-    /// Rejects a foreign protocol version, a nonzero reserved word, and a
-    /// length above `bound` bytes. It does not compare `len` with a payload.
-    pub(crate) fn validate(&self, bound: usize) -> IpcResult<()> {
+    /// Rejects a foreign protocol version and a nonzero reserved word. It does
+    /// not compare `len` with a payload.
+    pub(crate) fn validate(&self) -> IpcResult<()> {
         if !is_supported_ipc_version(self.version) {
             ipc_bail!(
                 "unsupported IPC version {}: this build requires {}",
@@ -195,22 +200,13 @@ impl Header {
         if self.reserved != 0 {
             ipc_bail!("IPC reserved header word must be zero");
         }
-        if self.len as usize > bound {
-            ipc_bail!(
-                "rank channel frame of {} bytes exceeds its {bound} byte bound",
-                self.len
-            );
-        }
         Ok(())
     }
 
-    /// Stamps the actual length and enforces the common send limit.
-    ///
-    /// Both transports call this before sending, so the sender refuses a frame
-    /// the receiver would reject under the same bound.
-    pub(crate) fn for_payload(mut self, len: usize, bound: usize) -> IpcResult<Self> {
+    /// Stamps the actual length, which must fit the header's `u32` field.
+    pub(crate) fn for_payload(mut self, len: usize) -> IpcResult<Self> {
         self.len = payload_len_u32(len)?;
-        self.validate(bound)?;
+        self.validate()?;
         Ok(self)
     }
 }
@@ -277,8 +273,6 @@ pub fn service_name(id: &str) -> String {
 pub struct ClientEndpoint {
     /// Request-response port used to loan and send request frames.
     client: IxClient,
-    /// Largest payload in bytes accepted in either direction.
-    max_payload: usize,
     /// How long `send_raw` keeps retrying while no server is connected.
     connect_timeout: Duration,
     /// Directional wake ports paired with the request-response service.
@@ -291,12 +285,12 @@ pub struct ClientEndpoint {
 impl ClientEndpoint {
     /// Connects a host endpoint to a worker service, creating it if absent.
     ///
-    /// `max_payload` bounds every payload in bytes. `max_inflight` is the number
+    /// `max_inflight` is the number
     /// of [`Pending`] handles this client may hold at once; the engine passes
-    /// its per-rank queue depth, which `RankProcess::finish_startup` requires
-    /// to equal the worker's advertised `queue_depth`. A send while that many
-    /// handles are alive fails with a transport error.
-    pub fn connect(service: &str, max_payload: usize, max_inflight: usize) -> IpcResult<Self> {
+    /// the per-rank queue depth it launched the worker with, which the worker
+    /// sizes its end of the channel with. A send while that many handles are
+    /// alive fails with a transport error.
+    pub fn connect(service: &str, max_inflight: usize) -> IpcResult<Self> {
         // Size the service for one client and one server, `max_inflight`
         // outstanding requests and one response per request, and disable
         // safe overflow so a full buffer never discards an unconsumed frame.
@@ -323,11 +317,11 @@ impl ClientEndpoint {
             .open_or_create()
             .context("opening iceoryx2 request-response service")?;
 
-        // Start with a slice of at most 64 KiB; power-of-two growth
-        // accommodates larger, variable FlatBuffers frames.
+        // Start with a 64 KiB slice; power-of-two growth accommodates larger,
+        // variable FlatBuffers frames.
         let client = factory
             .client_builder()
-            .initial_max_slice_len(max_payload.clamp(1, 64 * 1024))
+            .initial_max_slice_len(INITIAL_SLICE_LEN)
             .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .create()
             .context("creating iceoryx2 client port")?;
@@ -339,7 +333,6 @@ impl ClientEndpoint {
         Ok(Self {
             _node: node,
             client,
-            max_payload,
             connect_timeout: Duration::from_secs(300),
             events,
         })
@@ -420,12 +413,12 @@ impl ClientEndpoint {
     /// Sends a pre-encoded frame once and wakes the worker's request listener.
     ///
     /// Stamps `header.len` from `payload`. Fails with a transport error when the
-    /// header is invalid, the payload exceeds `max_payload`, or iceoryx2 refuses
-    /// the loan or send, for example while `max_inflight` pending handles are
+    /// header is invalid, the payload exceeds the header's `u32` length, or
+    /// iceoryx2 refuses the loan or send, for example while `max_inflight` pending handles are
     /// alive. Success does not imply that a server received the request; see
     /// `Pending::number_of_server_connections`.
     pub fn send_raw_attempt(&self, header: Header, payload: &[u8]) -> IpcResult<Pending> {
-        let header = header.for_payload(payload.len(), self.max_payload)?;
+        let header = header.for_payload(payload.len())?;
         // Loan exact shared-storage capacity, initialize the header and payload,
         // then transfer ownership to the request-response service.
         let mut request = self
@@ -451,7 +444,7 @@ impl ClientEndpoint {
             return Ok(None);
         };
         let header = *response.user_header();
-        header.validate(self.max_payload)?;
+        header.validate()?;
         verify_header_len(header, response.payload().len())?;
         let payload = response.payload().to_vec();
         Ok(Some(Frame { header, payload }))
@@ -485,8 +478,6 @@ impl ClientEndpoint {
 pub struct ServerEndpoint {
     /// Request-response port used to receive and answer request frames.
     server: IxServer,
-    /// Largest payload in bytes accepted in either direction.
-    max_payload: usize,
     /// Active requests retained until their matching `message_id` is answered.
     active: VecDeque<(u64, IxActive)>,
     /// Directional wake ports paired with the request-response service.
@@ -499,10 +490,8 @@ pub struct ServerEndpoint {
 impl ServerEndpoint {
     /// Creates the worker endpoint and its directional wake services.
     ///
-    /// `max_payload` and `max_inflight` size the service as in
-    /// [`ClientEndpoint::connect`]; each side enforces its own `max_payload` on
-    /// the frames it sends and receives.
-    pub fn bind(service: &str, max_payload: usize, max_inflight: usize) -> IpcResult<Self> {
+    /// `max_inflight` sizes the service as in [`ClientEndpoint::connect`].
+    pub fn bind(service: &str, max_inflight: usize) -> IpcResult<Self> {
         // Mirror `ClientEndpoint::connect` exactly; iceoryx2 refuses to open a
         // service whose existing settings are incompatible with the request.
         let service_name = ServiceName::new(service).context("invalid iceoryx2 service name")?;
@@ -528,7 +517,7 @@ impl ServerEndpoint {
         // Allocate response buffers with the same variable-size strategy.
         let server = factory
             .server_builder()
-            .initial_max_slice_len(max_payload.clamp(1, 64 * 1024))
+            .initial_max_slice_len(INITIAL_SLICE_LEN)
             .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .max_loaned_responses_per_request(1)
             .create()
@@ -541,7 +530,6 @@ impl ServerEndpoint {
         Ok(Self {
             _node: node,
             server,
-            max_payload,
             active: VecDeque::new(),
             events,
         })
@@ -564,7 +552,7 @@ impl ServerEndpoint {
         // Receiving from the ring consumes the work represented by wake hints.
         self.events.drain_worker_wakes()?;
         let header = *active.user_header();
-        header.validate(self.max_payload)?;
+        header.validate()?;
         verify_header_len(header, active.payload().len())?;
         let payload = active.payload().to_vec();
         // Retain transport ownership until a response with this message id arrives.
@@ -615,7 +603,7 @@ impl ServerEndpoint {
     /// the request is resolved a failed loan or send still consumes it and no
     /// response can follow.
     pub fn respond_raw(&mut self, header: Header, payload: &[u8]) -> IpcResult<()> {
-        let header = header.for_payload(payload.len(), self.max_payload)?;
+        let header = header.for_payload(payload.len())?;
 
         // Resolve and remove the exact active transport request before loaning
         // its response buffer.
@@ -677,10 +665,8 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
 /// Verifies protocol version and payload length before frame decoding.
 ///
 /// Checks the version and reserved word and that `header.len` equals `actual`.
-/// The payload bound is the receiving endpoint's check, so none is applied
-/// here beyond the `u32` range.
 fn verify_header_len(header: Header, actual: usize) -> IpcResult<()> {
-    header.validate(u32::MAX as usize)?;
+    header.validate()?;
     if header.len as usize != actual {
         ipc_bail!(
             "IPC payload length mismatch: header={} actual={actual}",
@@ -695,35 +681,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shared_storage_enforces_the_payload_bound_in_both_directions() {
-        // A frame one byte over the bound is refused by the sender on each
-        // side, and a frame exactly at the bound round-trips.
-        let service = format!("payload-bound-{}", std::process::id());
-        let mut server = ServerEndpoint::bind(&service, 256, 2).unwrap();
-        let client = ClientEndpoint::connect(&service, 256, 2).unwrap();
+    fn shared_storage_carries_frames_far_beyond_its_initial_slice() {
+        // A decoded video unit crosses hosts as one response of tens of
+        // megabytes; the ports grow their slices to whatever the frame needs.
+        let service = format!("large-frame-{}", std::process::id());
+        let mut server = ServerEndpoint::bind(&service, 2).unwrap();
+        let client = ClientEndpoint::connect(&service, 2).unwrap();
 
-        assert!(client.send_raw(Header::default(), &[0; 257]).is_err());
+        let request = vec![5; 72 << 20];
         let pending = client
             .send_raw(
                 Header {
-                    message_id: 7,
+                    message_id: 11,
                     ..Header::default()
                 },
-                &[9; 256],
+                &request,
             )
             .unwrap();
-        let request = server.recv().unwrap();
-        assert_eq!(request.payload, vec![9; 256]);
+        let received = server.recv().unwrap();
+        assert_eq!(received.payload.len(), request.len());
 
-        // The oversized response is refused before it consumes the request,
-        // so the in-bound response can still answer it.
-        assert!(server.respond_raw(request.header, &[0; 257]).is_err());
-        server.respond_raw(request.header, &[3; 256]).unwrap();
+        let answer = vec![6; 72 << 20];
+        server.respond_raw(received.header, &answer).unwrap();
         let response = client
-            .recv_response_timeout(&pending, Duration::from_secs(5))
+            .recv_response_timeout(&pending, Duration::from_secs(30))
             .unwrap()
             .unwrap();
-        assert_eq!(response.payload, vec![3; 256]);
+        assert_eq!(response.payload, answer);
     }
 
     #[test]

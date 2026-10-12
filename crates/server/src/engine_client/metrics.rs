@@ -18,7 +18,8 @@ use uniserve_observability::{
     SchedulerMetrics, WaitingReasonLabels,
 };
 
-use crate::serving::{FinishStatus, RequestStatsSnapshot};
+use super::requests::RequestStats;
+use crate::serving::FinishStatus;
 use uniserve_core::codec::stats::SchedulerStats;
 
 const WAITING_REASON_CAPACITY: &str = "capacity";
@@ -358,7 +359,7 @@ pub(crate) fn record_request_outcome(
     metrics: &RequestMetrics,
     labels: &EngineLabels,
     finished_reason: &'static str,
-    stats: &RequestStatsSnapshot,
+    stats: &RequestStats,
 ) {
     metrics
         .request_success
@@ -392,7 +393,7 @@ pub(crate) fn record_request_outcome(
 pub(crate) fn record_request_usage(
     metrics: &RequestMetrics,
     labels: &EngineLabels,
-    stats: &RequestStatsSnapshot,
+    stats: &RequestStats,
 ) {
     // Hidden protocol tokens are generated tokens too; together with the
     // visible ones they make up the engine's completion tokens.

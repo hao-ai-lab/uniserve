@@ -71,21 +71,23 @@ impl Scheduler {
             });
             return;
         }
-        // A canvas step and a block commit each spend a whole canvas of one
-        // scheduling step's token budget.
-        if let Some(canvas) = req
-            .canvas
-            .as_ref()
-            .filter(|canvas| canvas.canvas_length as usize > self.config.max_num_batched_tokens)
-        {
-            let _ = event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: format!(
-                    "a {}-token generation canvas exceeds the {}-token step budget",
-                    canvas.canvas_length, self.config.max_num_batched_tokens
-                ),
-            });
-            return;
+        // A request the deployment generates in canvases generates text only
+        // and names the seed its draws follow.
+        if self.config.canvas.is_some() && !req.is_readout() {
+            let error = if req.generates_images() {
+                Some(GenerationRequestError::CanvasGeneratesTextOnly)
+            } else if req.sampling.seed.is_none() {
+                Some(GenerationRequestError::UnseededCanvas)
+            } else {
+                None
+            };
+            if let Some(error) = error {
+                let _ = event_tx.send(EngineCoreOutput::Rejected {
+                    kind: RejectionKind::Invalid,
+                    message: format!("invalid generation request: {error:?}"),
+                });
+                return;
+            }
         }
         if let Some(feature) = self.missing_required_feature(&req) {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
@@ -117,7 +119,11 @@ impl Scheduler {
         // whose events are still undelivered; `enqueue_media` applies the
         // same count.
         let waiting = self.pending_request_count() + self.output.retained_len();
-        if waiting >= self.config.max_num_waiting {
+        if self
+            .config
+            .max_num_waiting
+            .is_some_and(|bound| waiting >= bound)
+        {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
                 kind: RejectionKind::Overloaded,
                 message: "scheduler waiting queue is full".into(),
@@ -131,7 +137,7 @@ impl Scheduler {
         let st = RequestState {
             finish_token_ids,
             allocations: None,
-            flow_prefix: None,
+            guidance_prefix: None,
             request_epoch: self.next_request_epoch,
             last_state_call_id: CallId::default(),
             latest_token: None,
@@ -170,7 +176,6 @@ impl Scheduler {
             prefix_published: Vec::new(),
             generated_token_ids: Vec::new(),
             round_token_ids: Vec::new(),
-            text_tokens_since_image: 0,
             feedback_image_b64: None,
             replayable: true,
             encoder_cache_pins: Vec::new(),
@@ -408,13 +413,11 @@ impl Scheduler {
     ///
     /// Rejects with `RejectionKind::Invalid` when the request fails
     /// validation; the worker reports no muxing component or no video
-    /// denoiser; the denoiser does not serve the request's task; the request's
-    /// inference-step count differs from the loaded model's; its call graph
-    /// cannot be built; `media_outputs` cannot bound its products; or the
-    /// worker has fewer than two request slots. A served task's calls all
-    /// have components: the executor checked them at startup. Rejects with
-    /// `RejectionKind::Overloaded` when the waiting bound is reached. A
-    /// rejection's send result is ignored.
+    /// denoiser; the denoiser does not serve the request's task; its call
+    /// graph cannot be built; or `media_outputs` cannot bound its products. A
+    /// served task's calls all have components: the executor checked them at
+    /// startup. Rejects with `RejectionKind::Overloaded` when the waiting
+    /// bound is reached. A rejection's send result is ignored.
     pub(super) fn enqueue_media(
         &mut self,
         request: DiffusionRequest,
@@ -463,13 +466,6 @@ impl Scheduler {
             );
             return;
         }
-        if request.sampling.num_inference_steps != self.info.num_inference_steps {
-            reject(
-                RejectionKind::Invalid,
-                "request prediction count disagrees with the loaded model".to_string(),
-            );
-            return;
-        }
         let graph = match VideoGraph::new(&request) {
             Ok(graph) => graph,
             Err(message) => {
@@ -484,15 +480,11 @@ impl Scheduler {
             );
             return;
         }
-        if self.info.request_slots < 2 {
-            reject(
-                RejectionKind::Invalid,
-                "worker does not provide two resident media state slots".to_string(),
-            );
-            return;
-        }
-        if self.waiting.len() + self.waiting_media.len() + self.output.retained_len()
-            >= self.config.max_num_waiting
+        let waiting = self.waiting.len() + self.waiting_media.len() + self.output.retained_len();
+        if self
+            .config
+            .max_num_waiting
+            .is_some_and(|bound| waiting >= bound)
         {
             reject(
                 RejectionKind::Overloaded,
@@ -510,12 +502,13 @@ impl Scheduler {
 
     /// Reserves a media request's row and output buffers on every routed worker.
     ///
-    /// Every declared output is reserved in full on every routed worker, not
-    /// only on the worker whose component produces it; spans are sized from
-    /// the shape bound's maximum element count and 256-byte aligned.
+    /// Every declared output is reserved in full in the buffer pool of each
+    /// rank that backs it on each routed worker, not only on the worker whose
+    /// component produces it; spans are sized from the shape bound's maximum
+    /// element count and 256-byte aligned.
     ///
     /// Returns `Ok(None)`, with nothing reserved, when a request row or buffer
-    /// span cannot be allocated on some worker now; `admit_media` then leaves
+    /// span cannot be allocated on some rank now; `admit_media` then leaves
     /// the request at the head of the queue. Returns `Err` when a routed
     /// worker has no media storage, after releasing what was already reserved
     /// on known workers.
@@ -557,12 +550,16 @@ impl Scheduler {
                     reserved.free(&mut self.storage)?;
                     return Err(UnknownMediaWorker(worker.clone()));
                 };
-                let Ok(buffer) = storage.buffers.allocate(request_key, bytes, 256) else {
-                    reserved.tensors.insert((component, index), tensor);
-                    reserved.free(&mut self.storage)?;
-                    return Ok(None);
-                };
-                tensor.allocations.insert(worker.clone(), buffer);
+                for rank in storage.holders(&component).to_vec() {
+                    let Ok(buffer) =
+                        storage.buffers[rank as usize].allocate(request_key, bytes, 256)
+                    else {
+                        reserved.tensors.insert((component, index), tensor);
+                        reserved.free(&mut self.storage)?;
+                        return Ok(None);
+                    };
+                    tensor.allocations.insert((worker.clone(), rank), buffer);
+                }
             }
             reserved.tensors.insert((component, index), tensor);
         }
@@ -578,6 +575,18 @@ impl Scheduler {
     pub(super) fn admit_media(&mut self) {
         while self.running_request_count() < self.config.max_num_seqs {
             let Some(submission) = self.waiting_media.pop_front() else {
+                break;
+            };
+            // The denoiser's fixed schedule sets every request's step count;
+            // submission refused requests while the worker reports none.
+            let Some(steps) = self
+                .info
+                .video_denoiser
+                .as_ref()
+                .map(|video| video.denoise_steps())
+            else {
+                self.waiting_media.push_front(submission);
+                self.invariant_broken("a queued media request has a video denoiser");
                 break;
             };
             let id = submission.request.request_id;
@@ -648,7 +657,6 @@ impl Scheduler {
             }
             self.next_request_epoch = self.next_request_epoch.saturating_add(1);
             let root = CallId::new(0, 0);
-            let steps = submission.request.sampling.num_inference_steps;
             let mut state = MediaFlowState {
                 request: submission.request,
                 graph: submission.graph,
@@ -682,7 +690,6 @@ impl Scheduler {
                 denoising: Denoising::new(steps),
                 scheduled_decode_units: 0,
                 scheduled_encode_units: 0,
-                encoded_video_units: 0,
                 audio_decoding_scheduled: false,
                 audio_encoding_scheduled: false,
                 audio_encoded: false,
@@ -725,9 +732,14 @@ impl Scheduler {
         &self,
         request: &GenerationRequest,
     ) -> Option<uniserve_core::GenerationFeatures> {
-        self.generation_limits
-            .covers(request.required_features())
-            .err()
+        // A block-diffusion runtime generates every request it does not read
+        // out in canvases.
+        let features = if self.config.canvas.is_some() && !request.is_readout() {
+            request.canvas_features()
+        } else {
+            request.required_features()
+        };
+        self.generation_limits.covers(features).err()
     }
 
     /// Returns whether the worker tracks image-latent capacity.
@@ -751,13 +763,13 @@ impl Scheduler {
     /// Materializes the negative-prompt KV prefix required by multi-branch guidance.
     ///
     /// Allocates the prefix its own request row and KV tables sized to the
-    /// negative prompt, and stores them in `RequestState::flow_prefix`.
+    /// negative prompt, and stores them in `RequestState::guidance_prefix`.
     /// Returns `true` when the prefix is in place, the request uses a single
     /// guidance branch, or the request is not running. Returns `false`,
     /// holding nothing new, when no request row or KV capacity is free, or
     /// (after latching engine-fatal) the KV cache is missing;
     /// `reserve_generation_resources` then declines the denoising call.
-    pub(super) fn ensure_flow_prefix(&mut self, id: RequestId) -> bool {
+    pub(super) fn ensure_guidance_prefix(&mut self, id: RequestId) -> bool {
         let (prefix_tokens, needs_alternative) = self
             .running
             .get(&id)
@@ -772,7 +784,7 @@ impl Scheduler {
             || self
                 .running
                 .get(&id)
-                .is_some_and(|state| state.flow_prefix.is_some())
+                .is_some_and(|state| state.guidance_prefix.is_some())
         {
             return true;
         }
@@ -806,7 +818,7 @@ impl Scheduler {
             allocations.free(&mut self.storage);
             return false;
         };
-        state.flow_prefix = Some(FlowPrefixState {
+        state.guidance_prefix = Some(GuidancePrefixState {
             allocations,
             new_units,
             diffusion_finalized: false,
@@ -814,12 +826,12 @@ impl Scheduler {
         true
     }
 
-    /// Releases the request's flow-prefix allocations.
-    pub(super) fn free_flow_prefix(&mut self, id: RequestId) {
+    /// Releases the request's guidance-prefix allocations.
+    pub(super) fn free_guidance_prefix(&mut self, id: RequestId) {
         let prefix = self
             .running
             .get_mut(&id)
-            .and_then(|state| state.flow_prefix.take());
+            .and_then(|state| state.guidance_prefix.take());
         if let Some(prefix) = prefix {
             prefix.allocations.free(&mut self.storage);
         }
@@ -841,7 +853,7 @@ impl Scheduler {
         for (id, intent) in cancelled {
             let reason = match intent {
                 TerminalIntent::Finish(reason) => reason,
-                TerminalIntent::Failure(_) => FinishReason::Error,
+                TerminalIntent::Failure(_) | TerminalIntent::Rejected(_) => FinishReason::Error,
                 TerminalIntent::None => continue,
             };
             self.finish(id, reason);
@@ -861,6 +873,7 @@ impl Scheduler {
         for (id, intent) in media {
             let event = match intent {
                 TerminalIntent::Failure(message) => DiffusionTerminal::Failed(message),
+                TerminalIntent::Rejected(message) => DiffusionTerminal::Rejected(message),
                 TerminalIntent::Finish(reason) => DiffusionTerminal::Finished(reason),
                 TerminalIntent::None => continue,
             };
@@ -942,7 +955,6 @@ impl Scheduler {
                     // with an error if a table covers fewer than `tokens`
                     // tokens.
                     self.ensure_request_capacity(id, 0, tokens);
-                    self.storage.reserved_units += need;
                     continue;
                 }
             } else {
@@ -1215,12 +1227,12 @@ fn acquire_cached_prefix(
         .ok_or("an admitted request's block tables cover every KV group")?;
 
     // Queries count the tokens eligible for reuse under the same rule as the
-    // prefix selection: a multiple of the largest page size that leaves at
+    // prefix selection: a multiple of the largest block size that leaves at
     // least one prompt token to compute, so prefill produces logits.
     let step = coordinator
         .groups()
         .iter()
-        .map(|group| group.page_tokens)
+        .map(|group| group.block_size)
         .max()
         .unwrap_or(1);
     let query_tokens = prompt.len().saturating_sub(1) / step * step;
@@ -1238,7 +1250,7 @@ fn acquire_cached_prefix(
     state.prefix_published = coordinator
         .groups()
         .iter()
-        .map(|group| hit.cached_tokens / group.page_tokens)
+        .map(|group| hit.cached_tokens / group.block_size)
         .collect();
     state.prefix_page_hashes = hit.page_hashes;
     state.num_computed_prompt_tokens = hit.cached_tokens as u32;

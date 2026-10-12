@@ -1,6 +1,5 @@
 """Independent checkpoint modules retain their values, buffers and placement."""
 
-import hashlib
 import json
 from dataclasses import dataclass, replace
 
@@ -80,7 +79,6 @@ def component_checkpoint(tmp_path):
             "scale": torch.tensor([0.5, 2.0]),
         },
     }
-    hashes = {}
     for name, values in tensors.items():
         directory = tmp_path / name
         directory.mkdir()
@@ -89,12 +87,7 @@ def component_checkpoint(tmp_path):
         (directory / "model.safetensors.index.json").write_text(
             json.dumps({"weight_map": dict.fromkeys(values, path.name)})
         )
-        hashes[path.relative_to(tmp_path).as_posix()] = hashlib.sha256(
-            path.read_bytes()
-        ).hexdigest()
-    manifest = tmp_path / "sha256.json"
-    manifest.write_text(json.dumps({"files": hashes}))
-    return tmp_path, loading.Config(checksum_manifest=manifest)
+    return tmp_path, loading.Config()
 
 
 def _load(
@@ -132,16 +125,6 @@ def test_component_directories_preserve_namespaces_and_persistent_buffers(
     torch.testing.assert_close(
         result.model(torch.tensor([[1.0, 2.0]])), torch.tensor([[5.0, 66.0]])
     )
-
-
-def test_checksum_covers_each_component_source(component_checkpoint):
-    root, io = component_checkpoint
-    save_file(
-        {"weight": torch.eye(2), "scale": torch.ones(2)},
-        root / "decoder" / "model.safetensors",
-    )
-    with pytest.raises(ValueError, match="checksum mismatch.*decoder/"):
-        _load(root, io)
 
 
 def test_missing_serialized_buffer_rejects_incomplete_component(
@@ -276,3 +259,53 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
     for owner in owners:
         if owner is not None:
             owner.close()
+
+
+class ChannelsLastConvolution(nn.Module):
+    """A convolution whose weight is declared in channels-last storage."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.convolution = nn.Conv3d(2, 3, 2, bias=False)
+        self.convolution.weight = nn.Parameter(
+            self.convolution.weight.detach().contiguous(
+                memory_format=torch.channels_last_3d
+            )
+        )
+
+
+@pytest.mark.parametrize("mode", ["eager", "layered"])
+def test_loaded_weight_keeps_its_declared_channels_last_storage(tmp_path, mode):
+    weight = torch.arange(48, dtype=torch.float32).reshape(3, 2, 2, 2, 2)
+    save_file({"weight": weight}, tmp_path / "model.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"weight": "model.safetensors"}})
+    )
+
+    def mapping(model):
+        layer = model.convolution
+        return (
+            weights.ModuleMapping(
+                layer,
+                "primary",
+                lambda reader: (
+                    weights.Assignment(layer.weight, reader.get("weight")),
+                ),
+                frozenset({"weight"}),
+            ),
+        )
+
+    io = replace(loading.Config(), mode=mode)
+    loaded = loading.load_model(
+        ChannelsLastConvolution,
+        Config(),
+        checkpoint=(checkpoint.Config().resolve(tmp_path, io=io),),
+        mapping=mapping,
+        device="cpu",
+        weights=weights.Config(dtype=torch.float32),
+        io=io,
+    ).model.convolution.weight
+
+    assert torch.equal(loaded, weight)
+    assert loaded.is_contiguous(memory_format=torch.channels_last_3d)
+    assert not loaded.is_contiguous()

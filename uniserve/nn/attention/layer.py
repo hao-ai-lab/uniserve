@@ -175,8 +175,7 @@ class Attention(nn.Module):
 
         if operator is None:
             if isinstance(batch, SegmentedInput) or (
-                isinstance(batch, PagedInput)
-                and batch.write_indices is not None
+                isinstance(batch, PagedInput) and batch.slot_mapping is not None
             ):
                 raise RuntimeError(
                     "cached attention requires an active ExecutionContext"
@@ -192,16 +191,16 @@ class Attention(nn.Module):
     ) -> None:
         """Write this call's K/V at its table's addresses, without attending.
 
-        The layer's own table entry supplies the physical write addresses; an
-        entry without write addresses publishes nothing. No request is
+        The layer's own table entry supplies the physical slot mapping; an
+        entry without a slot mapping publishes nothing. No request is
         scheduled or committed. With Ulysses, each rank supplies its local
         token interval and TP-local heads, and the same exchange as forward
         produces this rank's cache heads.
         """
         operator = _binding.attention.get().get(id(self))
         entry = attention.entry(None if operator is None else operator.table)
-        indices = getattr(entry, "write_indices", None)
-        if indices is None:
+        slot_mapping = getattr(entry, "slot_mapping", None)
+        if slot_mapping is None:
             return
         if operator is None:
             raise RuntimeError(
@@ -209,11 +208,11 @@ class Attention(nn.Module):
             )
 
         if self.context_parallel is not None:
-            operator.update_cache(k, v, indices=indices)
+            operator.update_cache(k, v, slot_mapping=slot_mapping)
             return
 
         if self.exchange.group.size > 1:
-            partition = TokenShard(indices.numel(), self.exchange.group)
+            partition = TokenShard(slot_mapping.numel(), self.exchange.group)
             if partition.num_tokens == 0:
                 return
             storage = _binding.attention_storage.get().get(id(self))
@@ -224,4 +223,4 @@ class Attention(nn.Module):
                 )
             )
 
-        operator.update_cache(k, v, indices=indices)
+        operator.update_cache(k, v, slot_mapping=slot_mapping)

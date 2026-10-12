@@ -18,26 +18,20 @@ use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::{
-    AttentionBackend, DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
+    DEFAULT_COMPONENT, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_SEQS, FlashInferBackend, LaneConfig,
+    TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::profile::diffusion_gemma::DenoisingOverrides;
-use uniserve_server::profile::omni::resolution::ResolutionName;
-use uniserve_server::profile::video::VideoResolution;
+use uniserve_server::serving::MAX_VIDEO_SECONDS;
 use uniserve_server::serving::systemone::{
     CandidateTokens, CanvasMode, ReadoutLayout, ReadoutOptions,
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, ImageFetchPolicy,
-    SchedulingPolicy, VideoMediaSettings,
+    SchedulingPolicy, VideoJobSettings, VideoMediaSettings,
 };
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
-
-/// Call batches kept in flight against a worker when neither the command
-/// line nor the deployment file sets its queue depth.
-const DEFAULT_QUEUE_DEPTH: usize = 2;
 
 /// Top-level parser for the `uniserve` binary.
 #[derive(Debug, Parser)]
@@ -159,54 +153,28 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(value_name = "MODEL")]
     pub model: String,
 
-    /// Local copy of the base checkpoint that a component export (such as
-    /// FastH3 OmniRef) pins for its other components. The server and the
-    /// workers verify its revision from its Hugging Face download records;
-    /// without it they read the pinned revision from the Hugging Face cache.
-    #[arg(long, value_name = "PATH")]
-    pub base_model: Option<std::path::PathBuf>,
-
-    /// Override the maximum model context length. When unset, the model's real
-    /// context length (`max_position_embeddings`) is used.
+    /// Override the maximum model context length. When unset, a model with a
+    /// root `config.json` uses its `max_position_embeddings` (8192 when it
+    /// declares none) and a MiniMax-H3 pipeline uses 16384 prompt tokens, the
+    /// longest prompt capacity startup prepares by default.
     #[arg(long = "max-model-len")]
     pub max_model_len: Option<u32>,
     /// Longest video duration, in seconds, a media deployment provisions and
     /// admits: a capacity within the video API's [4, 15] second range,
     /// advertised as `max_seconds`.
-    #[arg(long = "max-video-seconds", default_value_t = 15.0)]
+    #[arg(long = "max-video-seconds", default_value_t = MAX_VIDEO_SECONDS)]
     pub max_video_seconds: f64,
-    /// Comma-separated video resolution classes (`768p`, `480p`) a video
-    /// deployment prepares, each at every `--video-aspect-ratios` entry. A
-    /// request's `target.short_edge` selects one: 768 or 480. Only a FastH3
-    /// export generates the 480p buckets.
-    #[arg(
-        long = "video-resolutions",
-        value_delimiter = ',',
-        default_value = "768p"
-    )]
-    pub video_resolutions: Vec<VideoResolution>,
-    /// Comma-separated video aspect ratios, from the trained buckets `21:9`,
-    /// `16:9`, `4:3`, `1:1`, `3:4`, `9:16`, a video deployment prepares. A
-    /// request's `target.aspect_ratio` selects one; requests are refused at
-    /// any canvas the deployment did not prepare.
-    #[arg(
-        long = "video-aspect-ratios",
-        value_delimiter = ',',
-        default_value = "16:9,9:16"
-    )]
-    pub video_aspect_ratios: Vec<ResolutionName>,
     /// Most denoiser rows the conditions of one video request may take: a
     /// capacity video workers provision their condition products, request
-    /// slots and largest denoiser layout for, advertised as
-    /// `max_condition_rows`. The default holds two keyframes on the largest
-    /// canvas, every `fl2va` request; a `ref2va` deployment raises it to the
-    /// rows its references take, about 38,000 for a five-second reference
-    /// video with its soundtrack.
-    #[arg(
-        long = "max-condition-rows",
-        default_value_t = uniserve_server::EngineSettings::DEFAULT_MAX_CONDITION_ROWS
-    )]
-    pub max_condition_rows: u32,
+    /// slots and largest denoiser layout for. The worker that packs a
+    /// request's conditions refuses one that needs more. Without it the
+    /// workers provision the largest condition set their denoiser admits
+    /// (two keyframes for `fl2va`, nine images and three videos with
+    /// soundtracks for `ref2va`), so no request is refused for its
+    /// conditions and a machine that cannot hold that set fails at startup;
+    /// state a smaller capacity to serve less.
+    #[arg(long = "max-condition-rows")]
+    pub max_condition_rows: Option<u32>,
     /// Directory that `file://` condition media of video requests resolves
     /// under. Without it, `file://` media is refused.
     #[arg(long = "media-directory", value_name = "DIR")]
@@ -218,24 +186,46 @@ pub(crate) struct SharedRuntimeArgs {
     /// Bytes of condition media one video request may carry in total.
     #[arg(long = "max-request-bytes", default_value_t = VideoMediaSettings::DEFAULT_MAX_REQUEST_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
     pub max_request_bytes: u64,
+    /// Seconds a completed or failed asynchronous video job stays retrievable
+    /// before the server deletes it.
+    #[arg(long = "video-job-retention", default_value_t = VideoJobSettings::DEFAULT_RETENTION_SECONDS, value_parser = clap::value_parser!(u64).range(1..))]
+    pub video_job_retention: u64,
+    /// Bytes of generated video the asynchronous video jobs keep, retained
+    /// artifacts and unfinished downloads together. Retained artifacts are
+    /// shared-memory mappings, so this is the memory the job store may hold.
+    #[arg(long = "max-video-job-bytes", default_value_t = VideoJobSettings::DEFAULT_MAX_RETAINED_BYTES, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub max_video_job_bytes: usize,
     /// `ffprobe` executable that probes video and audio condition media.
     #[arg(long, default_value = "ffprobe", value_name = "PATH")]
     pub ffprobe: std::path::PathBuf,
+    /// Options of the served model's multimodal processor, as a JSON object.
+    /// The processor refuses an option it does not take. MiniMax H3's video
+    /// processor sizes `ref2va` references by two: an image whose short
+    /// edge exceeds `reference_image_short_edge` (a multiple of 32 up to
+    /// 2048, the default) scales down to it and a video larger than the
+    /// canvas of its aspect scales down to that canvas, while smaller
+    /// references keep their own size unless `enlarge_references` (false by
+    /// default) enlarges them to those sizes, as the released pipeline does.
+    #[arg(
+        long = "mm-processor-kwargs",
+        value_parser = parse_json::<serde_json::Map<String, Value>>,
+        value_name = "JSON",
+        default_value = "{}"
+    )]
+    pub mm_processor_kwargs: serde_json::Map<String, Value>,
     /// Optional explicit KV token capacity override for the worker.
-    #[arg(long = "max-total-tokens")]
-    pub kv_token_capacity: Option<u64>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_total_tokens: Option<u64>,
     /// Recompute prompt prefixes instead of reusing or retaining cached KV pages.
     #[arg(long)]
     pub disable_prefix_cache: bool,
-    /// Response-ring slot capacity in bytes for the worker IPC transport.
-    #[arg(long, default_value_t = EngineSettings::DEFAULT_RESP_SLOT_CAP, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
-    pub resp_slot_cap: usize,
     /// Compute device for the forward-only worker.
     #[arg(long, default_value = "cuda")]
     pub device: String,
-    /// Attention backend preference forwarded to the Python worker.
-    #[arg(long, default_value = "auto")]
-    pub attention_backend: AttentionBackend,
+    /// Attention provider the Python worker uses for every call, by the
+    /// name its attention registry gives it; `auto` selects per call.
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_ATTENTION_BACKEND)]
+    pub attention_backend: String,
     /// Python interpreter used to launch the forward-only worker.
     #[arg(long, default_value_os_t = default_worker_python(), hide = true)]
     pub worker_python: std::path::PathBuf,
@@ -266,14 +256,14 @@ pub(crate) struct SharedRuntimeArgs {
     pub workers: Option<Box<[WorkerConfig]>>,
     /// Directed product bindings: source[:rank]->destination[:rank]=mechanisms,
     /// where mechanisms names the edge's device mechanism, its host mechanism,
-    /// or both joined by `+` with the device mechanism first (`cuda_vmm+shm`).
+    /// or both joined by `+` with the device mechanism first (`cuda_vmm+posix_shm`).
     #[arg(long)]
     pub transfer: Option<TransferConfig>,
     /// Tokens per KV page of the cache group with the widest token rows, a
     /// power of two; every other group's page holds as many tokens as fit
     /// the same unit plane. Unset, the worker chooses the largest size, at
     /// most 64, whose pages its attention kernels read in every cache group.
-    #[arg(long = "page-size", value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: Option<u32>,
     /// This instance's host identity. Ranks are placed on it by name, and the
     /// engine owns exactly the ranks whose node matches it.
@@ -294,19 +284,22 @@ pub(crate) struct SharedRuntimeArgs {
     /// Maximum number of calls assembled into one forward batch.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub max_batch: Option<usize>,
-    /// Maximum transformer-token work admitted in one scheduling step.
+    /// Maximum transformer-token work admitted in one scheduling step. Token
+    /// models only: a video pipeline refuses it.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_batched_tokens: Option<usize>,
     /// Maximum number of concurrently resident requests.
     #[arg(long = "max-running-requests", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_seqs: Option<usize>,
-    /// Maximum number of prompt tokens processed per request in one prefill step.
+    /// Maximum number of requests the scheduler holds waiting, or finished
+    /// with undelivered events; a submission beyond it is rejected as
+    /// overloaded. Unbounded when unset.
+    #[arg(long = "max-queued-requests", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub max_num_waiting: Option<usize>,
+    /// Maximum number of prompt tokens processed per request in one prefill
+    /// step. Token models only: a video pipeline refuses it.
     #[arg(long = "chunked-prefill-size", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub long_prefill_threshold: Option<usize>,
-    /// Per-step budget of text prefill tokens allowed to join a decode batch
-    /// as one mixed extend+decode forward (0 disables mixing).
-    #[arg(long, default_value_t = DEFAULT_MIXED_PREFILL_TOKENS, hide = true)]
-    pub mixed_prefill_tokens: usize,
     /// Waiting queue policy used by the scheduler.
     #[arg(long = "schedule-policy", value_enum, default_value_t = SchedulerPolicyArg::Fcfs)]
     pub scheduler_policy: SchedulerPolicyArg,
@@ -314,6 +307,14 @@ pub(crate) struct SharedRuntimeArgs {
     /// `0` disables graceful drain (terminate immediately).
     #[arg(long, default_value_t = 30)]
     pub shutdown_timeout: u64,
+    /// Seconds a submitted batch may run without any rank making progress
+    /// before the worker group is treated as hung and replaced, failing its
+    /// requests. A rank that exits is detected at once; this bounds one that
+    /// is alive but stuck. A batch that legitimately runs longer, such as
+    /// the first evaluation of a layout prepared on arrival, needs a larger
+    /// value.
+    #[arg(long = "watchdog-timeout", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    pub watchdog_timeout: u64,
 
     /// The file path to the chat template, or the template in single-line form
     /// for the specified model.
@@ -354,9 +355,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// SSE streams and video downloads) are not bounded by it.
     #[arg(long = "request-timeout", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub request_timeout: Option<u64>,
-    /// HTTP admission limit for in-flight chat completion and image generation
-    /// requests, which are shed with 503 above it. Video requests are bounded
-    /// by the video job slots instead.
+    /// HTTP admission limit for in-flight chat completion, image generation,
+    /// System One and synchronous video requests, which are shed with 503
+    /// above it.
     #[arg(long = "max-concurrent-requests", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub max_concurrent_requests: Option<u64>,
     /// Enable or disable periodic logging of engine statistics.
@@ -474,32 +475,27 @@ impl SharedRuntimeArgs {
         worker_process.host = self.host_identity.clone();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
-        worker_process.base_model = self.base_model.clone();
-        let queue_depth = self.queue_depth.unwrap_or(DEFAULT_QUEUE_DEPTH);
+        let queue_depth = self
+            .queue_depth
+            .unwrap_or(WorkerProcessArgs::DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
-        worker_process.resp_slot_cap = self.resp_slot_cap;
-        worker_process.kv_token_capacity = self.kv_token_capacity;
+        worker_process.watchdog_timeout = Duration::from_secs(self.watchdog_timeout);
+        worker_process.max_total_tokens = self.max_total_tokens;
         worker_process.block_size = self.block_size;
         worker_process.attention_backend = self.attention_backend.clone();
 
         EngineSettings {
             max_batch: self.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
-            max_num_batched_tokens: self
-                .max_num_batched_tokens
-                .unwrap_or(DEFAULT_MAX_NUM_BATCHED_TOKENS),
+            max_num_batched_tokens: self.max_num_batched_tokens,
             max_num_seqs: self.max_num_seqs.unwrap_or(DEFAULT_MAX_NUM_SEQS),
-            long_prefill_threshold: self
-                .long_prefill_threshold
-                .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),
-            mixed_prefill_tokens: self.mixed_prefill_tokens,
+            max_num_waiting: self.max_num_waiting,
+            long_prefill_threshold: self.long_prefill_threshold,
             prefix_cache: !self.disable_prefix_cache,
             scheduler_policy: self.scheduler_policy.into(),
             // `None` lets `build_state` derive the model's real context length;
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
-            video_resolutions: self.video_resolutions.clone(),
-            video_aspect_ratios: self.video_aspect_ratios.clone(),
             max_condition_rows: self.max_condition_rows,
             // Without a written configuration each replica serves one
             // component over its `--worker-ranks` ranks. A model whose
@@ -535,7 +531,6 @@ impl SharedRuntimeArgs {
         Config {
             engine,
             model,
-            base_model: self.base_model,
             served_model_name: self.served_model_name,
             listener_mode,
             chat_template: self.chat_template,
@@ -555,6 +550,10 @@ impl SharedRuntimeArgs {
                 max_request_bytes: self.max_request_bytes,
                 ffprobe: self.ffprobe,
             },
+            video_jobs: VideoJobSettings {
+                retention: Duration::from_secs(self.video_job_retention),
+                max_retained_bytes: self.max_video_job_bytes,
+            },
             image_fetch: ImageFetchPolicy {
                 timeout: Duration::from_secs(self.image_fetch_timeout),
                 max_bytes: self.image_fetch_max_bytes,
@@ -566,6 +565,7 @@ impl SharedRuntimeArgs {
                 candidates: self.readout_candidates,
             },
             diffusion_generation: self.diffusion_generation_config.unwrap_or_default(),
+            mm_processor_kwargs: self.mm_processor_kwargs,
         }
     }
 }
@@ -575,10 +575,10 @@ impl SharedRuntimeArgs {
 #[educe(Debug)]
 pub(crate) struct WorkerProcessOptions {
     /// Independent microbatches overlapping attention and disaggregated experts.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=4))]
+    #[arg(long, default_value_t = WorkerProcessArgs::DEFAULT_EXPERT_MICROBATCHES, value_parser = clap::value_parser!(u32).range(1..))]
     pub expert_microbatches: u32,
     /// Checkpoint loader format used by every model worker.
-    #[arg(long, default_value = "auto", value_parser = ["auto", "safetensors", "pt", "dummy", "layered"])]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_LOAD_FORMAT, value_parser = ["auto", "safetensors", "pt", "dummy", "layered"])]
     pub load_format: String,
     /// Hugging Face cache root for repository model paths.
     #[arg(long)]
@@ -586,10 +586,7 @@ pub(crate) struct WorkerProcessOptions {
     /// Concurrent checkpoint file readers.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub load_threads: Option<u32>,
-    /// JSON map of checkpoint-relative paths to SHA-256 checksums.
-    #[arg(long)]
-    pub checksum_manifest: Option<std::path::PathBuf>,
-    #[arg(long = "dtype", default_value = "bfloat16")]
+    #[arg(long = "dtype", default_value_t = WorkerProcessArgs::DEFAULT_MODEL_DTYPE)]
     pub model_dtype: ModelDtype,
     /// JSON quantization policy, for example {"mode":"balanced"}.
     /// An empty object selects the model-owned default.
@@ -602,16 +599,18 @@ pub(crate) struct WorkerProcessOptions {
     pub quantization_config: serde_json::Value,
     #[arg(long)]
     pub kv_cache_dtype: Option<KvCacheDtype>,
-    /// Each worker rank's share of its device's total storage, in (0, 1].
-    /// A deployment file's `memory_fraction` overrides it for one worker.
+    /// Each worker rank's share of its device's total memory for static
+    /// allocations, weights and KV cache, in (0, 1]. A deployment file's
+    /// `mem_fraction_static` overrides it for one worker.
     #[arg(
-        long = "mem-fraction-static",
-        default_value = "0.70",
-        value_parser = parse_storage_fraction
+        long,
+        default_value_t = WorkerProcessArgs::DEFAULT_MEM_FRACTION_STATIC,
+        value_parser = parse_mem_fraction_static
     )]
-    pub kv_storage_fraction: f64,
-    /// Parallelism mesh forwarded to the Python worker, e.g.
-    /// `tower=text:cuda:0;gen:cuda:1`.
+    pub mem_fraction_static: f64,
+    /// Parallelism mesh forwarded to the Python worker: `tower=gen:<device>`
+    /// places the generation tower's modules on a second device, e.g.
+    /// `tower=gen:cuda:1`.
     #[arg(long, hide = true)]
     pub worker_mesh: Option<String>,
     #[arg(long, hide = true)]
@@ -620,46 +619,65 @@ pub(crate) struct WorkerProcessOptions {
     #[arg(long = "lane")]
     pub lanes: Vec<LaneConfig>,
     /// GPU computation capture policy. Full rejects unavailable capture; off disables all graphs.
-    #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_GRAPH_POLICY, value_parser = ["off", "auto", "full"])]
     pub graph_policy: String,
     #[arg(long, hide = true)]
     pub decode_graph_batch_sizes: Option<String>,
     /// Replay a startup-captured CUDA graph for every prefill call
     /// (default). `false` runs prefill eagerly, for debugging only.
-    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
+    #[arg(long, action = ArgAction::Set, default_value_t = WorkerProcessArgs::DEFAULT_PREFILL_CUDA_GRAPH, hide = true)]
     pub prefill_cuda_graph: bool,
     #[arg(long, hide = true)]
     pub prefill_graph_token_sizes: Option<String>,
     /// Capture image denoising calls at the configured flow shapes and
     /// replay those whose exact input signature was captured (default).
     /// `false` runs image denoising eagerly, for debugging only.
-    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
+    #[arg(long, action = ArgAction::Set, default_value_t = WorkerProcessArgs::DEFAULT_FLOW_CUDA_GRAPH, hide = true)]
     pub flow_cuda_graph: bool,
     #[arg(long, hide = true)]
     pub flow_graph_batch_sizes: Option<String>,
     #[arg(long, hide = true)]
     pub flow_graph_shapes: Option<String>,
-    /// Text capacities, in prompt tokens, of the video denoiser's layouts,
-    /// as an increasing comma-separated list whose last entry holds
-    /// `--max-model-len`, e.g. `1024,4096,16384`. Startup prepares every
-    /// admitted duration at every capacity, and a request evaluates in the
-    /// smallest capacity that holds its prompt; fewer capacities shorten
-    /// startup and lower resident memory, finer ones pad less. Defaults to
-    /// 1024 tokens, then steps of 2048 tokens.
+    /// Text capacities, in prompt tokens, of the video denoiser's layouts
+    /// below `--max-model-len`, as a comma-separated list, e.g. `1024,4096`.
+    /// `--max-model-len` is always the largest capacity, so a list holds no
+    /// entry above it. Startup prepares every admitted duration at every
+    /// capacity, and a request evaluates in the smallest capacity that holds
+    /// its prompt; fewer capacities shorten startup and lower resident
+    /// memory, finer ones pad less. Defaults to 1024 tokens, then steps of
+    /// 2048 tokens.
     #[arg(long)]
     pub video_text_capacities: Option<String>,
+    /// Comma-separated resolution classes (`768p`, `480p`) a video
+    /// deployment prepares, each at every `--video-aspect-ratios` entry. A
+    /// request's `target.short_edge` selects one. The video worker refuses a
+    /// class its denoiser does not generate: a released base checkpoint
+    /// generates 768p, a FastH3 DMD export also 480p.
+    #[arg(long, default_value = "768p", value_name = "LIST")]
+    pub video_resolutions: String,
+    /// Comma-separated aspect ratios (`21:9`, `16:9`, `4:3`, `1:1`, `3:4`,
+    /// `9:16`) a video deployment prepares, at every `--video-resolutions`
+    /// entry. A request's `target.aspect_ratio` selects one; requests are
+    /// refused at any canvas the deployment did not prepare.
+    #[arg(long, default_value = "16:9,9:16", value_name = "LIST")]
+    pub video_aspect_ratios: String,
     /// `ffmpeg` executable the media reader decodes reference videos with.
     /// The reference conditioning decodes with FFmpeg 8.1.2, whose LANCZOS
     /// scaler a reference video's pixels depend on.
-    #[arg(long, default_value = "ffmpeg", value_name = "PATH")]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_FFMPEG, value_name = "PATH")]
     pub ffmpeg: std::path::PathBuf,
-    #[arg(long, default_value_t = 512 * 1024 * 1024, hide = true)]
+    #[arg(
+        long,
+        default_value_t = WorkerProcessArgs::DEFAULT_FLASHINFER_WORKSPACE_SIZE,
+        value_parser = clap::value_parser!(u64).range(1..),
+        hide = true
+    )]
     pub flashinfer_workspace_size: u64,
     #[arg(long, hide = true)]
     pub flashinfer_use_tensor_core: Option<String>,
-    #[arg(long, default_value = "fa2", hide = true)]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_FLASHINFER_DECODE_BACKEND.as_str(), hide = true)]
     pub flashinfer_decode_backend: FlashInferBackend,
-    #[arg(long, default_value = "auto", hide = true)]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_FLASHINFER_PREFILL_BACKEND.as_str(), hide = true)]
     pub flashinfer_prefill_backend: FlashInferBackend,
     #[arg(long, hide = true)]
     pub flashinfer_decode_split_tile_size: Option<u32>,
@@ -677,11 +695,10 @@ impl WorkerProcessOptions {
             load_format: self.load_format.clone(),
             download_dir: self.download_dir.clone(),
             load_threads: self.load_threads,
-            checksum_manifest: self.checksum_manifest.clone(),
             model_dtype: self.model_dtype,
             quantization_config: self.quantization_config.clone(),
             kv_cache_dtype: self.kv_cache_dtype,
-            kv_storage_fraction: self.kv_storage_fraction,
+            mem_fraction_static: self.mem_fraction_static,
             mesh: self.worker_mesh.clone(),
             distributed_backend: self.distributed_backend.clone(),
             lanes: self.lanes.clone(),
@@ -693,6 +710,8 @@ impl WorkerProcessOptions {
             flow_graph_batch_sizes: self.flow_graph_batch_sizes.clone(),
             flow_graph_shapes: self.flow_graph_shapes.clone(),
             video_text_capacities: self.video_text_capacities.clone(),
+            video_resolutions: Some(self.video_resolutions.clone()),
+            video_aspect_ratios: Some(self.video_aspect_ratios.clone()),
             ffmpeg: self.ffmpeg.clone(),
             flashinfer_workspace_size: self.flashinfer_workspace_size,
             flashinfer_use_tensor_core: self.flashinfer_use_tensor_core.clone(),
@@ -725,13 +744,13 @@ fn parse_json_object(value: &str) -> Result<Value, String> {
     }
 }
 
-/// Parses a device storage fraction for clap, refusing a value outside the
-/// range `WorkerConfig::validate_storage_fraction` accepts.
-fn parse_storage_fraction(value: &str) -> Result<f64, String> {
+/// Parses a static memory fraction for clap, refusing a value outside the
+/// range `WorkerConfig::validate_mem_fraction_static` accepts.
+fn parse_mem_fraction_static(value: &str) -> Result<f64, String> {
     let fraction = value
         .parse::<f64>()
-        .map_err(|error| format!("invalid storage fraction {value:?}: {error}"))?;
-    WorkerConfig::validate_storage_fraction(fraction).map_err(|error| error.to_string())?;
+        .map_err(|error| format!("invalid mem_fraction_static {value:?}: {error}"))?;
+    WorkerConfig::validate_mem_fraction_static(fraction).map_err(|error| error.to_string())?;
     Ok(fraction)
 }
 
@@ -794,12 +813,12 @@ mod tests {
     }
 
     #[test]
-    fn serve_rejects_zero_page_size() {
+    fn serve_rejects_zero_block_size() {
         let result = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
             "serve",
             "model",
-            "--page-size",
+            "--block-size",
             "0",
         ]);
         assert!(result.is_err());
@@ -822,7 +841,7 @@ mod tests {
     #[test]
     fn serve_accepts_runtime_configuration() {
         let configuration = written_configuration(
-            r#"[{"id":"text","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"components":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1,"memory_fraction":0.25}]"#,
+            r#"[{"id":"text","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"components":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1,"mem_fraction_static":0.25}]"#,
         );
         let parsed = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
@@ -832,7 +851,7 @@ mod tests {
             "cpu",
             "--worker-ranks",
             "2",
-            "--page-size",
+            "--block-size",
             "128",
             "--queue-depth",
             "3",
@@ -848,8 +867,6 @@ mod tests {
             "1234",
             "--schedule-policy",
             "priority",
-            "--resp-slot-cap",
-            "1048576",
             "--dtype",
             "float16",
             "--mem-fraction-static",
@@ -860,14 +877,12 @@ mod tests {
             "/models/cache",
             "--load-threads",
             "4",
-            "--checksum-manifest",
-            "/models/checksums.json",
             "--graph-policy",
             "off",
             "--prefill-cuda-graph",
             "true",
             "--worker-mesh",
-            "tower=text:cpu",
+            "tower=gen:cpu",
             "--lane",
             r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]}"#,
             "--workers",
@@ -879,8 +894,7 @@ mod tests {
         let workers = args.runtime.workers.expect("the configuration was read");
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].id.0, "text");
-        // The file's `memory_fraction` key deserializes into `storage_fraction`.
-        assert_eq!(workers[0].storage_fraction, Some(0.25));
+        assert_eq!(workers[0].mem_fraction_static, Some(0.25));
         assert_eq!(workers[0].components["model"].ranks, vec![0, 1]);
         assert_eq!(
             workers[0].components["model"]
@@ -891,10 +905,10 @@ mod tests {
     }
 
     /// `--mem-fraction-static` is each rank's share of its device's total
-    /// storage, so the parser accepts exactly the finite values in (0, 1]
-    /// that the worker accepts, and refuses the rest before any rank starts.
+    /// memory, so the parser accepts exactly the finite values in (0, 1]
+    /// and refuses the rest before any rank starts.
     #[test]
-    fn serve_accepts_only_a_storage_fraction_in_the_unit_interval() {
+    fn serve_accepts_only_a_mem_fraction_static_in_the_unit_interval() {
         let serve = |fraction: &str| {
             <Cli as clap::Parser>::try_parse_from([
                 "uniserve",
@@ -996,23 +1010,6 @@ mod tests {
     }
 
     #[test]
-    fn serve_forwards_a_local_base_checkpoint() {
-        let parsed = <Cli as clap::Parser>::try_parse_from([
-            "uniserve",
-            "serve",
-            "/models/FastH3-OmniRef",
-            "--base-model",
-            "/models/MiniMax-H3",
-        ])
-        .expect("component export with a local base");
-        let Command::Serve(args) = parsed.command;
-        let config = args.to_uniserve_config();
-        let base = Some(std::path::PathBuf::from("/models/MiniMax-H3"));
-        assert_eq!(config.base_model, base);
-        assert_eq!(config.engine.worker_process.base_model, base);
-    }
-
-    #[test]
     fn serve_leaves_quantization_policy_to_model_by_default() {
         let parsed = <Cli as clap::Parser>::try_parse_from(["uniserve", "serve", "model"])
             .expect("MiniMax H3 default precision policy");
@@ -1062,6 +1059,32 @@ mod tests {
         );
         assert!(serve(&["--image-fetch-timeout", "0"]).is_err());
         assert!(serve(&["--image-fetch-max-bytes", "0"]).is_err());
+    }
+
+    /// The processor options are one JSON object, empty by default, that
+    /// reaches the server as stated for the served model's processor to
+    /// read; anything but an object is refused.
+    #[test]
+    fn serve_passes_the_processor_options_through() {
+        let serve = |flags: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(
+                ["uniserve", "serve", "model"]
+                    .into_iter()
+                    .chain(flags.iter().copied()),
+            )
+        };
+        let options = |flags: &[&str]| {
+            let Command::Serve(args) = serve(flags).expect("serve invocation").command;
+            Value::Object(args.to_uniserve_config().mm_processor_kwargs)
+        };
+
+        assert_eq!(options(&[]), serde_json::json!({}));
+        assert_eq!(
+            options(&["--mm-processor-kwargs", r#"{"enlarge_references": true}"#]),
+            serde_json::json!({"enlarge_references": true})
+        );
+        assert!(serve(&["--mm-processor-kwargs", "[1]"]).is_err());
+        assert!(serve(&["--mm-processor-kwargs", "true"]).is_err());
     }
 
     #[test]

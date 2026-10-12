@@ -118,16 +118,17 @@ class VisionConfig:
 class PixelConfig:
     """How the checkpoint's processor normalizes pixels before patching.
 
-    Each RGB channel maps ``x`` in ``[0, 255]`` to ``(x / 255 - mean) / std``.
-    The defaults are the Qwen3-VL processor's.
+    Each RGB channel maps ``x`` in ``[0, 255]`` to ``(x / 255 - mean) / std``;
+    a checkpoint states them as its processor's ``image_mean`` and
+    ``image_std``.
 
     Raises:
         ValueError: From ``__post_init__`` for anything but three finite
             means and three finite positive deviations.
     """
 
-    mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
-    std: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    mean: tuple[float, float, float]
+    std: tuple[float, float, float]
 
     def __post_init__(self) -> None:
         if (

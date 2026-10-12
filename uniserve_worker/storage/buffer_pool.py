@@ -1,16 +1,12 @@
-"""Worker backing for scheduler-placed cross-call buffers.
+"""Worker backing for engine-placed cross-call buffers.
 
-The engine scheduler places each cross-call output buffer at a byte offset in
-one logical pool of `WorkerInfo.buffer_pool_bytes` (`BufferAllocation`).
-`BufferPool` backs that pool with one fixed byte arena per worker device and
-returns typed tensor views over it; `TensorStore` binds and releases those
-views for the products it records.
-
-In the default mode a binding occupies exactly the scheduler's
-``[offset, offset + bytes)`` span. When this rank's physical pool is smaller
-than the logical pool, which happens when it produces or consumes only some
-components' products, `Worker` enables ``compact`` mode: scheduler offsets
-are ignored and each binding is placed first-fit in the physical arena.
+The engine places each cross-call buffer at a byte offset in the pool of
+`WorkerInfo.buffer_pool_bytes` this rank reports (`BufferAllocation`), from
+the components it knows this rank executes and reads. `BufferPool` backs that
+pool with one fixed byte arena per worker device and returns typed tensor
+views over it; `TensorStore` binds and releases those views for the products
+it records. A binding occupies exactly the engine's
+``[offset, offset + bytes)`` span.
 """
 
 from __future__ import annotations
@@ -23,8 +19,8 @@ import torch
 
 from uniserve.runtime.device import canonical_device
 from uniserve_worker.errors import (
+    ErrorCode,
     WorkerError,
-    WorkerErrorCode,
     invalid_descriptor,
 )
 from uniserve_worker.protocol.batch import BufferAllocation
@@ -35,7 +31,7 @@ from uniserve_worker.protocol.tensor import TensorRef
 def _invariant(message: str) -> WorkerError:
     """Construct a classified invariant error for persistent-buffer misuse."""
     return WorkerError(
-        code=WorkerErrorCode.INVARIANT_VIOLATION,
+        code=ErrorCode.INVARIANT_VIOLATION,
         message=message,
         fatal=True,
     )
@@ -45,15 +41,15 @@ def _invariant(message: str) -> WorkerError:
 class BufferBinding:
     """Binds a logical buffer allocation to its validated tensor view.
 
-    ``physical_offset`` and ``physical_bytes`` give the byte span reserved in
-    the device arena, which can exceed the tensor's own bytes.
+    ``offset`` and ``bytes`` give the byte span reserved in the device arena,
+    which can exceed the tensor's own bytes.
     ``binding_id`` is unique per pool and distinguishes successive bindings
     of the same buffer, so `BufferPool.release` rejects a stale binding.
     """
 
     buffer: BufferId
-    physical_offset: int
-    physical_bytes: int
+    offset: int
+    bytes: int
     binding_id: int
     device_name: str
     tensor: torch.Tensor
@@ -71,13 +67,11 @@ class BufferPool:
         *,
         byte_capacity: int,
         devices: tuple[torch.device | str, ...],
-        compact: bool = False,
     ) -> None:
         """Allocate one persistent arena per distinct device.
 
         Devices are canonicalized and deduplicated; an empty ``devices``
-        tuple allocates a single CPU arena. ``compact`` selects first-fit
-        placement instead of the scheduler's offsets.
+        tuple allocates a single CPU arena.
 
         Raises:
             ValueError: When ``byte_capacity`` is negative.
@@ -85,7 +79,6 @@ class BufferPool:
         self.byte_capacity = int(byte_capacity)
         if self.byte_capacity < 0:
             raise ValueError("persistent buffer capacity must not be negative")
-        self.compact = bool(compact)
 
         normalized: list[torch.device] = []
         for raw in devices:
@@ -115,48 +108,6 @@ class BufferPool:
         self._active: dict[tuple[str, BufferId], BufferBinding] = {}
         self._next_binding_id = 1
         self._lock = RLock()
-
-    def _compact_offset_locked(self, device_name: str, extent: int) -> int:
-        """Return the first aligned gap that can hold one physical binding.
-
-        Caller must hold ``_lock``.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when no gap on the device
-                can hold ``extent`` bytes.
-        """
-        cursor = 0
-        active_bindings = sorted(
-            (
-                binding
-                for binding in self._active.values()
-                if binding.device_name == device_name
-            ),
-            key=lambda binding: binding.physical_offset,
-        )
-
-        # Bindings start on 256-byte boundaries so any dtype view stays aligned.
-        # Product storage sizing in `bootstrap.capacity`
-        # (`product_storage_bytes`, `local_product_storage_bytes`) applies the
-        # same 256-byte rounding per product.
-        for active in active_bindings:
-            start = ((cursor + 255) // 256) * 256
-            if start + extent <= active.physical_offset:
-                return start
-            cursor = max(cursor, active.physical_offset + active.physical_bytes)
-
-        start = ((cursor + 255) // 256) * 256
-        if start + extent > self.byte_capacity:
-            spans = tuple(
-                (binding.physical_offset, binding.physical_bytes)
-                for binding in active_bindings
-            )
-            raise invalid_descriptor(
-                "physical buffer allocation exceeds the worker buffer pool: "
-                f"{extent} bytes requested from {self.byte_capacity} bytes "
-                f"with live spans {spans}"
-            )
-        return start
 
     def bind(
         self,
@@ -210,19 +161,8 @@ class BufferPool:
             if key in self._active:
                 raise invalid_descriptor("buffer allocation is already bound")
 
-            # Compact mode reserves only the tensor's bytes rounded up to the
-            # 256-byte binding alignment; otherwise the scheduler's span is
-            # used as placed.
-            extent = (
-                ((required + 255) // 256) * 256
-                if self.compact
-                else int(allocation.bytes)
-            )
-            start = (
-                self._compact_offset_locked(device_name, extent)
-                if self.compact
-                else int(allocation.offset)
-            )
+            start = int(allocation.offset)
+            extent = int(allocation.bytes)
             end = start + extent
             if end > self.byte_capacity:
                 raise invalid_descriptor(
@@ -232,10 +172,7 @@ class BufferPool:
             for active in self._active.values():
                 if active.device_name != device_name:
                     continue
-                if (
-                    start < active.physical_offset + active.physical_bytes
-                    and active.physical_offset < end
-                ):
+                if start < active.offset + active.bytes and active.offset < end:
                     raise invalid_descriptor(
                         "buffer allocation overlaps a live worker buffer"
                     )
@@ -245,8 +182,8 @@ class BufferPool:
             tensor = arena.narrow(0, start, required).view(dtype).reshape(shape)
             binding = BufferBinding(
                 buffer=allocation.buffer,
-                physical_offset=start,
-                physical_bytes=extent,
+                offset=start,
+                bytes=extent,
                 binding_id=self._next_binding_id,
                 device_name=device_name,
                 tensor=tensor,

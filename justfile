@@ -1,5 +1,5 @@
-# Shortcuts for local checks and tests. Build is `pip install` / `cargo`;
-# serving is `uniserve serve <model> --model-description <description>`.
+# Shortcuts for local checks and tests. The README's `uv sync` builds the
+# environment; serving is `uniserve serve <model> --served-model-name <name>`.
 
 python := env("PYTHON", ".venv/bin/python")
 cargo := env("CARGO", "cargo")
@@ -24,7 +24,7 @@ bench-build:
 lint: fmt clippy
     {{python}} -m ruff check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernels/src tests
     {{python}} -m ruff format --check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernels/src tests
-    {{python}} -m mypy uniserve uniserve_models uniserve_worker uniserve_eval
+    {{python}} -m mypy
 
 # Fast Python tests (CPU only)
 test-python-fast:

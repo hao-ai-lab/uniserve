@@ -14,7 +14,6 @@ partitioning, and resolves the load-time ``WorkerConfig``. The launch's
 from __future__ import annotations
 
 import logging
-import socket
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from importlib import import_module
@@ -37,7 +36,6 @@ from uniserve.nn.attention import (
     ContextParallelConfig,
     Ulysses,
 )
-from uniserve.nn.attention.vsa import BlockAttention
 from uniserve.nn.moe import FusedMoE
 from uniserve.nn.vae.patch import PatchAutoencoder
 from uniserve.processing import (
@@ -56,7 +54,7 @@ from uniserve_worker.config.deployment import (
     WorkerProcessArgs,
 )
 from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.errors import unsupported_setup
 from uniserve_worker.model_executor.component_binding import (
     Call,
     ComponentBinding,
@@ -74,14 +72,11 @@ class WorkerModel:
             components have no numerical calls, it is the weight-less
             meta-device description.
         config: The execution configuration. For a checkpoint model it is
-            resolved by ``loaded_worker_config``, and a numerical worker also
-            applies the launch's ``kv_cache_dtype`` override.
+            resolved by ``loaded_worker_config``.
         tokenizer: The loaded tokenizer; ``None`` for the stub model, on a
             host worker, or for a checkpoint without one.
         image_processor: The model's image preprocessing, if any.
         flow_prompt: The checkpoint's flow prompt template, if any.
-        checkpoint_identity: Identity of the loaded checkpoint; empty for a
-            model without one.
         entry_points: The checkpoint's IPC entry declarations; ``None`` for
             the stub model, whose declarations ``describe_components`` reads
             from the model's module.
@@ -92,28 +87,7 @@ class WorkerModel:
     tokenizer: Any | None = None
     image_processor: ImageProcessor | None = None
     flow_prompt: FlowPrompt | None = None
-    checkpoint_identity: str = ""
     entry_points: Mapping[str, ComponentEntry] | None = None
-    model_name: str | None = None
-
-
-def verify_checkpoint_identity(
-    expected: str | None, actual: str, *, rank: int, host: str
-) -> None:
-    """Refuse a rank whose loaded checkpoint is not the one the head derived.
-
-    ``expected`` is absent when the launching side could not read the
-    checkpoint locally; the engine then still requires every rank to report
-    the same identity. The refusal names the rank and host so an operator can
-    find the divergent copy.
-    """
-    if expected is None or expected == actual:
-        return
-
-    raise unsupported_setup(
-        f"rank {rank} on host {host} loaded checkpoint {actual}, but the "
-        f"head derived checkpoint {expected}"
-    )
 
 
 def prepare_worker_model(
@@ -121,13 +95,10 @@ def prepare_worker_model(
 ) -> tuple[models.Config | None, nn.Module, dict[str, tuple[Call, ...]]]:
     """Resolve the checkpoint configuration and this rank's resident modules.
 
-    This runs before process groups exist. The checkpoint identity is
-    verified against the launch expectation before ``load_worker_model``
-    materializes any weight. A placement that does not fit the model's
-    declarations, or a checkpoint identity that differs from the launch
-    expectation, raises ``WorkerError`` with ``UNSUPPORTED_SETUP``. Errors
-    from reading the checkpoint configuration and from ``_weight_config``
-    propagate.
+    This runs before process groups exist. A placement that does not fit the
+    model's declarations raises ``WorkerError`` with ``UNSUPPORTED_SETUP``.
+    Errors from reading the checkpoint configuration and from
+    ``_weight_config`` propagate.
 
     Returns:
         A tuple of the checkpoint configuration, narrowed to the module paths
@@ -156,7 +127,6 @@ def prepare_worker_model(
         launch.path,
         io=config.load,
         modules=frozenset(),
-        base=launch.base_model,
     )
     with torch.device("meta"):
         model = metadata.model_class(metadata.model)
@@ -201,19 +171,9 @@ def prepare_worker_model(
         launch.path,
         io=config.load,
         modules=resident,
-        base=launch.base_model,
         exclude_modules=expert_paths
         if split and not dedicated
         else frozenset(),
-    )
-
-    # The host name is the ``node`` the rank's ``WorkerEndpoint`` reports, so
-    # the refusal and the engine's own report name one host.
-    verify_checkpoint_identity(
-        launch.checkpoint_identity,
-        source.checkpoint_identity,
-        rank=config.execution.rank,
-        host=socket.gethostname(),
     )
 
     return (
@@ -234,12 +194,12 @@ def _weight_config(source, options, execution) -> weights.Config:
     ``options`` is the launch's ``quantization_config``. Exactly one source
     selects the base weight configuration: ``components`` selectors passed to
     the model package's ``weight_config`` factory (with ``mode`` or
-    ``quant_method`` as its preset, ``default`` without one); a named
-    precision in ``source.precisions``; a ``quant_method`` among the generic
-    formats, applied to every module; or, with no selector, the checkpoint's
-    own weights. ``ignored_layers`` then maps each listed module path to no
-    quantization, and the dtype comes from ``execution.model_dtype``.
-    ``kv_cache_dtype`` is accepted here but applied by ``load_worker_model``.
+    ``quant_method`` as its preset, the factory's own default without one); a
+    named precision in ``source.precisions``; a ``quant_method`` among the
+    generic formats, applied to every module; or, with no selector, the
+    checkpoint's own weights. ``ignored_layers`` then maps each listed module
+    path to no quantization, and the dtype comes from
+    ``execution.model_dtype``.
 
     Raises:
         ValueError: An unknown key, both ``mode`` and ``quant_method``,
@@ -254,7 +214,6 @@ def _weight_config(source, options, execution) -> weights.Config:
         "quant_method",
         "components",
         "ignored_layers",
-        "kv_cache_dtype",
     }
     if unknown:
         raise ValueError(
@@ -291,11 +250,9 @@ def _weight_config(source, options, execution) -> weights.Config:
                 "this model exposes complete precision presets "
                 "without component selectors"
             )
-        result = factory(
-            source.model,
-            preset="default" if selected is None else selected,
-            **components,
-        )
+        # Without a selector the factory applies its own default preset.
+        preset = {} if selected is None else {"preset": selected}
+        result = factory(source.model, **preset, **components)
     elif selected is None:
         result = source.weights
     elif selected in source.precisions:
@@ -427,7 +384,6 @@ def load_worker_model(
             None,
             source.image_processor,
             source.flow_prompt,
-            source.checkpoint_identity,
             source.entry_points,
         )
 
@@ -452,16 +408,6 @@ def load_worker_model(
             meshes[path] = binding.mesh
             attention[path] = attention_parallel(binding.config)
 
-    _require_sparse_tiles(
-        description,
-        {
-            call.path
-            for name in bindings
-            if not is_host_component(name)
-            for call in declarations.get(name, ())
-        },
-        config.execution.device,
-    )
     partition = None if experts is None or experts.size == 1 else experts
     placement = config.expert_parallel
     if placement is not None and placement.attention_ranks:
@@ -486,7 +432,6 @@ def load_worker_model(
         experts=partition,
     )
     model = loaded.model
-    model_name = f"{type(model).__module__}.{type(model).__qualname__}"
     if dedicated:
         # Keep the actual loaded expert modules in numerical traversal order.
         # The worker owns their invocation; no model capability or KV cache
@@ -499,14 +444,6 @@ def load_worker_model(
         model, config.execution, config.ipc.queue_depth
     )
 
-    # ``kv_cache_dtype`` in the launch's quantization_config overrides the
-    # KV storage dtype; ``_weight_config`` accepts the key but ignores it.
-    override = config.model.quantization_config.get("kv_cache_dtype")
-    if override is not None:
-        if not isinstance(override, str):
-            raise invalid_descriptor("worker KV dtype is unsupported")
-        worker_config = replace(worker_config, kv_cache_dtype=override)
-
     logger.info("loaded numerical model %s", type(model).__qualname__)
     return WorkerModel(
         model,
@@ -516,41 +453,8 @@ def load_worker_model(
         else load_tokenizer(source.tokenizer),
         source.image_processor,
         source.flow_prompt,
-        source.checkpoint_identity,
         {} if dedicated else source.entry_points,
-        model_name,
     )
-
-
-def _require_sparse_tiles(
-    model: nn.Module, paths: set[str], device: str
-) -> None:
-    """Refuse a device that no installed VSA provider serves for a tile.
-
-    A resident sparse attention layer's tile size fixes the block kernel it
-    needs, and 128-row tiles have an SM100 (data-center Blackwell) kernel
-    only. Reading the meta-device ``model`` under the resident module
-    ``paths`` refuses such a deployment at startup, before any weight loads.
-
-    Raises:
-        WorkerError: With ``UNSUPPORTED_SETUP`` naming the tile size and the
-            device.
-    """
-    from uniserve.runtime.backends.attention import vsa as providers
-
-    tiles = sorted(
-        {
-            child.tile_size
-            for path in paths
-            for child in model.get_submodule(path).modules()
-            if isinstance(child, BlockAttention)
-        }
-    )
-    for tile in tiles:
-        try:
-            providers.resolve("auto", device=torch.device(device), tile=tile)
-        except RuntimeError as error:
-            raise unsupported_setup(str(error)) from error
 
 
 def _devices(
@@ -607,40 +511,59 @@ def _devices(
 def loaded_worker_config(
     model: nn.Module, config: WorkerConfig, queue_depth: int
 ) -> WorkerConfig:
-    """Resolve media request slots from the worker's publication lifetime.
+    """Resolve the capacities that follow from the loaded model.
 
+    The condition capacity becomes the rows the deployment's video denoiser
+    provisions (``bootstrap.inputs.condition_capacity``): the configured
+    rows, the largest condition set the denoiser admits when none are
+    configured, and zero for a model without a video denoiser.
+
+    Media request slots follow from the worker's publication lifetime.
     A resident media slot occupies three positions of the worker's batch
-    queue, one reserved pipeline position and two unresolved outputs, and a
-    media worker keeps at least two slots resident. The same three-position
-    bound governs ``request_tensor_window`` and ``resolve_request_capacity``
-    in ``uniserve_worker.bootstrap.capacity``.
+    queue, one reserved pipeline position and two unresolved outputs. The
+    same three-position bound governs ``request_tensor_window`` and
+    ``resolve_request_capacity`` in ``uniserve_worker.bootstrap.capacity``.
 
     Only a model containing a ``VideoDecoder`` is adjusted: its batch bounds
-    and maximum request-pool size become the slot count, its minimum
-    request-pool size becomes two, and it drops the KV token capacity,
-    attention backend and generation device. Any other model's configuration
-    is returned unchanged.
+    and maximum request-pool size become the slot count, and it drops the KV
+    token capacity, attention backend and generation device. Any other
+    model's configuration is returned unchanged.
 
     Raises:
-        WorkerError: With ``UNSUPPORTED_SETUP`` when the queue depth or
-            ``max_batch_calls`` leaves fewer than two slots.
+        WorkerError: With ``UNSUPPORTED_SETUP`` when the queue depth leaves
+            no slot of three positions.
+        ValueError: The errors of ``video_denoiser`` and
+            ``condition_capacity``.
     """
+    # Imported here: the input builders import this module's siblings.
+    from uniserve_worker.bootstrap.inputs import (
+        condition_capacity,
+        video_denoiser,
+    )
+
+    denoiser = video_denoiser(model, config)
+    config = replace(
+        config,
+        max_condition_rows=0
+        if denoiser is None
+        else condition_capacity(model, denoiser, config),
+    )
+
     if any(isinstance(module, VideoDecoder) for module in model.modules()):
         state_slots = min(config.max_batch_calls, queue_depth // 3)
-        if state_slots < 2:
+        if state_slots < 1:
             raise unsupported_setup(
-                "resident media execution requires two slots of three queue "
-                f"positions each; queue depth {queue_depth} holds "
-                f"{queue_depth // 3}"
+                "resident media execution requires three queue positions "
+                f"per request slot; queue depth {queue_depth} holds "
+                f"{queue_depth // 3} slots"
             )
         config = replace(
             config,
-            kv_token_capacity=None,
+            max_total_tokens=None,
             attention_backend=None,
             max_batch_calls=state_slots,
             max_batch_tokens=state_slots,
             max_request_pool_size=state_slots,
-            min_request_pool_size=2,
             generation_device=None,
         )
     return config

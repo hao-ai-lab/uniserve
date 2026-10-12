@@ -46,9 +46,9 @@ def test_paged_input_maps_append_positions_across_reordered_blocks():
     assert batch.queries.maximum == 3
     assert batch.queries.offsets.tolist() == [0, 3, 4, 4]
     assert batch.prefixes.values.tolist() == [2, 0, 0]
-    assert batch.write_indices.tolist() == [10, 11, 0, 12]
+    assert batch.slot_mapping.tolist() == [10, 11, 0, 12]
     assert batch.block_table.indices.tolist() == [[2, 0], [3, 0], [0, 0]]
-    assert replace(batch, write_indices=None).write_indices is None
+    assert replace(batch, slot_mapping=None).slot_mapping is None
     with pytest.raises(ValueError, match="cover the prefix and query"):
         PagedInput.from_blocks(
             blocks=((2,),),
@@ -77,7 +77,7 @@ def test_empty_attention_lengths_and_batches_remain_well_defined():
         device="cpu",
     )
     assert batch.block_table.indices.shape == (0, 0)
-    assert batch.write_indices.numel() == 0
+    assert batch.slot_mapping.numel() == 0
 
 
 def test_attention_axes_are_distinct_and_context_names_its_axis():

@@ -179,7 +179,7 @@ def sensenova_checkpoint(root, dtype):
     """
     torch.manual_seed(221)
     config = u1.Config(
-        u1.TransformerConfig(37, 32, 48, 2, 4, 2, 8, ("full_attention",) * 2),
+        u1.TransformerConfig(37, 32, 48, 2, 4, 2, 8),
         vision.Config(16, 32, 0.5, 2, 3, 10000.0),
         flow.Config(
             flow.HeadConfig(32, 2, 1.0),

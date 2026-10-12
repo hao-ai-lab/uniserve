@@ -18,23 +18,20 @@
 //! Token semantics (stop conditions, image-branch triggers, public events)
 //! are resolved afterwards in `output`.
 
-use super::{EncoderCachePin, FlowPrefixState, Phase, RequestAllocations, TerminalIntent};
+use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, TerminalIntent};
 use crate::kv::{BlockTable, KvAllocation};
 
-use std::collections::HashSet;
 use uniserve_worker_ipc::{
-    CallCoordinates, DEFAULT_COMPONENT, ForwardMode, LatentParams, MediaCall, TransferMode,
+    CallCoordinates, DEFAULT_COMPONENT, ForwardMode, MediaCall, TransferMode,
 };
 
 use uniserve_core::{
-    GenerationRequest, ImageEncoderInput, ImageIngestStep, ImageInput, RequestId, SamplingParams,
+    CanvasSampling, GenerationRequest, ImageEncoderInput, ImageInput, RequestId, SamplingParams,
 };
 use uniserve_worker_ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, DrawLayout,
-    Readout, RequestKey, RequestOutput, Rng, SamplingState, ShapeBound, TensorRef, VisionInput,
+    Bounds, BufferId, Call, CallId, CallKind, CallOutput, CallStatus, CanvasStep, DType, DimBound,
+    Readout, RequestKey, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
-
-use crate::scheduler::image_artifact::png_artifact_dims_b64;
 
 /// Builds an unstamped product reference for a planned call output.
 ///
@@ -82,7 +79,7 @@ fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, Plannin
 /// The raw size counts three bytes per pixel plus one byte per row. The bound
 /// doubles it, adds 1 MiB, and applies base64's expansion of three bytes to
 /// four characters. It reaches the worker as part of `max_completion_bytes`,
-/// and `validate_generation_result` rejects a larger artifact.
+/// and the worker's encoder refuses a larger artifact.
 fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
     let raw = u64::from(height)
         .checked_mul(u64::from(width).saturating_mul(3).saturating_add(1))
@@ -102,12 +99,10 @@ const RANKED_LOGPROB_BYTES: u64 = 12;
 ///
 /// Returns `None` when neither generated nor prompt logprobs are requested.
 /// Each reported row costs 4 bytes plus `RANKED_LOGPROB_BYTES` per entry; a
-/// row's entries are its own token, the requested top-k candidates
-/// (`n_logprobs` or `n_prompt_logprobs`), and the distinct ids of
-/// `logprob_token_ids`. A call reports at most one generated row and
-/// `prompt_positions` prompt rows. The worker
-/// (`uniserve_worker.execution.commit`) costs its actual payload the same way
-/// and rejects one above `max_completion_bytes`.
+/// row's entries are its own token and the requested top-k candidates
+/// (`n_logprobs` or `n_prompt_logprobs`). A call reports at most one
+/// generated row and `prompt_positions` prompt rows. The worker sizes its pinned completion
+/// storage from the sum of these bounds over a batch.
 fn logprob_result_bytes(
     sampling: &SamplingParams,
     prompt_positions: u32,
@@ -117,22 +112,14 @@ fn logprob_result_bytes(
     if !generated && !prompt {
         return Ok(None);
     }
-    let requested_ids = sampling
-        .logprob_token_ids
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>()
-        .len() as u64;
     let generated_entries = generated.then_some(
         1_u64
             .checked_add(u64::from(sampling.n_logprobs))
-            .and_then(|value| value.checked_add(requested_ids))
             .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?,
     );
     let prompt_entries = prompt.then_some(
         1_u64
             .checked_add(u64::from(sampling.n_prompt_logprobs))
-            .and_then(|value| value.checked_add(requested_ids))
             .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?,
     );
     let generated_bytes = generated_entries
@@ -170,7 +157,7 @@ pub(crate) enum GenerationPhase {
     IngestState,
     /// Ingest the context: prefill prompt tokens and the vision blocks of
     /// input images between them, encoding each block first
-    /// (`Scheduler::next_context_computation`).
+    /// (`Scheduler::next_context_call`).
     Prefill,
     /// Decode understanding (text) tokens.
     DecodeUnd,
@@ -180,14 +167,14 @@ pub(crate) enum GenerationPhase {
     /// Publish the visible KV range as diffusion conditioning.
     PublishKv,
     /// Prepare the initial latent of the image.
-    PrepareGen,
+    LatentPreparation,
     /// Run the image's denoising steps.
-    DenoiseGen,
+    Denoising,
     /// Decode the final latent into the image. Never stored in
     /// `RequestState::phase`: `Scheduler::next_generation_phase` projects it
     /// once every denoising step is scheduled, while the accepted phase stays
-    /// `DenoiseGen`.
-    CommitGen,
+    /// `Denoising`.
+    ImageDecoding,
     /// Encode the generated image with the next feedback encoder.
     FeedbackEncode,
     /// Write the feedback encoder's feature into KV.
@@ -209,7 +196,7 @@ pub(crate) enum GenerationPhase {
 /// declares a completion predicate. The vision blocks of input images are
 /// instead attention blocks of a context prefill (`is_prompt_extend`).
 pub(super) fn consumes_image_features(call: &Call) -> bool {
-    call.code == CallKind::Forward(ForwardMode::Prefill)
+    call.kind == CallKind::Forward(ForwardMode::Prefill)
         && (call.latent_feature_input.is_some()
             || (!call.vision_inputs.is_empty() && call.completion_output.is_some()))
 }
@@ -219,9 +206,9 @@ pub(super) fn consumes_image_features(call: &Call) -> bool {
 ///
 /// `plan_encode` and `plan_image_extend` declare `completion_output` only for
 /// feedback, which is what separates the feedback variants here.
-pub(super) fn is_feedback_computation(call: &Call) -> bool {
+pub(super) fn is_feedback_call(call: &Call) -> bool {
     (matches!(
-        call.code,
+        call.kind,
         CallKind::Media(MediaCall::VisionEncoding) | CallKind::Media(MediaCall::LatentEncoding)
     ) || consumes_image_features(call))
         && call.completion_output.is_some()
@@ -255,13 +242,13 @@ pub(super) fn prefill_rows(call: &Call) -> usize {
 /// canvas-generating request's block commit is a prompt extension too, of the
 /// tokens of its stopped block.
 pub(super) fn is_prompt_extend(call: &Call) -> bool {
-    call.code == CallKind::Forward(ForwardMode::Prefill)
+    call.kind == CallKind::Forward(ForwardMode::Prefill)
         && !consumes_image_features(call)
         && call.completion_output.is_none()
 }
 
 impl RequestState {
-    /// Applies one validated computation in request order. Pending identities are
+    /// Applies one validated call in request order. Pending identities are
     /// consumed once before this update; inactive successors never reach it.
     ///
     /// Updates the request's cursors, KV extents, encoder indices, denoising
@@ -275,13 +262,12 @@ impl RequestState {
     ///
     /// Returns an error, before changing any state, for a call id with batch
     /// zero, a latent call without a latent product, or a denoising result
-    /// that has no submitted interval or that `Denoising::accept` rejects. The
-    /// caller then finishes the request with an error.
+    /// that `Denoising::accept` rejects. The caller then finishes the request
+    /// with an error.
     pub(crate) fn process_generation_result(
         &mut self,
         call: &Call,
-        latent: Option<&LatentParams>,
-        record: &RequestOutput,
+        record: &CallOutput,
     ) -> Result<(), GenerationResultError> {
         if call.call_id.batch_id == 0 {
             return Err(GenerationResultError::MissingCallId);
@@ -290,13 +276,13 @@ impl RequestState {
             return Ok(());
         }
 
-        if matches!(call.code, CallKind::Forward(_)) {
+        if matches!(call.kind, CallKind::Forward(_)) {
             // A forward reports the extent it initialized, which a verifier
             // leaves above the prefix it accepted.
             self.kv_computed_len = record.kv_computed_len;
         }
 
-        match call.code {
+        match call.kind {
             // A block commit is planned only in `CommitCanvas`, and a prompt
             // chunk never is; the committed block extends the context and
             // the next block starts at step zero.
@@ -336,7 +322,7 @@ impl RequestState {
                 // Logical positions advance by the image's position count once,
                 // after its last encoder.
                 self.kv_visible_len = record.kv_visible_len;
-                if is_feedback_computation(call) {
+                if is_feedback_call(call) {
                     self.feedback_encoder_index = self.feedback_encoder_index.saturating_add(1);
                     self.feedback_features = None;
                     if self.feedback_encoder_index
@@ -408,24 +394,20 @@ impl RequestState {
             }
             CallKind::Transfer(TransferMode::KvPublish) => {
                 self.image_conditioning = call.kv_output;
-                self.phase = GenerationPhase::PrepareGen;
+                self.phase = GenerationPhase::LatentPreparation;
             }
             CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::Denoising) => {
                 if call.latent_output.is_none() {
                     return Err(GenerationResultError::MissingLatentProduct);
                 }
-                if call.code == CallKind::Media(MediaCall::LatentPreparation) {
+                if call.kind == CallKind::Media(MediaCall::LatentPreparation) {
                     self.denoising.open(call.latent_output.clone());
-                    self.phase = GenerationPhase::DenoiseGen;
+                    self.phase = GenerationPhase::Denoising;
                 } else {
-                    let accepted = latent.is_some_and(|interval| {
-                        self.denoising.accept(
-                            interval,
-                            record.num_completed_steps,
-                            call.latent_output.clone(),
-                        )
-                    });
+                    let accepted = self
+                        .denoising
+                        .accept(record.step_index, call.latent_output.clone());
                     if !accepted {
                         return Err(GenerationResultError::Progress {
                             detail: "denoise_step_mismatch",
@@ -446,7 +428,7 @@ impl RequestState {
             }
             CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding)
-                if is_feedback_computation(call) =>
+                if is_feedback_call(call) =>
             {
                 self.feedback_features = call.encoder_output.clone();
                 self.phase = GenerationPhase::FeedbackState;
@@ -460,12 +442,15 @@ impl RequestState {
 
 /// Builds the immutable auxiliary feature product produced by an encode call.
 fn encoder_output(
-    step: ImageIngestStep,
+    encoder: MediaCall,
     limits: &uniserve_core::GenerationLimits,
 ) -> Result<TensorRef, PlanningError> {
-    let bytes = match step {
-        ImageIngestStep::VaeEncode => limits.max_latent_feature_bytes,
-        ImageIngestStep::VitEncode => limits.max_vision_feature_bytes,
+    // An image encoder is a latent or a vision encoding call
+    // (`GenerationRequest::validate`).
+    let bytes = if encoder == MediaCall::LatentEncoding {
+        limits.max_latent_feature_bytes
+    } else {
+        limits.max_vision_feature_bytes
     };
     Ok(bounded_tensor(
         0,
@@ -485,12 +470,12 @@ fn latent_output(output_index: u16, bytes: u64, dtype: DType) -> Result<TensorRe
     ))
 }
 
-/// Builds the actual computation before assigning storage and execution identities.
+/// Builds a call of `kind` before assigning storage and execution identities.
 ///
 /// Every optional input and output is unset, the call id and the request
 /// key's engine id and epoch are zero placeholders, and the bound is one
 /// token; the `plan_*` builders fill in the rest.
-fn computation(request: &GenerationRequest, code: CallKind) -> Call {
+fn new_call(request: &GenerationRequest, kind: CallKind) -> Call {
     Call {
         consumer_slots: Vec::new(),
         token_input: None,
@@ -499,7 +484,7 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
         call_id: CallId::new(0, 0),
         coordinates: CallCoordinates::default(),
         component: DEFAULT_COMPONENT.into(),
-        code,
+        kind,
         bounds: Bounds {
             max_tokens: 1,
             ..Bounds::default()
@@ -517,7 +502,7 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
         completion_output: None,
         transition_output: None,
         predicate: None,
-        rng: None,
+        image_index: None,
         input_image: None,
         kv_input: None,
         kv_output: None,
@@ -531,8 +516,8 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
 /// Plans a context prefill: prompt tokens `start..end` and the vision
 /// `blocks` of the input images between them, which write `block_tokens` KV
 /// tokens together, with a sampled-token output unless the request is a
-/// readout or generates canvases, or the context ends with a block of this
-/// call.
+/// readout or the deployment generates canvases (`generates_canvases`), or
+/// the context ends with a block of this call.
 ///
 /// The RNG coordinate is `end`, the exclusive prompt end. The prompt of a
 /// readout or of a canvas-generating request only conditions its canvases, so
@@ -548,6 +533,7 @@ pub(super) fn plan_prompt(
     blocks: Vec<VisionInput>,
     block_tokens: u32,
     sampling_state: Option<SamplingState>,
+    generates_canvases: bool,
 ) -> Result<Call, PlanningError> {
     if start > end
         || (start == end && blocks.is_empty())
@@ -559,7 +545,7 @@ pub(super) fn plan_prompt(
             prompt_tokens: request.prompt_token_ids.len(),
         });
     }
-    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = end.saturating_sub(start).saturating_add(block_tokens);
     call.input_token_ids = request.prompt_token_ids[start as usize..end as usize].to_vec();
     // A block after the call's last prompt token, at the prompt's end.
@@ -568,7 +554,7 @@ pub(super) fn plan_prompt(
         .is_some_and(|block| block.offset == end.saturating_sub(start))
         && end as usize == request.prompt_token_ids.len();
     call.vision_inputs = blocks;
-    if request.is_readout() || request.is_canvas_generation() || ends_with_block {
+    if request.is_readout() || generates_canvases || ends_with_block {
         return finish_plan(request, call, 0);
     }
     call.token_output = Some(output_tensor(0, DType::I64));
@@ -577,14 +563,9 @@ pub(super) fn plan_prompt(
         .is_some_and(|state| !state.transition_token_ids.is_empty())
         .then(|| output_tensor(3, DType::U8));
     call.sampling_state = sampling_state;
-    call.rng = Some(Rng {
-        seed: request.sampling.seed.unwrap_or(0),
-        semantic_index_base: u64::from(end),
-        draw_layout: DrawLayout::TargetSampling,
-    });
     // Prompt position zero reports no logprob, so a chunk starting there
     // covers one position fewer; `validate_generation_result` recovers the
-    // same offset from the call's RNG coordinate.
+    // same offset from the call's coordinates.
     let prompt_positions = if request.sampling.prompt_logprobs_requested() {
         end.saturating_sub(start)
             .saturating_sub(u32::from(start == 0))
@@ -615,7 +596,7 @@ pub(super) fn plan_readout(
             rows: request.readout.len(),
         })?;
 
-    let mut call = computation(request, CallKind::Forward(ForwardMode::TokenDenoising));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::TokenDenoising));
     let mut readout = Readout {
         slot_tokens: Vec::new(),
         candidate_offsets: vec![0],
@@ -644,7 +625,8 @@ pub(super) fn plan_readout(
 }
 
 /// Plans denoising step `step` of the canvas-generating `request`'s block
-/// `block`, the number of blocks already committed to its context.
+/// `block`, the number of blocks already committed to its context, under the
+/// deployment's `canvas` sampling.
 ///
 /// The call carries no tokens: the worker keeps the block's canvas and
 /// sampler state in the request's slot. Its `max_tokens` is the canvas
@@ -652,18 +634,14 @@ pub(super) fn plan_readout(
 /// committed tokens; its completion payload bound covers those tokens at
 /// four bytes each. Its completion output is true while the block continues
 /// after the step: the predicate of the next step, which the scheduler may
-/// queue before this one resolves. Fails with `NotCanvasGeneration` for a
-/// request without canvas sampling.
+/// queue before this one resolves.
 pub(super) fn plan_canvas_step(
     request: &GenerationRequest,
+    canvas: &CanvasSampling,
     block: u32,
     step: u32,
 ) -> Result<Call, PlanningError> {
-    let canvas = request
-        .canvas
-        .as_ref()
-        .ok_or(PlanningError::NotCanvasGeneration)?;
-    let mut call = computation(request, CallKind::Forward(ForwardMode::TokenDenoising));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::TokenDenoising));
     call.bounds.max_tokens = canvas.canvas_length;
     call.canvas = Some(CanvasStep { block, step });
     call.completion_output = Some(output_tensor(0, DType::U8));
@@ -674,16 +652,16 @@ pub(super) fn plan_canvas_step(
 
 /// Plans the commit of a stopped block's `tokens` to the context of the
 /// canvas-generating `request`: a prefill that writes them into KV, as causal
-/// prompt, and samples nothing. Fails with `NotCanvasGeneration` for a
-/// request without canvas sampling or an empty block.
+/// prompt, and samples nothing. Fails with `EmptyCanvasCommit` for an empty
+/// block.
 pub(super) fn plan_canvas_commit(
     request: &GenerationRequest,
     tokens: &[u32],
 ) -> Result<Call, PlanningError> {
-    if !request.is_canvas_generation() || tokens.is_empty() {
-        return Err(PlanningError::NotCanvasGeneration);
+    if tokens.is_empty() {
+        return Err(PlanningError::EmptyCanvasCommit);
     }
-    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = u32::try_from(tokens.len())
         .map_err(|_| PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
     call.input_token_ids = tokens.to_vec();
@@ -698,7 +676,6 @@ pub(super) fn plan_canvas_commit(
 /// `relay_input` continues from the predecessor's device-resident token.
 pub(super) fn plan_decode(
     request: &GenerationRequest,
-    logical_position: u32,
     spec_token_ids: Option<Vec<u32>>,
     input_token: u32,
     relay_input: bool,
@@ -710,7 +687,7 @@ pub(super) fn plan_decode(
     } else {
         CallKind::Forward(ForwardMode::Verify)
     };
-    let mut call = computation(request, code);
+    let mut call = new_call(request, code);
     call.bounds.max_tokens = (1 + draft_count).min(u32::MAX as usize) as u32;
     call.input_token_ids = match spec_token_ids {
         Some(drafts) if !drafts.is_empty() => drafts,
@@ -723,11 +700,6 @@ pub(super) fn plan_decode(
         .is_some_and(|state| !state.transition_token_ids.is_empty())
         .then(|| output_tensor(3, DType::U8));
     call.sampling_state = sampling_state;
-    call.rng = Some(Rng {
-        seed: request.sampling.seed.unwrap_or(0),
-        semantic_index_base: u64::from(logical_position.saturating_add(1)),
-        draw_layout: DrawLayout::TargetSampling,
-    });
     finish_plan(request, call, 0)
 }
 
@@ -736,8 +708,7 @@ pub(super) fn plan_decode(
 /// The call is a prefill that reads `feature` and may write up to the
 /// encoder's `kv_token_capacity` KV tokens. `feedback` declares the completion
 /// predicate that feedback writes report. `sample_continuation` declares a
-/// sampled-token output, drawn at `sampling_index` when one is given.
-#[allow(clippy::too_many_arguments)]
+/// sampled-token output.
 pub(super) fn plan_image_extend(
     limits: &uniserve_core::GenerationLimits,
     request: &GenerationRequest,
@@ -746,14 +717,14 @@ pub(super) fn plan_image_extend(
     feedback: bool,
     sample_continuation: bool,
     sampling_state: Option<SamplingState>,
-    sampling_index: Option<u64>,
 ) -> Result<Call, PlanningError> {
     let capacity = encoder.kv_token_capacity(limits)?;
-    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = capacity;
-    match encoder.encoder {
-        ImageIngestStep::VitEncode => call.vision_inputs = vec![VisionInput { offset: 0, feature }],
-        ImageIngestStep::VaeEncode => call.latent_feature_input = Some(feature),
+    if encoder.encoder == MediaCall::LatentEncoding {
+        call.latent_feature_input = Some(feature);
+    } else {
+        call.vision_inputs = vec![VisionInput { offset: 0, feature }];
     }
     call.completion_output = feedback.then(|| output_tensor(0, DType::U8));
     call.token_output = sample_continuation.then(|| output_tensor(1, DType::I64));
@@ -763,13 +734,6 @@ pub(super) fn plan_image_extend(
             .is_some_and(|state| !state.transition_token_ids.is_empty()))
     .then(|| output_tensor(3, DType::U8));
     call.sampling_state = sampling_state;
-    if call.token_output.is_some() {
-        call.rng = sampling_index.map(|semantic_index_base| Rng {
-            seed: request.sampling.seed.unwrap_or(0),
-            semantic_index_base,
-            draw_layout: DrawLayout::TargetSampling,
-        });
-    }
     finish_plan(request, call, 0)
 }
 
@@ -782,7 +746,7 @@ pub(super) fn plan_image_extend(
 pub(super) fn plan_encode(
     limits: &uniserve_core::GenerationLimits,
     request: &GenerationRequest,
-    step: ImageIngestStep,
+    step: MediaCall,
     image_base64: String,
     source: Option<TensorRef>,
     feedback: bool,
@@ -794,11 +758,7 @@ pub(super) fn plan_encode(
     } else if source.is_none() && image_base64.is_empty() {
         return Err(PlanningError::MissingImageInput);
     }
-    let code = match step {
-        ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
-        ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
-    };
-    let mut call = computation(request, code);
+    let mut call = new_call(request, CallKind::Media(step));
     if source.is_none() && !image_base64.is_empty() {
         call.input_image = Some(image_base64.into());
     }
@@ -816,7 +776,7 @@ pub(super) fn plan_close_kv(
     token: u32,
     relay_input: bool,
 ) -> Result<Call, PlanningError> {
-    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     if !relay_input {
         call.input_token_ids.push(token);
     }
@@ -837,10 +797,10 @@ pub(super) fn plan_kv_publish(
     if publication_bytes == 0 {
         return Err(PlanningError::MissingProductBound);
     }
-    let mut call = computation(request, CallKind::Transfer(TransferMode::KvPublish));
+    let mut call = new_call(request, CallKind::Transfer(TransferMode::KvPublish));
     call.bounds.max_tokens = 0;
     call.bounds.max_transfer_bytes = publication_bytes;
-    // Owner and producer are the placeholders from `computation`;
+    // Owner and producer are the placeholders from `new_call`;
     // `register_call` stamps them.
     call.kv_output = Some(BufferId {
         owner: call.request_key,
@@ -863,7 +823,7 @@ pub(super) fn plan_diffusion_prepare(
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut call = computation(request, CallKind::Media(MediaCall::LatentPreparation));
+    let mut call = new_call(request, CallKind::Media(MediaCall::LatentPreparation));
     call.kv_input = Some(conditioning);
     call.latent_output = Some(latent_output(
         0,
@@ -871,28 +831,22 @@ pub(super) fn plan_diffusion_prepare(
         latent_dtype.ok_or(PlanningError::MissingLatentDType)?,
     )?);
     call.completion_output = Some(output_tensor(1, DType::U8));
-    call.rng = Some(Rng {
-        seed: request.image.seed.unwrap_or(0),
-        semantic_index_base: u64::from(image_id),
-        draw_layout: DrawLayout::FlowNoise,
-    });
+    call.image_index = Some(image_id);
     finish_plan(request, call, 0)
 }
 
-/// Plans an exact denoising interval against its input latent and conditioning tensors.
+/// Plans one denoising step against its input latent and conditioning tensors.
 pub(super) fn plan_diffusion_step(
     limits: &uniserve_core::GenerationLimits,
     latent_dtype: Option<DType>,
     request: &GenerationRequest,
-    step_count: u16,
     conditioning: BufferId,
     latent: TensorRef,
 ) -> Result<Call, PlanningError> {
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut call = computation(request, CallKind::Media(MediaCall::Denoising));
-    call.bounds.max_tokens = u32::from(step_count.max(1));
+    let mut call = new_call(request, CallKind::Media(MediaCall::Denoising));
     call.kv_input = Some(conditioning);
     call.latent_input = Some(latent);
     call.latent_output = Some(latent_output(
@@ -912,33 +866,24 @@ pub(super) fn plan_diffusion_finalize(
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut call = computation(request, CallKind::Media(MediaCall::ImageDecoding));
+    let mut call = new_call(request, CallKind::Media(MediaCall::ImageDecoding));
     call.latent_input = Some(latent);
     call.image_output = feedback_image_output(request)?;
     call.completion_output = Some(output_tensor(2, DType::U8));
     finish_plan(request, call, 0)
 }
 
-/// Derives storage bounds directly from the computation's actual inputs and outputs.
+/// Derives storage bounds directly from the call's actual inputs and outputs.
 ///
-/// `max_latent_bytes` is the largest encoder, latent, or image output.
 /// `max_completion_bytes` covers the logprob payload of a token-producing call
 /// plus, for image decoding, the base64 PNG. `max_kv_units` starts at zero;
-/// `Scheduler::plan_computation` sets it for forward calls.
+/// `Scheduler::plan_call` sets it for forward calls.
 fn finish_plan(
     request: &GenerationRequest,
     mut call: Call,
     prompt_positions: u32,
 ) -> Result<Call, PlanningError> {
-    let max_latent_bytes = call
-        .encoder_output
-        .iter()
-        .chain(call.latent_output.iter())
-        .chain(call.image_output.iter())
-        .map(TensorRef::max_bytes)
-        .max()
-        .unwrap_or(0);
-    let image_completion_bytes = if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+    let image_completion_bytes = if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
         png_base64_bound(request.image.width, request.image.height)?
     } else {
         0
@@ -952,7 +897,6 @@ fn finish_plan(
     call.bounds = Bounds {
         max_tokens: call.bounds.max_tokens,
         max_kv_units: 0,
-        max_latent_bytes,
         max_completion_bytes: logprob_bytes.saturating_add(image_completion_bytes),
         max_transfer_bytes,
     };
@@ -998,8 +942,8 @@ pub(crate) enum PlanningError {
         end: usize,
         rows: usize,
     },
-    #[error("the request does not generate a nonempty canvas")]
-    NotCanvasGeneration,
+    #[error("a canvas commit carries no tokens")]
+    EmptyCanvasCommit,
     #[error("image generation branch is disabled")]
     GenerationBranchDisabled,
     #[error("generated-image feedback is disabled")]
@@ -1016,7 +960,7 @@ pub(crate) enum PlanningError {
     ProductGenerationExhausted,
 }
 
-/// Assigns final identities to the selected computation and its allocated outputs.
+/// Assigns final identities to the selected call and its allocated outputs.
 /// Identity exhaustion is checked before changing the shared generation counter.
 ///
 /// The caller must already have set `call.call_id` to the call's batch and
@@ -1071,19 +1015,18 @@ pub(super) fn register_call(
 
 /// Validates a result against submitted inputs and immutable request limits.
 ///
-/// `image_kv` and `latent` are the inputs frozen when the call was submitted
-/// (`InflightInput::Generation`); `media` is the artifact payload delivered
-/// with the result. A predicated result is valid only when the call carried a
-/// predicate and the result reports no tokens and no products. Returns the
-/// first violation found; the caller finishes the request with an error on
-/// any `Err`.
+/// `image_kv` is the input frozen when the call was submitted
+/// (`InflightInput::Generation`). A predicated result is valid only when the
+/// call carried a predicate and the result reports no tokens and no products.
+/// `canvas` is the deployment's block-diffusion sampling, which bounds a
+/// canvas step's block. Returns the first violation found; the caller
+/// finishes the request with an error on any `Err`.
 pub(crate) fn validate_generation_result(
     call: &Call,
     image_kv: Option<(u32, Option<u32>)>,
-    latent: Option<&LatentParams>,
     state: &RequestState,
-    record: &RequestOutput,
-    media: Option<&uniserve_core::SharedMedia>,
+    record: &CallOutput,
+    canvas: Option<&CanvasSampling>,
 ) -> Result<(), GenerationResultError> {
     let request = &state.req;
 
@@ -1099,10 +1042,7 @@ pub(crate) fn validate_generation_result(
         });
     }
     if record.status == CallStatus::Predicated {
-        if call.predicate.as_ref().is_none()
-            || !record.committed_tokens.as_slice().is_empty()
-            || !record.product_generations.is_empty()
-        {
+        if call.predicate.as_ref().is_none() || !record.committed_tokens.as_slice().is_empty() {
             return Err(GenerationResultError::Status {
                 detail: "invalid_predicated_result",
             });
@@ -1110,58 +1050,11 @@ pub(crate) fn validate_generation_result(
         return Ok(());
     }
 
-    let call_variant = call.code;
+    let call_variant = call.kind;
     if record.status != CallStatus::Ok {
         return Err(GenerationResultError::Status {
             detail: "call_failed",
         });
-    }
-
-    // Denoising must end exactly at the end of its submitted interval.
-    if call.code == CallKind::Media(MediaCall::Denoising) {
-        let interval = latent.ok_or(GenerationResultError::Progress {
-            detail: "denoise_input_step_missing",
-        })?;
-        if !super::Denoising::completes(interval, record.num_completed_steps) {
-            return Err(GenerationResultError::Progress {
-                detail: "denoise_step_mismatch",
-            });
-        }
-    }
-
-    // The worker reports one generation per tensor output, in
-    // `Call::tensor_outputs` order.
-    if !record
-        .product_generations
-        .iter()
-        .copied()
-        .eq(call.tensor_outputs().map(|tensor| tensor.generation))
-    {
-        return Err(GenerationResultError::Product {
-            detail: "tensor_generation_mismatch",
-        });
-    }
-
-    // Read the PNG header to check the requested dimensions. The output path
-    // (`image_done_event`) decodes the full image later.
-    let image_png = media.and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
-    if call_variant == CallKind::Media(MediaCall::ImageDecoding) {
-        if media.is_some_and(|value| value.len() as u64 > call.bounds.max_completion_bytes) {
-            return Err(GenerationResultError::Product {
-                detail: "image_capacity_exceeded",
-            });
-        }
-        let actual =
-            image_png
-                .and_then(png_artifact_dims_b64)
-                .ok_or(GenerationResultError::Product {
-                    detail: "missing_image_dimensions",
-                })?;
-        if actual != (request.image.height, request.image.width) {
-            return Err(GenerationResultError::Product {
-                detail: "image_dimensions_mismatch",
-            });
-        }
     }
 
     // A readout reports one finite log-probability per declared candidate,
@@ -1205,10 +1098,7 @@ pub(crate) fn validate_generation_result(
                 detail: "canvas_block_length_mismatch",
             });
         }
-        let last_step = request
-            .canvas
-            .as_ref()
-            .is_none_or(|canvas| step.step.saturating_add(1) >= canvas.max_steps);
+        let last_step = canvas.is_none_or(|canvas| step.step.saturating_add(1) >= canvas.max_steps);
         if committed == 0 && last_step {
             return Err(GenerationResultError::Progress {
                 detail: "canvas_step_limit_exceeded",
@@ -1335,16 +1225,13 @@ pub(crate) fn validate_generation_result(
     }
 
     // Prompt logprobs cover every input token of a prompt-extending prefill
-    // except prompt position zero. A prefill's RNG coordinate is its exclusive
-    // prompt end (`plan_prompt`), so a coordinate equal to the input length
-    // marks the chunk starting at position zero; this reads only the call,
-    // not request progress, which cancellation may have stopped.
+    // except prompt position zero, so a chunk starting there reports one
+    // position fewer; this reads only the call's stated coordinates, not
+    // request progress, which cancellation may have stopped.
     let prompt_tokens = (is_prompt_extend(call) && request.sampling.prompt_logprobs_requested())
         .then(|| {
             &call.input_token_ids[usize::from(
-                call.rng.as_ref().is_some_and(|rng| {
-                    rng.semantic_index_base == call.input_token_ids.len() as u64
-                }) && !call.input_token_ids.is_empty(),
+                call.coordinates.logical_position == 0 && !call.input_token_ids.is_empty(),
             )..]
         });
     match (
@@ -1492,8 +1379,6 @@ pub(crate) enum GenerationResultError {
     Identity { detail: &'static str },
     #[error("worker progress invalid: {detail}")]
     Progress { detail: &'static str },
-    #[error("worker product invalid: {detail}")]
-    Product { detail: &'static str },
     #[error("worker token result invalid: {detail}")]
     Token { detail: &'static str },
     #[error("worker logprob result invalid: {detail}")]
@@ -1516,7 +1401,7 @@ pub(crate) struct RequestState {
     /// Negative-prompt KV prefix for multi-branch guidance, allocated for the
     /// first denoising call and freed once every denoising step completes or
     /// the request finishes.
-    pub(super) flow_prefix: Option<FlowPrefixState>,
+    pub(super) guidance_prefix: Option<GuidancePrefixState>,
     /// Admission generation used to reject results from prior request lifetimes.
     pub(crate) request_epoch: u64,
     /// Most recent accepted state-producing call.
@@ -1528,7 +1413,7 @@ pub(crate) struct RequestState {
     /// the last host-observed execution result.
     pub(crate) speculative_chain_invalidated: bool,
     pub(super) output: super::output::RequestOutput,
-    /// Current accepted computation stage. Completion processing and output
+    /// Current accepted call stage. Completion processing and output
     /// resolution advance it; scheduling changes it only on an encoder-cache
     /// hit, which moves the request to `IngestState` without a call.
     pub(super) phase: Phase,
@@ -1602,10 +1487,9 @@ pub(crate) struct RequestState {
     pub(super) generated_token_ids: Vec<u32>,
     /// Tokens since the last model round boundary, used by suffix-trigger matching.
     pub(super) round_token_ids: Vec<u32>,
-    pub(super) text_tokens_since_image: usize,
     /// Host image bytes retained only while artifact-based feedback needs them.
     pub(super) feedback_image_b64: Option<String>,
-    /// False after a completed computation creates state unavailable from the input.
+    /// False after a completed call creates state unavailable from the input.
     pub(super) replayable: bool,
     /// Encoder-cache entries this request holds; released when the request
     /// finishes.
@@ -1674,8 +1558,7 @@ impl RequestState {
 
     /// Returns whether the request can open a generation branch.
     pub(super) fn can_open_gen_branch(&self) -> bool {
-        self.req.generates_images()
-            && self.num_generated_images < self.req.image.max_images as usize
+        self.req.generates_images() && self.num_generated_images < self.req.max_images as usize
     }
 
     /// Returns whether generation starts after context ingestion.
@@ -1775,7 +1658,7 @@ impl RequestState {
         };
         for _ in 0..blocks {
             let (image, input) = self.input_block(advance.cursor)?;
-            if input.encoder != ImageIngestStep::VitEncode {
+            if input.encoder != MediaCall::VisionEncoding {
                 return None;
             }
             advance.kv = advance.kv.checked_add(input.num_kv_tokens?)?;

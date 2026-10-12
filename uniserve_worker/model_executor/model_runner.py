@@ -9,8 +9,9 @@ serves two call paths:
   ``InputBuffers``, and ``run_batch`` replays a graph bucket selected by
   ``select_graph_shape`` or runs eagerly. Buckets are captured during startup
   through ``capture_batch``; once ``ModelExecutor.complete_startup`` seals
-  the runner, no batch graph is captured, and a batch whose configured
-  bucket is not resident fails instead of running eagerly.
+  the runner, no batch graph is captured, and a batch whose selected
+  configured bucket is not resident fails instead of running eagerly. A
+  batch no configured bucket holds runs eagerly.
 - Standalone invocations: ``execute_model`` evaluates one module call from
   ``ModelExecutor.run_module``. When graph pools exist, startup captures a
   graph per exact input signature on first use; once startup is sealed, a
@@ -164,14 +165,6 @@ class ModelRunner(Execution, ABC):
         assert tokens is not None
         return tokens
 
-    def capture_plan(self):
-        """Numerical captures whose startup collectives must pair on peers."""
-        return (
-            tuple(sorted(self.call_kinds)),
-            self.decode_shapes,
-            self.prefill_shapes,
-        )
-
     def select_graph_shape(self, batch, *, eligible):
         """Use the exact numerical signature for non-text graph variants.
 
@@ -282,7 +275,7 @@ class ModelRunner(Execution, ABC):
                             *inputs[0], **inputs[1], **resources
                         )
 
-                    # The eager call warms the computation and fixes the
+                    # The eager call warms the call and fixes the
                     # output shapes the borrowed backing views.
                     example = forward(static)
                     with self.graph_storage.allocate(self):
@@ -466,7 +459,7 @@ class ModelRunner(Execution, ABC):
         decoding where ``graph_inputs.greedy_decode`` applies. Inside an
         expert step the graph also joins every expert layer ``forward`` did
         not reach, so its replay makes all of the step's exchanges. Runners
-        with other captured computations override this together with
+        with other captured calls override this together with
         ``replay_graph``.
         """
         return capture_batch(
@@ -513,10 +506,8 @@ class ModelRunner(Execution, ABC):
 
         Raises:
             CUDAGraphError: After startup, a configured text bucket that
-                the batch selects is not resident, or a text runner with
-                prefill graphs has no bucket for a non-decode batch; before
-                startup, capturing a missing text bucket can also fail with
-                it.
+                the batch selects is not resident; before startup, capturing
+                a missing text bucket can also fail with it.
         """
         with self.context.activate():
             return self._run_batch(
@@ -624,7 +615,6 @@ class ModelRunner(Execution, ABC):
                             selected=shape,
                             borrow_output=borrow_output,
                         )
-                        result.validate_for(batch)
                     peer.context.join_expert_layers()
                     return result
 

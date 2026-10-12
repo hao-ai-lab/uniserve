@@ -43,7 +43,7 @@ def test_late_result_cannot_regress_progress_or_retire_pending_work():
         pool.finish(key)
         assert not pool.retirement_ready(key)
 
-        accepted = RequestProgress(flow_step=2)
+        accepted = RequestProgress(logical_position=2)
         pool.apply_result(
             RequestResult(key, second.call_id, CallStatus.OK, accepted)
         )
@@ -52,7 +52,10 @@ def test_late_result_cannot_regress_progress_or_retire_pending_work():
 
         pool.apply_result(
             RequestResult(
-                key, first.call_id, CallStatus.OK, RequestProgress(flow_step=1)
+                key,
+                first.call_id,
+                CallStatus.OK,
+                RequestProgress(logical_position=1),
             )
         )
         assert pool.get(key.request_id).accepted_progress == accepted
@@ -82,13 +85,13 @@ def test_cancelled_epoch_cannot_change_a_reused_request_slot():
                 key,
                 cancelled.call_id,
                 CallStatus.ERROR,
-                RequestProgress(flow_step=3),
+                RequestProgress(logical_position=3),
             )
         )
         pool.cancel_calls((cancelled,))
         current = pool.get(successor.request_id)
         assert not current.closed
         assert current.accepted_progress == RequestProgress()
-        assert pool.bind_calls((_call(successor, 2),), (1,)) == (current,)
+        assert pool.bind_calls((_call(successor, 2),)) == (current,)
     finally:
         pool.close()

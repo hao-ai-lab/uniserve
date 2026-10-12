@@ -17,8 +17,8 @@ row ``i`` is absolute position ``P_b + i``) to current keys ``[0, i]``.
   ``window`` is given; ``window`` counts history tokens.
 
 Prefix token ``t`` of sequence ``b`` lives in cache page
-``block_table[b, t // page_tokens - start_page[b]]`` at row
-``t % page_tokens`` (``start_page`` defaults to zero). The kernel reads
+``block_table[b, t // block_size - start_page[b]]`` at row
+``t % block_size`` (``start_page`` defaults to zero). The kernel reads
 only the pages that intersect ``[min_i lower_b(i), P_b)``: other table
 entries, other pages, and the unwritten rows at or past ``P_b`` of the last
 page may hold anything, NaN included, without affecting the result. The
@@ -99,7 +99,7 @@ _EXECUTORS: dict[tuple[object, ...], Callable[..., None]] = {}
 _SM_COUNTS: dict[int, int] = {}
 
 HEAD_DIMS = (256, 512)
-PAGE_TOKENS = (16, 32, 64)
+BLOCK_SIZES = (16, 32, 64)
 # Packed rows of one work tile, computed by a two-CTA cluster, by head
 # dimension, widest first: a 512-wide accumulator allows 64 rows per CTA;
 # at head dim 256 the 128-row tile serves batches too small to occupy the
@@ -150,7 +150,7 @@ def unsupported_configuration(
     query_heads: int,
     kv_heads: int,
     head_dim: int,
-    page_tokens: int,
+    block_size: int,
     dtype: torch.dtype,
     causal: bool = False,
     window: int | None = None,
@@ -175,8 +175,8 @@ def unsupported_configuration(
             "query heads per KV head must divide "
             f"{_TILE_ROWS[head_dim][0] // 2} at head_dim {head_dim}"
         )
-    if page_tokens not in PAGE_TOKENS:
-        return f"page_tokens {page_tokens} is not one of {PAGE_TOKENS}"
+    if block_size not in BLOCK_SIZES:
+        return f"block_size {block_size} is not one of {BLOCK_SIZES}"
     if causal and (head_dim != 512 or window is not None):
         # A causal chunk longer than a window would need a lower bound
         # within the block, and only full-attention head dimension 512
@@ -209,16 +209,16 @@ def _check(
     if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
         return "query, key and value must be [tokens, heads, head_dim]"
     if key_cache.ndim != 4 or value_cache.shape != key_cache.shape:
-        return "caches must share one [pages, page_tokens, heads, dim] shape"
+        return "caches must share one [pages, block_size, heads, dim] shape"
 
     tokens, query_heads, head_dim = query.shape
     kv_heads = key.shape[1]
-    pages, page_tokens, cache_heads, cache_dim = key_cache.shape
+    pages, block_size, cache_heads, cache_dim = key_cache.shape
     problem = unsupported_configuration(
         query_heads=query_heads,
         kv_heads=kv_heads,
         head_dim=head_dim,
-        page_tokens=page_tokens,
+        block_size=block_size,
         dtype=query.dtype,
         causal=causal,
         window=window,
@@ -494,7 +494,7 @@ def prefix_block_attention(
         key: BF16 ``[tokens, kv_heads, head_dim]`` current block keys, at the
             query rows. Query head ``h`` reads KV head ``h // G``.
         value: BF16 tensor shaped like ``key``.
-        key_cache: BF16 ``[pages, page_tokens, kv_heads, head_dim]``.
+        key_cache: BF16 ``[pages, block_size, kv_heads, head_dim]``.
         value_cache: BF16 tensor shaped like ``key_cache``.
         block_table: int32 ``[batch, width]`` physical page IDs.
         query_offsets: int32 ``[batch + 1]`` cumulative block row offsets.
@@ -605,7 +605,7 @@ def prefix_block_attention(
         "head_dim": query.shape[2],
         "tile_rows": tile_rows,
         "group_size": group,
-        "page_tokens": key_cache.shape[1],
+        "block_size": key_cache.shape[1],
         "query_window": bool(query_window) and window is not None,
         "has_window": window is not None,
         "has_prefix_start": prefix_start is not None,
@@ -721,7 +721,7 @@ def _causal_attention(
         "head_dim": query.shape[2],
         "tile_rows": tile_rows,
         "group_size": group,
-        "page_tokens": key_cache.shape[1],
+        "block_size": key_cache.shape[1],
         "has_prefix_start": prefix_start is not None,
         "has_start_page": start_page is not None,
         "has_lse": lse is not None,
@@ -793,7 +793,7 @@ def _causal_attention(
 
 __all__ = [
     "HEAD_DIMS",
-    "PAGE_TOKENS",
+    "BLOCK_SIZES",
     "available",
     "can_run",
     "import_error",

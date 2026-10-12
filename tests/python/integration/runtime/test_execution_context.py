@@ -25,9 +25,10 @@ from uniserve.runtime import (
     CUDAGraph,
     CUDAStream,
     ExecutionContext,
-    PrefixCache,
+    KVCache,
     Scratch,
 )
+from uniserve.runtime.kv_cache import plan_units
 from uniserve.tensors import BufferConfig
 
 pytestmark = pytest.mark.integration
@@ -73,12 +74,13 @@ def test_device_lengths_drive_current_attention_values(
         if graphs
         else None
     )
+    cache_config = Config({"attention": mha.Config(2, 64, (0, 1), dtype)})
     with (
         stream if stream is not None else nullcontext(),
-        PrefixCache(
-            Config({"attention": mha.Config(2, 64, (0, 1), dtype)}),
+        KVCache(
+            cache_config,
+            plan_units(cache_config, block_size=16),
             num_units=2,
-            block_size=16,
             device=device,
         ) as cache,
         ExecutionContext(
@@ -123,7 +125,7 @@ def test_device_lengths_drive_current_attention_values(
                 changed = indices(counts)
                 batch.queries.values.copy_(changed.queries.values)
                 batch.queries.offsets.copy_(changed.queries.offsets)
-                batch.write_indices.copy_(changed.write_indices)
+                batch.slot_mapping.copy_(changed.slot_mapping)
                 value.mul_(0.75)
                 context.bind_attention(AttentionBatch.single(batch))
                 actual = (
@@ -194,7 +196,12 @@ def test_replay_binding_still_rejects_inputs_outside_the_captured_contract():
         }
     )
     with (
-        PrefixCache(config, num_units=8, block_size=16, device=device) as cache,
+        KVCache(
+            config,
+            plan_units(config, block_size=16),
+            num_units=8,
+            device=device,
+        ) as cache,
         ExecutionContext(module, cache=cache, attention="trtllm") as context,
     ):
         context.prepare(TextSize(5, 2))
@@ -202,11 +209,11 @@ def test_replay_binding_still_rejects_inputs_outside_the_captured_contract():
         assert len(tables) == 2
 
         def batch(counts, scale=1):
-            # Each table pages at its group's page size; ``scale`` breaks
+            # Each table pages at its group's block size; ``scale`` breaks
             # that contract for the second table alone.
             entries = {}
             for number, table in enumerate(tables):
-                pages = cache.groups[cache.tables[table].group].page_tokens
+                pages = cache.groups[cache.tables[table].group].block_size
                 paged = PagedInput.from_blocks(
                     blocks=((1 + 2 * number,), (2 + 2 * number,)),
                     query_lengths=counts,
@@ -248,8 +255,18 @@ def test_nested_execution_contexts_keep_prefixes_independent():
     module.projection.weight.copy_(torch.eye(64))
     config = Config({"attention": mha.Config(1, 64, (0,), torch.float32)})
     with (
-        PrefixCache(config, num_units=1, block_size=16, device="cpu") as first,
-        PrefixCache(config, num_units=1, block_size=16, device="cpu") as second,
+        KVCache(
+            config,
+            plan_units(config, block_size=16),
+            num_units=1,
+            device="cpu",
+        ) as first,
+        KVCache(
+            config,
+            plan_units(config, block_size=16),
+            num_units=1,
+            device="cpu",
+        ) as second,
         ExecutionContext(module, cache=first, attention="torch") as a,
     ):
         a.prepare(TextSize(1, 1))
@@ -272,7 +289,7 @@ def test_nested_execution_contexts_keep_prefixes_independent():
             torch.testing.assert_close(
                 module(two, AttentionBatch.single(batch)), two
             )
-        readonly = replace(batch, write_indices=None)
+        readonly = replace(batch, slot_mapping=None)
         a.bind_attention(AttentionBatch.single(readonly))
         torch.testing.assert_close(
             module(two, AttentionBatch.single(readonly)), one
@@ -350,7 +367,12 @@ def test_eager_attention_replans_changed_sequence_boundaries():
         for _ in range(2)
     )
     with (
-        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
+        KVCache(
+            config,
+            plan_units(config, block_size=16),
+            num_units=2,
+            device=device,
+        ) as cache,
         ExecutionContext(layer, cache=cache, attention="flashinfer") as context,
     ):
         context.prepare(TextSize(5, 2))
@@ -438,7 +460,12 @@ def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
         prefixes=replace(initial.prefixes, host=None),
     )
     with (
-        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
+        KVCache(
+            config,
+            plan_units(config, block_size=16),
+            num_units=2,
+            device=device,
+        ) as cache,
         ExecutionContext(layer, cache=cache, attention=provider) as context,
     ):
         context.prepare(TextSize(5, 2))
@@ -455,7 +482,7 @@ def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
             changed = lengths(counts)
             batch.queries.values.copy_(changed.queries.values)
             batch.queries.offsets.copy_(changed.queries.offsets)
-            batch.write_indices.copy_(changed.write_indices)
+            batch.slot_mapping.copy_(changed.slot_mapping)
             torch.testing.assert_close(
                 layer(q, k, v, AttentionBatch.single(batch)),
                 expected(counts),
@@ -513,7 +540,12 @@ def test_context_without_derived_lengths_plans_only_with_host_mirrors():
         ]
     )
     with (
-        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
+        KVCache(
+            config,
+            plan_units(config, block_size=16),
+            num_units=2,
+            device=device,
+        ) as cache,
         ExecutionContext(
             layer, cache=cache, attention="torch", derive_host_lengths=False
         ) as context,
@@ -700,7 +732,12 @@ def test_table_batches_plan_cached_layers_beside_cacheless_layers():
         }
     )
     with (
-        PrefixCache(config, num_units=4, block_size=2, device="cpu") as cache,
+        KVCache(
+            config,
+            plan_units(config, block_size=2),
+            num_units=4,
+            device="cpu",
+        ) as cache,
         ExecutionContext(module, cache=cache, attention="torch") as context,
     ):
         context.prepare(TextSize(3, 1))

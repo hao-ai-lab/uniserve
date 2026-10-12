@@ -13,7 +13,7 @@
 //!    refuses another model name with `404`.
 //! 2. [`ReadoutEncoder::plan`] turns the request and its decoded image sizes
 //!    into a [`ReadoutPlan`]: prompts with image placements, canvas rows, and
-//!    per-slot candidate tokens, in prompt format [`PROMPT_FORMAT`].
+//!    per-slot candidate tokens.
 //! 3. The engine prefills each prompt, denoises each canvas row once, and
 //!    returns the candidates' full-vocabulary log-probabilities, which
 //!    [`ReadoutPlan::assemble`] turns into the official response, with the
@@ -46,8 +46,6 @@ pub use plan::{
     ReadoutEncoder, ReadoutLayout, ReadoutOptions, ReadoutPlan, ReadoutPrompt, ReadoutSlot,
     StartupError,
 };
-pub use prompt::PROMPT_FORMAT;
 pub use request::{
-    ChoiceOption, Criteria, MAX_CHOICE_OPTIONS, MAX_IMAGES, MAX_SCORE_LEVELS, Question,
-    SystemOneRequest,
+    ChoiceOption, Criteria, MAX_CHOICE_OPTIONS, MAX_SCORE_LEVELS, Question, SystemOneRequest,
 };

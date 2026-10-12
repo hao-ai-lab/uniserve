@@ -6,15 +6,15 @@ import pytest
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve import loading
 from uniserve.loading import weights
 from uniserve.model import CausalLM
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve_models import loading as models
 from uniserve_models.stub import image_processor as stub_image_processor
-from uniserve_worker.bootstrap.cache import cache_info
+from uniserve_worker.bootstrap.cache import cache_info, plan_cache
 from uniserve_worker.bootstrap.inputs import capability
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import TokenBufferConfig
@@ -68,7 +68,7 @@ def _text_runner(model, provider, decode_capacity=2, image_processor=None):
     captures prefill graphs for non-causal rows that replace their
     embeddings, as image feature rows do.
     """
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         model_dtype="bfloat16",
         block_size=16,
@@ -76,17 +76,21 @@ def _text_runner(model, provider, decode_capacity=2, image_processor=None):
         max_batch_calls=4,
         max_request_pool_size=4,
         max_batch_tokens=64,
-        max_sequence_tokens=64,
+        max_model_len=64,
         prefill_cuda_graph=True,
         prefill_graph_token_sizes=(16,),
         decode_graph_batch_sizes=(1, decode_capacity),
     )
-    cache = PrefixCache(
-        model.cache_config, num_units=16, block_size=16, device="cuda:0"
+    planes = plan_cache(model, config)
+    cache = KVCache(
+        model.cache_config,
+        planes,
+        num_units=16,
+        device="cuda:0",
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model, config, num_units=16),
+        info=cache_info(model, planes, num_units=16),
         request_pool_size=4,
         table_width=4,
     )
@@ -392,32 +396,36 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
         device="cuda:0",
         weights=weights.Config(dtype=torch.bfloat16),
     ).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         model_dtype="bfloat16",
         block_size=16,
         max_request_pool_size=2,
         max_batch_calls=2,
         max_batch_tokens=32,
-        max_sequence_tokens=32,
+        max_model_len=32,
         prefill_cuda_graph=True,
         prefill_graph_token_sizes=(16, 32),
         decode_graph_batch_sizes=(1, 2),
     )
     runner = ModelExecutor(model, config)
-    cache = PrefixCache(
-        model.cache_config, num_units=8, block_size=16, device="cuda:0"
+    planes = plan_cache(model, config)
+    cache = KVCache(
+        model.cache_config,
+        planes,
+        num_units=8,
+        device="cuda:0",
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model, config, num_units=8),
+        info=cache_info(model, planes, num_units=8),
         request_pool_size=2,
         table_width=2,
     )
     predicates = torch.tensor([False, True, True], device="cuda:0")
     try:
         runner.configure_inputs(
-            input_config=input_buffer_config(model, config),
+            input_config=input_buffer_config(model, config, planes=planes),
             kv_cache=manager,
             latent_pool=None,
             decode_predicates=predicates,
@@ -492,18 +500,17 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
 @torch.inference_mode()
 def test_loaded_worker_warmup_retires_its_request_resources(tmp_path):
     from uniserve.distributed import Communicator
-    from uniserve_worker.bootstrap.components import supported_calls
     from uniserve_worker.worker import Worker
 
     _save_checkpoint(tmp_path)
     model = models.load_model(
         models.read_config(tmp_path), device="cuda:0"
     ).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         block_size=16,
-        kv_token_capacity=128,
-        max_sequence_tokens=32,
+        max_total_tokens=128,
+        max_model_len=32,
         max_batch_calls=2,
         max_batch_tokens=32,
         max_request_pool_size=2,
@@ -516,9 +523,7 @@ def test_loaded_worker_warmup_retires_its_request_resources(tmp_path):
         worker_config=config,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_calls=supported_calls(model),
         queue_depth=2,
-        completion_payload_bytes=1 << 16,
     ) as worker:
         worker.warmup()
         assert worker.requests.request_ids() == ()

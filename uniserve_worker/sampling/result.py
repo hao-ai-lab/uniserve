@@ -38,8 +38,6 @@ LogprobValues: TypeAlias = tuple[
     torch.Tensor,
     tuple[int, ...],
     tuple[int, ...],
-    tuple[tuple[int, ...], ...],
-    int,
     int,
 ]
 

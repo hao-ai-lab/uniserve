@@ -14,10 +14,10 @@ use std::collections::HashMap;
 use uniserve_core::EngineCoreOutput;
 use uniserve_core::{
     GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, ImageTrigger,
-    RequestId, SamplingParams,
+    ModelDtype, RequestId, SamplingParams,
 };
 use uniserve_engine::{
-    AttentionBackend, Executor, Scheduler, SpecialTokenIds, WorkerExecutor, WorkerGroup, WorkerId,
+    Executor, Scheduler, SchedulerConfig, SimEngine, WorkerExecutor, WorkerGroup, WorkerId,
     WorkerProcessArgs,
 };
 
@@ -50,13 +50,11 @@ fn main() -> anyhow::Result<()> {
         .ranks,
         // Allows two physical runs in flight on the rank at once.
         queue_depth: 2,
-        req_slot_cap: 1 << 20,
-        resp_slot_cap: 8 << 20,
-        kv_token_capacity: None,
+        max_total_tokens: None,
         block_size: Some(256),
         max_batch_calls: 32,
         max_batch_tokens: 8192,
-        attention_backend: AttentionBackend::Auto,
+        attention_backend: "auto".into(),
         transfer: Default::default(),
         ..worker_config
     })?;
@@ -64,10 +62,17 @@ fn main() -> anyhow::Result<()> {
         WorkerExecutor::try_new(vec![(WorkerId("local".into()), engine)], Default::default())?;
     println!("info from worker: {:?}", engine.info());
 
-    let ctrl = SpecialTokenIds {
-        ..SpecialTokenIds::default()
-    };
-    let mut sched = Scheduler::new(Box::new(engine), ctrl, 32)?;
+    let mut sched = Scheduler::new(
+        Box::new(engine),
+        // The stub model's end-of-text id is the simulator's.
+        SimEngine::special_tokens(),
+        SchedulerConfig {
+            max_batch: 32,
+            ..Default::default()
+        },
+        ModelDtype::BFloat16,
+        SimEngine::generation_limits(),
+    )?;
 
     let mut rxs: HashMap<RequestId, (&str, uniserve_engine::EventRx)> = HashMap::new();
     let mut reqs = Vec::new();
@@ -142,6 +147,7 @@ fn generation_request(id: u64, constraint: GenerationConstraint) -> GenerationRe
             width: 128,
             ..Default::default()
         },
+        max_images: 1,
         max_und_tokens: 20,
         include_stop_token: false,
         stop_strings: Vec::new(),
@@ -150,6 +156,5 @@ fn generation_request(id: u64, constraint: GenerationConstraint) -> GenerationRe
         cache: Default::default(),
         image_generation: policy,
         readout: Vec::new(),
-        canvas: None,
     }
 }

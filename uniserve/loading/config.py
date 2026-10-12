@@ -12,8 +12,9 @@ from typing import Literal
 class Config:
     """Checkpoint IO policy: encoding, read mode, concurrency and caching.
 
-    Also integrity. mode selects eager full reads, per-shard layered reads,
-    or deterministic dummy values; prefetch defaults to mmap when unset.
+    ``mode`` selects eager full reads, per-shard layered reads, or
+    deterministic dummy values; ``mmap`` maps files instead of reading them
+    and hints the kernel to read them ahead.
     """
 
     format: Literal["auto", "safetensors", "pt"] = "auto"
@@ -23,9 +24,6 @@ class Config:
     ignore_patterns: tuple[str, ...] = ("original/**/*",)
     num_threads: int | None = None
     mmap: bool = True
-    prefetch: bool | None = None
-    drop_cache_after_load: bool = False
-    checksum_manifest: Path | None = None
 
     def __post_init__(self):
         if self.format not in {"auto", "safetensors", "pt"}:
@@ -47,7 +45,5 @@ class Config:
             raise ValueError(
                 "ignore patterns must be a tuple of nonempty patterns"
             )
-        for name in ("download_dir", "checksum_manifest"):
-            value = getattr(self, name)
-            if value is not None:
-                object.__setattr__(self, name, Path(value))
+        if self.download_dir is not None:
+            object.__setattr__(self, "download_dir", Path(self.download_dir))

@@ -32,10 +32,9 @@ REGISTRATION_TIMEOUT_SECONDS = 60
 # A socket endpoint binds every interface so a rank on another host can be
 # reached; the port is chosen by the system and reported once it exists.
 SOCKET_BIND_INTERFACE = "0.0.0.0"
-SOCKET_CHANNEL = "tcp"
 
 try:
-    from uniserve_worker._uniserve_ipc import DEBUG_BUILD, service_name
+    from uniserve_worker._uniserve_ipc import SOCKET_CHANNEL, service_name
     from uniserve_worker._uniserve_ipc import Server as WorkerIpcEndpoint
 except (
     ImportError
@@ -44,16 +43,6 @@ except (
         "_uniserve_ipc is not installed; reinstall the package "
         "(pip install -e .) to build it."
     ) from exc
-
-# Every call and result crosses the IPC extension, so an unoptimized build
-# turns into host overhead on the serving path; a worker never runs one.
-if DEBUG_BUILD:  # pragma: no cover - depends on the installed native extension.
-    raise ImportError(
-        "_uniserve_ipc is a debug build; install a release build "
-        "(pip install -e ., or cargo build --release -p uniserve-ipc-py and "
-        "copy target/release/lib_uniserve_ipc.so to "
-        "uniserve_worker/_uniserve_ipc.<abi>.so)."
-    )
 
 
 def endpoint_name(config: WorkerProcessArgs) -> str:
@@ -75,9 +64,10 @@ def endpoint_name(config: WorkerProcessArgs) -> str:
 def register_endpoint(config: WorkerProcessArgs, endpoint: str) -> None:
     """Report this rank's bound endpoint to the head's registration address.
 
-    One JSON line carries the report (``worker_id``, ``rank``, ``transport``
-    and ``endpoint``); the connection carries nothing else and closes after
-    the write. ``endpoint`` is what the channel actually bound.
+    One JSON line carries the report (``rank`` and ``endpoint``); the
+    connection carries nothing else and closes after the write. ``endpoint``
+    is what the channel actually bound. The head registers one worker group
+    per address and chose the channel mechanism, so neither is reported.
 
     A socket endpoint binds every interface, so its bound address names no
     interface the head can dial. The report therefore replaces the host part
@@ -95,9 +85,7 @@ def register_endpoint(config: WorkerProcessArgs, endpoint: str) -> None:
             _, bound_port = endpoint.rsplit(":", 1)
             endpoint = f"{connection.getsockname()[0]}:{bound_port}"
         report = {
-            "worker_id": config.worker_id,
             "rank": int(config.execution.rank),
-            "transport": config.ipc.channel_transport,
             "endpoint": endpoint,
         }
         connection.sendall(json.dumps(report).encode("utf-8") + b"\n")
@@ -115,7 +103,6 @@ def run_worker(config: WorkerProcessArgs) -> None:
     endpoint_service = endpoint_name(config)
     with WorkerIpcEndpoint(
         endpoint_service,
-        max_payload=config.ipc.max_payload_bytes,
         max_inflight=config.ipc.queue_depth,
         transport=config.ipc.channel_transport,
     ) as endpoint:
@@ -129,10 +116,9 @@ def run_worker(config: WorkerProcessArgs) -> None:
                 "worker IPC endpoint bound",
                 extra={
                     "service": endpoint_service,
-                    "max_payload_bytes": config.ipc.max_payload_bytes,
                     "max_inflight": config.ipc.queue_depth,
                     "supported_calls": sorted(
-                        value.value for value in config.supported_calls
+                        value.value for value in worker.info.supported_calls
                     ),
                 },
             )

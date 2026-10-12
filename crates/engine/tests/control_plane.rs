@@ -12,19 +12,21 @@
 //! - For request id `r`, the greedy token at text index `n` is
 //!   `1000 + (7r + n) % 5000` (1007, 1008, ... for request 1) until
 //!   `SimEngine::set_text_len` tokens have been produced; after that the
-//!   synthetic EOS (151645, the first EOS of `SpecialTokenIds::default`)
+//!   synthetic EOS (151645, the first EOS of `SimEngine::special_tokens`)
 //!   dominates the logits. The index restarts at zero when a generated image
 //!   is fed back into the request's context.
 //! - `SimEngine::set_queue_depth` bounds the batches the scheduler may keep
 //!   unresolved. Depth 1 is the serial oracle that the depth-invariance tests
 //!   compare depth 2 against.
-//! - The KV page size is 64 tokens, one unit per page (`WorkerInfo::default`),
-//!   unless a test calls `SimEngine::set_page_tokens` or `set_groups`, and
+//! - The KV block size is 64 tokens, one unit per page (`WorkerInfo::default`),
+//!   unless a test calls `SimEngine::set_block_size` or `set_groups`, and
 //!   generated images default to 512x512 (`ImageParams::default`).
 //! - The `general` request gauges and the `kv_cache` and `encoder` counters in
 //!   `SchedulerStats` are snapshots that `Scheduler::publish_cache_stats`
 //!   refreshes as the loop runs, not when an event is sent, so they can trail
 //!   the event stream. The `prefix` counters are recorded at admission.
+
+mod support;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,24 +34,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
-use uniserve_worker_ipc::{Call, CallKind, ForwardMode, MediaCall};
+use uniserve_worker_ipc::{Call, CallKind, ForwardMode, MediaCall, TransferMode};
 
 use uniserve_core::{EngineCoreOutput, FinishReason};
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageInput, ImageParams,
-    ImageTrigger, MultimodalInputs, RequestId, SamplingParams,
+    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger,
+    MultimodalInputs, RequestId, SamplingParams,
 };
 use uniserve_engine::{
     BatchEvent, BatchResult, EVENT_BUFFER_CAPACITY, EngineHandle, ExecutionBatch, Executor,
-    ExecutorError, ExecutorInfo, ExecutorSubmitError, Scheduler, SchedulingPolicy, SimEngine,
+    ExecutorError, ExecutorInfo, ExecutorSubmitError, SchedulerConfig, SchedulingPolicy, SimEngine,
     SimExecutor, SpecialTokenIds, WorkerId,
 };
 
 /// Default special tokens, whose first EOS id equals the simulator's synthetic
 /// EOS, so the simulator's end of text finishes requests with `Eos`.
 fn ctrl() -> SpecialTokenIds {
-    SpecialTokenIds::default()
+    SimEngine::special_tokens()
 }
 
 /// Advertised generation features follow the worker's supported calls: image
@@ -112,7 +114,7 @@ fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
             CallKind::Forward(ForwardMode::Decode),
         ];
         sim.mut_info_for_test().supported_calls.extend(calls);
-        let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+        let scheduler = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
         assert_eq!(
             scheduler.generation_limits().features,
             GenerationFeatures::UNDERSTANDING | expected,
@@ -130,7 +132,7 @@ fn encoder_products_obey_worker_entry_capacity() {
     info.buffer_pool_bytes = 8 << 30;
     info.encoder_entry_bytes = 128 << 20;
     info.encoder_cache_entries = 64;
-    let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    let scheduler = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
     let limits = scheduler.generation_limits();
     assert_eq!(limits.max_vision_feature_bytes, 128 << 20);
     assert_eq!(limits.max_latent_feature_bytes, 128 << 20);
@@ -165,7 +167,7 @@ fn image_input(
                 position,
                 num_positions: logical_positions,
                 encoders: vec![ImageEncoderInput {
-                    encoder: ImageIngestStep::VitEncode,
+                    encoder: MediaCall::VisionEncoding,
                     num_kv_tokens: Some(physical_tokens),
                     max_kv_tokens: None,
                 }],
@@ -177,7 +179,7 @@ fn image_input(
 /// Builds a unified generation request with a fixed image-generation policy.
 ///
 /// The policy triggers on token 1000, lets image-only requests start image
-/// computation without first generating internal text, and, for
+/// call without first generating internal text, and, for
 /// Default-constraint requests, feeds each generated image back through one
 /// ViT encode. Tests that need a different trigger use `with_trigger` or edit
 /// `image_generation` afterwards.
@@ -202,7 +204,7 @@ fn generation_request(
         feedback_next_token: FeedbackNextToken::EndOfImage,
         num_feedback_positions: 2,
         feedback_encoders: vec![ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: None,
             max_kv_tokens: None,
         }],
@@ -218,6 +220,7 @@ fn generation_request(
         latent_downsample: 16,
         max_vae_grid_tokens: 65_536,
         max_vit_grid_tokens: 8_192,
+        latent_bytes_per_unit: (256 << 20) / 65_536,
         max_latent_feature_bytes: 256 << 20,
         max_vision_feature_bytes: 256 << 20,
         commit_marker_tokens: 2,
@@ -232,6 +235,7 @@ fn generation_request(
         constraint,
         sampling,
         image,
+        max_images: 1,
         max_und_tokens,
         include_stop_token: false,
         stop_strings: Vec::new(),
@@ -240,7 +244,6 @@ fn generation_request(
         cache,
         image_generation: policy,
         readout: Vec::new(),
-        canvas: None,
     };
     request
         .validate_resources(&limits)
@@ -275,7 +278,7 @@ fn batch_requests(
     let mut sim = SimEngine::new();
     sim.set_queue_depth(depth);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::with_policy(executor, ctrl(), 32, policy).unwrap();
+    let sched = support::scheduler_with_policy(executor, ctrl(), 32, policy).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -358,7 +361,7 @@ fn text_and_image_requests_complete() {
 /// Cancelling a resident image request reports `Cancelled` and releases its
 /// resources, so an image request submitted behind it still completes. The
 /// latent pool (64 usable pages of 64 units) and buffer pool are reduced from
-/// the simulator defaults, and the first request runs `ImageParams::MAX_STEPS`
+/// the simulator defaults, and the first request runs a thousand
 /// denoising steps so it is still resident when the second arrives.
 #[test]
 fn cancellation_releases_latent_admission_for_a_waiting_image() {
@@ -368,7 +371,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     sim.mut_info_for_test().latent_pages = 65;
     sim.mut_info_for_test().buffer_pool_bytes = 16 << 20;
     sim.mut_info_for_test().max_batch_calls = 1024;
-    let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    let scheduler = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let thread = thread::spawn(move || scheduler.run(rx));
@@ -379,7 +382,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
             text_input(vec![4, 5, 6]),
             SamplingParams::default(),
             ImageParams {
-                steps: ImageParams::MAX_STEPS,
+                steps: 1000,
                 ..Default::default()
             },
             GenerationConstraint::GenOnly,
@@ -437,7 +440,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     assert_eq!(second_images, 1);
 }
 
-/// Image requests waiting for the one flow-prefix request row do not starve
+/// Image requests waiting for the one guidance-prefix request row do not starve
 /// the younger request that holds it.
 ///
 /// With four request slots, three requests run and one row is left for a
@@ -451,15 +454,23 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
 /// its next step is planned, so each pass finds the denoiser free and tries
 /// the older requests first.
 #[test]
-fn flow_prefix_holder_progresses_while_older_images_wait() {
+fn guidance_prefix_holder_progresses_while_older_images_wait() {
     const STEPS: u16 = 12;
 
     let mut sim = SimEngine::new();
     sim.set_queue_depth(1);
     sim.mut_info_for_test().request_slots = 4;
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
-    scheduler.set_token_budget(4096);
-    scheduler.set_long_prefill_threshold(64);
+    let scheduler = support::scheduler_with(
+        Box::new(SimExecutor::new(sim)),
+        ctrl(),
+        SchedulerConfig {
+            max_batch: 32,
+            max_num_batched_tokens: 4096,
+            long_prefill_threshold: 64,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(scheduler.config().max_num_seqs, 3);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -526,7 +537,7 @@ fn flow_prefix_holder_progresses_while_older_images_wait() {
 fn image_events_cover_declared_denoise_steps() {
     const STEPS: u16 = 3;
     let scheduler =
-        Scheduler::new(Box::new(SimExecutor::new(SimEngine::new())), ctrl(), 32).unwrap();
+        support::scheduler(Box::new(SimExecutor::new(SimEngine::new())), ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let scheduler_thread = thread::spawn(move || scheduler.run(rx));
@@ -592,22 +603,21 @@ fn image_events_cover_declared_denoise_steps() {
 fn scheduler_clamps_max_batch_to_worker_info() {
     let mut sim = SimEngine::new();
     sim.mut_info_for_test().max_batch_calls = 3;
-    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    let sched = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
 
     assert_eq!(sched.config().max_batch, 3);
 }
 
-/// Serves eight concurrent eight-token generations on a simulator whose
-/// workers report `prefill` and `decode` call bounds (zero for none), and
-/// returns the call count of every prefill batch and every decode batch the
-/// scheduler submitted, after checking that every request finished.
-fn forward_batch_calls(prefill: u32, decode: u32) -> (Vec<usize>, Vec<usize>) {
+/// Prefill and decode batches hold at most the calls the workers report one
+/// batch may hold: eight concurrent prompts prefill three at a time and still
+/// all finish.
+#[test]
+fn forward_batches_hold_at_most_the_workers_batch_calls() {
     let mut sim = SimEngine::new();
-    sim.mut_info_for_test().max_prefill_calls = prefill;
-    sim.mut_info_for_test().max_decode_calls = decode;
+    sim.mut_info_for_test().max_batch_calls = 3;
     let mut executor = SimExecutor::new(sim);
     let dispatched = executor.observe();
-    let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
+    let sched = support::scheduler(Box::new(executor), ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -648,7 +658,7 @@ fn forward_batch_calls(prefill: u32, decode: u32) -> (Vec<usize>, Vec<usize>) {
         let BatchEvent::Submitted(batch) = event else {
             continue;
         };
-        match batch.requests.first().map(|(call, _)| call.code) {
+        match batch.requests.first().map(|(call, _)| call.kind) {
             Some(CallKind::Forward(ForwardMode::Prefill)) => {
                 prefill_calls.push(batch.requests.len())
             }
@@ -656,41 +666,14 @@ fn forward_batch_calls(prefill: u32, decode: u32) -> (Vec<usize>, Vec<usize>) {
             _ => {}
         }
     }
-    (prefill_calls, decode_calls)
-}
-
-/// Prefill batches hold at most the calls the workers' captured prefill
-/// graphs hold, while decode batches keep the worker's call bound: eight
-/// concurrent prompts prefill three at a time and still all finish, and their
-/// decode steps share batches wider than three.
-#[test]
-fn prefill_batches_hold_at_most_the_calls_prefill_graphs_hold() {
-    let (prefill_calls, decode_calls) = forward_batch_calls(3, 0);
     assert!(
         prefill_calls.iter().all(|&calls| calls <= 3),
         "prefill batches {prefill_calls:?}"
     );
     assert_eq!(prefill_calls.iter().sum::<usize>(), 8);
     assert!(
-        decode_calls.iter().any(|&calls| calls > 3),
-        "decode batches {decode_calls:?}"
-    );
-}
-
-/// Decode batches hold at most the calls the workers' captured decode graphs
-/// hold, while prefill batches keep the worker's call bound: eight concurrent
-/// generations decode three at a time and still all finish, and their
-/// prompts share batches wider than three.
-#[test]
-fn decode_batches_hold_at_most_the_calls_decode_graphs_hold() {
-    let (prefill_calls, decode_calls) = forward_batch_calls(0, 3);
-    assert!(
         !decode_calls.is_empty() && decode_calls.iter().all(|&calls| calls <= 3),
         "decode batches {decode_calls:?}"
-    );
-    assert!(
-        prefill_calls.iter().any(|&calls| calls > 3),
-        "prefill batches {prefill_calls:?}"
     );
 }
 
@@ -728,7 +711,7 @@ fn call_window_metrics_record_the_full_lifecycle() {
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
     sim.set_text_len(6);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    let mut scheduler = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
     let request = generation_request(
         RequestId(1),
         text_input(vec![1, 2, 3, 4, 5]),
@@ -812,7 +795,7 @@ fn relay_run(
     let mut sim = SimEngine::new();
     sim.set_queue_depth(depth);
     sim.set_text_len(text_len);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    let mut scheduler = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
     let mut request = generation_request(
         RequestId(1),
         text_input(vec![1, 2, 3, 4, 5]),
@@ -930,7 +913,8 @@ fn image_context_decode_is_depth_invariant() {
         let mut sim = SimEngine::new();
         sim.set_queue_depth(queue_depth);
         sim.set_text_len(8);
-        let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+        let mut scheduler =
+            support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
         let request = generation_request(
             RequestId(1),
             image_input(vec![1, 2], vec![3, 4], 0xD3C0DE, 4, 1),
@@ -968,7 +952,7 @@ fn stop_token_terminates_with_stop() {
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+    let sched = support::scheduler(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1016,7 +1000,7 @@ fn run_until_control(abort: bool) -> FinishReason {
     sim.set_text_len(1024);
     sim.set_queue_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+    let sched = support::scheduler(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1067,14 +1051,14 @@ fn abort_and_cancel_are_distinct() {
     assert_eq!(run_until_control(true), FinishReason::Aborted);
 }
 
-/// A stop-string cutoff reported through `EngineHandle::stop_at` finishes only
+/// A stop-string cutoff reported through `EngineHandle::stop` finishes only
 /// its own request with `Stop`; a concurrent request runs to its own end.
 #[test]
 fn stop_string_cutoff_is_request_local() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1024);
     sim.set_queue_depth(2);
-    let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    let scheduler = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let scheduler_thread = thread::spawn(move || scheduler.run(rx));
@@ -1101,10 +1085,9 @@ fn stop_string_cutoff_is_request_local() {
     stopping.stop_strings = vec!["boundary".to_string()];
     let mut stopping_events = handle.submit(stopping).unwrap();
 
-    // A request with stop strings is acknowledged by the frontend decoder, not
-    // on receive (see `EngineHandle::submit`). The test plays that role for the
-    // first token and, once a second token arrives, stops the output at that
-    // one-token prefix.
+    // A request with stop strings is acknowledged by the frontend decoder
+    // (see `EngineHandle::submit`). The test plays that role for the first
+    // token and, once a second token arrives, stops the request.
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut consumed_tokens = 0;
     while consumed_tokens < 2 && Instant::now() < deadline {
@@ -1120,7 +1103,7 @@ fn stop_string_cutoff_is_request_local() {
         }
     }
     assert_eq!(consumed_tokens, 2);
-    handle.stop_at(RequestId(2), 1);
+    handle.stop(RequestId(2));
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut stop_reason = None;
@@ -1173,11 +1156,8 @@ fn hybrid_groups_share_one_unit_pool() {
             ..base.clone()
         },
         KvCacheGroup {
-            kind: KvGroupKind::SlidingWindow {
-                window: 96,
-                sink: 0,
-            },
-            page_tokens: 32,
+            kind: KvGroupKind::SlidingWindow { window: 96 },
+            block_size: 32,
             units_per_page: 3,
             layer_ids: (4..16).collect(),
             ..base
@@ -1185,9 +1165,17 @@ fn hybrid_groups_share_one_unit_pool() {
     ]);
     let mut executor = SimExecutor::new(sim);
     let dispatched = executor.observe();
-    let mut sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
     // A 64-token chunk reads at most six sliding pages with the window.
-    sched.set_long_prefill_threshold(64);
+    let sched = support::scheduler_with(
+        Box::new(executor),
+        ctrl(),
+        SchedulerConfig {
+            max_batch: 32,
+            long_prefill_threshold: 64,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -1257,7 +1245,7 @@ fn hybrid_groups_share_one_unit_pool() {
         };
         for (_, placement) in &batch.requests {
             for table in &placement.block_tables {
-                let (page_tokens, units_per_page) = if table.group_id == 0 {
+                let (block_size, units_per_page) = if table.group_id == 0 {
                     (64, 1)
                 } else {
                     (32, 3)
@@ -1266,7 +1254,7 @@ fn hybrid_groups_share_one_unit_pool() {
                 let pages = (table.unit_ids.len() / units_per_page) as u32;
                 assert_eq!(
                     table.allocated_tokens,
-                    (table.start_page + pages) * page_tokens
+                    (table.start_page + pages) * block_size
                 );
                 if table.group_id == 1 {
                     assert!(pages <= (96 + 2 * 64) / 32 + 1, "{table:?}");
@@ -1304,14 +1292,17 @@ fn prefix_cache_configuration_controls_reuse() {
         // caching is enabled. Page tails still require ordinary prefill.
         for rid in 1..=2 {
             let mut events = engine
-                .submit(uniserve_core::Request::Umm(generation_request(
-                    RequestId(rid),
-                    text_input(prompt.clone()),
-                    SamplingParams::default(),
-                    ImageParams::default(),
-                    GenerationConstraint::UndOnly,
-                    8,
-                )))
+                .submit(
+                    generation_request(
+                        RequestId(rid),
+                        text_input(prompt.clone()),
+                        SamplingParams::default(),
+                        ImageParams::default(),
+                        GenerationConstraint::UndOnly,
+                        8,
+                    )
+                    .into(),
+                )
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut tokens = Vec::new();
@@ -1356,7 +1347,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
 
     let mut sim = SimEngine::new();
     sim.set_text_len(2);
-    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    let sched = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -1437,9 +1428,19 @@ fn chunked_prefill_progresses_with_decode() {
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs).unwrap();
-    sched.set_long_prefill_threshold(64); // cap a prefill chunk at 64 tokens
-    sched.set_token_budget(256); // leaves room for other decodes per step
+    let sched = support::scheduler_with(
+        executor,
+        ctrl(),
+        SchedulerConfig {
+            max_batch: 32,
+            // Caps a prefill chunk at 64 tokens.
+            long_prefill_threshold: 64,
+            // Leaves room for other decodes per step.
+            max_num_batched_tokens: 256,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1501,7 +1502,7 @@ fn run_sampling(
     let mut sim = SimEngine::new();
     sim.set_text_len(text_len);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+    let sched = support::scheduler(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1649,7 +1650,7 @@ fn multimodal_encode_then_cache_hit() {
     sim.set_queue_depth(2);
     let executor = SimExecutor::new(sim);
     let wake = executor.command_waker();
-    let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
+    let sched = support::scheduler(Box::new(executor), ctrl(), 32).unwrap();
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::with_waker(tx, wake);
@@ -1733,7 +1734,7 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
     let mut sim = SimEngine::new();
     sim.set_text_len(6);
     sim.set_queue_depth(2);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    let mut scheduler = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
     let request = |request_id| {
         generation_request(
             RequestId(request_id),
@@ -1790,7 +1791,7 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
 
     let mut sim = SimEngine::new();
     sim.set_text_len(20);
-    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    let sched = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -1839,7 +1840,7 @@ fn a_latent_image_block_is_written_by_its_own_call() {
     sim.set_text_len(2);
     let mut executor = SimExecutor::new(sim);
     let boundary = executor.observe();
-    let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
+    let sched = support::scheduler(Box::new(executor), ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1854,12 +1855,12 @@ fn a_latent_image_block_is_written_by_its_own_call() {
     );
     request.multimodal_inputs.images[0].encoders = vec![
         ImageEncoderInput {
-            encoder: ImageIngestStep::VaeEncode,
+            encoder: MediaCall::LatentEncoding,
             num_kv_tokens: Some(6),
             max_kv_tokens: None,
         },
         ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: Some(5),
             max_kv_tokens: None,
         },
@@ -1892,10 +1893,10 @@ fn a_latent_image_block_is_written_by_its_own_call() {
         .collect();
     let context: Vec<_> = calls
         .iter()
-        .take_while(|call| call.code != CallKind::Forward(ForwardMode::Decode))
+        .take_while(|call| call.kind != CallKind::Forward(ForwardMode::Decode))
         .collect();
     assert_eq!(
-        context.iter().map(|call| call.code).collect::<Vec<_>>(),
+        context.iter().map(|call| call.kind).collect::<Vec<_>>(),
         vec![
             CallKind::Forward(ForwardMode::Prefill),
             CallKind::Media(MediaCall::LatentEncoding),
@@ -1930,7 +1931,7 @@ fn admission_carries_the_request_input_image_count() {
     sim.set_text_len(4);
     let mut executor = SimExecutor::new(sim);
     let boundary = executor.observe();
-    let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
+    let sched = support::scheduler(Box::new(executor), ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1983,19 +1984,18 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         sim.set_text_len(1_000_000);
         sim.set_queue_depth(queue_depth);
         let executor = Box::new(SimExecutor::new(sim));
-        let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+        let sched = support::scheduler(executor, ctrl(), 32).unwrap();
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
 
-        let req = with_trigger(
+        let mut req = with_trigger(
             generation_request(
                 RequestId(1),
                 text_input(vec![1, 2, 3]),
                 SamplingParams::default(),
                 ImageParams {
                     steps: 3,
-                    max_images: 4,
                     ..Default::default()
                 },
                 GenerationConstraint::Default,
@@ -2003,6 +2003,7 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
             ),
             ImageTrigger::Token { token_id: 1008 },
         );
+        req.max_images = 4;
         let mut erx = handle.submit(req).unwrap();
 
         let mut signature: Vec<(char, u32)> = Vec::new();
@@ -2055,6 +2056,94 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
     );
 }
 
+/// Serves four concurrent requests that open their image branches on the
+/// same step, on a simulator whose worker reports `transfer_tickets`, and
+/// returns how many KV publication calls each submitted batch carried, after
+/// checking that every request finished.
+fn kv_publish_batch_calls(transfer_tickets: u32) -> Vec<usize> {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1_000_000);
+    sim.mut_info_for_test().transfer_tickets = transfer_tickets;
+    let mut executor = SimExecutor::new(sim);
+    let dispatched = executor.observe();
+    let sched = support::scheduler(Box::new(executor), ctrl(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let mut receivers = (1..=4u64)
+        .map(|id| {
+            let request = with_trigger(
+                generation_request(
+                    RequestId(id),
+                    text_input(vec![1, 2, 3]),
+                    SamplingParams {
+                        logit_bias: vec![(2222, 1000.0)],
+                        ..Default::default()
+                    },
+                    ImageParams {
+                        steps: 2,
+                        ..Default::default()
+                    },
+                    GenerationConstraint::Default,
+                    12,
+                ),
+                ImageTrigger::Token { token_id: 2222 },
+            );
+            handle.submit(request).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut finished = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while finished < receivers.len() && Instant::now() < deadline {
+        for receiver in &mut receivers {
+            while let Ok(event) = receiver.try_recv() {
+                if let EngineCoreOutput::Finished { reason, .. } = event {
+                    assert_ne!(reason, FinishReason::Error);
+                    finished += 1;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.shutdown();
+    let _ = jh.join();
+    assert_eq!(finished, receivers.len(), "every request finishes");
+
+    dispatched
+        .try_iter()
+        .filter_map(|event| match event {
+            BatchEvent::Submitted(batch) => Some(
+                batch
+                    .requests
+                    .iter()
+                    .filter(|(call, _)| call.kind == CallKind::Transfer(TransferMode::KvPublish))
+                    .count(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The scheduler keeps no more transfer calls reserved than the transfer
+/// entries the workers report: with one entry, concurrent requests publish
+/// their KV one call at a time and still all finish, while a wider report
+/// lets the same requests share a batch.
+#[test]
+fn transfer_calls_in_flight_stay_within_the_workers_tickets() {
+    let narrow = kv_publish_batch_calls(1);
+    assert!(
+        narrow.iter().sum::<usize>() >= 4 && narrow.iter().all(|&calls| calls <= 1),
+        "publication calls per batch {narrow:?}"
+    );
+
+    let wide = kv_publish_batch_calls(1024);
+    assert!(
+        wide.iter().any(|&calls| calls > 1),
+        "publication calls per batch {wide:?}"
+    );
+}
+
 #[test]
 fn interleave_c4_generated_images_complete() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
@@ -2063,7 +2152,7 @@ fn interleave_c4_generated_images_complete() {
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
     sim.set_text_len(1_000_000);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    let mut scheduler = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
     let mut events = HashMap::new();
     let mut results = HashMap::new();
 
@@ -2080,7 +2169,6 @@ fn interleave_c4_generated_images_complete() {
                 SamplingParams::default(),
                 ImageParams {
                     steps: 2,
-                    max_images: 1,
                     ..Default::default()
                 },
                 GenerationConstraint::Default,
@@ -2142,7 +2230,7 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+    let sched = support::scheduler(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2157,8 +2245,6 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
             },
             ImageParams {
                 steps: 2,
-                max_images: 1,
-                retain_images: false,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2170,7 +2256,7 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     request.image_generation.feedback_next_token = FeedbackNextToken::Bos;
     request.image_generation.num_feedback_positions = 1;
     request.image_generation.feedback_encoders = vec![ImageEncoderInput {
-        encoder: ImageIngestStep::VitEncode,
+        encoder: MediaCall::VisionEncoding,
         num_kv_tokens: Some(1),
         max_kv_tokens: None,
     }];
@@ -2213,18 +2299,17 @@ fn gen_branch_waits_for_model_image_starts() {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000);
         sim.set_queue_depth(depth);
-        let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+        let sched = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
-        let request = with_trigger(
+        let mut request = with_trigger(
             generation_request(
                 RequestId(1),
                 text_input(vec![1, 2, 3]),
                 SamplingParams::default(),
                 ImageParams {
                     steps: 3,
-                    max_images: 3,
                     ..Default::default()
                 },
                 GenerationConstraint::Default,
@@ -2232,6 +2317,7 @@ fn gen_branch_waits_for_model_image_starts() {
             ),
             ImageTrigger::Token { token_id: 2222 },
         );
+        request.max_images = 3;
         let mut events = handle.submit(request).unwrap();
         let mut tokens = Vec::new();
         let mut images = 0;
@@ -2267,7 +2353,7 @@ fn gen_branch_waits_for_model_image_starts() {
 fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    let sched = support::scheduler(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2281,7 +2367,6 @@ fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
         },
         ImageParams {
             steps: 2,
-            max_images: 1,
             ..ImageParams::default()
         },
         GenerationConstraint::GenOnly,
@@ -2318,7 +2403,7 @@ fn und_only_round_close_trigger_cannot_open_gen() {
     sim.set_text_len(2);
     let control = ctrl();
     let close_token_ids = control.eos.clone();
-    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), control, 32).unwrap();
+    let sched = support::scheduler(Box::new(SimExecutor::new(sim)), control, 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2330,7 +2415,6 @@ fn und_only_round_close_trigger_cannot_open_gen() {
             SamplingParams::default(),
             ImageParams {
                 steps: 2,
-                max_images: 1,
                 ..ImageParams::default()
             },
             GenerationConstraint::UndOnly,
@@ -2372,14 +2456,14 @@ fn gen_branch_model_image_starts_spend_budget() {
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
     let trig = SpecialTokenIds {
-        ..SpecialTokenIds::default()
+        ..SimEngine::special_tokens()
     };
-    let sched = Scheduler::new(executor, trig, 32).unwrap();
+    let sched = support::scheduler(executor, trig, 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let req = with_trigger(
+    let mut req = with_trigger(
         generation_request(
             RequestId(1),
             text_input(vec![1, 2, 3]),
@@ -2389,7 +2473,6 @@ fn gen_branch_model_image_starts_spend_budget() {
             },
             ImageParams {
                 steps: 3,
-                max_images: 4,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2397,6 +2480,7 @@ fn gen_branch_model_image_starts_spend_budget() {
         ),
         ImageTrigger::Token { token_id: 2222 },
     );
+    req.max_images = 4;
     let mut erx = handle.submit(req).unwrap();
 
     let mut seq = Vec::new();
@@ -2444,9 +2528,9 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
     let mut sim = SimEngine::new();
     sim.set_text_len(8);
     sim.set_num_units(129);
-    sim.set_page_tokens(256);
+    sim.set_block_size(256);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+    let sched = support::scheduler(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2457,8 +2541,6 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
         SamplingParams::default(),
         ImageParams {
             steps: 3,
-            max_images: 1,
-            retain_images: true,
             ..Default::default()
         },
         GenerationConstraint::Default,
@@ -2498,7 +2580,7 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+    let sched = support::scheduler(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2513,7 +2595,6 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
             },
             ImageParams {
                 steps: 3,
-                max_images: 3,
                 ..Default::default()
             },
             GenerationConstraint::GenOnly,
@@ -2521,6 +2602,7 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
         ),
         ImageTrigger::Token { token_id: 2222 },
     );
+    req.max_images = 3;
     req.image_generation.requires_text_for_image = true;
 
     let mut erx = handle.submit(req).unwrap();
@@ -2572,7 +2654,7 @@ fn gen_branch_literal_trigger_starts_images() {
     sim.set_text_len(1_000_000); // never EOS on its own
     sim.set_queue_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+    let sched = support::scheduler(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2580,14 +2662,13 @@ fn gen_branch_literal_trigger_starts_images() {
     // Request 1 emits 1007, 1008, 1009, ... so the suffix [1008, 1009] matches
     // on its third token. Once the generated image is fed back into context,
     // the simulator restarts its sequence from 1007 and the suffix recurs.
-    let req = with_trigger(
+    let mut req = with_trigger(
         generation_request(
             RequestId(1),
             text_input(vec![1, 2, 3]),
             SamplingParams::default(),
             ImageParams {
                 steps: 3,
-                max_images: 2,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2597,6 +2678,7 @@ fn gen_branch_literal_trigger_starts_images() {
             token_ids: vec![1008, 1009],
         },
     );
+    req.max_images = 2;
     let mut erx = handle.submit(req).unwrap();
 
     let mut seq: Vec<char> = Vec::new();
@@ -2640,7 +2722,7 @@ fn image_start_logit_bias_steers_gen_branch() {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000); // never EOS on its own
         let executor = Box::new(SimExecutor::new(sim));
-        let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+        let sched = support::scheduler(executor, ctrl(), 32).unwrap();
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
@@ -2657,7 +2739,6 @@ fn image_start_logit_bias_steers_gen_branch() {
                 },
                 ImageParams {
                     steps: 3,
-                    max_images: 1,
                     ..Default::default()
                 },
                 GenerationConstraint::Default,
@@ -2708,7 +2789,7 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+    let sched = support::scheduler(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2720,7 +2801,6 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
             SamplingParams::default(),
             ImageParams {
                 steps: 3,
-                max_images: 1,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2764,7 +2844,7 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
     let executor = Box::new(SimExecutor::new(sim));
     let control = ctrl();
     let close_token_ids = control.eos.clone();
-    let sched = Scheduler::new(executor, control, 32).unwrap();
+    let sched = support::scheduler(executor, control, 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2776,7 +2856,6 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
             SamplingParams::default(),
             ImageParams {
                 steps: 2,
-                max_images: 1,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2826,12 +2905,12 @@ fn image_budget_suppresses_biased_image_start() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000); // never EOS on its own
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+    let sched = support::scheduler(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let req = with_trigger(
+    let mut req = with_trigger(
         generation_request(
             RequestId(1),
             text_input(vec![1, 2, 3]),
@@ -2841,7 +2920,6 @@ fn image_budget_suppresses_biased_image_start() {
             },
             ImageParams {
                 steps: 3,
-                max_images: 2,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2849,6 +2927,7 @@ fn image_budget_suppresses_biased_image_start() {
         ),
         ImageTrigger::Token { token_id: 2222 },
     );
+    req.max_images = 2;
     let mut erx = handle.submit(req).unwrap();
 
     let mut images = 0usize;
@@ -2897,7 +2976,8 @@ fn kv_resources_return_after_completion() {
     let handle = uniserve_engine::EngineHandle::new(command_tx);
 
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs).unwrap();
+    let mut sched =
+        support::scheduler_with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs).unwrap();
 
     // Keep receivers alive — a dropped receiver is treated as a cancellation.
     let mut keep_alive = Vec::new();
@@ -2914,7 +2994,6 @@ fn kv_resources_return_after_completion() {
             SamplingParams::default(),
             ImageParams {
                 steps: 4,
-                max_images: 1,
                 ..Default::default()
             },
             *mode,
@@ -2950,7 +3029,7 @@ fn cancellation_storm_retires_every_request() {
     let handle = uniserve_engine::EngineHandle::new(command_tx);
 
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let mut scheduler = Scheduler::new(executor, ctrl(), 32).unwrap();
+    let mut scheduler = support::scheduler(executor, ctrl(), 32).unwrap();
     let receivers = (1..=128)
         .map(|request_id| {
             handle
@@ -2996,7 +3075,7 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
     let mut scheduler =
-        Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs).unwrap();
+        support::scheduler_with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs).unwrap();
     let slow_events = handle
         .submit(generation_request(
             RequestId(1),
@@ -3111,7 +3190,7 @@ fn engine_death_delivers_the_terminal_behind_a_full_event_channel() {
         lost: Arc::clone(&lost),
     });
     let mut scheduler =
-        Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs).unwrap();
+        support::scheduler_with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs).unwrap();
     let mut events = handle
         .submit(generation_request(
             RequestId(1),

@@ -57,10 +57,10 @@ def packed_checkpoint(tmp_path, request):
                         "weight": "w4",
                     },
                     "components": {
-                        "denoiser": {
+                        "transformer": {
                             "enabled": True,
                             "modules": {
-                                "denoiser.transformer.layers.0.mlp.down": {
+                                "transformer.transformer.layers.0.mlp.down": {
                                     "activation_amax": 2688
                                 }
                             },
@@ -102,7 +102,7 @@ def test_packed_checkpoint_keeps_dense_modules_in_bf16(packed_checkpoint):
         '{"mode":"calibrated"}',
         '{"mode":"maximum"}',
         '{"components":{"mlp":"nvfp4"}}',
-        '{"ignored_layers":["denoiser"]}',
+        '{"ignored_layers":["transformer"]}',
     ),
 )
 def test_packed_checkpoint_rejects_runtime_numerical_overrides(

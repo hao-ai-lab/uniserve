@@ -1,7 +1,7 @@
 """SM100 block attention over a borrowed paged prefix.
 
 The provider binds ``uniserve_kernels.attention.prefix_block`` to a layer's
-prefix cache. It serves the reads whose query rows see a window of the
+K/V cache. It serves the reads whose query rows see a window of the
 sequence's paged prefix and their current block, with the visibility
 :class:`uniserve.nn.attention.Attention` defines:
 
@@ -23,7 +23,7 @@ sequence's paged prefix and their current block, with the visibility
 ``P`` is the row's absolute prefix length. Current K/V come from the packed
 projections at the query rows and the prefix from the cache through each
 row's block table, whose first column is its start page when the table
-carries one. A paged input's write addresses are committed before the read,
+carries one. A paged input's slot mapping is committed before the read,
 so later calls find the block in the cache. Device causal flags allow all
 rows to share one launch after the complete cache write. A paged batch
 with only host causal flags uses contiguous runs of equal causality.
@@ -63,23 +63,23 @@ def unsupported(
 ) -> str | None:
     """Return why the kernel cannot serve a layer, or None.
 
-    ``pages`` describes the layer's bound prefix cache: the kernel reads
+    ``pages`` describes the layer's bound K/V cache: the kernel reads
     prefixes only from paged caches storing the query dtype in 16-, 32- or
     64-token pages.
     """
     from uniserve_kernels.attention import prefix_block
 
     if pages is None:
-        return "requires a bound paged prefix cache"
+        return "requires a bound paged K/V cache"
     if pages.quantized:
-        return "does not read per-block FP8 prefix caches"
+        return "does not read per-block FP8 K/V caches"
     if pages.dtype != dtype:
         return "requires the cache to store the query dtype"
     return prefix_block.unsupported_configuration(
         query_heads=num_heads,
         kv_heads=num_kv_heads,
         head_dim=head_dim,
-        page_tokens=pages.page_tokens,
+        block_size=pages.block_size,
         dtype=dtype,
     )
 
@@ -108,7 +108,7 @@ def _serves_causal(*, num_heads, num_kv_heads, head_dim, dtype, cache, window):
             query_heads=num_heads,
             kv_heads=num_kv_heads,
             head_dim=head_dim,
-            page_tokens=pages.page_tokens,
+            block_size=pages.block_size,
             dtype=dtype,
             causal=True,
             window=window,
@@ -175,9 +175,9 @@ class _PrefixBlock(_Operator):
 
         # A later run may read rows an earlier run of the same sequence
         # writes, so the batch's complete write commits before any run; the
-        # runs carry no write addresses.
-        if batch.write_indices is not None:
-            self.update_cache(k, v, indices=batch.write_indices)
+        # runs carry no slot mapping.
+        if batch.slot_mapping is not None:
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
         for rows, _, run in causal_runs(batch):
             if rows.start == rows.stop:
                 continue
@@ -199,8 +199,8 @@ class _PrefixBlock(_Operator):
             # One launch commits the rows' write, fused where the storage
             # allows, and zeroes the ticket counter of the causal launch.
             prepare(self.cache, k, v, batch, semaphore=self._schedule[:1])
-        elif batch.write_indices is not None:
-            self.update_cache(k, v, indices=batch.write_indices)
+        elif batch.slot_mapping is not None:
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
         if not q.shape[0] or not batch.queries.batch_size:
             return
 

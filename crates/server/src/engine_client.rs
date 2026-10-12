@@ -25,17 +25,7 @@ pub use uniserve_engine::EventRx;
 pub use uniserve_engine::StreamCancelCause;
 
 impl EngineClient {
-    /// Returns the sampling controls this engine exposes to served requests:
-    /// every control when the worker supports token sampling, none otherwise.
-    pub fn served_sampling_controls(&self) -> Vec<crate::serving::ServedSamplingControl> {
-        if self.supports_token_sampling() {
-            crate::serving::ServedSamplingControl::ALL.to_vec()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Cancels one request at the consumer's acknowledged output prefix.
+    /// Cancels one request.
     ///
     /// See `EngineClient::cancel` for how an unsubmitted or unknown request is
     /// handled.

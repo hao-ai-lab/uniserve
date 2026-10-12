@@ -145,9 +145,9 @@ def decoded_units_layout(
     its row's leading frames, and the unit division names how many. The rows
     are host products a host rank's encoder reads in place.
     """
-    windows = decoder.frame_slices(size.num_frames)
-    frames = max(window.stop - window.start for window in windows)
-    shape = (len(windows), frames, size.frame.height, size.frame.width, 3)
+    clips = decoder.clips(size.num_frames)
+    frames = max(clip.stop - clip.start for clip in clips)
+    shape = (len(clips), frames, size.frame.height, size.frame.width, 3)
     return OutputLayout(
         shape,
         torch.uint8,
@@ -167,16 +167,16 @@ def encoded_units_layout(
     """
     from uniserve_worker.media.mux import encoded_unit_bytes
 
-    windows = decoder.frame_slices(size.num_frames)
+    clips = decoder.clips(size.num_frames)
     row = encoded_unit_bytes(
-        max(window.stop - window.start for window in windows),
+        max(clip.stop - clip.start for clip in clips),
         size.frame.height,
         size.frame.width,
     )
     return OutputLayout(
-        (len(windows), row),
+        (len(clips), row),
         torch.uint8,
-        (slice(0, len(windows)), slice(0, row)),
+        (slice(0, len(clips)), slice(0, row)),
         variable_axes=(0,),
     )
 
@@ -191,6 +191,22 @@ def _rows(shape: tuple[int, ...], dtype: torch.dtype) -> OutputLayout:
     )
 
 
+def _condition_rows(config: WorkerConfig) -> int:
+    """Return the condition rows a loaded worker's configuration states.
+
+    Raises:
+        ValueError: The capacity is unstated: a worker states it from its
+            model before it sizes any product
+            (``bootstrap.model_loader.loaded_worker_config``).
+    """
+    rows = config.max_condition_rows
+    if rows is None:
+        raise ValueError(
+            "condition products are sized once the condition capacity is stated"
+        )
+    return rows
+
+
 def condition_media_layouts(
     config: WorkerConfig,
     *,
@@ -202,7 +218,7 @@ def condition_media_layouts(
     """Describe the media reader's products, bounded for every request.
 
     A request's condition rows are at most ``config.max_condition_rows`` and
-    its presentation at most ``config.max_sequence_tokens`` tokens, which
+    its presentation at most ``config.max_model_len`` tokens, which
     bound what it reads:
 
     - ``condition_pixels``: ``[pixels, 3]`` RGB24 of every visual condition.
@@ -216,7 +232,7 @@ def condition_media_layouts(
     - ``vision_pixels``: the vision encoder's packed patch rows of every
       vision block, whose tokens all lie in the presentation.
     """
-    rows = config.max_condition_rows
+    rows = _condition_rows(config)
     # A 32-pixel square is the smallest raster whose rows are whole latent
     # patches, so its rows per frame count the rows of one patch.
     patch = image.Config(32, 32)
@@ -236,7 +252,7 @@ def condition_media_layouts(
         "condition_samples": _rows(
             (rows // 2 * audio_encoder.latent_rate, 2), torch.float32
         ),
-        "vision_pixels": vision.pixels_layout(config.max_sequence_tokens),
+        "vision_pixels": vision.pixels_layout(config.max_model_len),
     }
 
 
@@ -281,9 +297,7 @@ def output_layouts(
         and call.entry_point.method == "encode"
     ):
         return component.output_layout(
-            config.max_sequence_tokens
-            if prompt_tokens is None
-            else prompt_tokens,
+            config.max_model_len if prompt_tokens is None else prompt_tokens,
             getattr(torch, config.model_dtype),
         )
 
@@ -295,29 +309,24 @@ def output_layouts(
         isinstance(component, PatchEncoder) and builder is not None
     )
     if condition_encoder and call.entry_point.method == "encode":
-        if config.max_condition_rows == 0:
+        condition_rows = _condition_rows(config)
+        if condition_rows == 0:
             return {}
         if isinstance(component, PatchEncoder):
-            return component.features_layout(config.max_sequence_tokens)
+            return component.features_layout(config.max_model_len)
         # One row's width, from the encoder's own layout of a small input.
         if isinstance(component, VideoEncoder):
             sample = component.output_layout(
                 video.Config(1, image.Config(32, 32))
             )["video"]
             return {
-                "video": _rows(
-                    (config.max_condition_rows, sample.shape[1]), sample.dtype
-                )
+                "video": _rows((condition_rows, sample.shape[1]), sample.dtype)
             }
         # Past the vision and video encoders, ``condition_encoder`` leaves
         # the audio encoder.
         audio = cast(AudioEncoder, component)
         sample = audio.output_layout(audio.latent_rate)["audio"]
-        return {
-            "audio": _rows(
-                (config.max_condition_rows, sample.shape[1]), sample.dtype
-            )
-        }
+        return {"audio": _rows((condition_rows, sample.shape[1]), sample.dtype)}
 
     if isinstance(component, VideoPostprocessor):
         # The post-processor's RGB media units are the decoding call's
@@ -363,7 +372,7 @@ def output_layouts(
 
     size = builder.size(
         frames,
-        config.max_sequence_tokens if prompt_tokens is None else prompt_tokens,
+        config.max_model_len if prompt_tokens is None else prompt_tokens,
         canvas,
         conditions=conditions,
     )

@@ -1,4 +1,4 @@
-"""Loaded media capabilities preserve window values.
+"""Loaded media capabilities preserve clip values.
 
 They also preserve exact sample durations.
 """
@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.h3 import WIDE
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.media import video
 from uniserve.runtime import (
     ExecutionContext,
@@ -21,13 +22,12 @@ from uniserve.tensors import TensorOutput
 from uniserve_models import loading as models
 from uniserve_models.minimax_h3.packing import (
     audio_latent_frames,
-    tile_packing,
+    segment_packing,
     video_latent_frames,
 )
 from uniserve_worker.bootstrap.distributed import initialize_components
 from uniserve_worker.config.deployment import ComponentConfig
-from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.execution.media import decode_video_unit
+from uniserve_worker.execution.media import decode_video_clip
 from uniserve_worker.execution.model_executor import ModelExecutor
 
 pytestmark = [
@@ -40,7 +40,7 @@ pytestmark = [
 
 @torch.inference_mode()
 @pytest.mark.parametrize("precision", ("quality", "balanced"))
-def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(  # noqa: E501
+def test_clip_decoding_matches_native_reconstruction_and_exact_audio_duration(  # noqa: E501
     precision,
 ):
     checkpoint = os.environ.get("UNISERVE_H3_MODEL", "")
@@ -73,10 +73,10 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
         ).model
         runner = ModelExecutor(
             model,
-            WorkerConfig(
+            cpu_worker_config(
                 device="cuda:0",
                 model_dtype="bfloat16",
-                max_sequence_tokens=64,
+                max_model_len=64,
                 max_video_seconds=2,
                 max_request_pool_size=1,
             ),
@@ -105,20 +105,25 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                     .permute(0, 2, 3, 5, 1, 4, 6)
                     .reshape(-1, 96)
                 )
-                packed = tile_packing(
-                    num_text_tokens=64, num_frames=frames, canvas=WIDE
+                packed = segment_packing(
+                    num_frames=frames,
+                    canvas=WIDE,
+                    text_rows=64,
+                    condition_rows=0,
+                    tile=64,
+                    token_multiple=64,
                 )
                 latents = raster.index_select(
                     0, packed.video_raster_indices.to("cuda:0")
                 )
                 original = latents.clone()
-                windows = model.video_decoder.frame_slices(frames)
+                clips = model.video_decoder.clips(frames)
                 with ExecutionContext(
                     model.video_decoder.decoder, attention="auto"
                 ) as context:
                     context.prepare(None)
-                    for index in reversed(range(len(windows))):
-                        window = windows[index]
+                    for index in reversed(range(len(clips))):
+                        clip = clips[index]
                         with context.activate():
                             expected = (
                                 model.video_decoder.decoder(
@@ -128,8 +133,8 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                                 .clone()
                             )
                         for _ in range(2):
-                            result = decode_video_unit(
-                                runner, "video_decoder", latents, window, size
+                            result = decode_video_clip(
+                                runner, "video_decoder", latents, clip, size
                             )
                             actual = result.values[0]
                             assert actual.dtype == torch.float16
@@ -138,7 +143,7 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                                 actual, expected, rtol=0, atol=0
                             )
                             placed = model.video_decoder.place(
-                                actual, window, size
+                                actual, clip, size
                             )
                             assert placed.layout.local_slice[0] == slice(
                                 index, index + 1
@@ -215,13 +220,13 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                 pixel = torch.tensor(
                     [124, 116, 104], dtype=torch.uint8, device="cuda:0"
                 )
-                for index, window in enumerate(windows):
-                    segment = torch.zeros(
+                for index, clip in enumerate(clips):
+                    decoded = torch.zeros(
                         (1, *layout.shape[1:]),
                         dtype=layout.dtype,
                         device="cuda:0",
                     )
-                    segment_layout = replace(
+                    decoded_layout = replace(
                         layout,
                         local_slice=(
                             slice(index, index + 1),
@@ -230,22 +235,22 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                     )
                     result = runner.run_module(
                         "video_decoder",
-                        (TensorOutput(segment, segment_layout),),
+                        (TensorOutput(decoded, decoded_layout),),
                         method="forward",
                         size=size,
-                        frames=(window,),
+                        clips=(clip,),
                         sizes=(size,),
                         state=state,
                     )
                     pixels = result.values[0]
                     assert pixels.shape == (
-                        window.stop - window.start,
+                        clip.stop - clip.start,
                         768,
                         1344,
                         3,
                     )
                     assert torch.eq(pixels, pixel).all()
-                    assert torch.count_nonzero(segment) == 0
+                    assert torch.count_nonzero(decoded) == 0
             for value, expected in retained:
                 torch.testing.assert_close(value, expected, rtol=0, atol=0)
 
@@ -260,8 +265,8 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
             torch.cuda.synchronize()
             with torch.cuda.stream(video_stream):
                 torch.cuda._sleep(2_000_000_000)
-                video_result = decode_video_unit(
-                    runner, "video_decoder", latents, windows[0], size
+                video_result = decode_video_clip(
+                    runner, "video_decoder", latents, clips[0], size
                 )
                 video_done.record(video_stream)
             with torch.cuda.stream(audio_stream):

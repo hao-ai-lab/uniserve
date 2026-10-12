@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 from tests.python.fixtures.launch import worker_args
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve_worker.bootstrap.launch import WorkerIpcEndpoint, run_worker
 from uniserve_worker.protocol.call import ForwardMode
 from uniserve_worker.protocol.identity import CallId
@@ -19,7 +20,6 @@ def _model_config(directory, **overrides):
     directory.mkdir(parents=True, exist_ok=True)
     return worker_args(
         directory,
-        ipc_payload_cap=65536,
         max_batch_tokens=256,
         device="cpu",
         model=str(directory),
@@ -43,7 +43,7 @@ def _reported_endpoint(listener):
 
 def test_native_endpoint_close_releases_service_and_rejects_io():
     service = f"worker-{uuid4().hex}"
-    endpoint = WorkerIpcEndpoint(service, max_payload=65536)
+    endpoint = WorkerIpcEndpoint(service)
     assert not endpoint.closed
     assert endpoint.try_recv() is None
     endpoint.close()
@@ -56,14 +56,14 @@ def test_native_endpoint_close_releases_service_and_rejects_io():
     with pytest.raises(RuntimeError, match="closed"):
         with endpoint:
             pytest.fail("a closed endpoint cannot enter a service scope")
-    with WorkerIpcEndpoint(service, max_payload=65536) as replacement:
+    with WorkerIpcEndpoint(service) as replacement:
         assert replacement.try_recv() is None
 
 
 @pytest.mark.parametrize("failing_scope", (False, True))
 def test_endpoint_scope_closes_and_preserves_body_error(failing_scope):
     service = f"worker-{uuid4().hex}"
-    endpoint = WorkerIpcEndpoint(service, max_payload=65536)
+    endpoint = WorkerIpcEndpoint(service)
     failure = RuntimeError("service startup failed")
     try:
         with endpoint as bound:
@@ -78,7 +78,7 @@ def test_endpoint_scope_closes_and_preserves_body_error(failing_scope):
             "endpoint scope suppressed the startup exception"
         )
     assert endpoint.closed
-    with WorkerIpcEndpoint(service, max_payload=65536) as replacement:
+    with WorkerIpcEndpoint(service) as replacement:
         assert replacement.try_recv() is None
 
 
@@ -91,7 +91,7 @@ def test_model_loading_failure_releases_the_reported_endpoint(tmp_path):
         with pytest.raises(FileNotFoundError, match="modular_model_index.json"):
             run_worker(config)
         service = _reported_endpoint(listener)
-    with WorkerIpcEndpoint(service, max_payload=65536) as endpoint:
+    with WorkerIpcEndpoint(service) as endpoint:
         assert endpoint.try_recv() is None
 
 
@@ -102,16 +102,14 @@ def _stub_config(
     directory.mkdir(parents=True, exist_ok=True)
     return worker_args(
         directory,
-        ipc_payload_cap=65536,
         max_batch_tokens=256,
         max_batch_calls=2,
         device="cpu",
         no_model=True,
-        allow_stub=True,
         rank=rank,
         local_rank=rank,
         world_size=world_size,
-        kv_token_capacity=4096,
+        max_total_tokens=4096,
         components={
             "model": {
                 "ranks": list(range(world_size)),
@@ -128,7 +126,7 @@ def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
     import torch
     import torch.distributed as dist
 
-    from uniserve_worker.errors import WorkerError, WorkerErrorCode
+    from uniserve_worker.errors import ErrorCode, WorkerError
     from uniserve_worker.worker import Worker
 
     dist.init_process_group(
@@ -145,7 +143,7 @@ def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
                 Worker.from_config(
                     _stub_config(tmp_path / "borrowed-world", world_size=2)
                 )
-            assert raised.value.code is WorkerErrorCode.UNSUPPORTED_SETUP
+            assert raised.value.code is ErrorCode.UNSUPPORTED_SETUP
             assert not raised.value.fatal
         else:
             with Worker.from_config(_stub_config(tmp_path / "borrowed-world")):
@@ -248,10 +246,10 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
         token_call,
     )
     from tests.python.fixtures.execution_worker import execution_worker
-    from uniserve_worker.config.execution import LaneConfig, WorkerConfig
+    from uniserve_worker.config.execution import LaneConfig
     from uniserve_worker.protocol.call import CALL_KINDS, CallStatus
 
-    policy = WorkerConfig(
+    policy = cpu_worker_config(
         prefill_cuda_graph=False,
         graph_policy="off",
         lanes=(

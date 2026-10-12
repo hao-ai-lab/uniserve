@@ -22,15 +22,15 @@
 //! 2. The `*_from_table` and `*_from_fb` functions copy fields into owned
 //!    values and report missing required fields, unknown discriminants, and
 //!    illegal field combinations as [`CodecError::Invalid`].
-//! 3. The domain `validate` methods (`Call`, `Batch`, `BatchOutput`,
-//!    `WorkerInfo`, and others) check semantic invariants, reported as
-//!    [`CodecError::Validation`]. Decoders run many of them as values are
-//!    assembled, and aggregate validators such as `Batch::validate` run the
-//!    nested ones again.
+//! 3. The domain `validate` methods (`Batch`, `BatchOutput`, `WorkerInfo`)
+//!    check semantic invariants, reported as [`CodecError::Validation`]. Each
+//!    decoder runs its message's aggregate validator once, after the whole
+//!    message is assembled; the aggregate reaches every nested record, so no
+//!    nested decoder validates its record again.
 //!
 //! [`encode_request`] validates a submitted batch and [`encode_response`]
-//! validates info and result payloads before building the frame, so those
-//! payloads are checked by both sender and receiver.
+//! validates info and result payloads before building the frame, so the
+//! sender never emits a message its receiver would refuse.
 
 use std::collections::BTreeMap;
 
@@ -41,15 +41,15 @@ use uniserve_core::{KvCacheGroup, KvGroupKind, RequestId, SamplingParams, TokenL
 
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
-    ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds,
-    BufferAllocation, BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind,
-    CallStatus, CanvasSampling, CanvasStep, DType, DecodeRange, DiffusionSamplingParams, DimBound,
-    DrawLayout, ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
-    ForwardStats, KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall,
-    MediaOutput, NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
-    SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
-    TransferHandle, TransferMode, TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint,
-    WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
+    ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds, BufferAllocation,
+    BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallOutput, CallStatus,
+    CanvasStep, DType, DecodeRange, DiffusionSamplingParams, DimBound, ErrorCallIdentity,
+    ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode, ForwardStats, GenerationParams,
+    KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall, MediaOutput,
+    NewRequest, Readout, RequestKey, RequestKind, ResponseKind, SamplingState, ShapeBound,
+    TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferMode,
+    TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint, WorkerInfo, WorkerRequest,
+    WorkerResponse, WorkerResponseError,
 };
 use uniserve_core::{
     AudioClip, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator, VideoClip,
@@ -145,15 +145,12 @@ macro_rules! codec_ensure {
     };
 }
 
-/// Validates a worker request and encodes it as a FlatBuffers payload.
+/// Encodes a worker request as a FlatBuffers payload.
 ///
-/// Only a `Submit` request carries a payload to validate; `Batch::validate`
-/// failures return [`CodecError::Validation`]. The returned bytes are the
-/// frame payload without the transport `Header`.
+/// The sender validates a batch where it builds it, and the receiver's
+/// [`decode_request`] validates every frame, so encoding checks nothing. The
+/// returned bytes are the frame payload without the transport `Header`.
 pub fn encode_request(request: &WorkerRequest) -> CodecResult<Vec<u8>> {
-    if let Some(batch) = request.batch() {
-        batch.validate()?;
-    }
     let mut builder = FlatBufferBuilder::new();
     let root = encode::request(&mut builder, request);
     builder.finish(root, None);
@@ -231,12 +228,12 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
     let kind = response_kind_from_fb(response.kind())?;
     let message_id = response.message_id();
     let info = response.info().map(info_from_table).transpose()?;
-    let result = response.result().map(run_result_from_table).transpose()?;
+    let result = response.result().map(batch_output_from_table).transpose()?;
     let payload_count = usize::from(info.is_some()) + usize::from(result.is_some());
 
     // Error metadata occupies independent optional fields on the wire.
     let message = response.message().map(str::to_owned);
-    let code = response.code().map(str::to_owned);
+    let code = response.code().map(error_code_from_fb).transpose()?;
     let fatal = response.fatal();
     let phase = response.phase().map(str::to_owned);
     let route = response.route().map(str::to_owned);
@@ -291,12 +288,11 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
             let message = message
                 .filter(|value| !value.is_empty())
                 .context("error response has no message")?;
-            let code = code.filter(|value| !value.is_empty());
             WorkerResponse::Error {
                 message_id,
                 error: WorkerResponseError {
                     message,
-                    code,
+                    code: code.context("error response has no code")?,
                     fatal: fatal.context("error response has no fatal flag")?,
                     phase,
                     route,
@@ -309,17 +305,16 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
 
 /// Decodes a submitted batch and validates it with `Batch::validate`.
 ///
-/// Absent vectors decode as empty. Calls, admissions, commands, tensor
-/// references, and publications are also validated individually as they are
-/// decoded.
-fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
+/// Absent vectors decode as empty. `Batch::validate` checks every nested
+/// call, admission, command, tensor reference and publication.
+fn batch_from_table(table: fbs::Batch<'_>) -> CodecResult<Batch> {
     // Every collection keeps its wire order: `ForwardBatch::call_indices`
     // are positions in `calls`, and `commands` are an ordered sequence.
-    let run = Batch {
-        batch_id: run.batch_id(),
-        collective_seq: run.collective_seq(),
+    let batch = Batch {
+        batch_id: table.batch_id(),
+        collective_seq: table.collective_seq(),
 
-        calls: run
+        calls: table
             .calls()
             .map(|items| {
                 items
@@ -333,39 +328,39 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
         // Scheduler-owned KV unit tables and the columnar forward rows. The
         // `ForwardBatch` columns are parallel arrays; `ForwardBatch::validate`
         // checks that their lengths agree.
-        block_tables: run
+        block_tables: table
             .block_tables()
             .map(|items| items.iter().map(block_table_from_table).collect())
             .unwrap_or_default(),
-        new_cache_units: run
+        new_cache_units: table
             .new_cache_units()
             .map(|items| items.iter().map(cache_unit_allocation_from_table).collect())
             .unwrap_or_default(),
         forward: ForwardBatch {
-            call_indices: run
+            call_indices: table
                 .forward_call_indices()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
-            request_pool_indices: run
+            request_pool_indices: table
                 .request_pool_indices()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
-            seq_lens: run
+            seq_lens: table
                 .seq_lens()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
-            query_lens: run
+            query_lens: table
                 .query_lens()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
-            write_kv: run
+            write_kv: table
                 .write_kv()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
         },
 
         // Scheduler-owned latent, decode, and persistent-buffer allocations.
-        latent_params: run
+        latent_params: table
             .latent_params()
             .map(|items| {
                 items
@@ -375,7 +370,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             })
             .transpose()?
             .unwrap_or_default(),
-        decode_ranges: run
+        decode_ranges: table
             .decode_ranges()
             .map(|items| {
                 items
@@ -385,7 +380,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             })
             .transpose()?
             .unwrap_or_default(),
-        buffer_allocations: run
+        buffer_allocations: table
             .buffer_allocations()
             .map(|items| {
                 items
@@ -397,7 +392,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             .unwrap_or_default(),
 
         // Decode ordered controls and resolved host inputs.
-        commands: run
+        commands: table
             .commands()
             .map(|items| {
                 items
@@ -407,7 +402,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             })
             .transpose()?
             .unwrap_or_default(),
-        kv_inputs: run
+        kv_inputs: table
             .kv_inputs()
             .map(|items| {
                 items
@@ -417,7 +412,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             })
             .transpose()?
             .unwrap_or_default(),
-        input_products: run
+        input_products: table
             .input_products()
             .map(|items| {
                 items
@@ -431,12 +426,12 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
 
     // Cross-collection references (call ids, buffers, products) can only be
     // checked once the whole batch is decoded.
-    run.validate()?;
-    Ok(run)
+    batch.validate()?;
+    Ok(batch)
 }
 
-/// Decodes one request admission and validates it with `NewRequest::validate`,
-/// which also runs the sampling and image parameter checks.
+/// Decodes one request admission; `NewRequest::validate`, run by
+/// `BatchCommand::validate` from `Batch::validate`, checks it.
 fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewRequest> {
     let admission = NewRequest {
         request_key: request_key_from_table(admission.request_key(), "admission.request_key")?,
@@ -446,7 +441,10 @@ fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewReques
             .map(|ids| ids.iter().collect())
             .unwrap_or_default(),
         input_images: admission.input_images(),
-        ar: admission.ar().map(ar_params_from_table).transpose()?,
+        generation: admission
+            .generation()
+            .map(generation_params_from_table)
+            .transpose()?,
         image: admission.image().map(image_from_table).transpose()?,
         diffusion: admission
             .diffusion()
@@ -457,7 +455,6 @@ fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewReques
             .map(video_admission_from_table)
             .transpose()?,
     };
-    admission.validate()?;
     Ok(admission)
 }
 
@@ -563,8 +560,10 @@ fn video_condition_from_table(table: fbs::VideoCondition<'_>) -> CodecResult<Vid
 }
 
 /// Decodes autoregressive admission parameters, including sampling state.
-fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRequestParams> {
-    Ok(ArRequestParams {
+fn generation_params_from_table(
+    admission: fbs::GenerationParams<'_>,
+) -> CodecResult<GenerationParams> {
+    Ok(GenerationParams {
         sampling: sampling_from_table(
             admission
                 .sampling()
@@ -579,15 +578,6 @@ fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRe
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
         initial_position: admission.initial_position(),
-        canvas: admission.canvas().map(|canvas| CanvasSampling {
-            canvas_length: canvas.canvas_length(),
-            max_steps: canvas.max_steps(),
-            entropy_bound: canvas.entropy_bound(),
-            t_min: canvas.t_min(),
-            t_max: canvas.t_max(),
-            confidence_threshold: canvas.confidence_threshold(),
-            stability_threshold: canvas.stability_threshold(),
-        }),
     })
 }
 
@@ -601,35 +591,50 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
         schedule_points: table.schedule_points(),
         video_shift: table.video_shift(),
         audio_shift: table.audio_shift(),
+        frame_rate: table.frame_rate(),
+        audio_sample_rate: table.audio_sample_rate(),
+        frames: crate::FrameClips {
+            min_frames: table.frames().min_frames(),
+            clip_frames: table.frames().clip_frames(),
+            clip_latent_frames: table.frames().clip_latent_frames(),
+            tail_latent_frames: table.frames().tail_latent_frames(),
+        },
         canvases: table
             .canvases()
             .map(|canvases| {
                 canvases
                     .iter()
-                    .map(|canvas| uniserve_core::Canvas {
-                        width: canvas.width(),
-                        height: canvas.height(),
+                    .map(|served| crate::ServedCanvas {
+                        short_edge: served.short_edge(),
+                        aspect_ratio: served.aspect_ratio().unwrap_or_default().to_owned(),
+                        canvas: uniserve_core::Canvas {
+                            width: served.width(),
+                            height: served.height(),
+                        },
                     })
                     .collect()
             })
             .unwrap_or_default(),
-        max_sequence_rows: table.max_sequence_rows(),
-        condition_tiles: table.condition_tiles().map(|tiles| crate::ConditionTiles {
-            rows: tiles.rows(),
-            video: [tiles.frames(), tiles.height(), tiles.width()],
-        }),
+        references: table
+            .references()
+            .map(|limits| crate::ReferenceLimits {
+                images: limits.images(),
+                videos: limits.videos(),
+                audios: limits.audios(),
+                total: limits.total(),
+            })
+            .unwrap_or_default(),
     }
 }
 
 /// Decodes diffusion admission parameters; `NewRequest::validate` checks the
-/// frame, unit, and step counts and the output raster.
+/// frame and unit counts and the output raster.
 fn diffusion_params_from_table(
     admission: fbs::DiffusionSamplingParams<'_>,
 ) -> CodecResult<DiffusionSamplingParams> {
     Ok(DiffusionSamplingParams {
         num_frames: admission.num_frames(),
         video_units: admission.video_units(),
-        num_inference_steps: admission.num_inference_steps(),
         seed: admission.seed(),
         width: admission.width(),
         height: admission.height(),
@@ -669,7 +674,7 @@ fn cache_unit_allocation_from_table(
 fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<LatentParams> {
     Ok(LatentParams {
         request_key: request_key_from_table(params.request_key(), "latent params.request_key")?,
-        call_id: computation_id_from_fb(params.call_id())?,
+        call_id: call_id_from_fb(params.call_id())?,
         page_table: params
             .page_table()
             .map(|items| items.iter().collect())
@@ -677,8 +682,6 @@ fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<Latent
         latent_units: params.latent_units(),
         height: params.height(),
         width: params.width(),
-        start_step: params.start_step(),
-        step_count: params.step_count(),
     })
 }
 
@@ -686,9 +689,13 @@ fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<Latent
 fn decode_range_from_table(params: fbs::DecodeRange<'_>) -> CodecResult<DecodeRange> {
     Ok(DecodeRange {
         request_key: request_key_from_table(params.request_key(), "decode params.request_key")?,
-        call_id: computation_id_from_fb(params.call_id())?,
+        call_id: call_id_from_fb(params.call_id())?,
         cursor: params.cursor(),
         max_units: params.max_units(),
+        ranks: params
+            .ranks()
+            .map(|ranks| ranks.iter().collect())
+            .unwrap_or_default(),
     })
 }
 
@@ -720,19 +727,15 @@ fn coordinates_from_table(table: Option<fbs::CallCoordinates<'_>>) -> CodecResul
         logical_position: value.logical_position(),
         kv_visible_len: value.kv_visible_len(),
         kv_computed_len: value.kv_computed_len(),
-        flow_step: value.flow_step(),
     })
 }
 
-/// Decodes one call and validates the invariants it carries on its own with
-/// `Call::validate`.
-///
-/// Relationships to other calls and to the batch's allocation tables are
-/// checked afterwards by `Batch::validate`.
+/// Decodes one call; `Batch::validate` checks it and its relationships to
+/// other calls and to the batch's allocation tables.
 fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
     let call = Call {
         request_key: request_key_from_table(call.request_key(), "call.request_key")?,
-        call_id: computation_id_from_fb(call.call_id())?,
+        call_id: call_id_from_fb(call.call_id())?,
         coordinates: coordinates_from_table(call.coordinates())?,
         input_image: call.input_image().map(std::sync::Arc::from),
         kv_input: call.kv_input().map(buffer_id_from_table).transpose()?,
@@ -783,11 +786,10 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             force_finish: state.force_finish(),
         }),
         component: call.component().to_owned(),
-        code: computation_from_fb(call.code())?,
+        kind: call_kind_from_fb(call.kind())?,
         bounds: Bounds {
             max_tokens: call.max_tokens(),
-            max_kv_units: call.max_kv_units(),
-            max_latent_bytes: call.max_latent_bytes(),
+            max_kv_units: 0,
             max_completion_bytes: call.max_completion_bytes(),
             max_transfer_bytes: call.max_transfer_bytes(),
         },
@@ -852,14 +854,12 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             .map(tensor_ref_from_table)
             .transpose()?,
         predicate: call.predicate().map(tensor_ref_from_table).transpose()?,
-        rng: call.rng().map(rng_from_table).transpose()?,
+        image_index: Some(call.image_index()).filter(|&index| index != 0),
     };
-    call.validate()?;
     Ok(call)
 }
 
-/// Decodes one control-command union and validates it with
-/// `BatchCommand::validate`.
+/// Decodes one control-command union; `Batch::validate` checks it.
 fn command_from_table(envelope: fbs::BatchCommandEnvelope<'_>) -> CodecResult<BatchCommand> {
     // The FlatBuffers discriminator selects the only payload table permitted
     // to contribute command fields.
@@ -906,7 +906,6 @@ fn command_from_table(envelope: fbs::BatchCommandEnvelope<'_>) -> CodecResult<Ba
         _ => codec_bail!("batch command union is empty"),
     };
 
-    command.validate()?;
     Ok(command)
 }
 
@@ -985,18 +984,9 @@ fn tensor_ref_from_table(reference: fbs::TensorRef<'_>) -> CodecResult<TensorRef
     Ok(tensor)
 }
 
-/// Decodes deterministic random coordinates, rejecting an unknown draw layout.
-fn rng_from_table(rng: fbs::Rng<'_>) -> CodecResult<Rng> {
-    Ok(Rng {
-        seed: rng.seed(),
-        semantic_index_base: rng.semantic_index_base(),
-        draw_layout: draw_layout_from_fb(rng.draw_layout())?,
-    })
-}
-
 /// Decodes a batch output, preserving report order, then validates it with
 /// `BatchOutput::validate`.
-fn run_result_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutput> {
+fn batch_output_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutput> {
     // Completions and products are independent ordered streams;
     // `BatchOutput::validate` checks both once they are decoded.
     let report = BatchOutput {
@@ -1028,8 +1018,8 @@ fn run_result_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutpu
     Ok(report)
 }
 
-/// Decodes one call completion and validates it with `RequestOutput::validate`.
-fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<RequestOutput> {
+/// Decodes one call completion; `BatchOutput::validate` checks it.
+fn completion_record_from_table(record: fbs::CallOutput<'_>) -> CodecResult<CallOutput> {
     let finish_flags = record
         .finish_flags()
         .context("completion result has no finish flags")?;
@@ -1061,7 +1051,7 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
         .timing_counters()
         .context("completion record has no timing counters")?;
 
-    let record = RequestOutput {
+    let record = CallOutput {
         sampled_logprob: record.sampled_logprob(),
         top_logprobs: record
             .top_logprobs()
@@ -1086,24 +1076,19 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
             .map(|values| values.iter().collect())
             .unwrap_or_default(),
         request_key: request_key_from_table(record.request_key(), "completion.request_key")?,
-        call_id: computation_id_from_fb(record.call_id())?,
+        call_id: call_id_from_fb(record.call_id())?,
         status: call_status_from_fb(record.status())?,
-        product_generations: record
-            .product_generations()
-            .map(|items| items.iter().collect())
-            .unwrap_or_default(),
         error_code: record.error_code().map(error_code_from_fb).transpose()?,
+        error_message: record.error_message().map(str::to_owned),
         timing_counters: TimingCounters {
             queued_us: timing_counters.queued_us(),
             device_us: timing_counters.device_us(),
             copy_us: timing_counters.copy_us(),
             host_us: timing_counters.host_us(),
         },
-        code: computation_from_fb(record.code())?,
-        position: record.position(),
         kv_visible_len: record.kv_visible_len(),
         kv_computed_len: record.kv_computed_len(),
-        num_completed_steps: record.num_completed_steps(),
+        step_index: record.step_index(),
         committed_tokens: record
             .committed_tokens()
             .map(|items| items.iter().collect())
@@ -1117,9 +1102,6 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
         kv_output: record.kv_output().map(kv_transfer_from_table).transpose()?,
     };
 
-    // Domain validation applies cross-field status and generation invariants
-    // after all completion fields have been decoded.
-    record.validate()?;
     Ok(record)
 }
 
@@ -1140,7 +1122,6 @@ fn tensor_publication_from_table(
         )?,
         value,
     };
-    payload.validate()?;
     Ok(payload)
 }
 
@@ -1148,39 +1129,18 @@ fn tensor_publication_from_table(
 fn error_call_from_table(call: fbs::ErrorCallIdentity<'_>) -> CodecResult<ErrorCallIdentity> {
     Ok(ErrorCallIdentity {
         request_key: request_key_from_table(call.request_key(), "error call.request_key")?,
-        call_id: computation_id_from_fb(call.call_id())?,
+        call_id: call_id_from_fb(call.call_id())?,
     })
 }
 
 /// Decodes worker capabilities and validates them with `WorkerInfo::validate`.
 ///
-/// Absent `model_dtype`, `attention_backend`, and `checkpoint_identity` decode
-/// as empty strings, and absent optional vectors as empty. A media call bound
-/// more than once is a malformed frame.
+/// Absent optional vectors decode as empty. A media call bound more than once
+/// is a malformed frame.
 fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
     let info = WorkerInfo {
-        model_name: required_str(info.model_name(), "info.model_name")?,
         endpoint: endpoint_from_table(info.endpoint().context("info has no endpoint")?)?,
-        device: required_str(info.device(), "info.device")?,
         fabric_handles: info.fabric_handles(),
-        transfer_backends: info
-            .transfer_backends()
-            .context("info has no transfer backends")?
-            .iter()
-            .map(str::to_owned)
-            .collect(),
-        world_size: info.world_size(),
-        model_dtype: info.model_dtype().unwrap_or_default().to_owned(),
-        attention_backend: info.attention_backend().unwrap_or_default().to_owned(),
-        weight_formats: info
-            .weight_formats()
-            .map(|values| values.iter().map(str::to_owned).collect())
-            .unwrap_or_default(),
-        activation_formats: info
-            .activation_formats()
-            .map(|values| values.iter().map(str::to_owned).collect())
-            .unwrap_or_default(),
-        checkpoint_identity: info.checkpoint_identity().unwrap_or_default().to_owned(),
         components: info
             .components()
             .map(|items| {
@@ -1189,18 +1149,6 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
                     .map(|item| {
                         Ok(crate::ComponentInfo {
                             name: required_str(item.name(), "component.name")?,
-                            config: uniserve_core::ComponentConfig {
-                                ranks: item
-                                    .ranks()
-                                    .map(|ranks| ranks.iter().map(|rank| rank as usize).collect())
-                                    .unwrap_or_default(),
-                                parallel_config: parallel_from_fb(
-                                    item.parallel_config()
-                                        .context("component requires parallel_config")?,
-                                )?,
-                                distribution: distribution_from_fb(item.distribution())?,
-                                units_per_rank: item.units_per_rank() as usize,
-                            },
                             outputs: item
                                 .outputs()
                                 .context("component requires tensor result declarations")?
@@ -1231,16 +1179,13 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             .map(|items| {
                 items
                     .iter()
-                    .map(computation_from_fb)
+                    .map(call_kind_from_fb)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
             .unwrap_or_default(),
-        queue_depth: info.queue_depth(),
         max_batch_calls: info.max_batch_calls(),
         max_batch_tokens: info.max_batch_tokens(),
-        max_prefill_calls: info.max_prefill_calls(),
-        max_decode_calls: info.max_decode_calls(),
         request_slots: info.request_slots(),
         kv_cache: info.kv_cache().map(kv_cache_from_table).transpose()?,
         latent_page_units: info.latent_page_units(),
@@ -1250,6 +1195,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
         encoder_entry_bytes: info.encoder_entry_bytes(),
         max_unresolved_calls: info.max_unresolved_calls(),
         host_lane_capacity: info.host_lane_capacity(),
+        transfer_tickets: info.transfer_tickets(),
         media_components: {
             let mut components = std::collections::BTreeMap::new();
             if let Some(bindings) = info.media_components() {
@@ -1263,8 +1209,26 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             }
             components
         },
-        num_inference_steps: info.num_inference_steps(),
         video_denoiser: info.video_denoiser().map(video_denoiser_from_table),
+        image_warmups: info
+            .image_warmups()
+            .map(|shapes| {
+                shapes
+                    .iter()
+                    .map(|shape| crate::ImageWarmup {
+                        height: shape.height(),
+                        width: shape.width(),
+                        cfg_text_scale: shape.cfg_text_scale(),
+                        cfg_img_scale: shape.cfg_img_scale(),
+                        negative_token_ids: shape
+                            .negative_token_ids()
+                            .map(|ids| ids.iter().collect())
+                            .unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        canvas_step_rows: info.canvas_step_rows(),
     };
     info.validate()?;
     Ok(info)
@@ -1321,10 +1285,6 @@ fn sampling_from_table(sampling: fbs::SamplingParams<'_>) -> CodecResult<Samplin
         return_logprobs: sampling.return_logprobs(),
         return_prompt_logprobs: sampling.return_prompt_logprobs(),
         n_prompt_logprobs: sampling.n_prompt_logprobs(),
-        logprob_token_ids: sampling
-            .logprob_token_ids()
-            .map(|items| items.iter().collect())
-            .unwrap_or_default(),
         typical_p: sampling.typical_p(),
         forced_token_ids: sampling
             .forced_token_ids()
@@ -1355,12 +1315,6 @@ fn image_from_table(image: fbs::ImageParams<'_>) -> CodecResult<uniserve_core::I
             .negative_prompt()
             .map(str::to_string)
             .unwrap_or_default(),
-        max_images: image.max_images(),
-        image_prompts: image
-            .image_prompts()
-            .map(|items| items.iter().map(str::to_string).collect())
-            .unwrap_or_default(),
-        retain_images: image.retain_images(),
     })
 }
 
@@ -1426,22 +1380,20 @@ fn map_from_table(
 }
 
 /// Decodes one KV cache group: its retention kind, page shape, and this
-/// rank's layers and heads. `window` and `sink` are read only for sliding
-/// windows.
+/// rank's layers and heads. `window` is read only for sliding windows.
 fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
     let kind = if group.kind() == fbs::KvGroupKind::Full {
         KvGroupKind::Full
     } else if group.kind() == fbs::KvGroupKind::SlidingWindow {
         KvGroupKind::SlidingWindow {
             window: group.window(),
-            sink: group.sink(),
         }
     } else {
         codec_bail!("unknown KV group kind {}", group.kind().0)
     };
     Ok(KvCacheGroup {
         kind,
-        page_tokens: group.page_tokens(),
+        block_size: group.block_size(),
         units_per_page: group.units_per_page(),
         layer_ids: group
             .layer_ids()
@@ -1457,8 +1409,6 @@ fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
 /// Decodes the loaded rank identity used by startup and physical products.
 fn endpoint_from_table(endpoint: fbs::WorkerEndpoint<'_>) -> CodecResult<WorkerEndpoint> {
     let value = WorkerEndpoint {
-        worker_id: required_str(endpoint.worker_id(), "endpoint.worker_id")?,
-        rank: endpoint.rank(),
         node: required_str(endpoint.node(), "endpoint.node")?,
         address_space: required_str(endpoint.address_space(), "endpoint.address_space")?,
         incarnation: required_str(endpoint.incarnation(), "endpoint.incarnation")?,
@@ -1487,8 +1437,8 @@ where
 }
 
 /// Decodes a required call identity from its inline wire struct.
-fn computation_id_from_fb(id: Option<&fbs::CallId>) -> CodecResult<CallId> {
-    let id = id.context("computation identity is missing")?;
+fn call_id_from_fb(id: Option<&fbs::CallId>) -> CodecResult<CallId> {
+    let id = id.context("call identity is missing")?;
     Ok(CallId::new(id.batch_id(), id.request_index()))
 }
 
@@ -1496,7 +1446,7 @@ fn computation_id_from_fb(id: Option<&fbs::CallId>) -> CodecResult<CallId> {
 fn buffer_id_from_table(buffer: fbs::BufferId<'_>) -> CodecResult<BufferId> {
     let id = BufferId {
         owner: request_key_from_table(buffer.owner(), "buffer_id.owner")?,
-        producer_call_id: computation_id_from_fb(buffer.producer_call_id())?,
+        producer_call_id: call_id_from_fb(buffer.producer_call_id())?,
         output_index: buffer.output_index(),
         generation: buffer.generation(),
     };
@@ -1540,7 +1490,6 @@ fn token_logprob_from_fb(entry: &fbs::TokenLogprob) -> TokenLogprob {
 fn kv_cache_from_table(config: fbs::KVCacheInfo<'_>) -> CodecResult<KvCacheInfo> {
     Ok(KvCacheInfo {
         num_units: config.num_units(),
-        unit_bytes: config.unit_bytes(),
         groups: config
             .groups()
             .map(|items| {
@@ -1552,65 +1501,6 @@ fn kv_cache_from_table(config: fbs::KVCacheInfo<'_>) -> CodecResult<KvCacheInfo>
             .transpose()?
             .unwrap_or_default(),
         dtype: required_parse(config.dtype(), "info.kv_cache.dtype")?,
-    })
-}
-
-/// Decodes how a component spreads independent units over its ranks; wire
-/// `Local` maps to `None`, which runs the component as one model-parallel
-/// group.
-fn distribution_from_fb(
-    value: fbs::ComponentDistribution,
-) -> CodecResult<Option<uniserve_core::ComponentDistribution>> {
-    match value {
-        fbs::ComponentDistribution::Local => Ok(None),
-        fbs::ComponentDistribution::TemporalUnits => {
-            Ok(Some(uniserve_core::ComponentDistribution::TemporalUnits))
-        }
-        _ => codec_bail!("unknown component distribution"),
-    }
-}
-
-/// Decodes a component's parallel degrees and sequence-parallel strategy.
-///
-/// The strategy is a FlatBuffers union: every variant except
-/// `LocalSequence` requires its payload table. Wire `GatherSequence` maps to
-/// `SequenceParallel::Allgather`. `WorkerInfo::validate` checks the degrees
-/// against component membership.
-fn parallel_from_fb(config: fbs::ParallelConfig<'_>) -> CodecResult<uniserve_core::ParallelConfig> {
-    use uniserve_core::SequenceParallel;
-    let sequence_parallel = match config.sequence_parallel_type() {
-        fbs::SequenceParallel::LocalSequence => SequenceParallel::Local,
-        fbs::SequenceParallel::UlyssesSequence => {
-            let value = config
-                .sequence_parallel_as_ulysses_sequence()
-                .context("missing UlyssesSequence configuration")?;
-            SequenceParallel::Ulysses {
-                ulysses_degree: value.ulysses_degree() as usize,
-            }
-        }
-        fbs::SequenceParallel::GatherSequence => {
-            let value = config
-                .sequence_parallel_as_gather_sequence()
-                .context("missing GatherSequence configuration")?;
-            SequenceParallel::Allgather {
-                allgather_degree: value.allgather_degree() as usize,
-            }
-        }
-        fbs::SequenceParallel::HybridSequence => {
-            let value = config
-                .sequence_parallel_as_hybrid_sequence()
-                .context("missing HybridSequence configuration")?;
-            SequenceParallel::Hybrid {
-                ulysses_degree: value.ulysses_degree() as usize,
-                allgather_degree: value.allgather_degree() as usize,
-            }
-        }
-        _ => codec_bail!("unknown sequence parallel strategy"),
-    };
-    Ok(uniserve_core::ParallelConfig {
-        tensor_parallel_size: config.tensor_parallel_size() as usize,
-        pipeline_parallel_size: config.pipeline_parallel_size() as usize,
-        sequence_parallel,
     })
 }
 
@@ -1687,7 +1577,7 @@ fn transfer_mode_from_fb(value: fbs::TransferMode) -> CodecResult<TransferMode> 
 
 /// Encodes a call kind into the inline `CallKind` struct, setting exactly one
 /// of its three tags and leaving the others at `None`.
-fn computation_to_fb(value: CallKind) -> fbs::CallKind {
+fn call_kind_to_fb(value: CallKind) -> fbs::CallKind {
     let mut encoded = fbs::CallKind::default();
     match value {
         CallKind::Forward(mode) => encoded.set_forward_mode(forward_mode_to_fb(mode)),
@@ -1702,12 +1592,12 @@ fn computation_to_fb(value: CallKind) -> fbs::CallKind {
 /// The struct carries three independent tags whose `None` value means unset.
 /// A frame with zero or several set tags, or with an unknown value in the set
 /// tag, is malformed.
-fn computation_from_fb(value: &fbs::CallKind) -> CodecResult<CallKind> {
+fn call_kind_from_fb(value: &fbs::CallKind) -> CodecResult<CallKind> {
     let present = u8::from(value.forward_mode() != fbs::ForwardMode::None)
         + u8::from(value.media() != fbs::MediaCall::None)
         + u8::from(value.transfer() != fbs::TransferMode::None);
     if present != 1 {
-        codec_bail!("computation must select exactly one classification");
+        codec_bail!("call must select exactly one classification");
     }
     if value.forward_mode() != fbs::ForwardMode::None {
         Ok(CallKind::Forward(forward_mode_from_fb(
@@ -1886,7 +1776,7 @@ fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<Tra
                 height: transfer.height(),
                 width: transfer.width(),
                 latent_units: transfer.latent_units(),
-                step: transfer.step(),
+                step_index: transfer.step_index(),
                 tensor: tensor_transfer_from_table(
                     transfer
                         .tensor()
@@ -1925,25 +1815,6 @@ fn dtype_from_fb(dtype: fbs::DType) -> CodecResult<DType> {
     })
 }
 
-/// Maps a random-draw layout to its stable FlatBuffers discriminant.
-fn draw_layout_to_fb(layout: DrawLayout) -> fbs::DrawLayout {
-    match layout {
-        DrawLayout::TargetSampling => fbs::DrawLayout::TargetSampling,
-        DrawLayout::SpeculativeProposal => fbs::DrawLayout::SpeculativeProposal,
-        DrawLayout::FlowNoise => fbs::DrawLayout::FlowNoise,
-    }
-}
-
-/// Decodes a supported FlatBuffers random-draw layout.
-fn draw_layout_from_fb(layout: fbs::DrawLayout) -> CodecResult<DrawLayout> {
-    Ok(match layout {
-        fbs::DrawLayout::TargetSampling => DrawLayout::TargetSampling,
-        fbs::DrawLayout::SpeculativeProposal => DrawLayout::SpeculativeProposal,
-        fbs::DrawLayout::FlowNoise => DrawLayout::FlowNoise,
-        other => codec_bail!("unknown draw layout {}", other.0),
-    })
-}
-
 /// Maps a call status to its stable FlatBuffers discriminant.
 fn call_status_to_fb(status: CallStatus) -> fbs::CallStatus {
     match status {
@@ -1966,22 +1837,30 @@ fn call_status_from_fb(status: fbs::CallStatus) -> CodecResult<CallStatus> {
 /// Maps a worker error code to its stable FlatBuffers discriminant.
 fn error_code_to_fb(code: ErrorCode) -> fbs::ErrorCode {
     match code {
-        ErrorCode::InvalidCall => fbs::ErrorCode::InvalidCall,
-        ErrorCode::ResourceExhausted => fbs::ErrorCode::ResourceExhausted,
+        ErrorCode::UnsupportedCall => fbs::ErrorCode::UnsupportedCall,
+        ErrorCode::InvalidDescriptor => fbs::ErrorCode::InvalidDescriptor,
+        ErrorCode::UnsupportedSetup => fbs::ErrorCode::UnsupportedSetup,
+        ErrorCode::InputError => fbs::ErrorCode::InputError,
         ErrorCode::ComputeError => fbs::ErrorCode::ComputeError,
-        ErrorCode::Cancelled => fbs::ErrorCode::Cancelled,
-        ErrorCode::Internal => fbs::ErrorCode::Internal,
+        ErrorCode::ResourceError => fbs::ErrorCode::ResourceError,
+        ErrorCode::InvariantViolation => fbs::ErrorCode::InvariantViolation,
+        ErrorCode::FatalWorkerFailure => fbs::ErrorCode::FatalWorkerFailure,
+        ErrorCode::InvalidRequest => fbs::ErrorCode::InvalidRequest,
     }
 }
 
 /// Decodes a supported FlatBuffers worker error code.
 fn error_code_from_fb(code: fbs::ErrorCode) -> CodecResult<ErrorCode> {
     Ok(match code {
-        fbs::ErrorCode::InvalidCall => ErrorCode::InvalidCall,
-        fbs::ErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
+        fbs::ErrorCode::UnsupportedCall => ErrorCode::UnsupportedCall,
+        fbs::ErrorCode::InvalidDescriptor => ErrorCode::InvalidDescriptor,
+        fbs::ErrorCode::UnsupportedSetup => ErrorCode::UnsupportedSetup,
+        fbs::ErrorCode::InputError => ErrorCode::InputError,
         fbs::ErrorCode::ComputeError => ErrorCode::ComputeError,
-        fbs::ErrorCode::Cancelled => ErrorCode::Cancelled,
-        fbs::ErrorCode::Internal => ErrorCode::Internal,
+        fbs::ErrorCode::ResourceError => ErrorCode::ResourceError,
+        fbs::ErrorCode::InvariantViolation => ErrorCode::InvariantViolation,
+        fbs::ErrorCode::FatalWorkerFailure => ErrorCode::FatalWorkerFailure,
+        fbs::ErrorCode::InvalidRequest => ErrorCode::InvalidRequest,
         other => codec_bail!("unknown error code {}", other.0),
     })
 }
@@ -2042,7 +1921,7 @@ fn response_kind_from_fb(kind: fbs::RespKind) -> CodecResult<ResponseKind> {
 ///
 /// Its buffer identities and tensor transfers are validated as they are
 /// decoded; the descriptor as a whole is validated by its container:
-/// `Batch::validate` for `kv_inputs` and `RequestOutput::validate` for a
+/// `Batch::validate` for `kv_inputs` and `CallOutput::validate` for a
 /// completion's `kv_output`.
 fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransfer> {
     Ok(KvTransfer {
@@ -2076,7 +1955,7 @@ fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransf
 fn kv_group_transfer_from_table(group: fbs::KvGroupTransfer<'_>) -> CodecResult<KvGroupTransfer> {
     Ok(KvGroupTransfer {
         start: group.start(),
-        page_tokens: group.page_tokens(),
+        block_size: group.block_size(),
         tensors: group
             .tensors()
             .map(|items| {

@@ -40,8 +40,8 @@ def _worker_config(*, token_capacity: int | None):
         TEST_WORKER_CONFIG,
         device="cuda:0",
         block_size=BLOCK_SIZE,
-        kv_token_capacity=token_capacity,
-        kv_storage_fraction=STATIC_FRACTION,
+        max_total_tokens=token_capacity,
+        mem_fraction_static=STATIC_FRACTION,
     )
 
 
@@ -62,7 +62,7 @@ def test_explicit_kv_capacity_counts_the_units_of_every_group():
     # five-unit 128-token pages hold 1024 tokens in 16 + 8 * 5 units.
     capacity = derive_runtime_kv_capacity(
         pages=((64, 1), (128, 5)),
-        kv_token_capacity=1024,
+        max_total_tokens=1024,
         unit_bytes=4096,
     )
     assert (capacity.num_units, capacity.unit_bytes) == (56, 4096)
@@ -71,14 +71,13 @@ def test_explicit_kv_capacity_counts_the_units_of_every_group():
 def test_automatic_kv_capacity_reserves_all_storage_within_the_grant():
     capacity = derive_runtime_kv_capacity(
         pages=((64, 1),),
-        kv_token_capacity=None,
+        max_total_tokens=None,
         unit_bytes=64 * 128,
         device="cuda:0",
         available_bytes=10 * 64 * 128 + 100,
-        resident_copies=2,
         co_resident_units=2,
     )
-    assert capacity.num_units == 4
+    assert capacity.num_units == 8
 
 
 @pytest.mark.parametrize("tokens", [None, 256])
@@ -86,7 +85,7 @@ def test_kv_storage_cannot_exceed_its_grant(tokens):
     with pytest.raises(ValueError, match="grant"):
         derive_runtime_kv_capacity(
             pages=((64, 1),),
-            kv_token_capacity=tokens,
+            max_total_tokens=tokens,
             unit_bytes=64 * 128,
             available_bytes=64 * 128 - 1,
         )
@@ -96,7 +95,7 @@ def test_automatic_cuda_kv_capacity_requires_a_host_grant():
     with pytest.raises(ValueError, match="host storage grant"):
         derive_runtime_kv_capacity(
             pages=((64, 1),),
-            kv_token_capacity=None,
+            max_total_tokens=None,
             unit_bytes=64 * 128,
             device="cuda:0",
         )

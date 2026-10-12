@@ -25,7 +25,7 @@ import torch
 
 from uniserve.runtime import EventPool
 from uniserve.runtime.device import canonical_device
-from uniserve_worker.errors import WorkerError, WorkerErrorCode, resource_error
+from uniserve_worker.errors import ErrorCode, WorkerError, resource_error
 from uniserve_worker.profiling import timing_events_enabled
 from uniserve_worker.sampling.output import decode_logprobs
 
@@ -37,7 +37,7 @@ _next_buffer_generation = 1
 def _invariant(message: str) -> WorkerError:
     """Construct a classified invariant error for output-buffer misuse."""
     return WorkerError(
-        code=WorkerErrorCode.INVARIANT_VIOLATION,
+        code=ErrorCode.INVARIANT_VIOLATION,
         message=message,
         fatal=True,
     )
@@ -63,6 +63,7 @@ class OutputBuffer:
         "_rows",
         "_generation",
         "_host",
+        "_capacity",
         "_token_cursor",
         "_byte_cursor",
         "_token_cache",
@@ -105,8 +106,9 @@ class OutputBuffer:
         Args:
             rows: Result rows; each must be observed or discarded before the
                 buffer can retire, unless the lease is abandoned.
-            token_capacity: Allocation size in int64 words, shared by token
-                and byte captures.
+            token_capacity: Words the lease may capture, as int64 elements,
+                shared by token and byte captures. The engine's completion
+                bounds size it, so a capture past them is refused.
             devices: Devices that may produce captures. Non-CUDA devices are
                 dropped, and the allocation is pinned only when a CUDA device
                 remains.
@@ -150,19 +152,14 @@ class OutputBuffer:
             device="cpu",
             pin_memory=bool(self.devices),
         )
+        self._capacity = capacity
         self._token_cursor = 0
         self._byte_cursor = 0
 
         self._token_cache: dict[tuple[int, int], tuple[int, ...]] = {}
         self.logprob_layouts: dict[
             tuple[int, int],
-            tuple[
-                tuple[int, ...],
-                tuple[int, ...],
-                tuple[tuple[int, ...], ...],
-                int,
-                int,
-            ],
+            tuple[tuple[int, ...], tuple[int, ...], int],
         ] = {}
         self._logprob_cache: dict[
             tuple[int, int],
@@ -243,6 +240,7 @@ class OutputBuffer:
 
         self.devices = tuple(normalized)
         self._rows = count
+        self._capacity = capacity
         self._generation = _next_buffer_generation
         _next_buffer_generation += 1
 
@@ -445,8 +443,7 @@ class OutputBuffer:
         captures from the head must not cross.
         """
         return (
-            int(self._host.numel()) * int(self._host.element_size())
-            - self._byte_cursor
+            self._capacity * int(self._host.element_size()) - self._byte_cursor
         )
 
     def seal(self) -> None:
@@ -801,23 +798,20 @@ class OutputBuffer:
 class OutputPool:
     """Bounded owner of reusable pinned lane-output allocations.
 
-    At most ``capacity`` buffers are ever allocated, and no lease may exceed
-    ``max_words`` int64 words. A retired buffer is reused, grown if needed,
-    by a later lease.
+    At most ``capacity`` buffers are ever allocated. A retired buffer is
+    reused, grown if needed, by a later lease.
     """
 
     def __init__(
         self,
         *,
         capacity: int,
-        max_words: int,
         event_pool: EventPool,
     ) -> None:
         """Allocate a bounded set of reusable pinned completion buffers."""
         self.capacity = int(capacity)
-        self.max_words = int(max_words)
-        if self.capacity < 1 or self.max_words < 1:
-            raise ValueError("output-pool bounds must be positive")
+        if self.capacity < 1:
+            raise ValueError("output-pool capacity must be positive")
 
         self.event_pool = event_pool
         self._buffers: list[OutputBuffer] = []
@@ -834,16 +828,11 @@ class OutputPool:
     ) -> OutputBuffer:
         """Lease a reset or newly allocated output buffer within pool bounds.
 
-        Raises ``resource_error`` when ``token_capacity`` exceeds
-        ``max_words``, the pool is closed, or all ``capacity`` buffers are
-        leased; the leased buffer's own row-count checks also apply.
+        Raises ``resource_error`` when the pool is closed or all ``capacity``
+        buffers are leased; the leased buffer's own row-count checks also
+        apply.
         """
         words = int(token_capacity)
-        if words > self.max_words:
-            raise resource_error(
-                "lane output exceeds its startup storage bound"
-            )
-
         with self._lock:
             if self._closed:
                 raise resource_error("output pool is closed")

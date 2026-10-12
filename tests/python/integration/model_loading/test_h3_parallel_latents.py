@@ -41,7 +41,7 @@ from uniserve_models.minimax_h3 import (
 )
 from uniserve_models.minimax_h3.packing import (
     audio_latent_frames,
-    tile_packing,
+    segment_packing,
     unpatchify_video,
     video_latent_frames,
 )
@@ -143,7 +143,9 @@ def _generate(
     ranks, shape, axes, parallel = _LAYOUTS[kind]
     encoder_ranks = (0, 2, 1, 3)[:encoder_tp]
     topologies = {
-        "denoiser": DeviceMesh(ranks=ranks, shape=shape, axes=axes, rank=rank),
+        "transformer": DeviceMesh(
+            ranks=ranks, shape=shape, axes=axes, rank=rank
+        ),
         "text_encoder": DeviceMesh(
             ranks=encoder_ranks,
             shape=(encoder_tp,),
@@ -151,7 +153,7 @@ def _generate(
             rank=rank,
         ),
     }
-    attention = {"denoiser": parallel}
+    attention = {"transformer": parallel}
     config = models.read_config(checkpoint, modules=frozenset(topologies))
 
     # Numerical partitions can communicate over multi-axis fibers, such as
@@ -196,8 +198,8 @@ def _generate(
                 features.copy_(encoded)
         world.broadcast(features, src=0, out=features)
         if rank in ranks:
-            denoiser = model.denoiser
-            mesh = meshes["denoiser"]
+            denoiser = model.transformer
+            mesh = meshes["transformer"]
             pipeline = mesh.get_group("pp" if "pp" in axes else ())
             tensor = mesh.get_group("tp" if "tp" in axes else ())
             size = denoiser.make_size(frames, len(token_ids), canvas=WIDE)
@@ -256,9 +258,7 @@ def _generate(
                 for name, value in request.items():
                     value.copy_(staged[name])
                 # The checkpoint is distilled for eight evaluations.
-                schedules = denoiser.make_schedules(
-                    8, shift=None, device=device
-                )
+                schedules = denoiser.make_schedules(device=device)
                 for step_index in range(8):
                     inputs = DenoiserInput(
                         {
@@ -355,13 +355,18 @@ def _collect(checkpoint, requests, kind, directory, *, encoder_tp, precision):
             )
             for name in ("video", "audio")
         }
-        packing = tile_packing(
-            num_text_tokens=len(token_ids), num_frames=frames, canvas=WIDE
+        packing = segment_packing(
+            num_frames=frames,
+            canvas=WIDE,
+            text_rows=64,
+            condition_rows=0,
+            tile=64,
+            token_multiple=64,
         )
         raster = torch.empty_like(joined["video"])
         raster[packing.video_raster_indices] = joined["video"]
         video = unpatchify_video(
-            raster, frames=packing.video_frames, height=48, width=84
+            raster, frames=video_latent_frames(frames), height=48, width=84
         )
         audio = (
             joined["audio"]

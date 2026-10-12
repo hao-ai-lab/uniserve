@@ -34,32 +34,32 @@ if triton is not None:
         k_initialized_ptr,
         v_initialized_ptr,
         num_pages: tl.constexpr,
-        page_size: tl.constexpr,
+        block_size: tl.constexpr,
         row_width: tl.constexpr,
         head_dim: tl.constexpr,
         k_strides: tl.constexpr,
         v_strides: tl.constexpr,
-        block_size: tl.constexpr,
+        tile: tl.constexpr,
     ):
         """Scatter borrowed key and value rows into physical token slots."""
-        # ``num_pages`` and ``page_size`` are the cache's block count and
-        # tokens per block; ``block_size`` is this kernel's tile width
+        # ``num_pages`` and ``block_size`` are the cache's block count and
+        # tokens per block; ``tile`` is this kernel's column width
         # (``_WRITE_BLOCK``), unrelated to the cache block size. Shapes and
         # source strides are constexpr, so each distinct cache shape or
         # source stride tuple compiles its own specialization.
         #
-        # Grid: (token rows, ceil(row_width / block_size)). Each program
-        # scatters a ``block_size``-wide slice of one token's flattened
-        # [heads, head_dim] row. The caches are contiguous, so a slot indexes
-        # a [num_pages * page_size, row_width] view directly.
+        # Grid: (token rows, ceil(row_width / tile)). Each program scatters
+        # a ``tile``-wide slice of one token's flattened [heads, head_dim]
+        # row. The caches are contiguous, so a slot indexes a
+        # [num_pages * block_size, row_width] view directly.
         row = tl.program_id(0)
-        columns = tl.program_id(1) * block_size + tl.arange(0, block_size)
+        columns = tl.program_id(1) * tile + tl.arange(0, tile)
         location = tl.load(slots_ptr + row)
         # -1 excludes the token from both payload and initialization state.
         # Physical block zero is an ordinary, writable numerical block.
         cache_row = location
         persists = location >= 0
-        valid_address = location < num_pages * page_size
+        valid_address = location < num_pages * block_size
         # Triton compiles device asserts only in debug mode, so both launchers
         # (``paged_kv_write`` and ``uniserve_kernels.attention.paged``) pass
         # ``debug=True``.
@@ -96,7 +96,7 @@ if triton is not None:
             # same true value. Payload and flags are written by one launch, so
             # later work on the same stream observes both.
             if tl.program_id(1) == 0:
-                block = cache_row // page_size
+                block = cache_row // block_size
                 tl.store(
                     k_initialized_ptr + block, 1, mask=persists & valid_address
                 )
@@ -217,7 +217,7 @@ def paged_kv_write(
     assertion surfaces asynchronously as a CUDA error rather than a Python
     exception at this call.
     """
-    num_pages, page_size, heads, head_dim = (int(dim) for dim in k_cache.shape)
+    num_pages, block_size, heads, head_dim = (int(dim) for dim in k_cache.shape)
     row_width = heads * head_dim
     if slots.numel() == 0 or row_width == 0:
         return
@@ -233,7 +233,7 @@ def paged_kv_write(
             None if initialized is None else initialized[0],
             None if initialized is None else initialized[1],
             num_pages,
-            page_size,
+            block_size,
             row_width,
             head_dim,
             k_source.stride(),

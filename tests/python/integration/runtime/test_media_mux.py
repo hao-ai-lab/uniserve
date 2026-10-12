@@ -143,8 +143,8 @@ def test_a_unit_that_exceeds_its_reserved_row_fails_by_name():
     "backends",
     [
         ("channel", "channel"),
-        ("shm", "channel"),
-        ("shm", "shm"),
+        ("posix_shm", "channel"),
+        ("posix_shm", "posix_shm"),
         ("local", "channel"),
         ("local", "local"),
     ],
@@ -174,7 +174,7 @@ def test_encoded_units_cross_hosts_without_transferring_reserved_padding(
             capacity=TransferCapacity(1024 * 1024, 8), event_pool=EventPool()
         )
         for name, kind in (
-            ("shm", ShmTransport),
+            ("posix_shm", ShmTransport),
             ("channel", ChannelTransport),
             ("local", LocalTransport),
         )

@@ -8,7 +8,8 @@ sources ``config_sources`` names (downloaded for a Hub checkpoint, or
 header-only for a dummy Hub load); ``Model`` builds the module tree
 from that config; ``checkpoint_sources`` and ``checkpoint_mappings`` place
 checkpoint tensors into the tree; ``precisions(config)`` names the weight
-precision presets of a configuration and ``checkpoint_precision(config)`` is
+precision presets of a configuration, listing first the one a dense
+checkpoint loads without a selector, and ``checkpoint_precision(config)`` is
 its base configuration for a calibrated ModelOpt checkpoint; a package may
 also offer a ``weight_config(config, *, preset, **components)`` factory for
 per-component selections; ``entry_points`` declares the methods

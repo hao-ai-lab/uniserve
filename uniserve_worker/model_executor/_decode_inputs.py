@@ -47,7 +47,7 @@ if triton is not None:
         query_lengths,
         query_offsets,
         prefix_offsets,
-        write_indices,
+        slot_mapping,
         rows,
         unit_table_stride: tl.constexpr,
         unit_row_stride: tl.constexpr,
@@ -60,7 +60,7 @@ if triton is not None:
         block_table_stride: tl.constexpr,
         block_table_row_stride: tl.constexpr,
         start_page_stride: tl.constexpr,
-        write_stride: tl.constexpr,
+        slot_stride: tl.constexpr,
         max_rows: tl.constexpr,
         row_block: tl.constexpr,
         columns,
@@ -69,7 +69,7 @@ if triton is not None:
         """Gather one table's cells and per-row decode scalars.
 
         Axis 1 of the grid selects the numerical table. On it, program 0
-        writes the table's start pages and write addresses, and on table 0
+        writes the table's start pages and slot mapping, and on table 0
         also every shared per-row scalar column; the other programs copy the
         table's cells. Their outputs are disjoint, and the only input a
         program stores to (``request_pool_indices`` past ``rows``, on table
@@ -78,9 +78,9 @@ if triton is not None:
         """
         table = tl.program_id(1)
 
-        # [group, page tokens, window or -1] of this table.
+        # [group, block size, window or -1] of this table.
         group = tl.load(table_shapes + table * 3)
-        page_tokens = tl.load(table_shapes + table * 3 + 1)
+        block_size = tl.load(table_shapes + table * 3 + 1)
         window = tl.load(table_shapes + table * 3 + 2)
         units = request_unit_tables + table * unit_table_stride
 
@@ -103,7 +103,7 @@ if triton is not None:
             # A windowed table stages pages from the first one the decode
             # query's window reaches; a full table from page zero.
             first = tl.where(
-                window >= 0, tl.maximum(cache - window, 0) // page_tokens, 0
+                window >= 0, tl.maximum(cache - window, 0) // block_size, 0
             )
             tl.store(
                 start_pages + table * start_page_stride + offsets,
@@ -113,7 +113,7 @@ if triton is not None:
 
             # Cache length identifies the append page and its token offset.
             # Inactive rows and unavailable pages keep the public -1 sentinel.
-            column = cache // page_tokens - installed
+            column = cache // block_size - installed
             write_units = tl.load(
                 units + slots * unit_row_stride + column,
                 mask=live_rows & (column >= 0) & (column < request_width),
@@ -121,11 +121,11 @@ if triton is not None:
             )
             writes = tl.where(
                 write_units >= 0,
-                write_units.to(tl.int64) * page_tokens + cache % page_tokens,
+                write_units.to(tl.int64) * block_size + cache % block_size,
                 -1,
             )
             tl.store(
-                write_indices + table * write_stride + offsets,
+                slot_mapping + table * slot_stride + offsets,
                 writes,
                 mask=scalar_mask,
             )
@@ -203,7 +203,7 @@ if triton is not None:
             )
             cell_first = tl.where(
                 window >= 0,
-                tl.maximum(cell_cache - window, 0) // page_tokens,
+                tl.maximum(cell_cache - window, 0) // block_size,
                 0,
             )
             source = cell_first - cell_installed + cells
@@ -239,7 +239,7 @@ def gather_request_decode_inputs(
     query_lengths: torch.Tensor,
     query_offsets: torch.Tensor,
     prefix_offsets: torch.Tensor,
-    write_indices: torch.Tensor,
+    slot_mapping: torch.Tensor,
     rows: int,
     columns: int,
 ) -> None:
@@ -247,13 +247,13 @@ def gather_request_decode_inputs(
 
     ``request_pool_indices[:rows]`` identifies scheduler-owned request slots.
     The function materializes, for every numerical table ``t`` described by
-    ``table_shapes[t] = (group, page_tokens, window or -1)``, the slots'
+    ``table_shapes[t] = (group, block_size, window or -1)``, the slots'
     units from their first staged page into ``block_tables[t]``, that page
     into ``start_pages[t]`` and the append address into
-    ``write_indices[t]``; and, shared by all tables, next-token ids and
+    ``slot_mapping[t]``; and, shared by all tables, next-token ids and
     position axes, cache/query lengths and offsets. A row's first staged
     page of a windowed table is the first page its window reaches,
-    ``max(0, cache - window) // page_tokens``; of a full table, page zero.
+    ``max(0, cache - window) // block_size``; of a full table, page zero.
     ``request_unit_tables[t, slot]`` holds the slot's units from its
     installed start page ``request_start_pages[group, slot]`` on. Each table
     stages ``columns`` cells per row. Output rows beyond ``rows`` are
@@ -266,7 +266,7 @@ def gather_request_decode_inputs(
     table and slot strides of ``request_unit_tables``, the group stride of
     ``request_start_pages``, the first-axis strides of ``request_tokens`` and
     ``request_positions``, the table and row strides of ``block_tables``, the
-    table strides of ``start_pages`` and ``write_indices``, and the axis
+    table strides of ``start_pages`` and ``slot_mapping``, and the axis
     stride of ``positions``; every other dimension is indexed with unit
     stride, which is checked for the columns of ``positions`` and the unit
     tables.
@@ -299,7 +299,7 @@ def gather_request_decode_inputs(
         query_lengths,
         query_offsets,
         prefix_offsets,
-        write_indices,
+        slot_mapping,
     )
     device = request_pool_indices.device
     if device.type != "cuda" or any(
@@ -324,7 +324,7 @@ def gather_request_decode_inputs(
         or request_start_pages.ndim != 2
         or block_tables.ndim != 3
         or start_pages.ndim != 2
-        or write_indices.ndim != 2
+        or slot_mapping.ndim != 2
     ):
         raise ValueError("request-indexed decode tables have the wrong rank")
 
@@ -340,8 +340,8 @@ def gather_request_decode_inputs(
         or block_tables.stride(2) != 1
         or int(start_pages.shape[0]) != tables
         or int(start_pages.shape[1]) < max_rows
-        or int(write_indices.shape[0]) != tables
-        or int(write_indices.shape[1]) < max_rows
+        or int(slot_mapping.shape[0]) != tables
+        or int(slot_mapping.shape[1]) < max_rows
         or int(columns) < 1
     ):
         raise ValueError(
@@ -385,7 +385,7 @@ def gather_request_decode_inputs(
         block_table_stride=int(block_tables.stride(0)),
         block_table_row_stride=int(block_tables.stride(1)),
         start_page_stride=int(start_pages.stride(0)),
-        write_stride=int(write_indices.stride(0)),
+        slot_stride=int(slot_mapping.stride(0)),
         max_rows=max_rows,
         row_block=triton.next_power_of_2(max_rows),
         columns=int(columns),

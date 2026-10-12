@@ -3,13 +3,14 @@
 Also shared computation capabilities.
 """
 
+from . import mot
 from .decoder import ImageDecoder
 from .denoiser import (
     Condition,
     ConditionRole,
-    ConditionTiles,
     Denoiser,
     ImageDenoiser,
+    ReferenceLimits,
     VideoDenoiser,
     VideoSize,
 )
@@ -50,6 +51,7 @@ from .video import (
 )
 
 __all__ = [
+    "mot",
     "DenoiserInput",
     "EmbeddingReplacement",
     "ComponentEntry",
@@ -72,10 +74,10 @@ __all__ = [
     "Denoiser",
     "ImageDenoiser",
     "VideoDenoiser",
+    "ReferenceLimits",
     "VideoSize",
     "Condition",
     "ConditionRole",
-    "ConditionTiles",
     "ImageDecoder",
     "AudioDecoder",
     "AudioEncoder",

@@ -71,12 +71,6 @@ pub(super) struct RequestOutput {
     pub(super) events: EventJournal,
     /// `TextToken` events accepted into the ordered output.
     pub(super) tokens_sent: usize,
-    /// Text-token count the frontend decoder has acknowledged.
-    ///
-    /// `Scheduler::acknowledge_output` treats an acknowledgement that exceeds
-    /// `tokens_sent` or moves backwards as an error finish; `mark_stopped` and
-    /// cancellation apply the same upper bound.
-    pub(super) tokens_acked: usize,
     /// Prompt score positions received from worker completions.
     pub(super) prompt_logprobs_processed: usize,
     /// Prompt score positions published as `PromptLogprobs` events.
@@ -97,7 +91,6 @@ impl RequestOutput {
         Self {
             events: EventJournal::new(event_tx),
             tokens_sent: 0,
-            tokens_acked: 0,
             prompt_logprobs_processed: 0,
             prompt_logprobs_emitted: 0,
             decoder_boundaries: VecDeque::new(),
@@ -248,7 +241,7 @@ impl Scheduler {
     pub(super) fn resolve_decode_text(
         &mut self,
         id: RequestId,
-        mut record: uniserve_worker_ipc::RequestOutput,
+        mut record: uniserve_worker_ipc::CallOutput,
     ) {
         self.activate_request_tables(id);
 
@@ -313,7 +306,7 @@ impl Scheduler {
                 (
                     st.can_open_gen_branch(),
                     st.num_generated_images,
-                    st.req.image.max_images as usize,
+                    st.req.max_images as usize,
                 )
             };
             // A direct trigger token opens the image branch without being
@@ -368,10 +361,10 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         call: Call,
-        mut record: uniserve_worker_ipc::RequestOutput,
+        mut record: uniserve_worker_ipc::CallOutput,
         media: Option<&SharedMedia>,
     ) {
-        let call_variant = call.code;
+        let call_variant = call.kind;
 
         // Prompt scores share the completion but precede its phase transition.
         if !record.prompt_logprobs.is_empty() {
@@ -389,10 +382,7 @@ impl Scheduler {
 
                 // State-ingest and feedback calls use autoregressive extension
                 // transport while retaining their own completion transitions.
-                match (
-                    consumes_image_features(&call),
-                    is_feedback_computation(&call),
-                ) {
+                match (consumes_image_features(&call), is_feedback_call(&call)) {
                     // A prefill with neither image features nor a token output
                     // is the `CloseKv` write. It publishes nothing, and
                     // `process_generation_result` has already moved the request
@@ -419,10 +409,11 @@ impl Scheduler {
                             })
                         {
                             let bos = self.ctrl.bos;
+                            let generates_canvases = self.config.canvas.is_some();
                             if let Some(st) = self.running.get_mut(&id) {
                                 if st.req.is_readout() {
                                     st.phase = Phase::Readout;
-                                } else if st.req.is_canvas_generation() {
+                                } else if generates_canvases {
                                     st.phase = Phase::Canvas;
                                 } else {
                                     st.next_token = bos;
@@ -453,7 +444,6 @@ impl Scheduler {
 
                         if let Some(st) = self.running.get_mut(&id) {
                             st.num_generated_images += 1;
-                            st.text_tokens_since_image = 0;
                             st.round_token_ids.clear();
                         }
 
@@ -483,7 +473,7 @@ impl Scheduler {
                         let (can_open_gen_branch, images_done, max_images) = (
                             st.can_open_gen_branch(),
                             st.num_generated_images,
-                            st.req.image.max_images as usize,
+                            st.req.max_images as usize,
                         );
 
                         let direct_trigger = self
@@ -551,8 +541,9 @@ impl Scheduler {
                 // follow. So does a canvas-generating request's, and each of
                 // its block commits, which extend the context the same way;
                 // the next block follows.
+                let generates_canvases = self.config.canvas.is_some();
                 if let Some(st) = self.running.get_mut(&id)
-                    && (st.req.is_readout() || st.req.is_canvas_generation())
+                    && (st.req.is_readout() || generates_canvases)
                 {
                     st.phase = if st.req.is_readout() {
                         Phase::Readout
@@ -619,7 +610,7 @@ impl Scheduler {
                     return;
                 };
                 let (images_done, max_images) =
-                    (st.num_generated_images, st.req.image.max_images as usize);
+                    (st.num_generated_images, st.req.max_images as usize);
 
                 // A direct trigger token opens the image branch without being
                 // published as text.
@@ -689,19 +680,15 @@ impl Scheduler {
                 self.finish(id, FinishReason::Completed);
             }
             CallKind::Media(MediaCall::Denoising) => {
-                // Publish every newly committed step exactly once, including steps
-                // coalesced into a single worker completion. `bounds.max_tokens`
-                // is the call's step count, so subtracting it from the reported
-                // total gives the steps completed before this call. Step
-                // numbers saturate at `u16::MAX` to fit the event fields.
+                // Publish the newly committed step exactly once. A denoising
+                // call covers one step, so the steps completed before it are
+                // one fewer than the reported total. Step numbers saturate at
+                // `u16::MAX` to fit the event fields.
                 let Some(st) = self.running.get(&id) else {
                     return;
                 };
                 let (image_id, h, w, steps, prev_sd) = {
-                    let prev = record
-                        .num_completed_steps
-                        .saturating_sub(call.bounds.max_tokens)
-                        .min(u32::from(u16::MAX)) as u16;
+                    let prev = record.step_index.saturating_sub(1).min(u32::from(u16::MAX)) as u16;
                     (
                         st.image_id,
                         st.req.image.height,
@@ -805,14 +792,13 @@ impl Scheduler {
                     // ends with this image.
                     if let Some(st) = self.running.get_mut(&id) {
                         st.num_generated_images += 1;
-                        st.text_tokens_since_image = 0;
                     }
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
             CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {
-                match is_feedback_computation(&call) {
+                match is_feedback_call(&call) {
                     // Input-image encoding of the next block the context needs
                     // (`next_context_encode`): the product feeds the call that
                     // writes the block and, when the request writes the
@@ -905,7 +891,7 @@ impl Scheduler {
                         // vision block joins the context prefill that reaches
                         // it. Encodes follow the blocks' context order.
                         if let Some(st) = self.running.get_mut(&id) {
-                            if step == ImageIngestStep::VaeEncode {
+                            if step == MediaCall::LatentEncoding {
                                 st.input_image_features = Some(selected_product);
                                 st.phase = Phase::IngestState;
                             } else {
@@ -1096,7 +1082,6 @@ impl Scheduler {
 
             st.denoising.close();
             st.image_id += 1;
-            st.text_tokens_since_image = 0;
             st.phase = Phase::CloseKv;
             st.image_reservation_pending = true;
         }
@@ -1165,7 +1150,6 @@ impl Scheduler {
             return false;
         };
         st.generated_token_ids.push(tok);
-        st.text_tokens_since_image = st.text_tokens_since_image.saturating_add(1);
         if !st.req.emits_text() {
             return false;
         }
@@ -1186,7 +1170,6 @@ impl Scheduler {
             return;
         };
         st.generated_token_ids.extend_from_slice(&tokens);
-        st.text_tokens_since_image = st.text_tokens_since_image.saturating_add(tokens.len());
         if !st.req.emits_text() || tokens.is_empty() {
             return;
         }
@@ -1497,7 +1480,7 @@ impl Scheduler {
         // acknowledges the ordered close command.
         let mut awaits_close = false;
         let mut allocations = None;
-        let mut flow_prefix = None;
+        let mut guidance_prefix = None;
         if let Some(mut st) = self.running.remove(&id) {
             let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
             if st.worker_registered {
@@ -1508,7 +1491,7 @@ impl Scheduler {
                 };
                 self.inflight.pending_commands.push_back(command);
                 let mut allocations: Vec<RequestAllocations> = st
-                    .flow_prefix
+                    .guidance_prefix
                     .take()
                     .into_iter()
                     .map(|prefix| prefix.allocations)
@@ -1533,7 +1516,7 @@ impl Scheduler {
                 awaits_close = true;
             } else {
                 allocations = st.allocations.take();
-                flow_prefix = st.flow_prefix.take();
+                guidance_prefix = st.guidance_prefix.take();
             }
 
             // Remove admission reservations before exposing terminal output so
@@ -1543,14 +1526,6 @@ impl Scheduler {
                 .storage
                 .reserved_encoder_entries
                 .saturating_sub(st.req.num_encoder_cache_entries());
-            if st.reserve_worstcase {
-                let reserved = self.storage.cache().map_or(0, |cache| {
-                    cache
-                        .coordinator
-                        .units_for_tokens(st.max_reserved_kv_tokens)
-                });
-                self.storage.reserved_units = self.storage.reserved_units.saturating_sub(reserved);
-            }
 
             // Releasing the request's encoder pins may make cache products
             // physically reclaimable by their owning worker.
@@ -1585,7 +1560,7 @@ impl Scheduler {
         // Unregistered requests have no outstanding worker reference, so their
         // allocations can return to the scheduler immediately.
         if !awaits_close {
-            if let Some(prefix) = flow_prefix {
+            if let Some(prefix) = guidance_prefix {
                 prefix.allocations.free(&mut self.storage);
             }
             if let Some(allocations) = allocations {

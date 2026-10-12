@@ -9,6 +9,8 @@
 //! flight until the scheduler blocks for a completion, and the record of
 //! submissions and resolutions is a function of scheduling decisions alone.
 
+mod support;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::thread;
@@ -21,8 +23,7 @@ use uniserve_core::{
 };
 use uniserve_engine::{
     BatchEvent, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch,
-    RequestPlacement, Scheduler, SimEngine, SimExecutor, SpecialTokenIds, VideoDenoiserInfo,
-    WorkerId,
+    RequestPlacement, SchedulerConfig, SimEngine, SimExecutor, VideoDenoiserInfo, WorkerId,
 };
 use uniserve_worker_ipc::{
     Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes, ShapeBound,
@@ -34,7 +35,8 @@ const STEPS: u32 = 3;
 /// Every request carries the same short prompt.
 const PROMPT: [u32; 3] = [11, 12, 13];
 
-/// Declares one loaded component with the outputs it produces.
+/// Declares one loaded component with the outputs it produces and the
+/// placement the engine launched it with.
 ///
 /// A distributed component reconstructs one media unit per rank per round
 /// (`units_per_rank` of one) and keeps the default parallel config, whose
@@ -44,17 +46,19 @@ fn component(
     ranks: Vec<usize>,
     distributed: bool,
     outputs: Vec<OutputInfo>,
-) -> ComponentInfo {
+) -> (ComponentInfo, ComponentConfig) {
     let mut config = ComponentConfig::parallel(ranks, Default::default());
     if distributed {
         config.distribution = Some(ComponentDistribution::TemporalUnits);
     }
 
-    ComponentInfo {
-        name: name.to_owned(),
+    (
+        ComponentInfo {
+            name: name.to_owned(),
+            outputs,
+        },
         config,
-        outputs,
-    }
+    )
 }
 
 /// A small tensor result, indexed by media unit or row along a device-actual
@@ -134,29 +138,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
     sim.set_queue_depth(64);
     sim.set_results_on_wait(true);
 
-    let info = sim.mut_info_for_test();
-    info.supported_calls = MediaCall::ALL
-        .iter()
-        .filter(|call| **call != MediaCall::ImageDecoding)
-        .map(|call| CallKind::Media(*call))
-        .collect();
-    info.num_inference_steps = STEPS;
-    info.video_denoiser = Some(VideoDenoiserInfo {
-        tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
-        schedule_points: STEPS + 1,
-        video_shift: 12.0,
-        audio_shift: 3.0,
-        canvases: Vec::new(),
-        max_sequence_rows: None,
-        condition_tiles: None,
-    });
-    // The denoiser's latent pool holds the reserved sentinel page plus two
-    // pages of samples per request slot.
-    info.latent_page_units = 256;
-    info.latent_pages = 2 * info.request_slots + 1;
-    info.world_size = decoder_ranks as u32;
-    info.host_lane_capacity = host_lane_capacity;
-    info.components = vec![
+    sim.place_components(vec![
         component(
             "media_reader",
             vec![0],
@@ -225,7 +207,35 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
             vec![output("audio_samples", None)],
         ),
         component("muxer", vec![0], false, Vec::new()),
-    ];
+    ]);
+
+    let info = sim.mut_info_for_test();
+    info.supported_calls = MediaCall::ALL
+        .iter()
+        .filter(|call| **call != MediaCall::ImageDecoding)
+        .map(|call| CallKind::Media(*call))
+        .collect();
+    info.video_denoiser = Some(VideoDenoiserInfo {
+        tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
+        schedule_points: STEPS + 1,
+        video_shift: 12.0,
+        audio_shift: 3.0,
+        frame_rate: 24,
+        audio_sample_rate: 32_000,
+        frames: uniserve_worker_ipc::FrameClips {
+            min_frames: 22,
+            clip_frames: 17,
+            clip_latent_frames: 5,
+            tail_latent_frames: 2,
+        },
+        canvases: Vec::new(),
+        references: Default::default(),
+    });
+    // The denoiser's latent pool holds the reserved sentinel page plus two
+    // pages of samples per request slot.
+    info.latent_page_units = 256;
+    info.latent_pages = 2 * info.request_slots + 1;
+    info.host_lane_capacity = host_lane_capacity;
     info.media_components = BTreeMap::from([
         (MediaCall::MediaReading, "media_reader".to_owned()),
         (MediaCall::VisionEncoding, "text_encoder".to_owned()),
@@ -256,7 +266,6 @@ fn video_request(id: u64, video_units: u32) -> Request {
         sampling: DiffusionSamplingParams {
             num_frames: 16,
             video_units,
-            num_inference_steps: STEPS,
             seed: id,
             // The fixture decoder's raster (`video_worker`).
             width: 24,
@@ -379,7 +388,8 @@ impl Served {
 fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     let mut executor = SimExecutor::new(video_worker(1, 1));
     let boundary = executor.observe();
-    let scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32).unwrap();
+    let scheduler =
+        support::scheduler(Box::new(executor), SimEngine::special_tokens(), 32).unwrap();
     let (tx, commands) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let mut stream = handle
@@ -394,7 +404,6 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
             sampling: DiffusionSamplingParams {
                 num_frames: 128,
                 video_units: 32,
-                num_inference_steps: STEPS,
                 seed: 1,
                 width: 24,
                 height: 16,
@@ -458,7 +467,7 @@ fn media_calls(batch: &ExecutionBatch) -> Vec<ObservedCall> {
         .requests
         .iter()
         .filter_map(|(call, placement)| {
-            let CallKind::Media(media_call) = call.code else {
+            let CallKind::Media(media_call) = call.kind else {
                 return None;
             };
             Some(ObservedCall {
@@ -480,10 +489,16 @@ fn serve(sim: SimEngine, requests: Vec<Request>) -> Served {
 fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option<usize>) -> Served {
     let mut executor = SimExecutor::new(sim);
     let boundary = executor.observe();
-    let mut scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32).unwrap();
-    if let Some(bound) = max_num_waiting {
-        scheduler.set_max_num_waiting(bound);
-    }
+    let scheduler = support::scheduler_with(
+        Box::new(executor),
+        SimEngine::special_tokens(),
+        SchedulerConfig {
+            max_batch: 32,
+            max_num_waiting,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
 
@@ -542,7 +557,7 @@ fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option
         match event {
             BatchEvent::Submitted(batch) => {
                 readers.extend(batch.requests.iter().filter_map(|(call, placement)| {
-                    let CallKind::Media(media_call) = call.code else {
+                    let CallKind::Media(media_call) = call.kind else {
                         return None;
                     };
                     Some((
@@ -900,7 +915,6 @@ fn reference_request(id: u64, media: &Arc<MediaSource>) -> Request {
         sampling: DiffusionSamplingParams {
             num_frames: 16,
             video_units: 2,
-            num_inference_steps: STEPS,
             seed: id,
             width: 24,
             height: 16,
@@ -915,7 +929,7 @@ fn call_indices(served: &Served, request: RequestId, media_call: MediaCall) -> V
         .iter()
         .enumerate()
         .filter(|(_, (call, _))| {
-            call.request_key.request_id == request && call.code == CallKind::Media(media_call)
+            call.request_key.request_id == request && call.kind == CallKind::Media(media_call)
         })
         .map(|(index, _)| index)
         .collect()
@@ -931,10 +945,11 @@ fn leading(product: &uniserve_worker_ipc::TensorRef) -> u32 {
 
 /// A reference request reads its media first, then encodes its vision blocks
 /// before the text that splices them in, encodes its visual condition units
-/// in rounds across the latent encoder's ranks and its audio tracks in one
-/// further call, and prepares its latents from the text features and every
-/// condition's rows, in order. Each product carries the request's exact
-/// size, and each call names the components its graph reads it with.
+/// in rounds on the latent encoder's ranks that the prompt's encoding leaves
+/// free, and its audio tracks in one further call, and prepares its latents
+/// from the text features and every condition's rows, in order. Each product
+/// carries the request's exact size, and each call names the components its
+/// graph reads it with.
 #[test]
 fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     let request = RequestId(5);
@@ -973,6 +988,16 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
         vision[0] < text[0],
         "the vision tokens precede the text encoding"
     );
+    // The text encoding is submitted once its vision features exist, so it
+    // never waits in its worker's queue ahead of other calls.
+    let (text_submission, text_batch) = served.submissions_of(request, MediaCall::TextEncoding)[0];
+    assert!(
+        !text_batch
+            .in_flight
+            .iter()
+            .any(|call| call.is(request, MediaCall::VisionEncoding)),
+        "the text encoding was submitted while the vision encoding was in flight"
+    );
 
     // The vision encoding reads the patches and writes one row per token;
     // the text encoding reads those features.
@@ -982,21 +1007,61 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     let (text_call, _) = &served.calls[text[0]];
     assert_eq!(text_call.inputs, vision_call.outputs);
 
-    // Four visual units over two ranks: two rounds of two units writing the
-    // rows of their own units, then the audio call writing both tracks.
-    let rounds = latents
-        .iter()
-        .map(|index| {
-            let (call, placement) = &served.calls[*index];
-            let range = placement.decode.as_ref().unwrap();
-            (range.cursor, range.max_units, leading(&call.outputs[0]))
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(rounds, [(0, 2, 2 + 10), (2, 2, 10 + 4), (0, 1, 80)]);
-    for index in &latents[..2] {
-        assert_eq!(served.calls[*index].0.inputs, [read.outputs[0].clone()]);
+    // Four visual units, one per rank of each round: the rounds cover them
+    // in order, each writing the rows of its own units, then the audio call
+    // writes both tracks on one rank.
+    const UNIT_ROWS: [u32; 4] = [2, 10, 10, 4];
+    let (audio, rounds) = latents.split_last().unwrap();
+    let mut cursor = 0;
+    for index in rounds {
+        let (call, placement) = &served.calls[*index];
+        let range = placement.decode.as_ref().unwrap();
+        assert_eq!(range.cursor, cursor);
+        let rows = &UNIT_ROWS[cursor as usize..(cursor + range.max_units) as usize];
+        assert_eq!(leading(&call.outputs[0]), rows.iter().sum::<u32>());
+        assert_eq!(range.ranks.len() as u32, range.max_units);
+        assert!(range.ranks.iter().all(|rank| *rank < 2));
+        assert_eq!(call.inputs, [read.outputs[0].clone()]);
+        cursor += range.max_units;
     }
-    assert_eq!(served.calls[latents[2]].0.inputs, [read.outputs[1].clone()]);
+    assert_eq!(cursor, UNIT_ROWS.len() as u32);
+    let (audio_call, audio_placement) = &served.calls[*audio];
+    let range = audio_placement.decode.as_ref().unwrap();
+    assert_eq!(
+        (range.cursor, range.max_units, range.ranks.len()),
+        (0, 1, 1)
+    );
+    assert_eq!(leading(&audio_call.outputs[0]), 80);
+    assert_eq!(audio_call.inputs, [read.outputs[1].clone()]);
+
+    // A latent encoding call is dealt only to free ranks. Rank 0 encodes
+    // the prompt, so until the text encoding has completed a call names
+    // rank 1 alone, and none is submitted while an earlier one holds rank 1
+    // as well. The first round starts beside the vision encoding.
+    let dealt = served.submissions_of(request, MediaCall::LatentEncoding);
+    assert_eq!(dealt.len(), latents.len());
+    let beside = |submission: &Submission, media_call| {
+        submission
+            .in_flight
+            .iter()
+            .any(|call| call.is(request, media_call))
+    };
+    assert!(
+        dealt[0].0 < text_submission,
+        "the first round waited for the text encoding"
+    );
+    for ((position, submission), index) in dealt.iter().zip(&latents) {
+        let prompt_encoded =
+            *position > text_submission && !beside(submission, MediaCall::TextEncoding);
+        if !prompt_encoded {
+            let range = served.calls[*index].1.decode.as_ref().unwrap();
+            assert_eq!(range.ranks, [1]);
+            assert!(
+                !beside(submission, MediaCall::LatentEncoding),
+                "a call was dealt to a rank that held an earlier one"
+            );
+        }
+    }
 
     // Latent preparation follows every encoding and reads the text features,
     // the visual rounds in unit order, then the audio rows.
@@ -1079,6 +1144,27 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
     );
 }
 
+/// A worker that refuses a request's admitted size states why: the request
+/// is rejected as invalid with that reason, and a request admitted beside it
+/// still completes.
+#[test]
+fn a_request_the_worker_refuses_is_rejected_with_its_reason() {
+    let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
+    let mut sim = video_worker(2, 2);
+    let reason = "the conditions take 46848 rows, more than the 40960 this worker provisions";
+    sim.refuse_request(RequestId(1), reason);
+    let served = serve(sim, vec![reference_request(1, &media), video_request(2, 2)]);
+
+    let refused = served.outcomes[&RequestId(1)]
+        .iter()
+        .find_map(|event| match event {
+            EngineCoreOutput::Rejected { kind, message } => Some((*kind, message.clone())),
+            _ => None,
+        });
+    assert_eq!(refused, Some((RejectionKind::Invalid, reason.to_owned())));
+    served.assert_completed(RequestId(2));
+}
+
 /// A `t2va` request of two media units at `canvas`.
 fn canvas_request(id: u64, canvas: Canvas) -> Request {
     let Request::Diffusion(mut request) = video_request(id, 2) else {
@@ -1155,5 +1241,63 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
             "{message}"
         ),
         events => panic!("the oversized canvas was not refused: {events:?}"),
+    }
+}
+
+/// A video worker's ranks each back only the results of the components they
+/// execute and of the components that read them, and the engine places
+/// buffers in each rank's own pool: a rank that holds fewer results packs
+/// them from its own offset zero rather than at the offsets another rank's
+/// larger set implies.
+#[test]
+fn media_buffers_are_placed_in_the_pool_of_each_rank_that_backs_them() {
+    use std::collections::BTreeSet;
+
+    let served = serve(video_worker(3, 1), vec![video_request(1, 4)]);
+    served.assert_completed(RequestId(1));
+
+    // The ranks holding a span of what a call of this kind produces.
+    let ranks = |media_call: MediaCall| {
+        served
+            .calls
+            .iter()
+            .filter(|(call, _)| call.kind == CallKind::Media(media_call))
+            .flat_map(|(call, placement)| {
+                let outputs = call
+                    .buffer_outputs()
+                    .map(|product| product.buffer_id())
+                    .collect::<Vec<_>>();
+                placement
+                    .buffers
+                    .iter()
+                    .filter(move |span| outputs.contains(&span.allocation.buffer))
+            })
+            .map(|span| span.rank)
+            .collect::<BTreeSet<_>>()
+    };
+
+    // The text encoder and its reader, the denoiser, are placed on rank 0
+    // alone, so no other rank backs the encoder's conditioning.
+    assert_eq!(ranks(MediaCall::TextEncoding), BTreeSet::from([0]));
+    // The decoder and the video codec that reads its units run on three ranks.
+    assert_eq!(ranks(MediaCall::VideoDecoding), BTreeSet::from([0, 1, 2]));
+    // The audio decoder and the muxer's audio encoding run on rank 0 alone.
+    assert_eq!(ranks(MediaCall::AudioDecoding), BTreeSet::from([0]));
+
+    // A rank that backs fewer results starts its own pool at zero: rank 2
+    // holds only the decoder's, the codec's and the denoiser's products.
+    for rank in 0..3 {
+        let lowest = served
+            .calls
+            .iter()
+            .flat_map(|(_, placement)| placement.buffers.iter())
+            .filter(|span| span.rank == rank)
+            .map(|span| span.allocation.offset)
+            .min();
+        assert_eq!(
+            lowest,
+            Some(0),
+            "rank {rank} packs from its own offset zero"
+        );
     }
 }

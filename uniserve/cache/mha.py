@@ -339,27 +339,33 @@ class State(PrefixState):
                 )
             written += count
 
-    def _validate_update(self, key, value, indices) -> None:
+    def _validate_update(self, key, value, slot_mapping) -> None:
         """Check borrowed write views before standalone or fused computation."""
         if (
             key.shape != value.shape
             or key.ndim != 3
             or key.shape[1:] != self.key.shape[2:]
-            or indices.shape != (key.shape[0],)
+            or slot_mapping.shape != (key.shape[0],)
         ):
             raise ValueError(
-                "cache indices must align with [tokens, heads, dim] K/V"
+                "cache slot_mapping must align with [tokens, heads, dim] K/V"
             )
         if (
-            indices.dtype != torch.int64
-            or indices.device != key.device
+            slot_mapping.dtype != torch.int64
+            or slot_mapping.device != key.device
             or key.device != self.key.device
             or value.device != self.value.device
         ):
-            raise ValueError("cache indices must be int64 on the K/V device")
+            raise ValueError(
+                "cache slot_mapping must be int64 on the K/V device"
+            )
 
     def update(
-        self, key: torch.Tensor, value: torch.Tensor, *, indices: torch.Tensor
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        slot_mapping: torch.Tensor,
     ) -> None:
         """Write linear cache slots, with -1 excluding a token from all state.
 
@@ -368,8 +374,8 @@ class State(PrefixState):
         """
         from .paged import paged_kv_write
 
-        self._validate_update(key, value, indices)
-        if not indices.numel():
+        self._validate_update(key, value, slot_mapping)
+        if not slot_mapping.numel():
             return
 
         if not isinstance(self.key, QuantizedTensor) and not isinstance(
@@ -378,7 +384,7 @@ class State(PrefixState):
             paged_kv_write(
                 self.key,
                 self.value,
-                indices,
+                slot_mapping,
                 key,
                 value,
                 cast=key.dtype != self.key.dtype
@@ -393,21 +399,23 @@ class State(PrefixState):
         # The dense scatter validates addresses in its owning kernel. Encoded
         # updates also index per-block scale metadata before scattering, so
         # they must validate the same domain before those accesses.
-        valid = (indices >= -1) & (
-            indices < self.key.shape[0] * self.block_size
+        valid = (slot_mapping >= -1) & (
+            slot_mapping < self.key.shape[0] * self.block_size
         )
-        if indices.is_cuda:
+        if slot_mapping.is_cuda:
             torch._assert_async(valid.all(), "cache write index out of bounds")
         elif not bool(valid.all()):
             raise ValueError("cache write index out of bounds")
 
         count = self.key.shape[0]
-        blocks = torch.where(indices >= 0, indices // self.block_size, count)
+        blocks = torch.where(
+            slot_mapping >= 0, slot_mapping // self.block_size, count
+        )
 
         # The final slot collects excluded tokens. Fixed-size scatter metadata
         # avoids copying addresses to the host and supports graph replay.
         touched = torch.zeros(
-            count + 1, dtype=torch.bool, device=indices.device
+            count + 1, dtype=torch.bool, device=slot_mapping.device
         )
         touched.scatter_(0, blocks, True)
         touched = touched[:count]
@@ -425,7 +433,7 @@ class State(PrefixState):
             # Grow each touched block's scale to cover this update's maxima.
             fields = target.buffers()
             maximum = source.float().abs().amax((1, 2))
-            proposed = torch.zeros(count + 1, device=indices.device)
+            proposed = torch.zeros(count + 1, device=slot_mapping.device)
             proposed.scatter_reduce_(
                 0, blocks, maximum, reduce="amax", include_self=True
             )
@@ -469,7 +477,7 @@ class State(PrefixState):
         )
         key_encoded, value_encoded = encoded
         paged_kv_write(
-            key_store, value_store, indices, key_encoded, value_encoded
+            key_store, value_store, slot_mapping, key_encoded, value_encoded
         )
 
     def transfer_blocks(

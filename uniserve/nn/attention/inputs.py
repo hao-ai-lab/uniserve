@@ -174,7 +174,7 @@ def _paged(
     queries: SequenceLengths,
     prefixes: SequenceLengths,
     block_table: BlockTable,
-    write_indices: torch.Tensor | None,
+    slot_mapping: torch.Tensor | None,
 ) -> None:
     _sequences(queries, prefixes)
     if (
@@ -182,17 +182,17 @@ def _paged(
         or block_table.indices.device != queries.values.device
     ):
         raise ValueError("block tables must match query batch size and device")
-    if write_indices is not None and (
-        write_indices.ndim != 1
+    if slot_mapping is not None and (
+        slot_mapping.ndim != 1
         or (
             queries.num_tokens is not None
-            and write_indices.shape != (queries.num_tokens,)
+            and slot_mapping.shape != (queries.num_tokens,)
         )
-        or write_indices.dtype != torch.int64
-        or write_indices.device != queries.values.device
+        or slot_mapping.dtype != torch.int64
+        or slot_mapping.device != queries.values.device
     ):
         raise ValueError(
-            "write indices must be an int64 address per query token on its "
+            "slot mapping must be an int64 address per query token on its "
             "device"
         )
 
@@ -229,14 +229,12 @@ class PagedInput:
     queries: SequenceLengths
     prefixes: SequenceLengths
     block_table: BlockTable
-    write_indices: torch.Tensor | None
+    slot_mapping: torch.Tensor | None
     causal: tuple[bool, ...]
     causal_values: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
-        _paged(
-            self.queries, self.prefixes, self.block_table, self.write_indices
-        )
+        _paged(self.queries, self.prefixes, self.block_table, self.slot_mapping)
         _causal(self.causal, self.queries.batch_size)
         flags = self.causal_values
         if flags is not None and (
@@ -436,14 +434,12 @@ class SegmentedInput:
     queries: SequenceLengths
     prefixes: SequenceLengths
     block_table: BlockTable
-    write_indices: torch.Tensor | None
+    slot_mapping: torch.Tensor | None
     visible_current_end: torch.Tensor
     fully_visible_current: bool
 
     def __post_init__(self) -> None:
-        _paged(
-            self.queries, self.prefixes, self.block_table, self.write_indices
-        )
+        _paged(self.queries, self.prefixes, self.block_table, self.slot_mapping)
         _visibility(self.visible_current_end, self.queries)
 
 
@@ -477,12 +473,12 @@ AttentionInput = (
 class AttentionBatch:
     """One call's numerical attention inputs, one entry per cache table.
 
-    A layer bound to a prefix cache reads the entry of the table that holds
+    A layer bound to a K/V cache reads the entry of the table that holds
     its cache; a layer without a cache table reads the batch's only entry.
-    Table IDs come from the prefix cache's layout and are not model
+    Table IDs come from the K/V cache's layout and are not model
     configuration. Every packed entry shares ``queries``: the same query
     order, length and offset tensors. Entries may differ in their prefixes,
-    block tables, write addresses and key visibility. A dense input forms a
+    block tables, slot mapping and key visibility. A dense input forms a
     singleton batch without a packed query domain. The batch borrows its
     tensors and owns no cache, request or execution state.
     """

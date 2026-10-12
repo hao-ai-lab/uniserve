@@ -1,14 +1,17 @@
 //! Shared contracts and model-specific profiles for multimodal generation.
 //!
 //! The SenseNova and Bagel profiles fix each family's control tokens, prompt
-//! framing, output filters, image-generation defaults, and runtime limit
-//! ceilings. They also predict the KV tokens an input or generated image
-//! occupies from its pixel dimensions, and the request carries that count as
-//! an exact `ImageEncoderInput::num_kv_tokens`. The predictions replicate the
-//! worker's image resize arithmetic in
-//! `uniserve_worker/model_executor/image_inputs.py` and must stay in step with
-//! it: the engine scheduler rejects a worker result whose KV length differs
-//! from the declared count (`image_kv_mismatch`).
+//! framing, output filters, image-generation defaults, and runtime sizing.
+//! They also compute the KV tokens an input or generated image occupies from
+//! its pixel dimensions, and the request carries that count as an exact
+//! `ImageEncoderInput::num_kv_tokens`. The engine plans from it before any
+//! worker encodes: it reserves the request's KV units at admission and
+//! projects the extents of every later call from it, so the count is an
+//! input to scheduling, not a check. The computation replicates the worker's
+//! image resize arithmetic in `uniserve_worker/model_executor/image_inputs.py`
+//! (the shared `bagel_image_resize.json` and `sensenova_image_resize.json`
+//! fixtures pin both sides), and the engine scheduler rejects a worker result
+//! whose KV length differs from the declared count (`image_kv_mismatch`).
 
 pub mod bagel;
 pub mod resolution;
@@ -69,8 +72,6 @@ pub struct ImageGenerationDefaults {
     pub seed: Option<u64>,
     /// Default maximum number of images generated for one request.
     pub max_images: u16,
-    /// Hard profile limit on generated images per request.
-    pub max_images_limit: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -19,8 +19,6 @@ from enum import StrEnum
 from uniserve.media import image
 from uniserve.media import video as media_video
 from uniserve.model import ConditionRole
-from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.protocol.validation import _map, _seq, _str, _uint, _uints
 
 
 class VideoTask(StrEnum):
@@ -49,10 +47,6 @@ class MediaLocator:
     # Published byte count.
     bytes: int
 
-    def __post_init__(self) -> None:
-        if not self.name or "/" in self.name or self.bytes < 1:
-            raise invalid_descriptor("a condition's media locator is invalid")
-
 
 @dataclass(frozen=True, slots=True)
 class ImageFit:
@@ -66,21 +60,10 @@ class ImageFit:
     top: int
     size: image.Config
 
-    def __post_init__(self) -> None:
-        if (
-            self.left < 0
-            or self.top < 0
-            or self.left + self.size.width > self.resized.width
-            or self.top + self.size.height > self.resized.height
-        ):
-            raise invalid_descriptor(
-                "an image fit keeps a window outside its resized image"
-            )
-
 
 @dataclass(frozen=True, slots=True)
 class VideoClip:
-    """A reference video's frames on the 24 fps timeline.
+    """A reference video's frames on the output-rate timeline.
 
     The first ``start_frame`` frames are skipped and the next ``frames``
     kept, scaled onto ``canvas``; the video encoder encodes the leading
@@ -91,12 +74,6 @@ class VideoClip:
     start_frame: int
     frames: int
     vae_frames: int
-
-    def __post_init__(self) -> None:
-        if self.start_frame < 0 or not 1 <= self.vae_frames <= self.frames:
-            raise invalid_descriptor(
-                "a video clip encodes frames it does not keep"
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,15 +89,6 @@ class AudioClip:
     source_samples: int
     samples: int
 
-    def __post_init__(self) -> None:
-        if (
-            self.sample_rate < 1
-            or self.start_sample < 0
-            or self.source_samples < 1
-            or self.samples < 1
-        ):
-            raise invalid_descriptor("an audio track keeps no samples")
-
 
 @dataclass(frozen=True, slots=True)
 class ConditionVision:
@@ -135,10 +103,6 @@ class ConditionVision:
     grid: tuple[int, int, int]
     tokens: int
     frame_indices: tuple[int, ...] = ()
-
-    def __post_init__(self) -> None:
-        if len(self.grid) != 3 or min(self.grid) < 1 or self.tokens < 1:
-            raise invalid_descriptor("a conditioner view covers no patches")
 
     @property
     def patches(self) -> int:
@@ -168,47 +132,8 @@ class VideoCondition:
     audio_rows: int
 
     def __post_init__(self) -> None:
+        # The transport states the role by its wire spelling.
         object.__setattr__(self, "role", ConditionRole(self.role))
-        if (self.image is not None) + (self.video is not None) > 1 or (
-            self.image is not None and self.audio is not None
-        ):
-            raise invalid_descriptor(
-                "a video condition carries an invalid media combination"
-            )
-        if self.image is None and self.video is None and self.audio is None:
-            raise invalid_descriptor("a video condition carries no media")
-        if self.role is not ConditionRole.REFERENCE and self.image is None:
-            raise invalid_descriptor("a keyframe is one still image")
-        if (self.pixels is None) != (not self.latent_units) or any(
-            rows < 1 for rows in self.latent_units
-        ):
-            raise invalid_descriptor(
-                "a condition's latent units disagree with its pixels"
-            )
-        if (self.audio is None) != (self.audio_rows == 0):
-            raise invalid_descriptor(
-                "a condition's audio rows disagree with its audio track"
-            )
-        if self.vision is not None:
-            if self.pixels is None:
-                raise invalid_descriptor(
-                    "the conditioner reads no audio reference"
-                )
-            frames = () if self.video is None else self.vision.frame_indices
-            if self.video is None and (
-                self.vision.frame_indices or self.vision.grid[0] != 1
-            ):
-                raise invalid_descriptor(
-                    "an image's conditioner view samples one frame"
-                )
-            if self.video is not None and (
-                not frames
-                or any(b <= a for a, b in zip(frames, frames[1:]))
-                or frames[-1] >= self.video.frames
-            ):
-                raise invalid_descriptor(
-                    "a video's conditioner view samples frames it does not keep"
-                )
 
     @property
     def pixels(self) -> media_video.Config | None:
@@ -244,39 +169,8 @@ class VideoAdmission:
     conditions: tuple[VideoCondition, ...] = ()
 
     def __post_init__(self) -> None:
+        # The transport states the task by its wire spelling.
         object.__setattr__(self, "task", VideoTask(self.task))
-        if (self.task is VideoTask.T2VA) != (not self.conditions):
-            raise invalid_descriptor(
-                "only a conditioned video task carries conditions"
-            )
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "video admission"
-    ) -> VideoAdmission:
-        """Parse a video admission from its mapping form."""
-        data = _map(value, where)
-        return cls(
-            task=VideoTask(_str(data.get("task"), f"{where}.task")),
-            text_tags=_uints(data.get("text_tags", ()), f"{where}.text_tags"),
-            conditions=tuple(
-                _condition_from_mapping(item, f"{where}.conditions[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("conditions", ()), f"{where}.conditions")
-                )
-            ),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize the admission; ``from_mapping`` reads it back."""
-        return {
-            "task": self.task.value,
-            "text_tags": list(self.text_tags),
-            "conditions": [
-                _condition_to_mapping(condition)
-                for condition in self.conditions
-            ],
-        }
 
     def vision_spans(self) -> tuple[tuple[int, int], ...]:
         """The presentation's vision blocks as ``(start, stop)`` token ranges.
@@ -292,133 +186,6 @@ class VideoAdmission:
                 spans.append((start, index))
                 start = None
         return tuple(spans)
-
-
-def _raster(value: object, where: str) -> image.Config:
-    data = _map(value, where)
-    return image.Config(
-        _uint(data.get("height"), f"{where}.height"),
-        _uint(data.get("width"), f"{where}.width"),
-    )
-
-
-def _raster_mapping(value: image.Config) -> dict[str, int]:
-    return {"height": value.height, "width": value.width}
-
-
-def _audio_from_mapping(value: object, where: str) -> AudioClip:
-    data = _map(value, where)
-    return AudioClip(
-        *(
-            _uint(data.get(name), f"{where}.{name}")
-            for name in (
-                "sample_rate",
-                "start_sample",
-                "source_samples",
-                "samples",
-            )
-        )
-    )
-
-
-def _condition_from_mapping(value: object, where: str) -> VideoCondition:
-    """Parse one condition; absent media fields are None."""
-    data = _map(value, where)
-    source = _map(data.get("source"), f"{where}.source")
-    fit = data.get("image")
-    clip = data.get("video")
-    track = data.get("audio")
-    vision = data.get("vision")
-    return VideoCondition(
-        role=ConditionRole(_str(data.get("role"), f"{where}.role")),
-        source=MediaLocator(
-            _str(source.get("name"), f"{where}.source.name"),
-            _uint(source.get("bytes"), f"{where}.source.bytes"),
-        ),
-        image=None
-        if fit is None
-        else ImageFit(
-            _raster(_map(fit, f"{where}.image").get("resized"), where),
-            _uint(fit.get("left"), f"{where}.image.left"),
-            _uint(fit.get("top"), f"{where}.image.top"),
-            _raster(fit.get("size"), f"{where}.image.size"),
-        ),
-        video=None
-        if clip is None
-        else VideoClip(
-            _raster(_map(clip, f"{where}.video").get("canvas"), where),
-            _uint(clip.get("start_frame"), f"{where}.video.start_frame"),
-            _uint(clip.get("frames"), f"{where}.video.frames"),
-            _uint(clip.get("vae_frames"), f"{where}.video.vae_frames"),
-        ),
-        audio=None
-        if track is None
-        else _audio_from_mapping(track, f"{where}.audio"),
-        vision=None
-        if vision is None
-        else ConditionVision(
-            grid=tuple(  # type: ignore[arg-type]
-                _uints(_map(vision, where).get("grid"), f"{where}.grid")
-            ),
-            tokens=_uint(vision.get("tokens"), f"{where}.vision.tokens"),
-            frame_indices=_uints(
-                vision.get("frame_indices", ()), f"{where}.frame_indices"
-            ),
-        ),
-        latent_units=_uints(
-            data.get("latent_units", ()), f"{where}.latent_units"
-        ),
-        audio_rows=_uint(data.get("audio_rows", 0), f"{where}.audio_rows"),
-    )
-
-
-def _condition_to_mapping(condition: VideoCondition) -> dict[str, object]:
-    fit, clip, track, vision = (
-        condition.image,
-        condition.video,
-        condition.audio,
-        condition.vision,
-    )
-    return {
-        "role": condition.role.value,
-        "source": {
-            "name": condition.source.name,
-            "bytes": condition.source.bytes,
-        },
-        "image": None
-        if fit is None
-        else {
-            "resized": _raster_mapping(fit.resized),
-            "left": fit.left,
-            "top": fit.top,
-            "size": _raster_mapping(fit.size),
-        },
-        "video": None
-        if clip is None
-        else {
-            "canvas": _raster_mapping(clip.canvas),
-            "start_frame": clip.start_frame,
-            "frames": clip.frames,
-            "vae_frames": clip.vae_frames,
-        },
-        "audio": None
-        if track is None
-        else {
-            "sample_rate": track.sample_rate,
-            "start_sample": track.start_sample,
-            "source_samples": track.source_samples,
-            "samples": track.samples,
-        },
-        "vision": None
-        if vision is None
-        else {
-            "grid": list(vision.grid),
-            "tokens": vision.tokens,
-            "frame_indices": list(vision.frame_indices),
-        },
-        "latent_units": list(condition.latent_units),
-        "audio_rows": condition.audio_rows,
-    }
 
 
 __all__ = [

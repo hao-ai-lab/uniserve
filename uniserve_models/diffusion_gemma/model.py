@@ -26,6 +26,11 @@ from . import vision
 from .config import Config
 from .transformer import Backbone
 
+# Images one packed vision call holds. The largest packed graph's activations
+# (this many slots of ``max_patches`` rows) bound the graph pool every slot
+# count shares; a larger batch replays that graph once per group.
+VISION_SLOTS = 16
+
 
 class Model(nn.Module):
     """Compose the causal prompt pass, the canvas denoiser and the vision tower.
@@ -85,6 +90,7 @@ class Model(nn.Module):
             output_size=text.hidden_size,
             output_dtype=torch.bfloat16,
             max_patches=config.vision.max_patches,
+            max_slots=VISION_SLOTS,
         )
 
 

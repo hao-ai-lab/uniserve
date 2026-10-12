@@ -180,6 +180,53 @@ def test_post_load_can_derive_constants_without_hiding_unused_sources(
         assert result.reports[0].unexpected == ()
 
 
+def test_nonresident_prefixes_account_for_whole_groups_of_tensors(tmp_path):
+    def mapping(model):
+        (declared,) = _mapping(model)
+        return (
+            weights.ModuleMapping(
+                declared.module,
+                declared.source,
+                declared.map_weights,
+                declared.required,
+                nonresident_prefixes=("encoder.",),
+            ),
+        )
+
+    tensors = {
+        "first": torch.eye(4),
+        "second": torch.eye(4),
+        "encoder.layers.0.weight": torch.ones(4),
+        "encoder.layers.1.weight": torch.ones(4),
+    }
+    save_file(tensors, tmp_path / "model.safetensors")
+    io = loading.Config()
+    source = checkpoint.Config().resolve(tmp_path, io=io)
+
+    def load():
+        return loading.load_model(
+            Network,
+            NetworkConfig(),
+            checkpoint=(source,),
+            mapping=mapping,
+            device="cpu",
+            weights=weights.Config(dtype=torch.float32),
+            io=io,
+        )
+
+    result = load()
+    assert result.reports[0].skipped == (
+        "encoder.layers.0.weight",
+        "encoder.layers.1.weight",
+    )
+
+    # A tensor outside every declared prefix is still refused.
+    tensors["encoders.extra"] = torch.ones(4)
+    save_file(tensors, tmp_path / "model.safetensors")
+    with pytest.raises(RuntimeError, match="unexpected=.*encoders.extra"):
+        load()
+
+
 @pytest.mark.parametrize("quantizer", (None, Quantizer("fp8")))
 def test_merged_parameter_updates_are_visible_across_execution_contexts(
     tmp_path, quantizer

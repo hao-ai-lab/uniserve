@@ -14,9 +14,9 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 )
 from safetensors.torch import save_file
 
+from tests.python.fixtures.h3 import transformer_config
 from uniserve import loading
 from uniserve.loading import checkpoint, weights
-from uniserve_models.minimax_h3 import TransformerConfig
 from uniserve_models.minimax_h3.conditioning import Conditioner, assignments
 from uniserve_models.minimax_h3.modulation import TimestepEmbedding
 
@@ -24,7 +24,7 @@ pytestmark = pytest.mark.integration
 
 
 def _config():
-    return TransformerConfig(
+    return transformer_config(
         hidden_size=64,
         num_attention_heads=2,
         head_dim=32,
@@ -134,10 +134,10 @@ def test_timestep_projection_preserves_both_modality_coordinates():
     ).eval()
     model = TimestepEmbedding(config)
     with torch.no_grad():
-        model.video_projection[0].weight.copy_(reference.linear_1.weight)
-        model.video_projection[0].bias.copy_(reference.linear_1.bias)
-        model.video_projection[2].weight.copy_(reference.linear_2.weight)
-        model.video_projection[2].bias.copy_(reference.linear_2.bias)
+        model.projection[0].weight.copy_(reference.linear_1.weight)
+        model.projection[0].bias.copy_(reference.linear_1.bias)
+        model.projection[2].weight.copy_(reference.linear_2.weight)
+        model.projection[2].bias.copy_(reference.linear_2.bias)
         times = torch.tensor([[0.0, 0.0], [0.125, 0.4], [0.7, 0.95]])
         features = get_timestep_embedding(
             times.flatten(),

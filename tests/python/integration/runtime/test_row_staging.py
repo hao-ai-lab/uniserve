@@ -1,32 +1,32 @@
-"""Token rows stage the attention columns their host page layout describes.
+"""Token rows stage the attention columns their slots' resident tables imply.
 
 ``AttentionBuffers.stage_rows`` gathers every numerical table's units, first
-staged pages and write addresses from the request slots' resident tables.
+staged pages and slot mapping from the request slots' resident tables.
 Over random calls of a model whose windowed and full-attention groups share
-one unit pool (six numerical tables, as DiffusionGemma has), its staging,
-padded to a graph bucket, equals the staging of the same call's host layout
-(``attention.from_tables`` of ``attention.table_pages``): appending rows,
-mixed appending and read-only rows, read-only non-causal rows, rows whose
-windowed tables retired their first pages, and padding past the live rows.
+one unit pool (six numerical tables, as DiffusionGemma has), its staging
+equals the layout the tables define: every installed page of a full table
+and, for a windowed table, the pages from the first one the row's first
+query reaches back to through its last query; slot mapping at
+``unit * block_size + offset``, or -1 for rows that do not write. Padding
+the call to a graph bucket leaves its live rows unchanged. The calls
+cover appending rows, mixed appending and read-only rows, read-only
+non-causal rows, rows whose windowed tables retired their first pages, and
+padding past the live rows.
 """
 
 from __future__ import annotations
 
+import itertools
 import random
 
 import pytest
 import torch
 
 from tests.python.fixtures.hybrid import hybrid_model, hybrid_pool
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.math import ceil_div
 from uniserve.nn.attention import PagedInput
-from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.model_executor.attention import (
-    first_page,
-    from_tables,
-    row_tables,
-    table_pages,
-)
+from uniserve_worker.model_executor.attention import first_page
 from uniserve_worker.model_executor.graph_inputs import pad_text
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import (
@@ -53,7 +53,7 @@ def _install(manager, generator):
         extent = generator.randint(1, 96)
         extents[slot] = extent
         for group, shape in enumerate(tables.groups):
-            pages = ceil_div(extent, shape.page_tokens)
+            pages = ceil_div(extent, shape.block_size)
             start = (
                 generator.randint(0, max(0, pages - 2))
                 if shape.window is not None
@@ -111,30 +111,92 @@ def _rows(manager, extents, generator, *, write, causal):
     return tuple(rows)
 
 
-def _host_layout(rows, manager):
-    """The call's attention from its host page layout."""
+def _expected(rows, manager):
+    """The attention columns the installed tables define for ``rows``.
+
+    Returns the same keys as ``_columns``, computed from the host mirrors of
+    the tables alone: per numerical table, the staged units of each row
+    (zero past them, to the widest row), first pages and slot mapping.
+    """
+    tables = manager.block_tables
     queries = tuple(row.query_tokens for row in rows)
     prefixes = tuple(row.seq_len for row in rows)
-    return from_tables(
-        table_pages(
-            row_tables(rows, tables=manager.block_tables, cache=manager),
-            prefix_lengths=prefixes,
-            query_lengths=queries,
+    appending = any(row.write_kv for row in rows)
+    values = {
+        "queries": torch.tensor(queries, dtype=torch.int32),
+        "query_offsets": torch.tensor(
+            (0, *itertools.accumulate(queries)), dtype=torch.int32
         ),
-        query_lengths=queries,
-        prefix_lengths=prefixes,
-        causal=tuple(row.causal for row in rows),
-        write=tuple(row.write_kv for row in rows),
-    )
+        "query_host": queries,
+    }
+    for group, shape in enumerate(tables.groups):
+        for position in range(shape.units_per_page):
+            number = tables.first_table[group] + position
+            staged, firsts, slot_mapping = [], [], []
+            for row in rows:
+                table = tables.table(row.request_pool_idx, group)
+                first = (
+                    first_page(table, row.seq_len)
+                    if shape.window is not None
+                    else 0
+                )
+                end = table.end_page
+                if shape.window is not None:
+                    end = min(
+                        end,
+                        ceil_div(
+                            row.seq_len + row.query_tokens, shape.block_size
+                        ),
+                    )
+                units = table.row(position)
+                staged.append(
+                    units[first - table.start_page : end - table.start_page]
+                )
+                firsts.append(first)
+                for token in range(row.seq_len, row.seq_len + row.query_tokens):
+                    page = token // shape.block_size - table.start_page
+                    slot_mapping.append(
+                        table.row(position)[page] * shape.block_size
+                        + token % shape.block_size
+                        if row.write_kv
+                        else -1
+                    )
+            width = max(1, *map(len, staged))
+            values[number, "kind"] = (
+                "PagedInput" if appending else "SegmentedInput"
+            )
+            values[number, "prefixes"] = torch.tensor(
+                prefixes, dtype=torch.int32
+            )
+            values[number, "prefix_offsets"] = torch.tensor(
+                (0, *itertools.accumulate(prefixes)), dtype=torch.int32
+            )
+            values[number, "prefix_host"] = prefixes
+            values[number, "table"] = torch.tensor(
+                [[*units, *(0,) * (width - len(units))] for units in staged],
+                dtype=torch.int32,
+            )
+            values[number, "block_size"] = shape.block_size
+            values[number, "start"] = (
+                None
+                if shape.window is None
+                else torch.tensor(firsts, dtype=torch.int32)
+            )
+            values[number, "start_host"] = (
+                None if shape.window is None else tuple(firsts)
+            )
+            values[number, "slot_mapping"] = (
+                torch.tensor(slot_mapping, dtype=torch.int32)
+                if appending
+                else None
+            )
+            if appending:
+                values[number, "causal"] = tuple(row.causal for row in rows)
+    return values
 
 
-def _columns(batch, padding_from=None):
-    """Every staged attention column of a batch, on the host.
-
-    With ``padding_from``, the batch is padded to a bucket: its tables are
-    compared from that row on, since the columns of live rows past their
-    staged pages are never read and hold whatever earlier calls left.
-    """
+def _columns(batch):
+    """Every staged attention column of a batch, on the host."""
     attention = batch.inputs.attention
     values = {
         "queries": attention.queries.values,
@@ -146,15 +208,11 @@ def _columns(batch, padding_from=None):
         values[number, "prefixes"] = entry.prefixes.values
         values[number, "prefix_offsets"] = entry.prefixes.offsets
         values[number, "prefix_host"] = entry.prefixes.host
-        table, start = entry.block_table.indices, entry.block_table.start_page
-        if padding_from is not None:
-            table = table[padding_from:]
-            start = None if start is None else start[padding_from:]
-        values[number, "table"] = table
+        values[number, "table"] = entry.block_table.indices
         values[number, "block_size"] = entry.block_table.block_size
-        values[number, "start"] = start
+        values[number, "start"] = entry.block_table.start_page
         values[number, "start_host"] = entry.block_table.start_page_host
-        values[number, "writes"] = entry.write_indices
+        values[number, "slot_mapping"] = entry.slot_mapping
         if isinstance(entry, PagedInput):
             values[number, "causal"] = entry.causal
     return {
@@ -167,7 +225,7 @@ def _compare(columns, expected):
     assert columns.keys() == expected.keys()
     for key, value in expected.items():
         if isinstance(value, torch.Tensor):
-            assert torch.equal(columns[key], value), key
+            assert torch.equal(columns[key].to(value.dtype), value), key
         else:
             assert columns[key] == value, key
 
@@ -181,11 +239,11 @@ def _compare(columns, expected):
     ids=("appending", "mixed", "read_only"),
 )
 @torch.inference_mode()
-def test_rows_stage_the_columns_their_host_layout_describes(
+def test_rows_stage_the_columns_their_resident_tables_define(
     device, write, causal
 ):
     model = hybrid_model()
-    config = WorkerConfig(device=device, block_size=16, max_sequence_tokens=128)
+    config = cpu_worker_config(device=device, block_size=16, max_model_len=128)
     manager = hybrid_pool(
         model, config, num_units=UNITS, request_pool_size=SLOTS
     )
@@ -198,7 +256,6 @@ def test_rows_stage_the_columns_their_host_layout_describes(
         hidden_size=0,
     )
     staged = TokenBuffers(config=buffer_config, device=device)
-    reference = TokenBuffers(config=buffer_config, device=device)
     generator = random.Random(1 + (write is None) + 2 * (not causal))
     try:
         extents = _install(manager, generator)
@@ -214,33 +271,37 @@ def test_rows_stage_the_columns_their_host_layout_describes(
                 cache=manager,
                 tables=manager.block_tables,
             )
-            expected = reference.prepare_inputs(
-                rows,
-                forward_mode=ForwardMode.PREFILL,
-                attention=_host_layout(rows, manager),
-            )
-            _compare(_columns(actual), _columns(expected))
+            expected = _expected(rows, manager)
+            _compare(_columns(actual), expected)
             if not causal:
                 # Read-only canvases pad through the canvas runner instead.
                 continue
 
-            # Pad both to a bucket of spare rows and tokens, as a graph does.
+            # Padding to a bucket of spare rows and tokens keeps the live
+            # rows' columns, as a graph replay reads them.
             tokens = actual.inputs.input_ids.numel()
             bucket = (len(rows) + 1, tokens + 1, (WIDTH,) * 6, False)
-            padded, padded_expected = (
-                pad_text(batch, *bucket, staging=buffers)
-                for batch, buffers in (
-                    (actual, staged),
-                    (expected, reference),
+            padded = _columns(pad_text(actual, *bucket, staging=staged))
+            live = _columns(actual)
+            width = {
+                number: live[number, "table"].shape[1] for number in range(6)
+            }
+            assert padded["query_host"][: len(rows)] == live["query_host"]
+            for number in range(6):
+                assert torch.equal(
+                    padded[number, "table"][: len(rows), : width[number]],
+                    live[number, "table"],
                 )
-            )
-            _compare(
-                _columns(padded, len(rows)),
-                _columns(padded_expected, len(rows)),
-            )
+                if live[number, "slot_mapping"] is not None:
+                    live_slot_mapping = live[number, "slot_mapping"]
+                    assert torch.equal(
+                        padded[number, "slot_mapping"][
+                            : live_slot_mapping.numel()
+                        ],
+                        live_slot_mapping,
+                    )
     finally:
         if device != "cpu":
             torch.cuda.synchronize()
         staged.close()
-        reference.close()
         manager.close()

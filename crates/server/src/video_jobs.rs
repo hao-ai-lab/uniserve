@@ -1,25 +1,22 @@
-//! Bounded process-local video jobs and immutable retained artifacts.
+//! Process-local video jobs and immutable retained artifacts.
 //!
 //! `VideoJobs` is the job store behind the asynchronous video routes in
 //! `http::routes::openai::videos`. It holds each job's public record, its
 //! generated artifact once complete, and the cancellation token of its
-//! detached generation task. Nothing persists across a restart.
+//! detached generation task. Nothing persists across a restart. Synchronous
+//! video requests do not use it.
 //!
-//! Three bounds apply, each advertised by the video `capabilities` route:
+//! The operator's [`VideoJobSettings`] state the two policies of the store,
+//! and the video `capabilities` route advertises both:
 //!
-//! - `MAX_VIDEO_JOBS` job slots, shared by both video submission routes. A
-//!   slot is taken by `VideoJobs::reserve` before submission. An asynchronous
-//!   job keeps it while either its record or its generation task exists; a
-//!   synchronous request keeps it until its response body has been sent or
-//!   dropped.
-//! - `MAX_VIDEO_BYTES` of artifact bytes, counting artifacts retained by a job
-//!   and artifacts held by an unfinished download.
-//! - `VIDEO_RETENTION`, after which a completed or failed job's record is
-//!   deleted.
+//! - `max_retained_bytes` of artifact bytes, counting artifacts retained by
+//!   a job and artifacts held by an unfinished download. Retained artifacts
+//!   are shared-memory mappings, so this is the memory the store may hold.
+//! - `retention`, after which a completed or failed job's record is deleted.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -27,15 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use uniserve_core::SharedMedia;
 
-/// Maximum number of job slots held at once.
-pub(crate) const MAX_VIDEO_JOBS: usize = 128;
-/// Retained-artifact byte budget.
-///
-/// The `artifact_capacity_exceeded` message in `VideoJobs::finish` states this
-/// limit as "1 GiB"; the two must change together.
-pub(crate) const MAX_VIDEO_BYTES: usize = 1024 * 1024 * 1024;
-/// How long a completed or failed job is retained before it is deleted.
-pub(crate) const VIDEO_RETENTION: Duration = Duration::from_secs(3600);
+use crate::config::VideoJobSettings;
 
 /// Public job record, serialized in the responses of the video job routes.
 ///
@@ -50,7 +39,7 @@ pub(crate) struct VideoJob {
     pub model: String,
     pub created_at: u64,
     pub completed_at: Option<u64>,
-    /// Set with `completed_at`, to `VIDEO_RETENTION` after it.
+    /// Set with `completed_at`, to the store's retention after it.
     pub expires_at: Option<u64>,
     /// Requested duration in seconds: the target's, or the length of the
     /// reference soundtrack that sets it.
@@ -112,38 +101,13 @@ struct RetainedJob {
     /// The generated artifact; set only on successful completion.
     media: Option<Arc<RetainedMedia>>,
     /// Shared with the job's generation task.
-    cancellation: Arc<JobReservation>,
-}
-
-/// A job slot acquired before submission and not yet bound to a record.
-///
-/// Dropping it releases the slot, so a caller that abandons a request between
-/// admission and job creation leaves no record behind. The synchronous video
-/// route never binds its slot to a record; its response body holds the slot.
-pub(crate) struct JobSlot(OwnedSemaphorePermit);
-
-/// A job's cancellation token together with its job slot.
-///
-/// `VideoJobs::insert` keeps one `Arc` in the record and returns another,
-/// which the video routes move into the generation task, so the slot is
-/// released only once the record is removed and the task has ended. A deleted
-/// job therefore keeps its slot until its execution drains.
-pub(crate) struct JobReservation {
     cancellation: CancellationToken,
-    _slot: OwnedSemaphorePermit,
-}
-
-impl std::ops::Deref for JobReservation {
-    type Target = CancellationToken;
-    fn deref(&self) -> &Self::Target {
-        &self.cancellation
-    }
 }
 
 /// A completed artifact holding its share of the retained-byte budget.
 ///
 /// The download route moves an `Arc` of it into the response body, so the
-/// bytes stay counted against `MAX_VIDEO_BYTES` until the download ends, even
+/// bytes stay counted against the store's byte budget until the download ends, even
 /// if the job is deleted or expires meanwhile.
 pub(crate) struct RetainedMedia {
     media: Arc<SharedMedia>,
@@ -163,24 +127,14 @@ impl AsRef<[u8]> for RetainedMedia {
     }
 }
 
-/// Process-local job table and its capacity budgets.
+/// Process-local job table and its byte budget.
 pub(crate) struct VideoJobs {
     /// Jobs keyed by public job ID.
     entries: Mutex<BTreeMap<String, RetainedJob>>,
-    /// One permit per retained artifact byte, up to `MAX_VIDEO_BYTES`.
+    /// One permit per retained artifact byte, up to the configured budget.
     bytes: Arc<Semaphore>,
-    /// One permit per job slot, up to `MAX_VIDEO_JOBS`.
-    slots: Arc<Semaphore>,
-}
-
-impl Default for VideoJobs {
-    fn default() -> Self {
-        Self {
-            entries: Mutex::default(),
-            bytes: Arc::new(Semaphore::new(MAX_VIDEO_BYTES)),
-            slots: Arc::new(Semaphore::new(MAX_VIDEO_JOBS)),
-        }
-    }
+    /// The configured retention and byte budget.
+    settings: VideoJobSettings,
 }
 
 /// Current Unix time in whole seconds, or `0` if the clock is before the epoch.
@@ -192,47 +146,41 @@ pub(crate) fn timestamp() -> u64 {
 }
 
 impl VideoJobs {
+    /// Creates an empty store under `settings`.
+    pub(crate) fn new(settings: VideoJobSettings) -> Self {
+        Self {
+            entries: Mutex::default(),
+            bytes: Arc::new(Semaphore::new(settings.max_retained_bytes)),
+            settings,
+        }
+    }
+
+    /// The retention and byte budget the store was created with.
+    pub(crate) fn settings(&self) -> VideoJobSettings {
+        self.settings
+    }
+
     /// Locks the job table and recovers it after poisoning.
     fn entries(&self) -> MutexGuard<'_, BTreeMap<String, RetainedJob>> {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Acquires one bounded job slot before the request reaches the engine.
+    /// Adds a record before detaching generation from its HTTP caller.
     ///
-    /// Does not wait: returns an error message when every slot is taken.
-    pub(crate) fn reserve(&self) -> Result<JobSlot, &'static str> {
-        Arc::clone(&self.slots)
-            .try_acquire_owned()
-            .map(JobSlot)
-            .map_err(|_| {
-                "video job limit reached; delete retained jobs or wait for running video requests to finish"
-            })
-    }
-
-    /// Binds a reserved slot to its record before detaching generation from its HTTP caller.
-    ///
-    /// Returns the reservation the generation task must hold until it ends.
-    /// Fails without inserting when `record.id` is already present; the slot is
-    /// then dropped and released.
-    pub(crate) fn insert(
-        &self,
-        record: VideoJob,
-        slot: JobSlot,
-    ) -> Result<Arc<JobReservation>, &'static str> {
+    /// Returns the cancellation token the generation task must watch. Fails
+    /// without inserting when `record.id` is already present.
+    pub(crate) fn insert(&self, record: VideoJob) -> Result<CancellationToken, &'static str> {
         let mut entries = self.entries();
         if entries.contains_key(&record.id) {
             return Err("video job already exists");
         }
-        let cancellation = Arc::new(JobReservation {
-            cancellation: CancellationToken::new(),
-            _slot: slot.0,
-        });
+        let cancellation = CancellationToken::new();
         entries.insert(
             record.id.clone(),
             RetainedJob {
                 record,
                 media: None,
-                cancellation: Arc::clone(&cancellation),
+                cancellation: cancellation.clone(),
             },
         );
         Ok(cancellation)
@@ -267,7 +215,7 @@ impl VideoJobs {
     /// A successful result is retained only if its bytes fit the remaining
     /// retained-byte budget; otherwise the job fails with
     /// `artifact_capacity_exceeded`. Either way the record gets `completed_at`
-    /// and `expires_at`, and a timer task deletes it after `VIDEO_RETENTION`
+    /// and `expires_at`, and a timer task deletes it after the retention
     /// unless its token is cancelled first. If the job was already deleted,
     /// the result and any budget it took are dropped and no timer starts.
     ///
@@ -294,8 +242,10 @@ impl VideoJobs {
                 })),
                 None => Err(VideoFailure {
                     code: "artifact_capacity_exceeded",
-                    message: "retained videos and active downloads exceed the 1 GiB limit"
-                        .to_owned(),
+                    message: format!(
+                        "retained videos and active downloads exceed the {}-byte limit",
+                        self.settings.max_retained_bytes
+                    ),
                 }),
             }
         });
@@ -305,7 +255,7 @@ impl VideoJobs {
 
         let now = timestamp();
         job.record.completed_at = Some(now);
-        job.record.expires_at = Some(now + VIDEO_RETENTION.as_secs());
+        job.record.expires_at = Some(now + self.settings.retention.as_secs());
         match result {
             Ok(media) => {
                 job.record.status = "completed";
@@ -325,14 +275,15 @@ impl VideoJobs {
         }
 
         // The expiry timer holds only a clone of the token and a `Weak` handle,
-        // so a pending timer neither keeps the job slot nor keeps `VideoJobs`
-        // alive. `delete` and `cancel_all` cancel the token, which ends it.
-        let expiry_cancellation = job.cancellation.cancellation.clone();
+        // so a pending timer does not keep `VideoJobs` alive. `delete` and
+        // `cancel_all` cancel the token, which ends it.
+        let expiry_cancellation = job.cancellation.clone();
         let weak = Arc::downgrade(self);
         let id = id.to_owned();
+        let retention = self.settings.retention;
         tokio::spawn(async move {
             tokio::select! {
-                _ = tokio::time::sleep(VIDEO_RETENTION) => {}
+                _ = tokio::time::sleep(retention) => {}
                 _ = expiry_cancellation.cancelled() => return,
             }
             if let Some(jobs) = weak.upgrade() {
@@ -374,6 +325,8 @@ impl VideoJobs {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn record(id: &str) -> VideoJob {
@@ -398,27 +351,14 @@ mod tests {
         }
     }
 
-    fn insert(jobs: &VideoJobs, id: &str) -> Result<Arc<JobReservation>, &'static str> {
-        jobs.insert(record(id), jobs.reserve()?)
-    }
-
-    #[tokio::test]
-    async fn an_abandoned_reservation_releases_its_slot_without_a_record() {
-        let jobs = Arc::new(VideoJobs::default());
-        let slots = (0..MAX_VIDEO_JOBS)
-            .map(|_| jobs.reserve().unwrap())
-            .collect::<Vec<_>>();
-        assert!(jobs.reserve().is_err());
-        drop(slots);
-        assert!(jobs.reserve().is_ok());
-        assert!(jobs.list().is_empty());
+    fn store() -> Arc<VideoJobs> {
+        Arc::new(VideoJobs::new(VideoJobSettings::default()))
     }
 
     #[tokio::test]
     async fn deleted_work_is_cancelled_and_cannot_reappear() {
-        // `cancellation` stands in for the generation task's reservation.
-        let jobs = Arc::new(VideoJobs::default());
-        let cancellation = insert(&jobs, "video-a").unwrap();
+        let jobs = store();
+        let cancellation = jobs.insert(record("video-a")).unwrap();
         jobs.progress("video-a", "denoising", 2);
         let running = jobs.get("video-a").unwrap();
         assert_eq!(
@@ -440,26 +380,15 @@ mod tests {
         );
         assert!(jobs.get("video-a").is_none());
         assert!(jobs.list().is_empty());
-
-        // The deleted job's slot stays taken while its task still holds the
-        // reservation, so only `MAX_VIDEO_JOBS - 1` more jobs fit.
-        for index in 0..127 {
-            insert(&jobs, &format!("video-{index}")).unwrap();
-        }
-        assert!(insert(&jobs, "video-next").is_err());
-        drop(cancellation);
-        assert!(insert(&jobs, "video-next").is_ok());
     }
 
     #[tokio::test]
-    async fn failures_have_retention_and_deletion_releases_record_capacity() {
-        let jobs = Arc::new(VideoJobs::default());
-        // Each returned reservation is dropped at once, so every slot is held
-        // by its record alone.
-        for index in 0..128 {
-            insert(&jobs, &format!("video-{index}")).unwrap();
-        }
-        assert!(insert(&jobs, "video-overflow").is_err());
+    async fn a_failed_job_expires_after_the_configured_retention() {
+        let jobs = Arc::new(VideoJobs::new(VideoJobSettings {
+            retention: Duration::from_secs(90),
+            ..VideoJobSettings::default()
+        }));
+        jobs.insert(record("video-0")).unwrap();
 
         jobs.finish(
             "video-0",
@@ -474,11 +403,10 @@ mod tests {
         assert_eq!(failed.error.unwrap().code, "generation_failed");
         assert_eq!(
             failed.expires_at.unwrap() - failed.completed_at.unwrap(),
-            3600
+            90
         );
 
         assert!(jobs.delete("video-0"));
-        assert!(insert(&jobs, "video-next").is_ok());
-        assert_eq!(jobs.list().len(), 128);
+        assert!(jobs.list().is_empty());
     }
 }

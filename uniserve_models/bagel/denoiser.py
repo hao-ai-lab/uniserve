@@ -41,6 +41,9 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
     # and its image-unconditional branch reads the conditioning prefix.
     framing_tokens = 2
     image_unconditional = BranchSource.CONDITIONING
+    # The start marker sits at the position before the image, the patches
+    # share the next one and the end marker takes the one after.
+    rope_advance = 2
 
     markers: torch.Tensor
 

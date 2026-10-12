@@ -5,11 +5,10 @@
 //! `IncrementalDecoder`, decodes requested logprobs, and matches stop strings.
 //! `serving::assembly` feeds its output to the chat output processor.
 //!
-//! The decoder also drives the engine's output acknowledgement. When the
-//! request has stop strings, `EventRx` does not acknowledge tokens on receipt;
-//! this module acknowledges each token only after checking that it completes
-//! no stop string, and on a match stops generation at the consumed token
-//! count with `EventRx::cancel_at_consumed_prefix`.
+//! The decoder also reports its stop-string decisions to the engine: it
+//! acknowledges each token only after checking that it completes no stop
+//! string, and on a match stops generation with
+//! `EventRx::cancel_at_consumed_prefix`.
 
 use std::sync::Arc;
 

@@ -119,7 +119,11 @@ def _load(root, module):
 def _module():
     with torch.device("meta"):
         return FusedMoE(
-            EXPERTS, HIDDEN, INTERMEDIATE, top_k=2, activation="gelu_tanh"
+            EXPERTS,
+            HIDDEN,
+            INTERMEDIATE,
+            top_k=2,
+            activation="gelu_pytorch_tanh",
         )
 
 

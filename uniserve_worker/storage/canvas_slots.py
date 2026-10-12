@@ -11,10 +11,10 @@ Concurrent executions own separate staging and sampler workspaces while
 sharing these banks for disjoint request slots. Slot ``0`` is the padding
 sentinel, as in ``DecodeState``.
 
-Every canvas uses the one block-diffusion sampling the deployment serves
-(``WorkerConfig.canvas_sampling``): its stability threshold sizes the
-argmax history, and a request that carries other sampling is refused
-(``sampling``). The host records the step each slot ran last, so a call that
+Every canvas uses the one block-diffusion sampling the deployment is
+launched with (``WorkerConfig.canvas_sampling``): its stability threshold
+sizes the argmax history and ``constants`` holds the sampler's values. The
+host records the step each slot ran last, so a call that
 skips or repeats a step of its canvas is refused before any device work
 (``advance``); ``reset`` forgets a slot's canvas when a request is admitted
 to it or released from it.
@@ -38,8 +38,8 @@ from uniserve.model import CanvasTokens, TokenDenoiser, VocabShard
 from uniserve.nn import VocabParallelEmbedding
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig
+from uniserve_worker.config.execution import CanvasSampling
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.protocol.batch import CanvasSampling
 
 # Sampler state fields kept per slot, each a bank with one row per slot.
 FIELDS = ("canvas", "history", "self_conditioning")
@@ -168,9 +168,8 @@ class CanvasSlots:
         self.canvas_length = tokens.length
         self.vocab_size = int(vocab_size)
         self.hidden_size = int(hidden_size)
-        self.served = sampling
         self.history_depth = sampling.stability_threshold
-        # The sampler's constants for the served sampling, with the model's
+        # The sampler's constants for the launch sampling, with the model's
         # end-of-sequence and padding tokens; the sampler checks their domain.
         self.constants = sampler.CanvasSampling(
             steps=sampling.max_steps,
@@ -286,23 +285,6 @@ class CanvasSlots:
         """Release the banks once every reader has retired."""
         self.banks = {}
         self._backing.close()
-
-    def sampling(self, admitted: CanvasSampling) -> sampler.CanvasSampling:
-        """The sampler constants of a request's admitted canvas sampling.
-
-        Every request carries the sampling the deployment serves, so these
-        are ``constants``.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when ``admitted`` is not the
-                served sampling.
-        """
-        if admitted != self.served:
-            raise invalid_descriptor(
-                "the admitted canvas sampling is not the sampling this "
-                "worker serves"
-            )
-        return self.constants
 
     def advance(self, slot: int, block: int, step: int) -> None:
         """Record that ``slot`` runs step ``step`` of its block ``block``.

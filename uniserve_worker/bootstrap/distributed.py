@@ -56,8 +56,7 @@ def initialize_components(
     Raises:
         ValueError: Among other causes, when this rank is a member of no
             component (checked after every rank has taken part in group
-            creation) or when ``ComponentBinding`` finds a placement that
-            disagrees with its mesh.
+            creation) or when a component's members lie outside its Worker.
     """
     meshes = {}
     rings = {}

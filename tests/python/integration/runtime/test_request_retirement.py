@@ -66,7 +66,7 @@ def _worker(root):
         stub_worker_config(PAGE, max_batch_tokens=256),
         device="cuda:0",
         model_dtype="bfloat16",
-        max_sequence_tokens=128,
+        max_model_len=128,
         graph_policy="off",
         prefill_cuda_graph=False,
     )
@@ -77,9 +77,7 @@ def _worker(root):
         image_processor=loaded.image_processor,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_calls=None,
         queue_depth=3,
-        completion_payload_bytes=1 << 16,
         attention="torch",
         host_slots=(0, 1),
     )
