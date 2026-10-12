@@ -177,13 +177,13 @@ class Decoder(nn.Module):
 
 
 class Model(nn.Module):
-    """FLUX latent codec: sample and normalize latents and decode them back.
+    """FLUX VAE: sample and normalize latents and decode them back.
 
-    ``encoder`` and ``decoder`` wrap this codec's networks in the shared
+    ``encoder`` and ``decoder`` wrap this VAE's networks in the shared
     latent encoding and decoding with the checkpoint's scale and shift;
     ``uniserve_models.bagel.model.Model`` composes the same two modules into
     its ``PatchAutoencoder``. ``encode`` and ``decode`` serve direct use of
-    the codec.
+    the VAE.
     """
 
     def __init__(self, config: Config):

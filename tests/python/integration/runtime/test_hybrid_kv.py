@@ -12,9 +12,9 @@ import torch
 
 from tests.python.fixtures.hybrid import hybrid_model, hybrid_pool
 from tests.python.fixtures.transport import make_transport
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.runtime import EventPool
 from uniserve_worker.bootstrap.cache import plan_cache, table_widths
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import (
     TokenBufferConfig,
@@ -39,7 +39,7 @@ CONSUMER = ((1, 2, (21, 22, 23, 24, 25), 48), (1, 0, (3, 4), 64))
 
 
 def _config(device):
-    return WorkerConfig(device=device, block_size=16, max_sequence_tokens=128)
+    return cpu_worker_config(device=device, block_size=16, max_model_len=128)
 
 
 def _install(pool, tables):
@@ -66,7 +66,7 @@ def _history(pool, device):
     written = {}
     for name, table, row in _layers(pool):
         state = pool.cache.state(name)
-        first = table.start_page * table.shape.page_tokens
+        first = table.start_page * table.shape.block_size
         length = 40 - first
         shape = (length, *state.key.shape[2:])
         key = torch.randn(shape, generator=generator).to(device)
@@ -118,9 +118,9 @@ def test_publication_carries_each_group_from_its_first_needed_token(
         # A reader at token 40 needs the windowed group's last eight tokens
         # and the full group's whole history, each over its group's layers.
         windowed, full = publication.groups
-        assert (windowed.start, windowed.page_tokens) == (32, 16)
+        assert (windowed.start, windowed.block_size) == (32, 16)
         assert windowed.tensors[0].shape == (8, 10, 4, 4)
-        assert (full.start, full.page_tokens) == (0, 32)
+        assert (full.start, full.block_size) == (0, 32)
         assert full.tensors[0].shape == (40, 2, 1, 8)
         producer.validate_publications(((source, publication),), ())
         producer.apply_publications(((source, publication),), ())
@@ -145,7 +145,7 @@ def test_publication_carries_each_group_from_its_first_needed_token(
         # Each layer holds exactly the carried tokens at its own units.
         for name, table, row in _layers(consumer):
             first, key, value = written[name]
-            start = table.start_page * table.shape.page_tokens
+            start = table.start_page * table.shape.block_size
             actual = consumer.cache.state(name).read(
                 table.row(row), start=0, length=40 - start
             )
@@ -220,7 +220,7 @@ def test_staging_builds_one_entry_per_table_from_each_row_start():
             assert entry.block_table.start_page.tolist() == [2]
             assert entry.block_table.start_page_host == (2,)
             assert entry.block_table.indices.tolist() == [[unit]]
-            assert entry.write_indices.tolist() == [
+            assert entry.slot_mapping.tolist() == [
                 unit * 16 + offset for offset in range(8, 12)
             ]
         # The full table stages every held page from page zero.
@@ -228,7 +228,7 @@ def test_staging_builds_one_entry_per_table_from_each_row_start():
         assert full.block_table.block_size == 32
         assert full.block_table.start_page is None
         assert full.block_table.indices.tolist() == [[1, 2]]
-        assert full.write_indices.tolist() == [
+        assert full.slot_mapping.tolist() == [
             2 * 32 + offset for offset in range(8, 12)
         ]
         assert full.prefixes.values.tolist() == [40]
@@ -316,7 +316,7 @@ def test_indexed_decode_gathers_every_table_in_one_staging():
                 entry.block_table.indices[:, :width].tolist()
                 == other.block_table.indices.tolist()
             )
-            assert entry.write_indices.tolist() == other.write_indices.tolist()
+            assert entry.slot_mapping.tolist() == other.slot_mapping.tolist()
             assert entry.prefixes.values.tolist() == list(lengths[::-1])
             if other.block_table.start_page is None:
                 assert entry.block_table.start_page is None

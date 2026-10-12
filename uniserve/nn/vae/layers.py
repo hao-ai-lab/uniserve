@@ -238,7 +238,7 @@ class DiagonalGaussian(nn.Module):
     """Split mean/log-variance moments and optionally sample the posterior.
 
     ``log_variance_range`` clamps the log-variance before it scales the
-    noise, as latent diffusion codecs bound it against overflow; None leaves
+    noise, as latent diffusion VAEs bound it against overflow; None leaves
     it unbounded. A sample draws standard normal noise from ``generator`` on
     the moments' device unless the caller supplies ``noise``, a draw with the
     mean's shape, dtype and device. A caller that reproduces a reference

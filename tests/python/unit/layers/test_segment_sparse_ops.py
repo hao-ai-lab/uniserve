@@ -67,7 +67,7 @@ def test_gated_tiles_round_as_the_eager_product_and_sum(scale):
     assert torch.equal(output, expected)
 
 
-def _segments(tile_segments, valid_sizes, keep):
+def _segments(tile_segments, variable_block_sizes, keep):
     """Segment tables over ``tile_segments`` (-1 dense or empty) on the host."""
     segments = torch.tensor(tile_segments, dtype=torch.int32)
     starts = torch.zeros_like(segments)
@@ -75,7 +75,7 @@ def _segments(tile_segments, valid_sizes, keep):
     for segment, count in enumerate(keep):
         starts[segment] = int((segments < segment).sum())
         keeps[segment] = count
-    valid = torch.tensor(valid_sizes, dtype=torch.int32)
+    valid = torch.tensor(variable_block_sizes, dtype=torch.int32)
     return Segments(
         TILE, segments.numel() * TILE, valid, segments, starts, keeps
     )
@@ -88,7 +88,7 @@ def _on_device(segments):
         *(
             table.cuda()
             for table in (
-                segments.valid_sizes,
+                segments.variable_block_sizes,
                 segments.tile_segments,
                 segments.segment_starts,
                 segments.segment_keep,
@@ -167,3 +167,23 @@ def test_tile_selection_matches_the_eager_sort_composition(
 
     assert torch.equal(counts.cpu(), expected[1])
     assert torch.equal(indices.cpu(), expected[0])
+
+
+def test_a_query_window_selects_as_its_rows_of_the_whole_sequence():
+    layout = [-1] * 4 + [0] * 40 + [-1] * 2 + [1] * 50
+    torch.manual_seed(9)
+    valid = [int(v) for v in torch.randint(1, TILE + 1, (len(layout),))]
+    valid[7] = valid[50] = 0
+    segments = _segments(layout, valid, [11, 9])
+    scores = torch.randn(HEADS, len(layout), len(layout))
+    expected = select(scores, segments)
+
+    window = slice(33, 76)
+    indices, counts = select(
+        scores[:, window].cuda(),
+        _on_device(segments),
+        query_tile_offset=window.start,
+    )
+
+    assert torch.equal(counts.cpu(), expected[1][:, window])
+    assert torch.equal(indices.cpu(), expected[0][:, window])

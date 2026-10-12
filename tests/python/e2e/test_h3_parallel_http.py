@@ -142,8 +142,6 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
         },
         "video_decoder": {
             "ranks": ranks,
-            "distribution": "temporal_units",
-            "units_per_rank": 1,
         },
         "audio_decoder": {"ranks": [0]},
     }
@@ -174,7 +172,8 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
         ("tensor2_ulysses4", "balanced", grouping, 2)
         for grouping in ("split", "mixed")
     ]
-    # A single admitted request still needs the worker's two state slots.
+    # The worker's two state slots follow its queue depth, not the number of
+    # admitted requests, so one admitted request still leaves two.
     + [("ulysses4", "quality", "whole", 1)],
 )
 def test_component_bindings_release_cancelled_requests(
@@ -211,8 +210,6 @@ def test_component_bindings_release_cancelled_requests(
         "text_encoder": {"ranks": [0]},
         "video_decoder": {
             "ranks": [2, 0],
-            "distribution": "temporal_units",
-            "units_per_rank": 1,
         },
         "audio_decoder": {"ranks": [1]},
     }
@@ -236,8 +233,6 @@ def test_component_bindings_release_cancelled_requests(
             },
             "video_decoder": {
                 "ranks": ranks,
-                "distribution": "temporal_units",
-                "units_per_rank": 1,
             },
             "audio_decoder": {"ranks": [0]},
         }
@@ -349,8 +344,6 @@ def test_component_bindings_release_cancelled_requests(
             "components": {
                 "video_codec": {
                     "ranks": list(range(decoder_units)),
-                    "distribution": "temporal_units",
-                    "units_per_rank": 1,
                 },
                 "muxer": {"ranks": [decoder_units]},
             },
@@ -391,22 +384,16 @@ def test_component_bindings_release_cancelled_requests(
             # only.
             f"{source}->{destination}="
             + (
-                "shm"
+                "posix_shm"
                 if "host" in (source, destination) or not device_products
-                else "cuda_vmm+shm"
+                else "cuda_vmm+posix_shm"
             )
             for source, destination in sorted(edges)
         ),
         "--queue-depth",
         "6",
-        "--max-batch",
-        "2",
         "--max-running-requests",
         str(max_running_requests),
-        "--max-num-batched-tokens",
-        "2",
-        "--chunked-prefill-size",
-        "1",
         "--max-model-len",
         "16384",
         "--max-video-seconds",
@@ -414,7 +401,7 @@ def test_component_bindings_release_cancelled_requests(
         # Two text capacities bound the startup capture of every admitted
         # duration; the requests below exercise both.
         "--video-text-capacities",
-        "1024,16384",
+        "1024",
         # One and two device layouts hold the whole denoiser on each of their
         # ranks and split the 15-second sequence over fewer of them, so their
         # warmup reaches a larger share of the device than the four-device
@@ -543,7 +530,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         # Two text capacities bound the startup capture of every admitted
         # duration.
         "--video-text-capacities",
-        "1024,16384",
+        "1024",
         # Full-duration decoder graphs need a larger static grant on H200
         # alongside BF16 weights and two resident request slots.
         "--mem-fraction-static",
@@ -586,6 +573,8 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         # clean endpoint.
         schedule = video["schedule"]
         assert schedule["num_inference_steps"] == expected_steps + 1
+        # A request states its work in these fields alone; the checkpoint
+        # fixes the schedule.
         assert set(video["request_fields"]) == {
             "model",
             "prompt",
@@ -593,46 +582,17 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             "conditions",
             "target",
             "seed",
-            "num_inference_steps",
-            "flow_shift",
-            "audio_flow_shift",
-            "num_outputs_per_prompt",
-            "n",
-            "quality",
-            "seconds",
-            "size",
-            "width",
-            "height",
         }
         river = t2va_request("FastH3", "A river", 5, 1001)
         for payload in (
-            {**river, "input_reference": "image.png"},
-            # Denoiser forwards are one fewer than the schedule's points.
-            {**river, "num_inference_steps": expected_steps},
+            # Longer than the deployment's default 15-second capacity.
             {**river, "target": {**river["target"], "duration_seconds": 16}},
             # Buckets the deployment did not prepare.
             {**river, "target": {**river["target"], "aspect_ratio": "1:1"}},
             {**river, "target": {**river["target"], "short_edge": 480}},
-            {**river, "seconds": 10},
         ):
             response = client.post("/v1/videos", json=payload)
             assert response.status_code == 400, (payload, response.text)
-        # The duration-only body without a task or target is refused on both
-        # routes, naming the missing task.
-        for route in ("/v1/videos", "/v1/videos/sync"):
-            response = client.post(
-                route,
-                json={
-                    "model": "FastH3",
-                    "prompt": "A river",
-                    "seconds": 5,
-                    "seed": 1001,
-                },
-            )
-            assert response.status_code == 400
-            error = response.json()["error"]
-            assert error["type"] == "invalid_request_error"
-            assert "task" in error["message"], error
         payload = t2va_request(
             "FastH3",
             "A river flows through a forest, with birds singing.",
@@ -640,15 +600,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             1001,
         )
         # Multipart fields carry the same names; the target is JSON text.
-        # Restating the reported schedule and the SGLang client's duration
-        # and size is accepted.
-        form = {
-            **payload,
-            "target": json.dumps(payload["target"]),
-            **schedule,
-            "seconds": 5,
-            "size": "1344x768",
-        }
+        form = {**payload, "target": json.dumps(payload["target"])}
         response = client.post(
             "/v1/videos",
             files={name: (None, str(value)) for name, value in form.items()},

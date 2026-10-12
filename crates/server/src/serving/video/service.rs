@@ -20,9 +20,8 @@ use uniserve_core::{
 use uniserve_engine::VideoDenoiserInfo;
 
 use super::plan::{
-    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_ASPECT_RATIO,
-    MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES,
-    MIN_ASPECT_RATIO, NAMED_ASPECT_RATIOS, PlanLimits, ReferenceConfig, Target, VisionConfig,
+    CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, PlanLimits, ProcessorConfig,
+    ReferenceConfig, Target,
 };
 use super::probe::{MediaProber, ProbeConfig};
 use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
@@ -30,7 +29,7 @@ use super::{ConditionInput, VideoInputs, VideoProcessor};
 use crate::config::VideoMediaSettings;
 use crate::openai::{ApiError, VideoCondition, VideoGenerationRequest};
 use crate::profile::tokenizer::DynTokenizer;
-use crate::serving::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ServeError, ServeRequestId, VIDEO_FPS};
+use crate::serving::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ServeError, ServeRequestId};
 
 /// The fields of the video request body, in schema order.
 pub(crate) const REQUEST_FIELDS: [&str; 6] =
@@ -39,11 +38,14 @@ pub(crate) const REQUEST_FIELDS: [&str; 6] =
 /// A video request ready for submission.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessedVideo {
-    /// The engine request; its identifier is a placeholder the runtime
-    /// replaces with the one it reserves.
+    /// The engine request. `EngineClient` stamps the identifier it reserved
+    /// for the request at submission.
     pub request: DiffusionRequest,
     /// The requested duration in seconds, before frame alignment.
     pub duration_seconds: f64,
+    /// The duration of the generated frames, in seconds: the frame count at
+    /// the deployment's frame rate.
+    pub actual_seconds: f64,
     /// The generated canvas.
     pub canvas: Canvas,
 }
@@ -52,7 +54,6 @@ pub struct ProcessedVideo {
 pub struct VideoService {
     denoiser: VideoDenoiserInfo,
     tasks: Vec<VideoTask>,
-    max_video_seconds: f64,
     /// Condition units one latent encoding round covers while a request's
     /// prompt is encoded, which reference images are banded to fill
     /// (`RequestPlan::image_bands`).
@@ -62,20 +63,20 @@ pub struct VideoService {
 }
 
 impl VideoService {
-    /// Binds the served denoiser, whose handshake states the condition rows
-    /// the deployment provisioned, the checkpoint's vision processor, the
-    /// deployment's duration capacity, the condition units its latent
-    /// encoder covers in one round, its media policy, how it sizes
+    /// Binds the served denoiser, whose handshake states its tasks, schedule
+    /// and the canvases the deployment prepared, the checkpoint's vision
+    /// processor, the deployment's duration capacity, the condition units its
+    /// latent encoder covers in one round, its media policy, how it sizes
     /// references, and the tokenizer.
     ///
     /// # Errors
     ///
-    /// Fails when the handshake names a task this server does not know or
-    /// is otherwise invalid, when the reference config is invalid, or when
-    /// the media fetcher cannot be built.
+    /// Fails when the handshake names a task this server does not know,
+    /// declares no canvas or is otherwise invalid, when the reference config
+    /// is invalid, or when the media fetcher cannot be built.
     pub fn new(
         denoiser: VideoDenoiserInfo,
-        vision: VisionConfig,
+        vision: ProcessorConfig,
         max_video_seconds: f64,
         latent_encoding_lane: u32,
         media: &VideoMediaSettings,
@@ -85,6 +86,10 @@ impl VideoService {
         denoiser
             .validate()
             .map_err(|error| anyhow::anyhow!("invalid video denoiser handshake: {error}"))?;
+        anyhow::ensure!(
+            !denoiser.canvases.is_empty(),
+            "invalid video denoiser handshake: the worker prepared no canvas"
+        );
         references.validate().map_err(anyhow::Error::msg)?;
         let tasks = denoiser
             .tasks
@@ -106,16 +111,16 @@ impl VideoService {
         let limits = PlanLimits {
             tasks: tasks.clone(),
             max_video_seconds,
-            // An empty list means the denoiser generates every canvas of the
-            // canvas rule.
-            canvases: (!denoiser.canvases.is_empty()).then(|| denoiser.canvases.clone()),
+            frame_rate: denoiser.frame_rate,
+            frames: denoiser.frames,
+            canvases: denoiser.canvases.clone(),
+            reference_limits: denoiser.references,
             references,
         };
         Ok(Self {
             processor: VideoProcessor::new(fetcher, prober, vision, limits, tokenizer),
             denoiser,
             tasks,
-            max_video_seconds,
             latent_encoding_lane: latent_encoding_lane.max(1),
             media: media.clone(),
         })
@@ -124,34 +129,39 @@ impl VideoService {
     /// The denoiser network evaluations of every request: one per schedule
     /// interval.
     pub fn num_inference_steps(&self) -> u32 {
-        self.denoiser.schedule_points - 1
+        self.denoiser.denoise_steps()
     }
 
     /// Describes the served video contract for `GET /v1/capabilities`.
     ///
     /// Reports the tasks and their condition rules, with how the deployment
-    /// sizes `ref2va` references, the canvas rule, the
-    /// short edges and named aspect ratios the deployment serves and the
-    /// canvas each pair resolves to, the duration range, the fixed schedule
-    /// (its sigma points and shifts), the
-    /// prompt and sequence capacities, and the media sources and size caps.
+    /// sizes `ref2va` references, the canvas rule, the short edges and
+    /// aspect ratios the deployment serves and the canvas each pair selects,
+    /// the output frame rate and audio sample rate, the duration range, the
+    /// fixed schedule (its sigma points and shifts), the prompt capacity, and
+    /// the media sources and size caps.
     pub fn capabilities(&self, max_prompt_tokens: u32) -> Value {
-        // The named ratios served at any short edge, in their canonical
-        // order, and each served pair's canvas; `auto` is 16:9 for t2va and
-        // ref2va.
-        let served = plan::named_canvases(self.processor.limits());
-        let named: Vec<String> = NAMED_ASPECT_RATIOS
-            .iter()
-            .map(|(width, height)| format!("{width}:{height}"))
-            .filter(|ratio| served.iter().any(|(_, served, _)| served == ratio))
-            .collect();
+        // Each served pair's canvas, and the aspect ratios served at any
+        // short edge, in the order the deployment selected them; `auto` is
+        // 16:9 for t2va and ref2va.
+        let mut aspect_ratios: Vec<&str> = Vec::new();
         let mut sizes = serde_json::Map::new();
-        for (short_edge, aspect_ratio, size) in served {
+        for served in &self.denoiser.canvases {
+            if !aspect_ratios.contains(&served.aspect_ratio.as_str()) {
+                aspect_ratios.push(&served.aspect_ratio);
+            }
             let entry = sizes
-                .entry(short_edge.to_string())
+                .entry(served.short_edge.to_string())
                 .or_insert_with(|| json!({}));
-            entry[aspect_ratio] = json!({"width": size.width, "height": size.height});
+            entry[&served.aspect_ratio] =
+                json!({"width": served.canvas.width, "height": served.canvas.height});
         }
+        let canvases: Vec<Value> = self
+            .denoiser
+            .canvases
+            .iter()
+            .map(|served| json!({"width": served.canvas.width, "height": served.canvas.height}))
+            .collect();
         let limits = MediaLimits::new(self.media.max_request_bytes);
         let references = self.processor.limits().references;
         let conditions: serde_json::Map<String, Value> = self
@@ -165,10 +175,10 @@ impl VideoService {
                         "aspect_ratio": "auto or W:H",
                     }),
                     VideoTask::Ref2va => json!({
-                        "max_images": MAX_IMAGE_REFERENCES,
-                        "max_videos": MAX_VIDEO_REFERENCES,
-                        "max_audios": MAX_AUDIO_REFERENCES,
-                        "max_references": MAX_REFERENCES,
+                        "max_images": self.denoiser.references.images,
+                        "max_videos": self.denoiser.references.videos,
+                        "max_audios": self.denoiser.references.audios,
+                        "max_references": self.denoiser.references.total,
                         "keyframe_frame_indices": [[], [0], [-1], [0, -1]],
                         "reference_image_short_edge": references.image_short_edge,
                         "enlarge_references": references.enlarge,
@@ -184,14 +194,15 @@ impl VideoService {
                 "short_edges": self.processor.limits().short_edges(),
                 "multiple": CANVAS_MULTIPLE,
                 "max_pixels": CANVAS_MAX_PIXELS,
-                "aspect_ratios": named,
+                "aspect_ratios": aspect_ratios,
                 "sizes": sizes,
-                "free_aspect_range": [MIN_ASPECT_RATIO, MAX_ASPECT_RATIO],
-                "canvases": (!self.denoiser.canvases.is_empty()).then_some(&self.denoiser.canvases),
+                "canvases": canvases,
             },
-            "fps": VIDEO_FPS,
+            "fps": self.denoiser.frame_rate,
+            "audio_sample_rate": self.denoiser.audio_sample_rate,
+            "frames": self.denoiser.frames,
             "min_seconds": MIN_VIDEO_SECONDS,
-            "max_seconds": self.max_video_seconds,
+            "max_seconds": self.processor.limits().max_video_seconds,
             "model_max_seconds": MAX_VIDEO_SECONDS,
             "schedule": {
                 "num_inference_steps": self.denoiser.schedule_points,
@@ -204,9 +215,6 @@ impl VideoService {
                 "http": self.media.remote_media,
                 "file": self.media.media_directory.is_some(),
                 "max_request_bytes": limits.total_bytes,
-                "max_image_bytes": limits.image_bytes,
-                "max_video_bytes": limits.video_bytes,
-                "max_audio_bytes": limits.audio_bytes,
             },
             "request_fields": REQUEST_FIELDS,
         })
@@ -278,7 +286,7 @@ impl VideoService {
         }
         Ok(ProcessedVideo {
             request: DiffusionRequest {
-                request_id: RequestId(0),
+                request_id: RequestId::default(),
                 task: plan.task,
                 prompt_token_ids,
                 text_tags: processed.presentation.tags,
@@ -287,16 +295,14 @@ impl VideoService {
                 priority: 0,
                 sampling: DiffusionSamplingParams {
                     num_frames: plan.num_frames,
-                    // Each H3 video media unit decodes one 17-frame temporal
-                    // latent window past the first 5 frames.
-                    video_units: (plan.num_frames - 5) / 17,
-                    num_inference_steps: self.num_inference_steps(),
+                    video_units: self.denoiser.frames.units(plan.num_frames),
                     seed: request.seed,
                     width: plan.canvas.width,
                     height: plan.canvas.height,
                 },
             },
             duration_seconds: plan.duration_seconds,
+            actual_seconds: f64::from(plan.num_frames) / f64::from(self.denoiser.frame_rate),
             canvas: plan.canvas,
         })
     }
@@ -324,7 +330,7 @@ mod tests {
     use uniserve_core::{
         Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VideoTask, VisionGrid,
     };
-    use uniserve_engine::VideoDenoiserInfo;
+    use uniserve_engine::{ReferenceLimits, VideoDenoiserInfo};
 
     use super::super::plan::ReferenceConfig;
     use super::super::plan::tests::{fixture, vision};
@@ -344,7 +350,21 @@ mod tests {
                 schedule_points: 50,
                 video_shift: 12.0,
                 audio_shift: 3.0,
-                canvases: Vec::new(),
+                frame_rate: 24,
+                audio_sample_rate: 32_000,
+                frames: uniserve_engine::FrameClips {
+                    min_frames: 22,
+                    clip_frames: 17,
+                    clip_latent_frames: 5,
+                    tail_latent_frames: 2,
+                },
+                canvases: super::super::plan::tests::served_canvases(),
+                references: ReferenceLimits {
+                    images: 9,
+                    videos: 3,
+                    audios: 3,
+                    total: 12,
+                },
             },
             vision(&fixture()),
             15.0,

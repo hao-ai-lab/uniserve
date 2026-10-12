@@ -15,13 +15,11 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.sampling import SamplingParams
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.protocol.call import (
     CallStatus,
-    DrawLayout,
     ForwardMode,
-    Rng,
     SamplingState,
 )
 from uniserve_worker.protocol.identity import CallId
@@ -40,7 +38,7 @@ pytestmark = [
 def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
     graphs, finish_policy
 ) -> None:
-    policy = WorkerConfig(
+    policy = cpu_worker_config(
         graph_policy="full" if graphs else "off",
         prefill_cuda_graph=False,
         decode_graph_batch_sizes=(2,),
@@ -244,7 +242,6 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
     )
     tokens = tuple(completion.committed_tokens[0] for completion in completions)
     for position, completion in enumerate(completions, start=2):
-        assert completion.position == position
         assert completion.kv_visible_len == position
         assert completion.kv_computed_len == position
     expected = []
@@ -325,11 +322,6 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         predecessor=root_parent(pipelined),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
-        rng=Rng(
-            seed=917,
-            semantic_index_base=2,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
     parent_report = worker.submit(
         execution_batch(
@@ -345,11 +337,6 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         mode=ForwardMode.DECODE,
         tokens=(0,),
         predicate=predecessor.token_output,
-        rng=Rng(
-            seed=917,
-            semantic_index_base=3,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
     successor_report = worker.submit(
         execution_batch(
@@ -373,11 +360,6 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         predecessor=root_parent(serial),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
-        rng=Rng(
-            seed=917,
-            semantic_index_base=2,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
     serial_parent_report = serial_worker.submit(
         execution_batch(
@@ -396,11 +378,6 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         predecessor=observation.call_id,
         mode=ForwardMode.DECODE,
         tokens=(serial_first,),
-        rng=Rng(
-            seed=917,
-            semantic_index_base=3,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
     serial_successor_report = serial_worker.submit(
         execution_batch(
@@ -443,11 +420,6 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         predecessor=root_parent(pipelined),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
-        rng=Rng(
-            seed=613,
-            semantic_index_base=2,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
     parent_report = worker.submit(
         execution_batch(
@@ -463,11 +435,6 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         mode=ForwardMode.DECODE,
         tokens=(0,),
         predicate=predecessor.token_output,
-        rng=Rng(
-            seed=613,
-            semantic_index_base=3,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
     successor_report = worker.submit(
         execution_batch(
@@ -491,11 +458,6 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         predecessor=root_parent(serial),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
-        rng=Rng(
-            seed=613,
-            semantic_index_base=2,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
     serial_parent_report = serial_worker.submit(
         execution_batch(
@@ -514,11 +476,6 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> (
         predecessor=observation.call_id,
         mode=ForwardMode.DECODE,
         tokens=(serial_first,),
-        rng=Rng(
-            seed=613,
-            semantic_index_base=3,
-            draw_layout=DrawLayout.TARGET_SAMPLING,
-        ),
     )
     serial_successor_report = serial_worker.submit(
         execution_batch(

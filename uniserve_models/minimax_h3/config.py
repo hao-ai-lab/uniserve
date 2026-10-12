@@ -2,13 +2,15 @@
 
 ``read_config`` recognizes the checkpoint (``checkpoint.detect``), reads the
 JSON sidecars of every component, and returns one immutable ``Config``
-before any module is constructed. The network architecture is fixed:
-``Config`` rejects any network or output field that differs from its
-default. What a checkpoint may vary is each denoiser's grids and attention
-(``DenoiserConfig``): the base release's uniform schedule and dense
-attention, or a FastH3 student's distilled schedule and sparse attention as
-its ``fastvideo_inference.json`` states them; the output heads of a
-parallel-decoding student; and the latent normalization statistics.
+before any module is constructed. The checkpoint's own configuration
+defines each network's dimensions; the modules are parameterised by it. The
+reader refuses only what the packing and reconstruction code hard-codes:
+the 16x spatial and 4x temporal video compression with its 17-frame clip,
+the audio hop of the timeline, the ``[1, 2, 2]`` patch and the text
+encoder's SiLU gating. A checkpoint also states each denoiser's grids and
+attention (``DenoiserConfig``): the base release's uniform schedule and
+dense attention, or a FastH3 student's distilled schedule and sparse
+attention as its ``fastvideo_inference.json`` states them.
 """
 
 from __future__ import annotations
@@ -21,23 +23,37 @@ from functools import partial
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    TypeAlias,
+    TypeGuard,
+    cast,
+    get_origin,
+    get_type_hints,
+)
 
 from uniserve.diffusion import BlockGrid, FixedGrid, RungGrid, UniformGrid
 from uniserve.media import image
-from uniserve.nn.functional import Rounding
 from uniserve_models import qwen3_vl
 
-from . import audio_vae, output, video_vae
+from . import audio_vae, video_vae
 from .checkpoint import TASK_PARTITIONS, Layout, detect
-from .encoder import TextEncoderConfig
-from .packing import CANVAS_MULTIPLE
+from .encoder import RETAINED_LAYERS, TextEncoderConfig
+from .packing import (
+    AUDIO_HOP,
+    AUDIO_SAMPLE_RATE,
+    CANVAS_MULTIPLE,
+    CLIP_FRAMES,
+    CLIP_LATENTS,
+    VIDEO_TILE_SHAPES,
+)
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
-# DMD rungs are unshifted noise levels on the 1000-step training clock.
-TRAINING_CLOCK = 1000.0
+# DMD rungs are unshifted noise levels on the 1000-step training schedule.
+NUM_TRAIN_TIMESTEPS = 1000.0
 
 # The base release evaluates the released sigma grid of 50 points: 49
 # network evaluations and the clean endpoint.
@@ -45,8 +61,10 @@ UNIFORM_GRID_POINTS = 50
 
 # The released (adapt_shape_v1) canvas rule: a 768-pixel short edge, an area
 # cap of the 16:9 canvas, sides on the packing's 32-pixel grid, and aspect
-# ratios from 1:4 to 4:1. Request planning and the denoisers' canvases both
-# resolve through ``canvas``.
+# ratios from 1:4 to 4:1. The denoisers' canvases resolve through ``canvas``;
+# the server's planner (``crates/server/src/serving/video/plan.rs``) applies
+# the same rule, and both are tested against the diffusers reference vectors
+# in ``tests/python/fixtures/minimax_h3_plan.json``.
 CANVAS_SHORT_EDGE = 768
 CANVAS_MAX_PIXELS = 768 * 1344
 MIN_ASPECT_RATIO, MAX_ASPECT_RATIO = 1 / 4, 4
@@ -124,19 +142,30 @@ def rule_canvases() -> tuple[image.Config, ...]:
     return tuple(dict.fromkeys(canvas(ratio, 1.0) for ratio in probes))
 
 
+# The canvas rule's canvas of every named aspect ratio, at the 768-pixel
+# short edge, keyed as a request selects it: ``(short_edge, "W:H")``.
+NAMED_CANVASES = MappingProxyType(
+    {
+        (CANVAS_SHORT_EDGE, f"{width}:{height}"): canvas(width, height)
+        for width, height in NAMED_ASPECT_RATIOS
+    }
+)
+
 # FastH3 DMD students are trained on, and generate only, 12 buckets: the
 # named aspect ratios at the 768p and 480p resolutions. The 768p buckets are
 # the canvas rule's canvases; the 480p buckets, (height, width) below in the
 # same ratio order, are the training table's own rather than a rescaled rule
 # (21:9 is 992x416, not 960x416). A deployment prepares a subset of them.
-DMD_CANVASES = (
-    *(canvas(*ratio) for ratio in NAMED_ASPECT_RATIOS),
-    image.Config(416, 992),
-    image.Config(480, 832),
-    image.Config(480, 640),
-    image.Config(480, 480),
-    image.Config(640, 480),
-    image.Config(832, 480),
+DMD_CANVASES = MappingProxyType(
+    {
+        **NAMED_CANVASES,
+        (480, "21:9"): image.Config(416, 992),
+        (480, "16:9"): image.Config(480, 832),
+        (480, "4:3"): image.Config(480, 640),
+        (480, "1:1"): image.Config(480, 480),
+        (480, "3:4"): image.Config(640, 480),
+        (480, "9:16"): image.Config(832, 480),
+    }
 )
 
 
@@ -150,32 +179,26 @@ class TransformerConfig:
 
     ``output_heads`` is 1 for an ordinary DiT and the fine-grid interval
     count for a parallel-decoding (PDD) student, whose output projections
-    hold one head-major prediction per interval. ``rounding`` is the
-    elementwise recipe for the block epilogues (modulation, gated residuals,
-    Q/K rotation and SwiGLU gating): the base release and the ref2va
-    students are defined by references that round after every eager BF16
-    operation; the t2va students keep UniServe's single-rounding kernels,
-    with which their published results were served.
+    hold one head-major prediction per interval.
     """
 
-    hidden_size: int = 5376
-    num_attention_heads: int = 56
-    head_dim: int = 128
-    num_hidden_layers: int = 50
-    num_refiner_layers: int = 2
-    intermediate_size: int = 14336
-    video_channels: int = 24
-    audio_channels: int = 32
-    text_dim: int = 5120
-    frequency_dim: int = 256
-    time_hidden_dim: int = 5376
-    time_dim: int = 2688
-    rope_frequency_dim: int = 16
-    rope_theta: float = 10000.0
-    norm_eps: float = 1e-5
-    qk_norm_eps: float = 1e-5
-    output_heads: int = 1
-    rounding: Rounding = Rounding.STEPWISE
+    hidden_size: int
+    num_attention_heads: int
+    head_dim: int
+    num_hidden_layers: int
+    num_refiner_layers: int
+    intermediate_size: int
+    video_channels: int
+    audio_channels: int
+    text_dim: int
+    frequency_dim: int
+    time_hidden_dim: int
+    time_dim: int
+    rope_frequency_dim: int
+    rope_theta: float
+    norm_eps: float
+    qk_norm_eps: float
+    output_heads: int
 
     def __post_init__(self) -> None:
         for name in (
@@ -209,8 +232,6 @@ class TransformerConfig:
                 raise ValueError(
                     f"H3 transformer {name} must be finite and positive"
                 )
-        if not isinstance(self.rounding, Rounding):
-            raise ValueError("H3 transformer rounding must be a Rounding")
         # Each of the three rotary axes (time, height, width) rotates
         # 2 * rope_frequency_dim channels of a head; the rest stay unrotated.
         if (
@@ -242,11 +263,9 @@ class SparseAttention:
     """Video sparse attention over ``tile``-row spatiotemporal tiles.
 
     Each video query tile keeps ``ceil((1 - sparsity) n)`` of the ``n`` key
-    tiles of the generated video. Without ``reference_keep`` the generated
-    video is the only selected segment, packed in 64-row tiles
-    (``packing.TilePacking``, the t2va students). With it, every reference
-    video is a segment of its own, of which a query keeps the fraction
-    ``reference_keep`` (``packing.SegmentPacking``, the ref2va students).
+    tiles of the generated video. Every reference video is a segment of its
+    own, of which a query keeps the fraction ``reference_keep``; a network
+    without reference videos states none (``packing.SegmentPacking``).
     """
 
     tile: int
@@ -254,8 +273,12 @@ class SparseAttention:
     reference_keep: float | None = None
 
     def __post_init__(self) -> None:
-        if self.tile not in (64, 128):
-            raise ValueError("H3 sparse attention tiles hold 64 or 128 rows")
+        # A tile holds a video tile shape of the segment packing.
+        if self.tile not in VIDEO_TILE_SHAPES:
+            raise ValueError(
+                "H3 sparse attention tiles hold "
+                f"{' or '.join(map(str, VIDEO_TILE_SHAPES))} rows"
+            )
         for name in ("sparsity",) + (
             () if self.reference_keep is None else ("reference_keep",)
         ):
@@ -270,8 +293,6 @@ class SparseAttention:
             raise ValueError("H3 VSA sparsity must lie in [0, 1)")
         if self.reference_keep is not None and not 0 < self.reference_keep <= 1:
             raise ValueError("H3 reference keep rate must lie in (0, 1]")
-        if self.reference_keep is None and self.tile != 64:
-            raise ValueError("single-segment H3 sparse attention tiles 64 rows")
 
 
 Attention: TypeAlias = DenseAttention | SparseAttention
@@ -287,34 +308,38 @@ class DenoiserConfig:
             their shifts; requests cannot change them.
         attention: Dense or sparse attention.
         tasks: The tasks this DiT serves, in canonical order.
-        canvases: The only canvases the checkpoint generates, or None when it
-            generates every canvas of the canvas rules.
+        canvases: The only canvases the checkpoint generates, keyed by the
+            ``(short_edge, "W:H")`` a request selects them with, or None
+            when it generates every canvas of the canvas rule.
     """
 
     transformer: TransformerConfig
     grids: Mapping[str, FixedGrid]
     attention: Attention
     tasks: tuple[str, ...]
-    canvases: tuple[image.Config, ...] | None
+    canvases: Mapping[tuple[int, str], image.Config] | None
 
     def __post_init__(self) -> None:
         if (
             not isinstance(self.tasks, tuple)
             or not self.tasks
-            or any(
-                task not in ("t2va", "fl2va", "ref2va") for task in self.tasks
-            )
+            or any(task not in TASK_PARTITIONS for task in self.tasks)
             or len(set(self.tasks)) != len(self.tasks)
         ):
             raise ValueError("H3 denoiser tasks must name distinct H3 tasks")
         if self.canvases is not None and (
-            not isinstance(self.canvases, tuple)
+            not isinstance(self.canvases, Mapping)
             or not self.canvases
             or any(
-                not isinstance(value, image.Config) for value in self.canvases
+                not isinstance(value, image.Config)
+                for value in self.canvases.values()
             )
+            # A canvas is named once, so a raster's name is its own.
+            or len(set(self.canvases.values())) != len(self.canvases)
         ):
-            raise ValueError("H3 denoiser canvases must be image.Config values")
+            raise ValueError(
+                "H3 denoiser canvases must name distinct image.Config values"
+            )
         if (
             set(self.grids) != {"video", "audio"}
             or any(
@@ -344,7 +369,7 @@ class DenoiserConfig:
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Compose the fixed H3 networks and the checkpoint's denoisers.
+    """Compose the checkpoint's encoders, denoisers and VAEs.
 
     ``denoisers`` maps each DiT partition the checkpoint holds
     (``transformer`` or ``transformer_ref``) to its configuration; a
@@ -355,7 +380,6 @@ class Config:
     denoisers: Mapping[str, DenoiserConfig]
     video_vae: video_vae.Config
     audio_vae: audio_vae.Config
-    output: output.Config = output.Config()
 
     def __post_init__(self) -> None:
         if not isinstance(self.denoisers, Mapping) or not self.denoisers:
@@ -381,42 +405,10 @@ class Config:
                 raise ValueError(
                     "H3 audio latent channels must match the denoiser"
                 )
-        # Packing, attention and native reconstruction implement this
-        # architecture; typed configs do not imply arbitrary variants. The
-        # latent statistics come from each checkpoint and are exempt, as are
-        # the PDD output heads and the denoiser's rounding recipe.
-        expected_networks: tuple[tuple[str, object, object], ...] = (
-            ("text_encoder", self.text_encoder, TextEncoderConfig()),
-            ("video_vae", self.video_vae, video_vae.Config()),
-            ("audio_vae", self.audio_vae, audio_vae.Config()),
-            ("output", self.output, output.Config()),
-            *(
-                (f"{name}.transformer", value.transformer, TransformerConfig())
-                for name, value in self.denoisers.items()
-            ),
-        )
-        for name, actual, expected in expected_networks:
-            for field in fields(expected):  # type: ignore[arg-type]
-                if field.name in {
-                    "latents_mean",
-                    "latents_std",
-                    "output_heads",
-                    "rounding",
-                }:
-                    continue
-                value = getattr(actual, field.name)
-                supported = getattr(expected, field.name)
-                if value != supported:
-                    raise ValueError(
-                        f"H3 {name}.{field.name} must be {supported!r}, "
-                        f"got {value!r}"
-                    )
 
 
 # Checkpoint config field names mapped to the typed config fields they fill.
-# ``_normalize`` reads the checkpoint through them, and ``weights`` maps back
-# through them to construct the native modules whose parameter names it
-# enumerates.
+# ``normalize`` reads the checkpoint through them.
 TRANSFORMER_FIELDS = {
     "num_attention_heads": "num_attention_heads",
     "attention_head_dim": "head_dim",
@@ -498,7 +490,7 @@ def _fasth3_grids(
         grid = partial(
             RungGrid,
             tuple(contract["dmd_denoising_steps"]),
-            clock=TRAINING_CLOCK,
+            num_train_timesteps=NUM_TRAIN_TIMESTEPS,
         )
     elif "pdd_step_indices" in contract:
         grid = partial(
@@ -515,9 +507,7 @@ def _fasth3_grids(
     return _modality_grids(grid, shifts)
 
 
-def _transformer(
-    values: Mapping[str, Any], *, heads: int, rounding: Rounding
-) -> TransformerConfig:
+def _transformer(values: Mapping[str, Any], *, heads: int) -> TransformerConfig:
     missing = set(TRANSFORMER_FIELDS) - values.keys()
     if missing:
         raise ValueError(
@@ -532,7 +522,6 @@ def _transformer(
         )
     return TransformerConfig(
         output_heads=heads,
-        rounding=rounding,
         **{
             target: values[source]
             for source, target in TRANSFORMER_FIELDS.items()
@@ -540,7 +529,25 @@ def _transformer(
     )
 
 
-def _text_encoder(metadata: Mapping[str, Any]) -> TextEncoderConfig:
+def _pixels(preprocessor: Mapping[str, Any]) -> qwen3_vl.PixelConfig:
+    """Read the pixel normalization of the checkpoint's image processor."""
+    missing = {"image_mean", "image_std"} - preprocessor.keys()
+    if missing:
+        raise ValueError(
+            "MiniMax-H3 processor preprocessor_config is missing fields: "
+            f"{', '.join(sorted(missing))}"
+        )
+    mean, std = preprocessor["image_mean"], preprocessor["image_std"]
+    if not isinstance(mean, list) or not isinstance(std, list):
+        raise ValueError(
+            "MiniMax-H3 processor image_mean and image_std must be lists"
+        )
+    return qwen3_vl.PixelConfig(mean=tuple(mean), std=tuple(std))
+
+
+def _text_encoder(
+    metadata: Mapping[str, Any], preprocessor: Mapping[str, Any]
+) -> TextEncoderConfig:
     text = metadata.get("text_config")
     if not isinstance(text, dict):
         raise ValueError("MiniMax-H3 text encoder requires text_config")
@@ -578,42 +585,71 @@ def _text_encoder(metadata: Mapping[str, Any]) -> TextEncoderConfig:
         )
     return TextEncoderConfig(
         **{target: text[source] for source, target in TEXT_FIELDS.items()},
+        num_retained_layers=RETAINED_LAYERS,
         mrope_sections=tuple(rope["mrope_section"]),
         image_token_id=metadata["image_token_id"],
         video_token_id=metadata["video_token_id"],
         vision=qwen3_vl.read_vision_config(vision),
+        pixels=_pixels(preprocessor),
     )
+
+
+def _sequence_fields(config: type) -> set[str]:
+    """Name the fields ``config`` annotates as tuples."""
+    return {
+        name
+        for name, hint in get_type_hints(config).items()
+        if get_origin(hint) is tuple
+    }
 
 
 def _video_vae(values: Mapping[str, Any]) -> video_vae.Config:
     result = {}
+    sequences = _sequence_fields(video_vae.Config)
     for field in fields(video_vae.Config):
         if field.name not in values:
             raise ValueError(
                 f"MiniMax-H3 video_vae is missing field {field.name}"
             )
         value = values[field.name]
-        if isinstance(field.default, tuple):
+        if field.name in sequences:
             if not isinstance(value, (tuple, list)):
                 raise ValueError(
                     f"MiniMax-H3 video_vae.{field.name} must be a sequence"
                 )
             value = tuple(value)
         result[field.name] = value
-    return video_vae.Config(**result)
+    config = video_vae.Config(**result)
+
+    # Packing, request planning and reconstruction hard-code the clip
+    # timeline: a 17-frame clip encodes to 5 latent frames, 3 of which the
+    # final clip drops, at 16x spatial and 4x temporal compression.
+    clip = (
+        config.clip_length,
+        config.clip_latents,
+        config.clip_latents - config.token_drop,
+        config.spatial_compression,
+        config.temporal_compression,
+    )
+    if clip != (CLIP_FRAMES, CLIP_LATENTS, 2, 16, 4):
+        raise ValueError(
+            "MiniMax-H3 video_vae must encode 17-frame clips to 5 latent "
+            "frames, dropping 3 of them from the final clip, at 16x spatial "
+            "and 4x temporal compression"
+        )
+    return config
 
 
 def _audio_vae(values: Mapping[str, Any]) -> audio_vae.Config:
     result = {}
+    sequences = _sequence_fields(audio_vae.Config)
     for field in fields(audio_vae.Config):
         if field.name not in values:
             raise ValueError(
                 f"MiniMax-H3 audio_vae is missing field {field.name}"
             )
         value = values[field.name]
-        if isinstance(field.default, tuple) and not isinstance(
-            value, (tuple, list)
-        ):
+        if field.name in sequences and not isinstance(value, (tuple, list)):
             raise ValueError(
                 f"MiniMax-H3 audio_vae.{field.name} must be a sequence"
             )
@@ -624,10 +660,20 @@ def _audio_vae(values: Mapping[str, Any]) -> audio_vae.Config:
                     "must contain sequences"
                 )
             value = tuple(tuple(row) for row in value)
-        elif isinstance(field.default, tuple):
+        elif field.name in sequences:
             value = tuple(value)
         result[field.name] = value
-    return audio_vae.Config(**result)
+    config = audio_vae.Config(**result)
+
+    # Request planning counts latents in hops of the timeline.
+    if (
+        math.prod(config.encoder_rates) != AUDIO_HOP
+        or math.prod(config.decoder_rates) != AUDIO_HOP
+    ):
+        raise ValueError(
+            f"MiniMax-H3 audio_vae must hop {AUDIO_HOP} samples per latent"
+        )
+    return config
 
 
 def _shifts(metadata: Mapping[str, Mapping[str, Any]]) -> dict[str, float]:
@@ -647,12 +693,14 @@ def normalize(
 ) -> Config:
     """Normalize recognized checkpoint sidecars without allocating resources.
 
-    ``metadata`` holds the parsed JSON of ``text_encoder``, ``video_vae``,
+    ``metadata`` holds the parsed JSON of ``text_encoder``, ``processor``
+    (the image processor's ``preprocessor_config.json``), ``video_vae``,
     ``audio_vae``, ``scheduler``, ``audio_scheduler`` and one entry per DiT
     partition the layout holds (its ``config.json``).
     """
     for name in (
         "text_encoder",
+        "processor",
         "video_vae",
         "audio_vae",
         "scheduler",
@@ -661,9 +709,12 @@ def normalize(
     ):
         if not isinstance(metadata.get(name), Mapping):
             raise ValueError(f"MiniMax-H3 requires {name} metadata")
-    if metadata["audio_vae"].get("sampling_rate") != 32000:
+    # Request planning resamples every soundtrack to the timeline's
+    # AUDIO_SAMPLE_RATE, so the audio VAE must run at it.
+    if metadata["audio_vae"].get("sampling_rate") != AUDIO_SAMPLE_RATE:
         raise ValueError(
-            "MiniMax-H3 audio output requires a 32000 Hz sampling clock"
+            f"MiniMax-H3 audio output requires a {AUDIO_SAMPLE_RATE} Hz "
+            "sampling clock"
         )
     shifts = _shifts(metadata)
     contract = layout.contract
@@ -681,16 +732,7 @@ def normalize(
             if contract is None
             else _fasth3_attention(contract)
         )
-        # Single-segment VSA normalizes and rotates Q/K in its fused input
-        # preparation, which rounds once.
-        transformer = _transformer(
-            values,
-            heads=heads,
-            rounding=Rounding.ONCE
-            if isinstance(attention, SparseAttention)
-            and attention.reference_keep is None
-            else Rounding.STEPWISE,
-        )
+        transformer = _transformer(values, heads=heads)
         if contract is None:
             grids = _modality_grids(
                 partial(UniformGrid, UNIFORM_GRID_POINTS), shifts
@@ -707,7 +749,9 @@ def normalize(
             else None,
         )
     return Config(
-        text_encoder=_text_encoder(metadata["text_encoder"]),
+        text_encoder=_text_encoder(
+            metadata["text_encoder"], metadata["processor"]
+        ),
         denoisers=denoisers,
         video_vae=_video_vae(metadata["video_vae"]),
         audio_vae=_audio_vae(metadata["audio_vae"]),
@@ -717,6 +761,7 @@ def normalize(
 # Component sidecars, relative to the checkpoint root.
 _SIDECARS = {
     "text_encoder": "text_encoder/config.json",
+    "processor": "processor/preprocessor_config.json",
     "video_vae": "vae/config.json",
     "audio_vae": "audio_vae/config.json",
     "scheduler": "scheduler/scheduler_config.json",

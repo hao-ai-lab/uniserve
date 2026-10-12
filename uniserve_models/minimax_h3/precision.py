@@ -18,17 +18,16 @@ import torch
 from uniserve.loading import weights
 from uniserve.quantization import QuantizationConfig, Quantizer
 
-from .config import Config, TransformerConfig
-from .video_vae import Config as VideoConfig
+from .config import Config
 
 # This table is the single definition of each named numerical tier. Both
 # complete presets and component overrides expand through weight_config.
 # Each row names (attention, mlp, text_encoder, video_vae) representations, in
-# weight_config's keyword order. "default" selects "quality": the dense
-# checkpoint's own BF16 transformer and FP16 video decoder, which every
-# supported GPU computes. Quantized tiers are explicit choices.
+# weight_config's keyword order. "quality" is the dense checkpoint's own BF16
+# transformer and FP16 video decoder, which every supported GPU computes, and
+# it is listed first: ``precisions`` lists the preset a launch without a
+# selector loads first. Quantized tiers are explicit choices.
 _formats = {
-    "default": ("bf16", "bf16", "bf16", "fp16"),
     "quality": ("bf16", "bf16", "bf16", "fp16"),
     "balanced": ("bf16", "bf16", "bf16", "nvfp4"),
     "performance": ("bf16", "fp8", "bf16", "nvfp4"),
@@ -39,7 +38,7 @@ _formats = {
 def weight_config(
     config: Config,
     *,
-    preset: str = "default",
+    preset: str = "quality",
     attention: str | None = None,
     mlp: str | None = None,
     text_encoder: str | None = None,
@@ -59,8 +58,8 @@ def weight_config(
         video_vae: Video VAE decoder projections: fp16, bf16 or nvfp4.
 
     Returns:
-        Module-path dtypes and quantization for the default H3 layer counts
-        of ``TransformerConfig`` and the video VAE ``Config``.
+        Module-path dtypes and quantization for the layer counts of each
+        denoiser and of the video VAE decoder in ``config``.
 
     Raises:
         ValueError: The preset is unknown or a component representation is
@@ -125,8 +124,8 @@ def weight_config(
         },
     }
     quantization = {}
-    for component in config.denoisers:
-        for index in range(TransformerConfig().num_hidden_layers):
+    for component, denoiser in config.denoisers.items():
+        for index in range(denoiser.transformer.num_hidden_layers):
             path = f"{component}.transformer.layers.{index}"
             # With FP8, the merged attention projection takes one tensor-wide
             # scale; the attention output and feed-forward take per-row
@@ -160,7 +159,7 @@ def weight_config(
         dtypes[f"{path}.decoder.input"] = dtype
         dtypes[f"{path}.decoder.output"] = dtype
 
-    for index in range(VideoConfig().decoder_num_layers):
+    for index in range(config.video_vae.decoder_num_layers):
         for layer in ("qkv", "output", "mlp"):
             child = f"{path}.decoder.layers.{index}.{layer}"
             dtypes[child] = dtype
@@ -172,8 +171,9 @@ def precisions(config: Config) -> Mapping[str, weights.Config]:
     """Complete presets ``uniserve_models.loading.load_model`` accepts by name.
 
     These apply to a dense checkpoint; a calibrated ModelOpt checkpoint offers
-    none. ``read_config`` takes the "default" entry as a dense checkpoint's
-    base weights, which a checkpoint quantization_config may refine.
+    none. ``read_config`` takes the first entry, ``quality``, as a dense
+    checkpoint's base weights, which a checkpoint quantization_config may
+    refine.
     """
     return MappingProxyType(
         {name: weight_config(config, preset=name) for name in _formats}

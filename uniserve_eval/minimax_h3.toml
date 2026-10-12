@@ -1,8 +1,8 @@
 # MiniMax-H3 on NVIDIA GB200 GPUs: the UniServe deployments of the base
-# checkpoint's two denoisers, of the FastH3 OmniRef export and of FastH3
-# 8-Step V2, and the SGLang, vLLM-Omni and FastVideo baselines, on the
-# performance workloads W1 to W5 and the OmniRef reference matrix. FastH3
-# 8-Step V2's own workload (W6) is measured by uniserve_eval/fast_h3.toml.
+# checkpoint's two denoisers and of the FastH3 OmniRef export, and the SGLang,
+# vLLM-Omni and FastVideo baselines, on the performance workloads W1 to W5 and
+# the OmniRef reference matrix. FastH3 8-Step V2, on W1, W2 and its own
+# workload W6, is measured by uniserve_eval/fast_h3.toml.
 #
 # Environment:
 # - UNISERVE_MINIMAX_H3_MODEL names a local copy of MiniMaxAI/MiniMax-H3 at
@@ -14,8 +14,6 @@
 #   the Hugging Face cache holds the MiniMax-H3 revision it pins
 #   (9bfb6693f2cf6de171db46d1aa586f67d773a1da), from which UniServe reads the
 #   components the export omits.
-# - UNISERVE_FAST_H3_MODEL names a local copy of
-#   FastVideo/FastVideo-FastH3-8-Step-V2, as in uniserve_eval/fast_h3.toml.
 # - UNISERVE_MINIMAX_H3_FFMPEG names the bin directory of the FFmpeg 8.1.2
 #   build whose ffprobe probes condition media and whose ffmpeg decodes
 #   reference videos for UniServe.
@@ -43,10 +41,9 @@
 #   clips (full).
 # The base checkpoint's schedule is 50 sigma points (49 denoiser
 # evaluations) with video shift 12 and audio shift 3; OmniRef's is 9 points,
-# its 8 fused-block forwards, with the same shifts. Every base and OmniRef
-# point states its schedule: UniServe refuses one other than its
-# checkpoint's, and the baselines run the schedule they are sent. FastH3
-# points state none and run the checkpoint's own.
+# its 8 fused-block forwards, with the same shifts. A UniServe point states
+# no schedule and runs its checkpoint's own; a baseline point states the
+# schedule it measures, which the baseline runs as sent.
 #
 # A point first sends its one warmup row (seed 42), which is not measured,
 # then its measured rows one at a time, each with its own seed from 0: four
@@ -71,13 +68,13 @@ artifact_root = "artifacts/minimax_h3/measurements"
 # and W2; 1935 text rows for W3; up to 6913 for W5), the duration bound the
 # longest target, and the condition capacity the rows the references pack.
 
-# Base FL2VA (the diffusers root's denoiser) for t2va: the full 15-second
-# range and one 1024-token text capacity.
+# Base FL2VA (the diffusers root's transformer component) for t2va: the full
+# 15-second range and one 1024-token text capacity.
 [servers.gb200-4]
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4.json", "--max-running-requests", "2", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-4.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -93,13 +90,11 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-w1.video]
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 
 [benchmarks.gb200-4-w1.load]
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
 
@@ -119,13 +114,11 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-w2.video]
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 
 [benchmarks.gb200-4-w2.load]
 num_prompts = 4
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
 
@@ -141,7 +134,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "2048", "--video-text-capacities", "2048", "--max-video-seconds", "8", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4.json", "--max-running-requests", "2", "--max-model-len", "2048", "--video-text-capacities", "2048", "--max-video-seconds", "8", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-4-keyframe.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -157,14 +150,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-w3.video]
 task = "fl2va"
 aspect_ratio = "auto"
-seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-w3.load]
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 
@@ -173,7 +164,7 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# Base Ref2VA (the diffusers root's reference_denoiser): 5 seconds, an
+# Base Ref2VA (the diffusers root's transformer_ref component): 5 seconds, an
 # 8192-token text capacity and 40,960 condition rows, which hold W5's
 # reference video, its soundtrack and the audio reference (about 38,000
 # rows packed densely). References are enlarged to their encoding size, as
@@ -182,7 +173,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4-reference.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "8192", "--video-text-capacities", "8192", "--max-video-seconds", "5", "--max-condition-rows", "40960", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}", "--mm-processor-kwargs", "{\"enlarge_references\":true}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4-reference.json", "--max-running-requests", "2", "--max-model-len", "8192", "--video-text-capacities", "8192", "--max-video-seconds", "5", "--max-condition-rows", "40960", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}", "--mm-processor-kwargs", "{\"enlarge_references\":true}"]
 
 [servers.gb200-4-reference.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -198,14 +189,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-reference-w4.video]
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-reference-w4.load]
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
 
@@ -225,14 +214,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-reference-w5.video]
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-reference-w5.load]
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
 
@@ -242,7 +229,7 @@ videos_per_second = "higher"
 "video_latency_ms.p95" = "lower"
 
 # FastH3 OmniRef on the same deployment file: the export's reference DiT
-# with the other components of its pinned base. Its region-sparse attention
+# with the other components of its pinned base. Its segment-sparse attention
 # packs each condition into whole 128-row tiles, so W5 takes 47,104
 # condition rows there; the capacity is 49,152. References are enlarged to
 # their encoding size here too.
@@ -250,7 +237,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4-reference.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "8192", "--video-text-capacities", "8192", "--max-video-seconds", "5", "--max-condition-rows", "49152", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}", "--mm-processor-kwargs", "{\"enlarge_references\":true}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4-reference.json", "--max-running-requests", "2", "--max-model-len", "8192", "--video-text-capacities", "8192", "--max-video-seconds", "5", "--max-condition-rows", "49152", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}", "--mm-processor-kwargs", "{\"enlarge_references\":true}"]
 
 [servers.gb200-4-omniref.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -266,14 +253,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-omniref-w4.video]
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-omniref-w4.load]
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
 
@@ -293,14 +278,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-omniref-w5.video]
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-omniref-w5.load]
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
 
@@ -326,7 +309,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-reference-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "24576", "--video-text-capacities", "4096,7168,8192,9216,10240,12288,15360,24576", "--max-video-seconds", "15", "--max-condition-rows", "56192", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-reference-two-node.json", "--max-running-requests", "2", "--max-model-len", "24576", "--video-text-capacities", "4096,7168,8192,9216,10240,12288,15360", "--max-video-seconds", "15", "--max-condition-rows", "56192", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-8-omniref-refs.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -342,14 +325,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-image-5s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-5s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-5s-warmup.jsonl"
 
@@ -369,14 +350,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-image-voice-5s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-voice-5s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-5s-warmup.jsonl"
 
@@ -396,14 +375,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-images3-5s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images3-5s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images3-5s-warmup.jsonl"
 
@@ -423,14 +400,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-images9-5s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images9-5s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images9-5s-warmup.jsonl"
 
@@ -450,14 +425,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-clip-5s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clip-5s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clip-5s-warmup.jsonl"
 
@@ -477,14 +450,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-video-5s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-video-5s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-5s-warmup.jsonl"
 
@@ -504,14 +475,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-clips3-5s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clips3-5s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clips3-5s-warmup.jsonl"
 
@@ -531,14 +500,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-mixed-5s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-mixed-5s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-5s-warmup.jsonl"
 
@@ -558,14 +525,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-full-5s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-full-5s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-full-5s-warmup.jsonl"
 
@@ -585,14 +550,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-image-10s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-10s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-10s-warmup.jsonl"
 
@@ -612,14 +575,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-image-voice-10s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-voice-10s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-10s-warmup.jsonl"
 
@@ -639,14 +600,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-images3-10s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images3-10s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images3-10s-warmup.jsonl"
 
@@ -666,14 +625,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-images9-10s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images9-10s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images9-10s-warmup.jsonl"
 
@@ -693,14 +650,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-clip-10s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clip-10s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clip-10s-warmup.jsonl"
 
@@ -720,14 +675,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-video-10s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-video-10s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-10s-warmup.jsonl"
 
@@ -747,14 +700,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-clips3-10s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clips3-10s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clips3-10s-warmup.jsonl"
 
@@ -774,14 +725,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-mixed-10s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-mixed-10s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-10s-warmup.jsonl"
 
@@ -801,14 +750,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-full-10s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-full-10s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-full-10s-warmup.jsonl"
 
@@ -828,14 +775,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-image-15s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-15s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-15s-warmup.jsonl"
 
@@ -855,14 +800,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-image-voice-15s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-voice-15s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-15s-warmup.jsonl"
 
@@ -882,14 +825,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-images3-15s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images3-15s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images3-15s-warmup.jsonl"
 
@@ -909,14 +850,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-images9-15s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images9-15s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images9-15s-warmup.jsonl"
 
@@ -936,14 +875,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-clip-15s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clip-15s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clip-15s-warmup.jsonl"
 
@@ -963,14 +900,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-video-15s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-video-15s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-15s-warmup.jsonl"
 
@@ -990,14 +925,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-clips3-15s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clips3-15s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clips3-15s-warmup.jsonl"
 
@@ -1017,14 +950,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-mixed-15s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-mixed-15s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-15s-warmup.jsonl"
 
@@ -1044,14 +975,12 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-omniref-ref-full-15s.video]
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-full-15s.load]
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-full-15s-warmup.jsonl"
 
@@ -1070,7 +999,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-reference-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "48128", "--video-text-capacities", "4096,7168,8192,10240,14336,15360,22528,37888,48128", "--max-video-seconds", "15", "--max-condition-rows", "79104", "--mm-processor-kwargs", "{\"enlarge_references\":true}", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-reference-two-node.json", "--max-running-requests", "2", "--max-model-len", "48128", "--video-text-capacities", "4096,7168,8192,10240,14336,15360,22528,37888", "--max-video-seconds", "15", "--max-condition-rows", "79104", "--mm-processor-kwargs", "{\"enlarge_references\":true}", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-8-omniref-refs-enlarged.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -1093,7 +1022,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-5s-warmup.jsonl"
 
@@ -1120,7 +1048,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-5s-warmup.jsonl"
 
@@ -1147,7 +1074,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images3-5s-warmup.jsonl"
 
@@ -1174,7 +1100,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images9-5s-warmup.jsonl"
 
@@ -1201,7 +1126,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clip-5s-warmup.jsonl"
 
@@ -1228,7 +1152,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-5s-warmup.jsonl"
 
@@ -1255,7 +1178,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clips3-5s-warmup.jsonl"
 
@@ -1282,7 +1204,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-5s-warmup.jsonl"
 
@@ -1309,7 +1230,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-full-5s-warmup.jsonl"
 
@@ -1336,7 +1256,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-10s-warmup.jsonl"
 
@@ -1363,7 +1282,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-10s-warmup.jsonl"
 
@@ -1390,7 +1308,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images3-10s-warmup.jsonl"
 
@@ -1417,7 +1334,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images9-10s-warmup.jsonl"
 
@@ -1444,7 +1360,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clip-10s-warmup.jsonl"
 
@@ -1471,7 +1386,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-10s-warmup.jsonl"
 
@@ -1498,7 +1412,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clips3-10s-warmup.jsonl"
 
@@ -1525,7 +1438,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-10s-warmup.jsonl"
 
@@ -1552,7 +1464,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-full-10s-warmup.jsonl"
 
@@ -1579,7 +1490,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-15s-warmup.jsonl"
 
@@ -1606,7 +1516,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-15s-warmup.jsonl"
 
@@ -1633,7 +1542,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images3-15s-warmup.jsonl"
 
@@ -1660,7 +1568,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images9-15s-warmup.jsonl"
 
@@ -1687,7 +1594,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clip-15s-warmup.jsonl"
 
@@ -1714,7 +1620,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-15s-warmup.jsonl"
 
@@ -1741,7 +1646,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clips3-15s-warmup.jsonl"
 
@@ -1768,7 +1672,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-15s-warmup.jsonl"
 
@@ -1795,77 +1698,10 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 3
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-full-15s-warmup.jsonl"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-full-15s.metrics]
-videos_per_second = "higher"
-"video_latency_ms.p50" = "lower"
-"video_latency_ms.p95" = "lower"
-
-# FastH3 8-Step V2 (UNISERVE_FAST_H3_MODEL, a local copy of
-# FastVideo/FastVideo-FastH3-8-Step-V2) on W1 and W2, with the deployment and
-# options of uniserve_eval/fast_h3.toml's gb200-4-bf16 server, which measures
-# its own workload (W6). The requests state no schedule: the server serves
-# the checkpoint's, 9 sigma points (8 DMD forwards) with shifts 10 and 3.
-[servers.fast-h3-gb200-4]
-host = "127.0.0.1"
-port = 18083
-ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
-
-[servers.fast-h3-gb200-4.environment]
-NCCL_NVLS_ENABLE = "0"
-
-[benchmarks.fast-h3-gb200-4-w1]
-server = "fast-h3-gb200-4"
-task = "video"
-model = "FastH3"
-dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
-endpoint = "/v1/videos/sync"
-
-[benchmarks.fast-h3-gb200-4-w1.video]
-task = "t2va"
-aspect_ratio = "16:9"
-seconds = 5.0
-
-[benchmarks.fast-h3-gb200-4-w1.load]
-num_prompts = 8
-request_rate = inf
-max_concurrency = 1
-warmup_requests = 0
-request_timeout_s = 3600
-warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
-
-[benchmarks.fast-h3-gb200-4-w1.metrics]
-videos_per_second = "higher"
-"video_latency_ms.p50" = "lower"
-"video_latency_ms.p95" = "lower"
-
-[benchmarks.fast-h3-gb200-4-w2]
-server = "fast-h3-gb200-4"
-task = "video"
-model = "FastH3"
-dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
-endpoint = "/v1/videos/sync"
-
-[benchmarks.fast-h3-gb200-4-w2.video]
-task = "t2va"
-aspect_ratio = "16:9"
-seconds = 15.0
-
-[benchmarks.fast-h3-gb200-4-w2.load]
-num_prompts = 4
-request_rate = inf
-max_concurrency = 1
-warmup_requests = 0
-request_timeout_s = 3600
-warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
-
-[benchmarks.fast-h3-gb200-4-w2.metrics]
 videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
@@ -1875,7 +1711,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-two-node.json", "--max-running-requests", "2", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-8.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -1891,13 +1727,11 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-w1.video]
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 
 [benchmarks.gb200-8-w1.load]
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
 
@@ -1917,13 +1751,11 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-w2.video]
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 
 [benchmarks.gb200-8-w2.load]
 num_prompts = 4
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
 
@@ -2007,7 +1839,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2017,7 +1848,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
 
@@ -2038,7 +1868,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2048,7 +1877,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 4
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
 
@@ -2069,7 +1897,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "fl2va"
 aspect_ratio = "auto"
-seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2080,7 +1907,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 
@@ -2089,10 +1915,9 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# SGLang's Ref2VA partition with the same recipe (--model-variant ref2va).
-# The recipe's platform attention (cuDNN SDPA) measured 65.12 s for W4 and
-# 132.41 s for W5 against 65.49 s and 132.79 s with FlashAttention-4
-# (--attention-backend fa; exploratory, two requests each).
+# SGLang's Ref2VA partition with the same recipe (--model-variant ref2va),
+# including its platform attention (cuDNN SDPA); FlashAttention-4
+# (--attention-backend fa) is no faster on W4 and W5.
 [servers.sglang-gb200-4-reference]
 host = "127.0.0.1"
 port = 18083
@@ -2117,7 +1942,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2128,7 +1952,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
 
@@ -2149,7 +1972,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2160,7 +1982,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
 
@@ -2209,7 +2030,6 @@ endpoint = "/v1/videos/sync"
 backend = "vllm-omni"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2218,7 +2038,6 @@ audio_flow_shift = 3.0
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
 
@@ -2239,7 +2058,6 @@ endpoint = "/v1/videos/sync"
 backend = "vllm-omni"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2248,7 +2066,6 @@ audio_flow_shift = 3.0
 num_prompts = 4
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
 
@@ -2269,7 +2086,6 @@ endpoint = "/v1/videos/sync"
 backend = "vllm-omni"
 task = "fl2va"
 aspect_ratio = "auto"
-seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2279,7 +2095,6 @@ audio_flow_shift = 3.0
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 
@@ -2289,10 +2104,9 @@ videos_per_second = "higher"
 "video_latency_ms.p95" = "lower"
 
 # vLLM-Omni's Ref2VA partition directory; it serves ref2va only. The recipe
-# with the text encoder sharded over the four ranks (--text-encoder-tp-size 4)
-# measured lowest on 4xGB200: 52.48 s for W4 and 138.55 s for W5 against the
-# recipe's 52.65 s and 138.95 s (exploratory, two requests each; the
-# difference is within the run-to-run spread on W5).
+# runs with the text encoder sharded over the four ranks
+# (--text-encoder-tp-size 4), which is at least as fast on W4 and W5 as the
+# recipe's own text encoder placement.
 [servers.vllm-omni-gb200-4-reference]
 host = "127.0.0.1"
 port = 18083
@@ -2318,7 +2132,6 @@ endpoint = "/v1/videos/sync"
 backend = "vllm-omni"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2328,7 +2141,6 @@ audio_flow_shift = 3.0
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
 
@@ -2349,7 +2161,6 @@ endpoint = "/v1/videos/sync"
 backend = "vllm-omni"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2359,7 +2170,6 @@ audio_flow_shift = 3.0
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
 
@@ -2400,7 +2210,6 @@ endpoint = "/v1/videos/sync"
 backend = "fastvideo"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 9
 parallel_decoding = true
@@ -2409,7 +2218,6 @@ parallel_decoding = true
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
 
@@ -2430,7 +2238,6 @@ endpoint = "/v1/videos/sync"
 backend = "fastvideo"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 9
 parallel_decoding = true
@@ -2439,7 +2246,6 @@ parallel_decoding = true
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
 
@@ -2454,7 +2260,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "2048", "--video-text-capacities", "2048", "--max-video-seconds", "8", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-two-node.json", "--max-running-requests", "2", "--max-model-len", "2048", "--video-text-capacities", "2048", "--max-video-seconds", "8", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 
 [servers.gb200-8-keyframe.environment]
@@ -2472,7 +2278,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-w3.video]
 task = "fl2va"
 aspect_ratio = "auto"
-seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 
@@ -2480,7 +2285,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 
@@ -2529,7 +2333,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2540,7 +2343,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
 
@@ -2564,7 +2366,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2575,7 +2376,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 4
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
 
@@ -2599,7 +2399,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "fl2va"
 aspect_ratio = "auto"
-seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2611,7 +2410,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 
@@ -2651,7 +2449,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2662,7 +2459,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-5s-warmup.jsonl"
 
@@ -2683,7 +2479,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2694,7 +2489,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-5s-warmup.jsonl"
 
@@ -2715,7 +2509,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2726,7 +2519,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images3-5s-warmup.jsonl"
 
@@ -2747,7 +2539,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2758,7 +2549,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images9-5s-warmup.jsonl"
 
@@ -2779,7 +2569,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2790,7 +2579,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clip-5s-warmup.jsonl"
 
@@ -2811,7 +2599,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2822,7 +2609,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-5s-warmup.jsonl"
 
@@ -2843,7 +2629,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2854,7 +2639,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clips3-5s-warmup.jsonl"
 
@@ -2875,7 +2659,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2886,7 +2669,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-5s-warmup.jsonl"
 
@@ -2907,7 +2689,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2918,7 +2699,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-full-5s-warmup.jsonl"
 
@@ -2939,7 +2719,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2950,7 +2729,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-10s-warmup.jsonl"
 
@@ -2971,7 +2749,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -2982,7 +2759,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-10s-warmup.jsonl"
 
@@ -3003,7 +2779,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3014,7 +2789,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images3-10s-warmup.jsonl"
 
@@ -3035,7 +2809,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3046,7 +2819,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images9-10s-warmup.jsonl"
 
@@ -3067,7 +2839,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3078,7 +2849,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clip-10s-warmup.jsonl"
 
@@ -3099,7 +2869,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3110,7 +2879,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-10s-warmup.jsonl"
 
@@ -3131,7 +2899,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3142,7 +2909,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clips3-10s-warmup.jsonl"
 
@@ -3163,7 +2929,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3174,7 +2939,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-10s-warmup.jsonl"
 
@@ -3195,7 +2959,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3206,7 +2969,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-full-10s-warmup.jsonl"
 
@@ -3227,7 +2989,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3238,7 +2999,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-15s-warmup.jsonl"
 
@@ -3259,7 +3019,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3270,7 +3029,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-15s-warmup.jsonl"
 
@@ -3291,7 +3049,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3302,7 +3059,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images3-15s-warmup.jsonl"
 
@@ -3323,7 +3079,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3334,7 +3089,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-images9-15s-warmup.jsonl"
 
@@ -3355,7 +3109,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3366,7 +3119,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clip-15s-warmup.jsonl"
 
@@ -3387,7 +3139,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3398,7 +3149,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-15s-warmup.jsonl"
 
@@ -3419,7 +3169,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3430,7 +3179,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-clips3-15s-warmup.jsonl"
 
@@ -3451,7 +3199,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3462,7 +3209,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-15s-warmup.jsonl"
 
@@ -3483,7 +3229,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -3494,7 +3239,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 7200
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-full-15s-warmup.jsonl"
 
@@ -3517,9 +3261,6 @@ points = ["gb200-8-omniref-ref-image-5s", "gb200-8-omniref-ref-image-voice-5s", 
 
 [suites.gb200-8-omniref-refs-enlarged]
 points = ["gb200-8-omniref-enlarged-ref-image-5s", "gb200-8-omniref-enlarged-ref-image-voice-5s", "gb200-8-omniref-enlarged-ref-images3-5s", "gb200-8-omniref-enlarged-ref-images9-5s", "gb200-8-omniref-enlarged-ref-clip-5s", "gb200-8-omniref-enlarged-ref-video-5s", "gb200-8-omniref-enlarged-ref-clips3-5s", "gb200-8-omniref-enlarged-ref-mixed-5s", "gb200-8-omniref-enlarged-ref-full-5s", "gb200-8-omniref-enlarged-ref-image-10s", "gb200-8-omniref-enlarged-ref-image-voice-10s", "gb200-8-omniref-enlarged-ref-images3-10s", "gb200-8-omniref-enlarged-ref-images9-10s", "gb200-8-omniref-enlarged-ref-clip-10s", "gb200-8-omniref-enlarged-ref-video-10s", "gb200-8-omniref-enlarged-ref-clips3-10s", "gb200-8-omniref-enlarged-ref-mixed-10s", "gb200-8-omniref-enlarged-ref-full-10s", "gb200-8-omniref-enlarged-ref-image-15s", "gb200-8-omniref-enlarged-ref-image-voice-15s", "gb200-8-omniref-enlarged-ref-images3-15s", "gb200-8-omniref-enlarged-ref-images9-15s", "gb200-8-omniref-enlarged-ref-clip-15s", "gb200-8-omniref-enlarged-ref-video-15s", "gb200-8-omniref-enlarged-ref-clips3-15s", "gb200-8-omniref-enlarged-ref-mixed-15s", "gb200-8-omniref-enlarged-ref-full-15s"]
-
-[suites.fast-h3-gb200-4]
-points = ["fast-h3-gb200-4-w1", "fast-h3-gb200-4-w2"]
 
 [suites.gb200-8]
 points = ["gb200-8-w1", "gb200-8-w2", "gb200-8-w3"]

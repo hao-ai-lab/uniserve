@@ -12,8 +12,8 @@ use base64::Engine as _;
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-use uniserve_core::{GenerationLimits, GenerationRequest, ImageIngestStep};
-use uniserve_engine::VideoDenoiserInfo;
+use uniserve_core::{Canvas, GenerationLimits, GenerationRequest, MediaCall};
+use uniserve_engine::{ServedCanvas, VideoDenoiserInfo};
 use uniserve_server::VideoMediaSettings;
 use uniserve_server::openai::VideoGenerationRequest;
 use uniserve_server::profile::assets::ResolvedModelFiles;
@@ -24,9 +24,9 @@ use uniserve_server::serving::media::{
     ImageFetchError, ImageFetchPolicy, ImageFetcher, ImageInput, ImageListError,
 };
 use uniserve_server::serving::video::VideoService;
-use uniserve_server::serving::video::plan::VisionConfig;
+use uniserve_server::serving::video::plan::ProcessorConfig;
 use uniserve_server::serving::{
-    InputProcessor, ResponseOptions, ServeRequestId, ServedFeature, chat_image_urls,
+    InputProcessor, RequestRenderer, ResponseOptions, ServeRequestId, chat_image_urls,
 };
 
 /// Base64 payload of a 1x1 PNG image.
@@ -51,15 +51,43 @@ const SPECIAL_TOKENS: &[&str] = &[
     "</answer>",
 ];
 
+/// A canvas a worker declares for a short edge and an aspect ratio.
+fn served(short_edge: u32, aspect_ratio: &str, width: u32, height: u32) -> ServedCanvas {
+    ServedCanvas {
+        short_edge,
+        aspect_ratio: aspect_ratio.to_owned(),
+        canvas: Canvas { width, height },
+    }
+}
+
 /// What a released base denoiser reports in its handshake: text-to-video
-/// over every canvas of the canvas rule, on the 50-point schedule.
+/// over the canvases of the named aspect ratios, on the 50-point schedule.
 fn base_denoiser() -> VideoDenoiserInfo {
     VideoDenoiserInfo {
         tasks: vec!["t2va".to_owned()],
         schedule_points: 50,
         video_shift: 12.0,
         audio_shift: 3.0,
-        canvases: Vec::new(),
+        frame_rate: 24,
+        audio_sample_rate: 32_000,
+        frames: uniserve_engine::FrameClips {
+            min_frames: 22,
+            clip_frames: 17,
+            clip_latent_frames: 5,
+            tail_latent_frames: 2,
+        },
+        canvases: [
+            ("21:9", 1536, 672),
+            ("16:9", 1344, 768),
+            ("4:3", 1024, 768),
+            ("1:1", 768, 768),
+            ("3:4", 768, 1024),
+            ("9:16", 768, 1344),
+        ]
+        .into_iter()
+        .map(|(aspect_ratio, width, height)| served(768, aspect_ratio, width, height))
+        .collect(),
+        references: Default::default(),
     }
 }
 
@@ -73,7 +101,7 @@ fn video_service(
 ) -> VideoService {
     VideoService::new(
         denoiser,
-        VisionConfig {
+        ProcessorConfig {
             patch_size: 16,
             temporal_patch_size: 2,
             merge_size: 2,
@@ -209,11 +237,11 @@ fn try_resolved_model(
     )
     .unwrap();
     // A diffusers pipeline checkpoint has no root `config.json`, so MiniMax H3
-    // is built by `ModelConfig::from_pipeline`, here with the server's default
-    // 15-second maximum video duration.
+    // is built by `ModelConfig::from_pipeline` and served by a video service
+    // with the server's default 15-second maximum video duration.
     let config = match description {
         ModelDescription::MiniMaxH3 => {
-            ModelConfig::from_pipeline(description.id(), description, 15.0, Some(4096)).unwrap()
+            ModelConfig::from_pipeline(description.id(), description, Some(4096)).unwrap()
         }
         _ => tokio::runtime::Builder::new_current_thread()
             .build()
@@ -222,23 +250,22 @@ fn try_resolved_model(
                 description.id(),
                 directory.path().to_str().unwrap(),
                 &files,
-                None,
+                Some(4096),
                 tokenizer.as_ref(),
             ))
             .unwrap(),
     };
-    let video = (description == ModelDescription::MiniMaxH3)
-        .then(|| video_service(base_denoiser(), 15.0, &tokenizer));
+    let renderer = match description {
+        ModelDescription::MiniMaxH3 => {
+            RequestRenderer::Video(video_service(base_denoiser(), 15.0, &tokenizer))
+        }
+        _ => RequestRenderer::Chat(renderer),
+    };
     let model = InputProcessor::new(
         config,
         Arc::clone(&tokenizer),
-        Some(renderer),
-        uniserve_server::serving::WorkerCapabilities {
-            limits,
-            sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
-            max_model_tokens: 4096,
-        },
-        video,
+        renderer,
+        uniserve_server::serving::WorkerCapabilities { limits },
         true,
     )?;
     Ok((directory, tokenizer, model))
@@ -253,6 +280,7 @@ fn runtime_limits() -> GenerationLimits {
         latent_downsample: 16,
         max_vae_grid_tokens: 1_000_000,
         max_vit_grid_tokens: 1_000_000,
+        latent_bytes_per_unit: u64::MAX.div_ceil(1_000_000),
         max_latent_feature_bytes: u64::MAX,
         max_vision_feature_bytes: u64::MAX,
         commit_marker_tokens: 2,
@@ -299,6 +327,24 @@ fn resolve_images(
         .build()
         .unwrap()
         .block_on(fetcher.fetch_all(urls))
+}
+
+/// A single-turn text chat request to `processor`'s served model, with the
+/// wire `fields` set on top.
+fn chat_request(
+    processor: &InputProcessor,
+    fields: serde_json::Value,
+) -> uniserve_server::openai::ChatCompletionRequest {
+    let mut request = serde_json::json!({
+        "model": processor.served_model_name(),
+        "messages": [{"role": "user", "content": "hello"}],
+        "modalities": ["text"],
+    });
+    request
+        .as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    serde_json::from_value(request).unwrap()
 }
 
 /// Resolves a chat request's input images under the default image policy
@@ -521,7 +567,7 @@ fn sensenova_places_the_input_image_at_its_rendered_slot() {
             .collect::<Vec<_>>(),
     );
     assert_eq!(position, marker_positions[1]);
-    assert_eq!(steps, &[ImageIngestStep::VitEncode]);
+    assert_eq!(steps, &[MediaCall::VisionEncoding]);
 
     // Feedback for the default 16:9 canvas (2048x1152) is a 64x36 ViT grid at
     // 32 pixels per token plus one marker token.
@@ -561,7 +607,7 @@ fn bagel_places_the_input_image_between_surrounding_chat_text() {
     assert!((position as usize) < response.prompt_token_ids.len());
     assert_eq!(
         steps,
-        &[ImageIngestStep::VaeEncode, ImageIngestStep::VitEncode]
+        &[MediaCall::LatentEncoding, MediaCall::VisionEncoding]
     );
 }
 
@@ -588,7 +634,6 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
     );
     let sampling = accepted.request.sampling;
     assert_eq!(sampling.seed, 42);
-    assert_eq!(sampling.num_inference_steps, 49);
     assert_eq!((sampling.num_frames, sampling.video_units), (124, 7));
     assert_eq!((sampling.width, sampling.height), (1344, 768));
     assert_eq!(accepted.duration_seconds, 5.0);
@@ -693,41 +738,37 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
 #[tokio::test]
 async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
-    let canvas = |width, height| uniserve_core::Canvas { width, height };
     // 768p 16:9, then 480p 21:9 and 16:9.
     let denoiser = VideoDenoiserInfo {
         tasks: vec!["t2va".to_owned()],
         schedule_points: 9,
         video_shift: 10.0,
         audio_shift: 3.0,
-        canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
+        frame_rate: 24,
+        audio_sample_rate: 32_000,
+        frames: uniserve_engine::FrameClips {
+            min_frames: 22,
+            clip_frames: 17,
+            clip_latent_frames: 5,
+            tail_latent_frames: 2,
+        },
+        canvases: vec![
+            served(768, "16:9", 1344, 768),
+            served(480, "21:9", 992, 416),
+            served(480, "16:9", 832, 480),
+        ],
+        references: Default::default(),
     };
-    let processor = |max_video_seconds: f64| {
-        let mut config = loaded.config().clone();
-        config.parameters =
-            uniserve_server::profile::ModelParameters::MiniMaxH3 { max_video_seconds };
-        InputProcessor::new(
-            config,
-            Arc::clone(&tokenizer),
-            None,
-            uniserve_server::serving::WorkerCapabilities {
-                limits: runtime_limits(),
-                sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
-                max_model_tokens: 4096,
-            },
-            Some(video_service(
-                denoiser.clone(),
-                max_video_seconds,
-                &tokenizer,
-            )),
-            true,
-        )
-    };
-    for capacity in [0.0, 3.5, 15.5, f64::NAN] {
-        assert!(processor(capacity).is_err(), "{capacity} s");
-    }
-
-    let model = processor(10.0).unwrap();
+    let model = InputProcessor::new(
+        loaded.config().clone(),
+        Arc::clone(&tokenizer),
+        RequestRenderer::Video(video_service(denoiser, 10.0, &tokenizer)),
+        uniserve_server::serving::WorkerCapabilities {
+            limits: runtime_limits(),
+        },
+        true,
+    )
+    .unwrap();
     let capabilities = model.video_capabilities();
     assert_eq!(capabilities["tasks"], serde_json::json!(["t2va"]));
     assert_eq!(capabilities["min_seconds"], 4.0);
@@ -748,7 +789,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     );
     assert_eq!(
         capabilities["canvas"]["aspect_ratios"],
-        serde_json::json!(["21:9", "16:9"])
+        serde_json::json!(["16:9", "21:9"])
     );
     assert_eq!(
         capabilities["canvas"]["sizes"],
@@ -777,8 +818,13 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         .await
         .unwrap();
     assert_eq!(prepared.request.sampling.num_frames, 243);
-    assert_eq!(prepared.request.sampling.num_inference_steps, 8);
-    assert_eq!(prepared.canvas, canvas(1344, 768));
+    assert_eq!(
+        prepared.canvas,
+        Canvas {
+            width: 1344,
+            height: 768
+        }
+    );
 
     // A 480 short edge names the 480p training bucket of the ratio.
     let narrow = model
@@ -790,7 +836,13 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         )
         .await
         .unwrap();
-    assert_eq!(narrow.canvas, canvas(992, 416));
+    assert_eq!(
+        narrow.canvas,
+        Canvas {
+            width: 992,
+            height: 416
+        }
+    );
     assert_eq!(
         (
             narrow.request.sampling.width,
@@ -819,33 +871,12 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
             "{target}"
         );
     }
-
-    // Only a video checkpoint has a video service, and it needs one.
-    let mut config = loaded.config().clone();
-    config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
-        max_video_seconds: 10.0,
-    };
-    assert!(
-        InputProcessor::new(
-            config,
-            Arc::clone(&tokenizer),
-            None,
-            uniserve_server::serving::WorkerCapabilities {
-                limits: runtime_limits(),
-                sampling_controls: Vec::new(),
-                max_model_tokens: 4096,
-            },
-            None,
-            true,
-        )
-        .is_err()
-    );
 }
 
-/// `InputProcessor::new` replaces the checkpoint's context length with the
-/// worker's `max_model_tokens`, and text preprocessing enforces that bound.
+/// Text preprocessing refuses a prompt longer than the model's
+/// `max_model_len`.
 #[test]
-fn worker_context_capacity_limits_preprocessed_requests() {
+fn context_length_limits_preprocessed_requests() {
     let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::Qwen3, "qwen3");
     let renderer = HfChatRenderer::new(
         Some(CHAT_TEMPLATE.to_string()),
@@ -853,37 +884,36 @@ fn worker_context_capacity_limits_preprocessed_requests() {
         ChatTemplateContentFormatOption::String,
     )
     .unwrap();
+    let mut config = loaded.config().clone();
+    config.max_model_len = 8;
     let processor = InputProcessor::new(
-        loaded.config().clone(),
+        config,
         tokenizer,
-        Some(renderer),
+        RequestRenderer::Chat(renderer),
         uniserve_server::serving::WorkerCapabilities {
             limits: runtime_limits(),
-            sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
-            max_model_tokens: 8,
         },
-        None,
         true,
     )
     .unwrap();
 
-    assert_eq!(processor.config().max_model_tokens, Some(8));
-    let request = uniserve_server::serving::TextPromptRequest::new(
-        "context-capacity",
-        "This prompt exceeds eight tokens",
-    );
-    assert!(matches!(
-        processor.preprocess_text_request(request),
-        Err(uniserve_server::serving::ServeError::Tokenize {
-            source: uniserve_server::serving::TokenizeError::Text(
-                uniserve_server::serving::text::Error::PromptTooLong {
-                    max_model_len: 8,
-                    ..
-                }
+    let error = processor
+        .preprocess_chat_request(
+            ServeRequestId::new("context-capacity"),
+            chat_request(
+                &processor,
+                serde_json::json!({"messages": [{
+                    "role": "user",
+                    "content": "This prompt exceeds eight tokens"
+                }]}),
             ),
-            ..
-        })
-    ));
+            Vec::new(),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+    let message = error.to_error_response().error.message;
+    assert!(message.contains("8"), "{message}");
 }
 
 /// Defaults fill only omitted controls: an explicit zero temperature stays
@@ -948,8 +978,7 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
                 "size": format!("{width}x{height}"),
                 "steps": 4,
                 "seed": 17,
-                "guidance_scale": 7.5,
-                "n": 1
+                "guidance_scale": 7.5
             }))
             .unwrap();
         let (generation, _) = processor
@@ -964,7 +993,7 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
             (width, height)
         );
         assert_eq!(generation.image.steps, 4);
-        assert_eq!(generation.image.max_images, 1);
+        assert_eq!(generation.max_images, 1);
         assert_eq!(generation.image.seed, Some(17));
         assert_eq!(generation.sampling.seed, Some(17));
         assert_eq!(generation.image.cfg_text_scale, 7.5);
@@ -1047,54 +1076,42 @@ fn bagel_rejects_a_canvas_side_beyond_its_latent_position_table() {
     }
 }
 
-/// Cache namespace and salt select a stable isolation partition, the bypass
-/// flags disable prefix-cache reads and writes without changing the
-/// partition, and prompt logprobs disable reads only, because a prefix-cache
-/// hit would skip the prompt positions whose logprobs are requested.
+/// The cache salt selects a stable isolation partition, and prompt logprobs
+/// disable prefix-cache reads only, because a prefix-cache hit would skip the
+/// prompt positions whose logprobs are requested.
 #[test]
-fn cache_controls_preserve_isolation_and_prompt_logprob_requirements() {
-    use uniserve_server::serving::TextPromptRequest;
-
+fn cache_salt_isolates_and_prompt_logprobs_disable_cache_reads() {
     for (description, model_type) in [
         (ModelDescription::Qwen3, "qwen3"),
         (ModelDescription::SenseNova, "neo_chat"),
         (ModelDescription::Bagel, "bagel"),
     ] {
         let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
-        let mut request = TextPromptRequest::new("cache-controls", "hello");
+        let preprocess = |fields: serde_json::Value| {
+            processor
+                .preprocess_chat_request(
+                    ServeRequestId::new("cache-controls"),
+                    chat_request(&processor, fields),
+                    Vec::new(),
+                )
+                .unwrap()
+        };
 
-        let (shared, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        let (shared, _) = preprocess(serde_json::json!({}));
         assert_eq!(shared.cache.isolation_key, None);
         assert!(shared.cache.read && shared.cache.write);
 
-        // The same namespace and salt always produce the same key.
-        request.cache_namespace = Some("ab".to_string());
-        request.cache_salt = Some("c".to_string());
-        let (isolated, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        // The same salt always produces the same key, and another salt another.
+        let (isolated, _) = preprocess(serde_json::json!({"cache_salt": "ab"}));
         assert!(isolated.cache.isolation_key.is_some());
-        let (repeat, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        assert!(isolated.cache.read && isolated.cache.write);
+        let (repeat, _) = preprocess(serde_json::json!({"cache_salt": "ab"}));
         assert_eq!(repeat.cache.isolation_key, isolated.cache.isolation_key);
-
-        // Namespace and salt are separate coordinates, even when their
-        // concatenated text is identical.
-        request.cache_namespace = Some("a".to_string());
-        request.cache_salt = Some("bc".to_string());
-        let (other, _) = processor.preprocess_text_request(request.clone()).unwrap();
+        let (other, _) = preprocess(serde_json::json!({"cache_salt": "ba"}));
         assert_ne!(other.cache.isolation_key, isolated.cache.isolation_key);
 
-        request.bypass_cache_read = true;
-        request.no_cache_store = true;
-        let (disabled, response) = processor.preprocess_text_request(request.clone()).unwrap();
-        assert!(!disabled.cache.read && !disabled.cache.write);
-        assert!(!response.cache.read_enabled && !response.cache.write_enabled);
-        assert_eq!(disabled.cache.isolation_key, other.cache.isolation_key);
-
-        request.bypass_cache_read = false;
-        request.no_cache_store = false;
-        request.stop.prompt_logprobs = Some(0);
-        let (logprobs, response) = processor.preprocess_text_request(request).unwrap();
+        let (logprobs, response) = preprocess(serde_json::json!({"prompt_logprobs": 0}));
         assert!(!logprobs.cache.read && logprobs.cache.write);
-        assert!(!response.cache.read_enabled && response.cache.write_enabled);
         assert!(response.prompt_logprobs_requested);
     }
 }
@@ -1166,13 +1183,10 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
     InputProcessor::new(
         loaded.config().clone(),
         tokenizer,
-        Some(renderer),
+        RequestRenderer::Chat(renderer),
         uniserve_server::serving::WorkerCapabilities {
             limits: runtime_limits(),
-            sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
-            max_model_tokens: 4096,
         },
-        None,
         true,
     )
     .unwrap()
@@ -1194,13 +1208,7 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
     });
     for model_type in ["qwen3", "qwen3_moe"] {
         let json_calls = with_template(model_type, QWEN3_TEMPLATE);
-        assert!(
-            json_calls
-                .support()
-                .features
-                .contains(&ServedFeature::ToolCalling),
-            "{model_type}"
-        );
+        assert!(json_calls.supports_tool_calling(), "{model_type}");
         json_calls
             .preprocess_chat_request(
                 ServeRequestId::new("json-tools"),
@@ -1211,13 +1219,7 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
 
         for template in [XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
             let other = with_template(model_type, template);
-            assert!(
-                !other
-                    .support()
-                    .features
-                    .contains(&ServedFeature::ToolCalling),
-                "{model_type}"
-            );
+            assert!(!other.supports_tool_calling(), "{model_type}");
             let error = other
                 .preprocess_chat_request(
                     ServeRequestId::new("other-tools"),
@@ -1235,7 +1237,7 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
 
 /// Negative seeds are accepted and reinterpreted as their two's-complement
 /// `u64` value, and a logprob count of `-1` requests every candidate
-/// (`u32::MAX`) while values below `-1` are rejected, for every token model.
+/// (`u32::MAX`), for every token model.
 #[test]
 fn sampling_controls_have_the_same_meaning_across_token_models() {
     for (description, model_type) in [
@@ -1245,14 +1247,18 @@ fn sampling_controls_have_the_same_meaning_across_token_models() {
     ] {
         let (_directory, _, model) = resolved_model(description, model_type);
         for seed in [-1, -2] {
-            let mut input = uniserve_server::serving::TextPromptRequest::new("sampling", "hello");
-            input.sampling.seed = Some(seed);
-            input.stop.logprobs = Some(-1);
-            let (request, _) = model.preprocess_text_request(input.clone()).unwrap();
+            let (request, _) = model
+                .preprocess_chat_request(
+                    ServeRequestId::new("sampling"),
+                    chat_request(
+                        &model,
+                        serde_json::json!({"seed": seed, "logprobs": true, "top_logprobs": -1}),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap();
             assert_eq!(request.sampling.seed, Some(seed as u64));
             assert_eq!(request.sampling.n_logprobs, u32::MAX);
-            input.stop.logprobs = Some(-2);
-            assert!(model.preprocess_text_request(input).is_err());
         }
     }
 }

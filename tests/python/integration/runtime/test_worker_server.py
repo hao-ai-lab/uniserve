@@ -19,7 +19,7 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-from uniserve_worker.errors import WorkerError
+from uniserve_worker.errors import ErrorCode, WorkerError
 from uniserve_worker.execution.executor import Submission
 from uniserve_worker.protocol.batch import Batch, Finish, NewRequest
 from uniserve_worker.protocol.call import Call, CallStatus, ForwardMode
@@ -132,7 +132,7 @@ def test_duplicate_submissions_are_rejected_while_the_original_completes(
     assert responses[1]["kind"] == "result"
     for message_id in (2, 3):
         assert responses[message_id]["kind"] == "error"
-        assert responses[message_id]["code"] == "InvalidDescriptor"
+        assert responses[message_id]["code"] is ErrorCode.INVALID_DESCRIPTOR
     assert responses[4]["kind"] == "ok"
 
 
@@ -155,7 +155,7 @@ def test_failed_submissions_cannot_be_reused_and_allow_shutdown() -> None:
     for message_id in (1, 2):
         response = responses[message_id]
         assert response["kind"] == "error"
-        assert response["code"] == "InvalidDescriptor"
+        assert response["code"] is ErrorCode.INVALID_DESCRIPTOR
         assert response["fatal"] is False
     assert [response["message_id"] for response in endpoint.responses] == [
         1,
@@ -192,7 +192,7 @@ def test_execution_failure_is_logged_under_the_submit_request(
 
     responses = _by_call(endpoint)
     assert responses[1]["kind"] == "error"
-    assert responses[1]["code"] == "InvalidDescriptor"
+    assert responses[1]["code"] is ErrorCode.INVALID_DESCRIPTOR
     failures = [
         record.getMessage()
         for record in caplog.records
@@ -285,7 +285,7 @@ def test_refused_call_batch_reports_its_call_kind_route_over_ipc() -> None:
 
     response = _by_call(endpoint)[1]
     assert response["kind"] == "error"
-    assert response["code"] == "InvalidDescriptor"
+    assert response["code"] is ErrorCode.INVALID_DESCRIPTOR
     assert response["route"] == "prefill"
 
 
@@ -349,10 +349,10 @@ def test_a_batch_id_that_does_not_advance_is_refused_before_new_admission() -> (
     responses = _by_call(endpoint)
     assert responses[1]["kind"] == "result"
     assert responses[2]["kind"] == "error"
-    assert responses[2]["code"] == "InvalidDescriptor"
+    assert responses[2]["code"] is ErrorCode.INVALID_DESCRIPTOR
     assert responses[3]["kind"] == "error"
-    assert responses[3]["code"] == "InvalidDescriptor"
-    # Rejected work must not admit its request; the same computation still
+    assert responses[3]["code"] is ErrorCode.INVALID_DESCRIPTOR
+    # Rejected work must not admit its request; the same call still
     # executes once its batch identity advances.
     result = responses[4]["result"]
     assert result["batch_id"] == 3
@@ -450,8 +450,7 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
         max_batch_tokens=256,
         max_batch_calls=2,
         no_model=True,
-        allow_stub=True,
-        kv_token_capacity=4096,
+        max_total_tokens=4096,
     )
     request = {"kind": "info", "message_id": 1}
     endpoint = QueuedWorkerIpc((request,))

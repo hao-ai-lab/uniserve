@@ -34,7 +34,7 @@ def _model(device, quantized, group=None):
             HIDDEN,
             INTERMEDIATE,
             top_k=TOP_K,
-            activation="gelu_tanh",
+            activation="gelu_pytorch_tanh",
             device=device,
             dtype=torch.bfloat16,
         )

@@ -23,10 +23,11 @@ use crate::executor::WorkerResult;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use super::{BatchSubmitError, WorkerGroup};
+use super::{BatchSubmitError, IncarnationRegistry, WorkerGroup};
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerId, logical_result,
+    RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerId,
+    logical_result,
 };
 use anyhow::Context;
 use uniserve_core::CommandWaker;
@@ -43,7 +44,7 @@ struct PendingWorker {
     /// reconciliation when the group will send no report.
     submitted: bool,
     /// Calls whose completion this worker has not yet returned, with the
-    /// computation code the completion must carry.
+    /// call code the completion must carry.
     calls: HashMap<(RequestKey, uniserve_worker_ipc::CallId), uniserve_worker_ipc::CallKind>,
 }
 
@@ -93,7 +94,7 @@ struct WorkerSubmission {
 impl WorkerSubmission {
     /// Builds the one submission a worker receives for this batch.
     ///
-    /// A batch carries one computation to one component, so a worker receives
+    /// A batch carries one call to one component, so a worker receives
     /// it once, under one identity, and answers it once. Product inputs the
     /// worker does not yet hold travel as dependencies and hold the submission
     /// in its queue until they resolve. Inputs, KV inputs, and dependencies
@@ -162,6 +163,9 @@ pub struct WorkerExecutor {
     /// Worker identity to its index in `workers`.
     routing: HashMap<WorkerId, usize>,
     workers: Vec<(WorkerId, WorkerGroup)>,
+    /// The worker and rank of every live rank incarnation, which the groups
+    /// keep current as they replace ranks.
+    incarnations: IncarnationRegistry,
     executor_info: ExecutorInfo,
     /// Sum of the workers' queue depths; `submit` refuses a batch with
     /// `WouldBlock` while this many logical batches are pending.
@@ -182,8 +186,9 @@ pub struct WorkerExecutor {
     /// call, until the buffer is freed or its request finishes without
     /// retaining it.
     buffer_routes: HashMap<BufferId, BufferRoute>,
-    /// Persistent buffer addresses are local to a physical Worker address space.
-    buffer_allocations: HashMap<(usize, BufferId), BufferAllocation>,
+    /// Persistent buffer addresses are local to the buffer pool of one rank of
+    /// a physical Worker, keyed by worker index, rank, and buffer.
+    buffer_allocations: HashMap<(usize, u32, BufferId), BufferAllocation>,
     /// Every worker that produces or reads a buffer: the targets of its `Free`.
     buffer_workers: HashMap<BufferId, HashSet<usize>>,
     /// Tensor publications returned by producing workers, merged across the
@@ -301,17 +306,44 @@ pub(crate) fn video_unit_codecs(
     Ok(pairings)
 }
 
+/// Returns the spans a destination's ranks read a persistent dependency at.
+///
+/// A routed destination may reserve its own spans, which take precedence.
+/// Without one, a rank takes the span the producer's rank of that index held;
+/// the runtime's shared pool places a span at one offset on every rank, so a
+/// destination rank the producer's pool did not cover takes the offset the
+/// producer's ranks share. Empty when neither side holds a span.
+fn dependency_spans(
+    own: Vec<RankBuffer>,
+    produced: Vec<RankBuffer>,
+    ranks: u32,
+) -> Vec<RankBuffer> {
+    if !own.is_empty() {
+        return own;
+    }
+    let Some(first) = produced.first().copied() else {
+        return Vec::new();
+    };
+    (0..ranks)
+        .map(|rank| {
+            produced
+                .iter()
+                .find(|span| span.rank == rank)
+                .copied()
+                .unwrap_or(RankBuffer { rank, ..first })
+        })
+        .collect()
+}
+
 impl WorkerExecutor {
     /// Binds launched worker groups into one executor.
     ///
     /// Fails when the command wake cannot be created, `workers` is empty, a
-    /// worker identity repeats or disagrees with its loaded instance, a group
-    /// was initialized with transfer bindings other than `transfer`, a worker
-    /// reports invalid capabilities, the workers loaded different models or
-    /// checkpoints or expose different outputs for a replicated component, the
-    /// media routing or video codec pairing is refused, a transfer edge names
-    /// an unbound worker or rank, repeats a physical rank pair, or uses a
-    /// mechanism an endpoint did not initialize or that cannot serve the edge's
+    /// worker identity repeats, a group was initialized with transfer
+    /// bindings other than `transfer`, the workers expose different outputs
+    /// for a replicated component, the media routing or video codec pairing
+    /// is refused, a transfer edge names an unbound worker or rank, repeats a
+    /// physical rank pair, or uses a mechanism that cannot serve the edge's
     /// endpoints, or no runtime capacity view can be derived from the workers.
     /// As a side effect every group learns the deployment-wide media routing.
     pub fn try_new(
@@ -331,17 +363,9 @@ impl WorkerExecutor {
                 "WorkerGroup {id} was initialized with different transfer bindings"
             );
             anyhow::ensure!(
-                executor.info().endpoint.worker_id == id.0,
-                "worker binding {id} disagrees with its loaded instance identity"
-            );
-            anyhow::ensure!(
                 routing.insert(id.clone(), index).is_none(),
                 "worker identity {id} is repeated"
             );
-            executor
-                .info()
-                .validate()
-                .with_context(|| format!("worker {id} reported invalid capabilities"))?;
         }
         let mut executor_info = ExecutorInfo::from_workers(
             workers
@@ -349,6 +373,32 @@ impl WorkerExecutor {
                 .map(|worker| (worker.0.clone(), worker.1.info().clone()))
                 .collect(),
         )?;
+        // The engine states the placement it launched each group with; the
+        // reports do not carry it.
+        executor_info.placements = workers
+            .iter()
+            .map(|(id, worker)| {
+                let (_, components) = worker.placement();
+                (
+                    id.clone(),
+                    crate::executor::PoolPlacement {
+                        queue_depth: worker.queue_depth(),
+                        components: components.clone(),
+                    },
+                )
+            })
+            .collect();
+        // Each rank reports the buffer bytes it backs.
+        executor_info.rank_buffer_bytes = workers
+            .iter()
+            .map(|(id, worker)| {
+                let bytes = (0..worker.world_size())
+                    .filter_map(|rank| worker.rank_info(rank))
+                    .map(|info| info.buffer_pool_bytes)
+                    .collect();
+                (id.clone(), bytes)
+            })
+            .collect();
         // The video graph may span workers, so each group learns the whole
         // deployment's routing to name the ranks that read its products.
         let media_routing = executor_info.media_routing()?;
@@ -360,8 +410,13 @@ impl WorkerExecutor {
             })
             .collect::<Vec<_>>();
         executor_info.video_codecs = video_unit_codecs(&media_routing, &placements)?;
+        // Every group registers its live incarnations in one table, so a
+        // publication's source resolves to its worker and rank whichever
+        // group produced it.
+        let incarnations = IncarnationRegistry::default();
         for (_, worker) in &mut workers {
             worker.set_media_routing(media_routing.clone());
+            worker.share_incarnations(incarnations.clone());
         }
 
         // Every edge expands to the physical (source rank, destination rank)
@@ -385,20 +440,22 @@ impl WorkerExecutor {
                     "transfer edge names an unbound rank"
                 );
             }
-            for source_rank in 0..source.info().world_size {
+            for source_rank in 0..source.world_size() as u32 {
                 if edge.source_rank.is_some_and(|rank| rank != source_rank) {
                     continue;
                 }
+                let source_on_cuda = source.rank_on_cuda(source_rank as usize);
                 let source = source.rank_info(source_rank as usize).with_context(|| {
                     format!("transfer edge source has no rank {source_rank} in its world")
                 })?;
-                for destination_rank in 0..destination.info().world_size {
+                for destination_rank in 0..destination.world_size() as u32 {
                     if edge
                         .destination_rank
                         .is_some_and(|rank| rank != destination_rank)
                     {
                         continue;
                     }
+                    let destination_on_cuda = destination.rank_on_cuda(destination_rank as usize);
                     let destination = destination
                         .rank_info(destination_rank as usize)
                         .with_context(|| {
@@ -412,18 +469,10 @@ impl WorkerExecutor {
                         "physical transfer edge has conflicting bindings"
                     );
                     // An edge carries device products on one mechanism and
-                    // host products on another; both endpoints must have
-                    // initialized each one.
+                    // host products on another. The launch initialized each
+                    // rank with the mechanisms its edges name
+                    // (`TransferConfig::rank_backends`).
                     for mechanism in edge.mechanisms() {
-                        let backend = mechanism.as_str();
-                        anyhow::ensure!(
-                            source.transfer_backends.iter().any(|name| name == backend)
-                                && destination
-                                    .transfer_backends
-                                    .iter()
-                                    .any(|name| name == backend),
-                            "physical edge requires an uninitialized transfer backend {backend}"
-                        );
                         // Each mechanism decides for itself how far it reaches.
                         // An edge it cannot serve would fail on its first
                         // publication, so it is refused here by name instead.
@@ -437,8 +486,7 @@ impl WorkerExecutor {
                             ),
                             crate::executor::TransferBackend::CudaVmm => {
                                 anyhow::ensure!(
-                                    source.device.starts_with("cuda:")
-                                        && destination.device.starts_with("cuda:"),
+                                    source_on_cuda && destination_on_cuda,
                                     "CUDA VMM requires CUDA devices on both endpoints"
                                 );
                                 // A device handle crosses hosts only where the
@@ -462,7 +510,7 @@ impl WorkerExecutor {
                                 }
                             }
                             // Shared storage names a segment in one host's namespace.
-                            crate::executor::TransferBackend::Shm => anyhow::ensure!(
+                            crate::executor::TransferBackend::PosixShm => anyhow::ensure!(
                                 !crosses_hosts,
                                 "transfer edge from worker {} on host {source_host} to worker {} \
                              on host {destination_host} crosses hosts over shared storage, \
@@ -482,13 +530,11 @@ impl WorkerExecutor {
         // workers from which it cannot be derived.
         executor_info.runtime_info()?;
 
-        let depth = workers
-            .iter()
-            .map(|worker| worker.1.info().queue_depth.max(1) as usize)
-            .sum();
+        let depth = executor_info.queue_depth();
         let worker_count = workers.len();
         Ok(Self {
             routing,
+            incarnations,
             workers,
             executor_info,
             depth,
@@ -737,7 +783,7 @@ impl WorkerExecutor {
         if lost {
             self.admitted_workers.retain(|(worker, _)| *worker != index);
             self.buffer_allocations
-                .retain(|(worker, _), _| *worker != index);
+                .retain(|(worker, _, _), _| *worker != index);
             for workers in self.buffer_workers.values_mut() {
                 workers.remove(&index);
             }
@@ -842,7 +888,7 @@ impl WorkerExecutor {
         Ok(admissions)
     }
 
-    /// Includes every admitted or queued owner of this request's computation and products.
+    /// Includes every admitted or queued owner of this request's call and products.
     fn request_workers(&self, request: RequestKey) -> Vec<usize> {
         let mut owners = self
             .admitted_workers
@@ -902,11 +948,9 @@ impl WorkerExecutor {
     /// single rank; false otherwise, including when either component of a
     /// pair is not loaded on the worker.
     fn shares_product_storage(&self, producer: &BufferRoute, consumer_entry: &str) -> bool {
-        let entries = &self.workers[producer.worker_index].1.info().components;
-        let source = entries
-            .iter()
-            .find(|entry| entry.name == producer.component);
-        let destination = entries.iter().find(|entry| entry.name == consumer_entry);
+        let (_, entries) = self.workers[producer.worker_index].1.placement();
+        let source = entries.get(&producer.component);
+        let destination = entries.get(consumer_entry);
         if producer.component == consumer_entry {
             // A consumer call on the component that produced the product runs on
             // the same ranks, and each rank reads the copy it holds when every
@@ -919,12 +963,12 @@ impl WorkerExecutor {
             // ranks read the product's publication. Without a description of
             // the component, its ranks are taken to hold their own copies.
             return !producer.declared_output
-                || source.is_none_or(|source| source.config.publishes_on_every_rank());
+                || source.is_none_or(|source| source.publishes_on_every_rank());
         }
         source
             .zip(destination)
             .is_some_and(|(source, destination)| {
-                source.config.ranks.len() == 1 && source.config.ranks == destination.config.ranks
+                source.ranks.len() == 1 && source.ranks == destination.ranks
             })
     }
 
@@ -990,7 +1034,7 @@ impl WorkerExecutor {
         let collective_seq = self.worker_collective_seqs[worker_index]
             .checked_add(1)
             .context("collective sequence space exhausted")?;
-        let mut wire = ExecutionBatch {
+        let (mut wire, mut rank_buffers) = ExecutionBatch {
             id: batch.id,
             requests: batch.requests.clone(),
             commands,
@@ -1012,31 +1056,42 @@ impl WorkerExecutor {
             }
             // A routed destination may reserve a different address from its
             // producer, and that allocation takes precedence. Without one the
-            // producer's allocation is used.
-            let params = self
-                .buffer_allocations
-                .get(&(worker_index, *dependency))
-                .or_else(|| {
-                    let producer = self.buffer_routes.get(dependency)?;
-                    self.buffer_allocations
-                        .get(&(producer.worker_index, *dependency))
-                })
-                .copied()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "persistent dependency {:?} has no scheduler params",
-                        dependency
-                    )
-                })?;
-            if !wire
-                .buffer_allocations
-                .iter()
-                .any(|existing| existing.buffer == params.buffer)
-            {
-                wire.buffer_allocations.push(params);
+            // producer's allocation is used. Spans are per rank, so each rank
+            // takes its own.
+            let producer = self
+                .buffer_routes
+                .get(dependency)
+                .map(|route| route.worker_index);
+            let held = |worker: usize| {
+                self.buffer_allocations
+                    .iter()
+                    .filter(move |((owner, _, buffer), _)| owner == &worker && buffer == dependency)
+                    .map(|((_, rank, _), allocation)| RankBuffer {
+                        rank: *rank,
+                        allocation: *allocation,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let produced = producer.map(held).unwrap_or_default();
+            let spans = dependency_spans(
+                held(worker_index),
+                produced,
+                self.workers[worker_index].1.world_size() as u32,
+            );
+            anyhow::ensure!(
+                !spans.is_empty(),
+                "persistent dependency {:?} has no scheduler params",
+                dependency
+            );
+            for span in spans {
+                if !rank_buffers.iter().any(|existing| {
+                    existing.rank == span.rank
+                        && existing.allocation.buffer == span.allocation.buffer
+                }) {
+                    rank_buffers.push(span);
+                }
             }
         }
-        wire.validate()?;
 
         // Drop every location whose source endpoint is not the current
         // incarnation of a bound rank.
@@ -1051,16 +1106,9 @@ impl WorkerExecutor {
                     .flat_map(|publication| publication.tensors_mut()),
             );
         for tensor in tensors {
-            tensor.locations.retain(|location| {
-                self.routing
-                    .get(&WorkerId(location.source.worker_id.clone()))
-                    .and_then(|index| {
-                        self.workers[*index]
-                            .1
-                            .rank_info(location.source.rank as usize)
-                    })
-                    .is_some_and(|owner| owner.endpoint == location.source)
-            });
+            tensor
+                .locations
+                .retain(|location| self.incarnations.position(&location.source).is_some());
         }
 
         // Routing stays on the head: the group names each call's reading
@@ -1073,7 +1121,10 @@ impl WorkerExecutor {
                 Some(((call.request_key, call.call_id), readers))
             })
             .collect();
-        match self.workers[worker_index].1.submit_batch(wire, &readers) {
+        match self.workers[worker_index]
+            .1
+            .submit_batch(wire, &readers, &rank_buffers)
+        {
             Ok(()) => {}
             Err(BatchSubmitError::WouldBlock(_)) => return Ok(Dispatch::Deferred),
             Err(BatchSubmitError::Failed(error)) => {
@@ -1308,9 +1359,29 @@ impl WorkerExecutor {
                     .get(&identity)
                     .context("worker returned an unknown call")?;
                 anyhow::ensure!(seen.insert(identity), "worker returned a duplicate call");
+                // A completion's payload must fit the kind of the call it
+                // answers: only a successful KV-publish call publishes KV,
+                // and only a successful token-denoising call reports
+                // candidate log-probabilities.
+                let output = &completion.output;
+                let successful = output.status == uniserve_worker_ipc::CallStatus::Ok;
                 anyhow::ensure!(
-                    completion.output.code == *kind,
-                    "worker returned a computation code that disagrees with its call"
+                    output.kv_output.is_none()
+                        || (successful
+                            && *kind
+                                == uniserve_worker_ipc::CallKind::Transfer(
+                                    uniserve_worker_ipc::TransferMode::KvPublish
+                                )),
+                    "worker returned a KV publication for a call that does not publish one"
+                );
+                anyhow::ensure!(
+                    output.candidate_logprobs.is_empty()
+                        || (successful
+                            && *kind
+                                == uniserve_worker_ipc::CallKind::Forward(
+                                    uniserve_worker_ipc::ForwardMode::TokenDenoising
+                                )),
+                    "worker returned candidate log-probabilities for a call that reads none"
                 );
             }
             anyhow::ensure!(
@@ -1446,7 +1517,7 @@ impl WorkerExecutor {
                     BatchCommand::Free { buffer } => {
                         self.buffer_workers.remove(&buffer);
                         self.buffer_allocations
-                            .retain(|(_, identity), _| *identity != buffer);
+                            .retain(|(_, _, identity), _| *identity != buffer);
                         self.buffer_routes.retain(|identity, _| *identity != buffer);
                         self.kv_transfers.remove(&buffer);
                         self.transfer_products
@@ -1477,7 +1548,7 @@ impl WorkerExecutor {
         self.kv_transfers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
         self.buffer_allocations
-            .retain(|(_, buffer), _| buffer.owner != request || retained.contains(buffer));
+            .retain(|(_, _, buffer), _| buffer.owner != request || retained.contains(buffer));
         self.buffer_workers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
     }
@@ -1587,7 +1658,7 @@ impl Executor for WorkerExecutor {
             // register the producer and holders of its outputs and the
             // worker-local buffer allocations its placement names.
             for (call, placement) in &batch.requests {
-                let variant = call.code;
+                let variant = call.kind;
                 let call_worker =
                     self.routing
                         .get(&placement.worker)
@@ -1603,10 +1674,9 @@ impl Executor for WorkerExecutor {
                         .contains(&variant),
                     "target worker does not support call {variant:?}"
                 );
-                let entries = &self.workers[call_worker].1.info().components;
+                let (_, entries) = self.workers[call_worker].1.placement();
                 anyhow::ensure!(
-                    entries.is_empty()
-                        || entries.iter().any(|binding| binding.name == call.component),
+                    entries.is_empty() || entries.contains_key(&call.component),
                     "call targets unloaded component {}",
                     call.component
                 );
@@ -1639,13 +1709,13 @@ impl Executor for WorkerExecutor {
                         .insert(call_worker);
                 }
                 for params in &placement.buffers {
-                    if let Some(existing) = self
-                        .buffer_allocations
-                        .insert((call_worker, params.buffer), *params)
-                    {
+                    if let Some(existing) = self.buffer_allocations.insert(
+                        (call_worker, params.rank, params.allocation.buffer),
+                        params.allocation,
+                    ) {
                         anyhow::ensure!(
-                            existing == *params,
-                            "buffer identity was assigned conflicting worker-local allocations"
+                            existing == params.allocation,
+                            "buffer identity was assigned conflicting rank-local allocations"
                         );
                     }
                 }
@@ -1654,7 +1724,7 @@ impl Executor for WorkerExecutor {
                         placement
                             .buffers
                             .iter()
-                            .any(|params| params.buffer == output.buffer_id()),
+                            .any(|params| params.allocation.buffer == output.buffer_id()),
                         "persistent product {:?} has no scheduler params",
                         output
                     );
@@ -1794,7 +1864,7 @@ impl Executor for WorkerExecutor {
                         submitted: false,
                         calls: calls
                             .iter()
-                            .map(|(call, _)| ((call.request_key, call.call_id), call.code))
+                            .map(|(call, _)| ((call.request_key, call.call_id), call.kind))
                             .collect(),
                     },
                 );
@@ -2293,5 +2363,60 @@ mod placement_tests {
             message.contains("host b") && message.contains("host a"),
             "{message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dependency_span_tests {
+    use super::dependency_spans;
+    use crate::executor::RankBuffer;
+    use uniserve_core::RequestId;
+    use uniserve_worker_ipc::{BufferAllocation, BufferId, CallId, RequestKey};
+
+    fn span(rank: u32, offset: u64) -> RankBuffer {
+        RankBuffer {
+            rank,
+            allocation: BufferAllocation {
+                buffer: BufferId {
+                    owner: RequestKey::new(1, RequestId(1), 1),
+                    producer_call_id: CallId::new(1, 0),
+                    output_index: 0,
+                    generation: 1,
+                },
+                offset,
+                bytes: 256,
+            },
+        }
+    }
+
+    #[test]
+    fn a_destination_that_reserved_its_own_spans_reads_them() {
+        let own = vec![span(0, 512), span(1, 1024)];
+        let produced = vec![span(0, 0)];
+
+        assert_eq!(dependency_spans(own.clone(), produced, 2), own);
+    }
+
+    #[test]
+    fn a_destination_rank_the_producers_pool_did_not_cover_takes_the_shared_offset() {
+        // The producer ran on one rank; the destination has three.
+        let spans = dependency_spans(Vec::new(), vec![span(0, 768)], 3);
+
+        assert_eq!(spans, vec![span(0, 768), span(1, 768), span(2, 768)]);
+    }
+
+    #[test]
+    fn a_destination_rank_the_producer_covered_takes_that_ranks_span() {
+        let produced = vec![span(0, 0), span(1, 256)];
+
+        assert_eq!(
+            dependency_spans(Vec::new(), produced, 3),
+            vec![span(0, 0), span(1, 256), span(2, 0)]
+        );
+    }
+
+    #[test]
+    fn a_dependency_no_pool_placed_has_no_span() {
+        assert!(dependency_spans(Vec::new(), Vec::new(), 2).is_empty());
     }
 }

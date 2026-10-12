@@ -3,9 +3,9 @@
 The executor (`uniserve_worker.execution.executor`) drives a batch through
 these stages, in order:
 
-1. `validate_batch` checks batch-level bounds, routing, and call support
-   after the batch's `Start` commands and before its other commands are
-   applied.
+1. `validate_batch` checks the batch's routing, call count, forward-row
+   request slots and video admission order after the batch's `Start`
+   commands and before its other commands are applied.
 2. `prepare_batch` runs after the batch's commands are applied. It adds cache
    publications for KV installations and collects the futures
    (`BatchState.storage_dependencies`) that must resolve before this batch's
@@ -33,7 +33,6 @@ import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future
-from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, cast
 
@@ -43,7 +42,6 @@ from uniserve.media import image as media_image
 from uniserve_worker.errors import (
     invalid_descriptor,
     resource_error,
-    unsupported_call,
     unsupported_setup,
 )
 from uniserve_worker.execution import calls as calls
@@ -52,9 +50,6 @@ from uniserve_worker.execution.commit import discard_batch
 from uniserve_worker.execution.host_media import (
     BORROWED_INPUT_CALLS,
     encoded_unit_positions,
-)
-from uniserve_worker.execution.media import (
-    validate_batch as validate_video_batch,
 )
 from uniserve_worker.execution.output import PendingOutput, create_outputs
 from uniserve_worker.profiling import record_component
@@ -94,7 +89,6 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
@@ -207,9 +201,7 @@ def prepare_batch(
         # already in its sequence, in every group.
         for allocation in batch.new_cache_units:
             storage_dependencies.extend(
-                cache.write_dependencies(
-                    cache.unit_spans(cache.validate_units(allocation.unit_ids))
-                )
+                cache.write_dependencies(cache.unit_spans(allocation.unit_ids))
             )
 
         for row, write_kv in enumerate(batch.write_kv):
@@ -253,7 +245,7 @@ def prepare_batch(
                 for table in _slot_tables(batch, tables, slot):
                     start = max(
                         kv_publication.base_extent,
-                        table.start_page * table.shape.page_tokens,
+                        table.start_page * table.shape.block_size,
                     )
                     if start < end:
                         storage_dependencies.extend(
@@ -308,7 +300,7 @@ def prepare_inputs(
     output_pool: OutputPool,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> None:
@@ -358,7 +350,7 @@ def prepare_inputs(
         if call.kind in BORROWED_INPUT_CALLS
         for product in call.inputs
     }
-    shm = transports.get("shm")
+    shm = transports.get("posix_shm")
     borrowed = {
         entry.product.buffer_id
         for entry in entries
@@ -388,7 +380,7 @@ def prepare_inputs(
             # One transferred product must land on exactly one consumer device:
             # the compute device (`call_devices(...)[0]`) of its consumers.
             devices = {
-                model_runner.call_devices(call)[0]
+                model_executor.call_devices(call)[0]
                 for call in batch.calls
                 if entry.product in call.tensor_inputs()
                 or entry.product == call.predicate
@@ -544,7 +536,7 @@ def prepare_inputs(
                         for location in value.tensor.locations
                         if location.backend in transports
                         and (
-                            location.backend != "shm"
+                            location.backend != "posix_shm"
                             or location.source.node
                             == transports[location.backend].source.node
                         )
@@ -596,12 +588,10 @@ def prepare_inputs(
                     value.latent_units,
                     value.height,
                     value.width,
-                    value.step,
                 ) != (
                     params.latent_units,
                     params.height,
                     params.width,
-                    params.start_step,
                 ):
                     raise invalid_descriptor(
                         "latent transfer disagrees with its scheduler params"
@@ -733,7 +723,7 @@ def prepare_inputs(
             state,
             tensor_store=tensor_store,
             output_pool=output_pool,
-            model_runner=model_runner,
+            model_executor=model_executor,
         )
     except BaseException as error:
         if resumable and isinstance(error, ReadBackpressureError):
@@ -756,7 +746,7 @@ def _prepare_predicates(
     *,
     tensor_store: TensorStore,
     output_pool: OutputPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Capture completion-valued (U8) predicates into one completion buffer.
 
@@ -784,7 +774,9 @@ def _prepare_predicates(
     buffer = output_pool.acquire(
         len(scheduled),
         token_capacity=len(scheduled),
-        devices=tuple(model_runner.call_devices(call)[0] for call in scheduled),
+        devices=tuple(
+            model_executor.call_devices(call)[0] for call in scheduled
+        ),
     )
     captures: list[tuple[CallIdentity, tuple[int, int], int]] = []
     pending: list[tuple[CallIdentity, BufferId, int]] = []
@@ -799,7 +791,7 @@ def _prepare_predicates(
         for call in scheduled:
             source = cast(TensorRef, call.predicate).buffer_id
             if source not in state.tensor_reads:
-                grouped[model_runner.call_devices(call)[0]].append(call)
+                grouped[model_executor.call_devices(call)[0]].append(call)
             else:
                 pending.append(
                     (
@@ -887,13 +879,12 @@ def reserve_outputs(
     kv_cache: KVCacheManager | None,
     host_tasks: HostLane,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     output_pool: OutputPool,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> None:
@@ -934,7 +925,7 @@ def reserve_outputs(
     )
 
     if active_calls:
-        stream = model_runner.call_stream(active_calls[0])
+        stream = model_executor.call_stream(active_calls[0])
         if stream is not None:
             # A standalone capability's batch runs on the stream
             # `ModelExecutor.call_stream` selects for its first active call.
@@ -973,14 +964,6 @@ def reserve_outputs(
             # together: a failure before `state.bind_outputs` abandons any
             # acquired buffer here, and a later one is handled by
             # `discard_batch`.
-            request_pool_indices = tuple(
-                int(
-                    request_pool.get(
-                        call.request_key.request_id
-                    ).request_pool_idx
-                )
-                for call in scheduled
-            )
             completion = output_pool.acquire(
                 len(scheduled),
                 token_capacity=_completion_words(scheduled),
@@ -988,13 +971,11 @@ def reserve_outputs(
                     dict.fromkeys(
                         device
                         for call in scheduled
-                        for device in model_runner.call_devices(call)
+                        for device in model_executor.call_devices(call)
                     )
                 ),
             )
-            candidates = create_outputs(
-                request_pool, scheduled, request_pool_indices, completion
-            )
+            candidates = create_outputs(request_pool, scheduled, completion)
         except BaseException:
             if completion is not None:
                 completion.abandon()
@@ -1012,7 +993,7 @@ def reserve_outputs(
             _reserve_host_tasks(
                 active_calls,
                 host_tasks=host_tasks,
-                worker_info=worker_info,
+                model_executor=model_executor,
                 config=config,
                 state=state,
             )
@@ -1040,13 +1021,13 @@ def reserve_outputs(
                 _bind_latent_inputs(
                     active_calls,
                     latent_pool=latent_pool,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             _reserve_outputs(
                 scheduled,
                 tensor_store=tensor_store,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
 
@@ -1072,13 +1053,13 @@ def reserve_outputs(
                 kv_cache=kv_cache,
                 tensor_store=tensor_store,
                 latent_pool=latent_pool,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
             _consume_predicates(
                 active_calls,
                 tensor_store=tensor_store,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
             _publish_predicated_outputs(
@@ -1103,10 +1084,9 @@ def reserve_outputs(
 
 def _completion_words(scheduled: tuple[Call, ...]) -> int:
     """Compute completion-word capacity for one batch."""
-    # Capacity is counted in `OutputBuffer` elements (int64), matching the
-    # `OutputPool.max_words` bound set in `uniserve_worker.worker`: one
-    # sampling column of `SAMPLING_COMPLETION_FIELDS` elements per call, plus
-    # each call's `max_completion_bytes` rounded up at 4 bytes per element.
+    # Capacity is counted in `OutputBuffer` elements (int64): one sampling
+    # column of `SAMPLING_COMPLETION_FIELDS` elements per call, plus each
+    # call's `max_completion_bytes` rounded up at 4 bytes per element.
     return max(
         1,
         SAMPLING_COMPLETION_FIELDS * len(scheduled)
@@ -1122,7 +1102,7 @@ def _reserve_host_tasks(
     *,
     state: BatchState,
     host_tasks: HostLane,
-    worker_info: WorkerInfo,
+    model_executor: ModelExecutor,
     config: WorkerConfig,
 ) -> None:
     """Reserve bounded host-lane slots for the calls that run host work.
@@ -1130,7 +1110,7 @@ def _reserve_host_tasks(
     A media unit encode reserves one slot per unit this rank takes from the
     round; audio encoding, muxing and image decoding reserve one each. A
     non-distributed component's encode and mux work belongs to its
-    publication owner (`WorkerInfo.output_rank`), so other ranks reserve
+    publication owner (`ModelExecutor.output_rank`), so other ranks reserve
     nothing for it; image decoding reserves on every rank that runs it.
 
     The slots are stored in the call's `PendingOutput.host.tasks`. A failure
@@ -1147,21 +1127,14 @@ def _reserve_host_tasks(
         }:
             continue
 
-        component = next(
-            (
-                binding
-                for binding in worker_info.components
-                if binding.name == call.component
-            ),
-            None,
-        )
+        binding = model_executor.bindings.get(call.component)
         distributed = (
-            component is not None and component.config.distribution is not None
+            binding is not None and binding.config.distribution is not None
         )
         if (
             call.kind is not MediaCall.IMAGE_DECODING
             and not distributed
-            and config.rank != worker_info.output_rank(call.component)
+            and config.rank != model_executor.output_rank(call.component)
         ):
             continue
 
@@ -1172,12 +1145,12 @@ def _reserve_host_tasks(
             )
 
         count = 1
-        if call.kind is MediaCall.VIDEO_ENCODING and component is not None:
+        if call.kind is MediaCall.VIDEO_ENCODING and binding is not None:
             count = len(
                 encoded_unit_positions(
                     call,
                     state=state,
-                    component=component.config,
+                    component=binding.config,
                     rank=config.rank,
                 )
             )
@@ -1195,49 +1168,26 @@ def _reserve_host_tasks(
 def validate_batch(
     batch: Batch,
     *,
-    worker_info: WorkerInfo,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     config: WorkerConfig,
     predecessors: Mapping[CallId, CallId | None],
 ) -> None:
-    """Validate batch resources, routing, and call support before staging.
+    """Validate the batch's routing and ordering before staging.
 
     Runs before the batch's `Finish` and `Free` commands are applied; `Start`
     commands are applied first so that `predecessors` covers requests the
-    batch admits. Checks that buffer allocations fit the worker buffer pool,
-    that every call targets a component placed on this rank (when the worker
-    declares components) and a supported call kind, the batch call limit,
-    the upper bound of request-slot indices, and the video preparation
-    ordering checked by `uniserve_worker.execution.media.validate_batch`.
-    Violations raise `invalid_descriptor` or `unsupported_call` errors.
+    batch admits. Checks that every call targets a component placed on this
+    rank (when the worker declares components), the batch call limit, the
+    upper bound of forward rows' request slots, and that latent preparation
+    follows its request's admission root. Buffer allocations, block tables
+    and call kinds are refused by their owners (`BufferPool.bind`,
+    `BlockTables.install` and `Worker.supports_call`).
+    Violations raise `invalid_descriptor` errors.
     """
-    invalid_buffer = next(
-        (
-            params
-            for params in batch.buffer_allocations
-            if params.offset + params.bytes > worker_info.buffer_pool_bytes
-        ),
-        None,
-    )
-    if invalid_buffer is not None:
-        raise invalid_descriptor(
-            "batch buffer params exceeds the worker buffer pool: "
-            f"offset={invalid_buffer.offset}, bytes={invalid_buffer.bytes}, "
-            f"capacity={worker_info.buffer_pool_bytes}, "
-            f"buffer={invalid_buffer.buffer}"
-        )
-
-    if worker_info.components:
+    if model_executor.bindings:
         for call in batch.calls:
-            entry = next(
-                (
-                    entry
-                    for entry in worker_info.components
-                    if entry.name == call.component
-                ),
-                None,
-            )
-            if entry is None or config.rank not in entry.config.ranks:
+            binding = model_executor.bindings.get(call.component)
+            if binding is None or config.rank not in binding.config.ranks:
                 raise invalid_descriptor(
                     f"call targets component {call.component!r} outside "
                     "this rank"
@@ -1248,27 +1198,25 @@ def validate_batch(
             "execution batch exceeds the worker_config call limit"
         )
 
-    for call in batch.calls:
-        variant = call.kind
-        if variant not in worker_info.supported_calls:
-            raise unsupported_call(variant.value, call.request_key.request_id)
-
     if any(
         index > config.max_request_pool_size
-        for index in (
-            *(table.request_pool_idx for table in batch.block_tables),
-            *batch.request_pool_indices,
-        )
+        for index in batch.request_pool_indices
     ):
         raise invalid_descriptor(
             "execution batch exceeds request-slot capacity"
         )
 
-    validate_video_batch(
-        batch,
-        postprocessor=model_runner.video_postprocessor,
-        predecessors=predecessors,
-    )
+    # Latent preparation opens a request's trajectory, so it must be the first
+    # state-advancing call of its request: the call it follows is the
+    # admission root, not an earlier step.
+    if model_executor.video_postprocessor is not None:
+        for call in batch.calls:
+            if call.kind is MediaCall.LATENT_PREPARATION and predecessors.get(
+                call.call_id
+            ) != CallId(0, 0):
+                raise invalid_descriptor(
+                    "video preparation does not follow its request root"
+                )
 
 
 def _reserve_outputs(
@@ -1276,7 +1224,7 @@ def _reserve_outputs(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Bind each declared device value to its concrete bounded owner.
 
@@ -1303,7 +1251,7 @@ def _reserve_outputs(
 
     for call in scheduled:
         # Outputs are bound on the call's output device.
-        device = model_runner.call_devices(call)[2]
+        device = model_executor.call_devices(call)[2]
         request = state.pending_output(call.request_key.request_id)
         predicated = request.status is CallStatus.PREDICATED
 
@@ -1325,7 +1273,7 @@ def _reserve_outputs(
                     # mathematics.
                     persistent_bindings.append((output, device))
                     continue
-                layout = model_runner.output_layout(
+                layout = model_executor.output_layout(
                     call.component,
                     output.output_index,
                     request.request.admission.diffusion,
@@ -1351,7 +1299,7 @@ def _reserve_outputs(
             if call.encoder_output is not None:
                 encoder_bindings.append((call.encoder_output, device))
 
-        # A skipped computation propagates false predicates but publishes no
+        # A skipped call propagates false predicates but publishes no
         # sampled token, feature, image, or latent state.
         for scalar in (
             call.token_output,
@@ -1435,7 +1383,7 @@ def _consume_predicates(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Hand each active call its predicate tensor and register the reader.
 
@@ -1457,7 +1405,7 @@ def _consume_predicates(
         predicate = call.predicate
         if predicate is None:
             continue
-        device = model_runner.call_devices(call)[0]
+        device = model_executor.call_devices(call)[0]
         grouped.setdefault(device, []).append(
             (
                 call,
@@ -1508,16 +1456,14 @@ def _bind_latent_inputs(
     *,
     state: BatchState,
     latent_pool: LatentPool | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Validate trajectory parameters and bind rank-local latent staging.
 
-    Only the params of the given (active) calls are considered. With an
-    image builder, the params are checked against the admitted image
-    dimensions and the committed solver step, and every row receives a
-    `LatentPool.stage` view in `latent.staging`. Without one, the params are
-    validated by `_validate_sample_params` and only recorded. Raises
-    `invalid_descriptor` errors on any disagreement.
+    Only the params of the given (active) calls are considered. Each row is
+    checked against the admitted image dimensions and receives a
+    `LatentPool.stage` view in `latent.staging`. Raises `invalid_descriptor`
+    errors on any disagreement.
     """
     identities = {calls.call_identity(call) for call in scheduled}
     parameters = tuple(
@@ -1530,41 +1476,35 @@ def _bind_latent_inputs(
 
     pool = latent_pool
     requests = {
-        calls.call_identity(call): (
-            call,
-            state.pending_output(call.request_key.request_id),
+        calls.call_identity(call): state.pending_output(
+            call.request_key.request_id
         )
         for call in scheduled
     }
 
     if pool is None:
         raise invalid_descriptor("latent params require a resident latent pool")
+    if model_executor.image_builder is None:
+        raise invalid_descriptor("latent params have no image denoiser")
 
     # Image trajectories bind validated image dimensions and page ownership
-    # and borrow the pool's step staging. A standalone denoiser's runner
-    # stages its own steps, so its calls keep only their parameters.
+    # and borrow the pool's step staging.
+    flow = model_executor.image_builder
     rows: list[tuple[CallIdentity, LatentParams, int]] = []
     for params in parameters:
         identity = (params.request_key, params.call_id)
-        selected = requests.get(identity)
-        if selected is None:
+        request = requests.get(identity)
+        if request is None:
             raise invalid_descriptor(
                 "latent params names a call outside its batch"
             )
-        call, request = selected
         slot = int(request.request.request_pool_idx)
-
-        if model_runner.image_builder is None:
-            _validate_sample_params(call, request, params, model_runner)
-            request.latent.input_params = params
-            continue
 
         image = request.request.image
         if image is None:
             raise invalid_descriptor(
                 "latent params has no admitted image dimensions"
             )
-        flow = model_runner.image_builder
         expected_units = int(
             flow.denoiser.latent_shape(
                 "image",
@@ -1578,50 +1518,6 @@ def _bind_latent_inputs(
         ):
             raise invalid_descriptor(
                 "latent params disagrees with admitted model dimensions"
-            )
-
-        # A transferred trajectory commits at the step it was published at;
-        # a resident trajectory commits at its recorded solver step.
-        transferred = next(
-            (
-                publication.value
-                for publication in state.input_products
-                if publication.product in call.tensor_inputs()
-                and isinstance(publication.value, LatentTransferValue)
-            ),
-            None,
-        )
-        committed_step = (
-            int(calls.require_progress(request).flow_step)
-            if transferred is None
-            else transferred.step
-        )
-
-        if call.kind is MediaCall.LATENT_PREPARATION:
-            if int(params.start_step) != 0 or int(params.step_count) != 0:
-                raise invalid_descriptor(
-                    "media preparation params carries denoise steps"
-                )
-        elif call.kind is MediaCall.DENOISING:
-            if (
-                int(params.start_step) != committed_step
-                or int(params.step_count) < 1
-                or int(params.start_step) + int(params.step_count)
-                > int(image.steps)
-                or (
-                    int(call.bounds.max_tokens) > 0
-                    and int(params.step_count) > int(call.bounds.max_tokens)
-                )
-            ):
-                raise invalid_descriptor(
-                    "media denoise params exceeds its committed schedule"
-                )
-        elif (
-            int(params.start_step) != committed_step
-            or int(params.step_count) != 0
-        ):
-            raise invalid_descriptor(
-                "latent reader params disagrees with committed step state"
             )
 
         rows.append((identity, params, slot))
@@ -1647,43 +1543,6 @@ def _bind_latent_inputs(
         request.latent.staging = value
 
 
-def _validate_sample_params(
-    call: Call,
-    request: PendingOutput,
-    params: LatentParams,
-    model_runner: ModelExecutor,
-) -> None:
-    """Validate a standalone denoiser's trajectory parameters.
-
-    The request's pages are the run its slot owns, and each call covers the
-    fixed step interval of its kind: preparation opens the trajectory at step
-    zero and each denoising call advances one step from the committed one.
-    """
-    builder = model_runner.media_builder
-    if builder is None:
-        raise invalid_descriptor("latent params has no denoiser to advance")
-    slot = int(request.request.request_pool_idx)
-    if (
-        tuple(params.page_table) != builder.slot_pages(slot)
-        or int(params.latent_units) != builder.sample_pages.units
-    ):
-        raise invalid_descriptor(
-            "latent params does not name the pages of its request slot"
-        )
-
-    step = int(calls.require_progress(request).flow_step)
-    if call.kind is MediaCall.LATENT_PREPARATION:
-        valid = int(params.start_step) == 0 and int(params.step_count) == 0
-    elif call.kind is MediaCall.DENOISING:
-        valid = int(params.start_step) == step and int(params.step_count) == 1
-    else:
-        valid = int(params.start_step) == step and int(params.step_count) == 0
-    if not valid:
-        raise invalid_descriptor(
-            "latent params disagrees with the request's committed step"
-        )
-
-
 def _bind_cache_tables(
     scheduled: tuple[Call, ...],
     *,
@@ -1697,10 +1556,9 @@ def _bind_cache_tables(
     alternative-prefix slots of their forward rows, the batch's block tables
     are validated and installed in `BlockTables`, and new cache units that no
     KV import initializes are zeroed. Each call's forward rows are then
-    recorded in `state.forward_indices`, the main row's prefix is checked
-    against the call's projected visible KV length, and the units each row
-    accesses in every group are retained in the `KVCacheManager` until the
-    batch's output buffer completes.
+    recorded in `state.forward_indices`, and the units each row accesses in
+    every group are retained in the `KVCacheManager` until the batch's
+    output buffer completes.
     """
     cache = kv_cache
     page_tables = request_tables
@@ -1736,9 +1594,9 @@ def _bind_cache_tables(
         tables.append(
             (
                 int(table.request_pool_idx),
-                cache.validate_group(table.group_id),
+                int(table.group_id),
                 int(table.start_page),
-                cache.validate_units(table.unit_ids),
+                table.unit_ids,
                 int(table.allocated_tokens),
             )
         )
@@ -1748,15 +1606,7 @@ def _bind_cache_tables(
     for allocation in inputs.new_cache_units:
         if allocation.request_pool_idx not in slots:
             continue
-        units = cache.validate_units(allocation.unit_ids)
-        installed = page_tables.table(
-            allocation.request_pool_idx,
-            cache.validate_group(allocation.group_id),
-        )
-        if not set(units).issubset(installed.units):
-            raise invalid_descriptor(
-                "new cache units are outside the installed block table"
-            )
+        units = tuple(allocation.unit_ids)
 
         # A KV import resets the new units it covers before copying into
         # them (`CacheImport.initialized_units`); every other new unit is
@@ -1786,31 +1636,6 @@ def _bind_cache_tables(
         main_slot = int(request.request.request_pool_idx)
         call_rows = rows_by_call.get(calls.call_identity(call), [])
         state.forward_indices[calls.call_identity(call)] = tuple(call_rows)
-
-        main_descriptor = next(
-            (
-                row
-                for row in call_rows
-                if inputs.request_pool_indices[row] == main_slot
-            ),
-            None,
-        )
-        if main_descriptor is not None:
-            visible = int(request.progress.kv_visible_len)
-            declared = (
-                inputs.seq_lens[main_descriptor]
-                - inputs.query_lens[main_descriptor]
-            )
-            relayed = (
-                call.predicate is not None and call.predicate.dtype is DType.I64
-            )
-            # A queued relay carries a capacity bound computed before its
-            # predecessor's predicate was known. Actual KV length and validity
-            # come from the device row; an inactive descendant must still drain.
-            if declared < visible or (not relayed and declared != visible):
-                raise invalid_descriptor(
-                    "forward row sequence length disagrees with execution state"
-                )
 
         for descriptor in call_rows:
             slot = inputs.request_pool_indices[descriptor]
@@ -1851,7 +1676,7 @@ def _stage_input_products(
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> None:
     """Publish query-ready transferred values into their owning stores.
 
@@ -1859,8 +1684,8 @@ def _stage_input_products(
     resident publication of its buffer, and every other non-borrowed input
     must be query-ready; violations raise `invalid_descriptor`. A latent
     import is adopted by the `LatentPool` as a live trajectory at its
-    transferred step, and the destination's projected `flow_step` moves to
-    that step. A device or encoder import is completed in the `TensorStore`.
+    transferred step. A device or encoder import is completed in the
+    `TensorStore`.
     Borrowed inputs are skipped.
     """
     # KV imports consumed by this batch must be complete and conflict-free
@@ -1917,16 +1742,9 @@ def _stage_input_products(
                 value.latent_units != int(params.latent_units)
                 or value.height != int(params.height)
                 or value.width != int(params.width)
-                or value.step != int(params.start_step)
             ):
                 raise invalid_descriptor(
                     "latent transfer disagrees with its scheduler params"
-                )
-
-            request = state.pending_output(product.request_key.request_id)
-            if int(calls.require_progress(request).flow_step) != 0:
-                raise invalid_descriptor(
-                    "latent transfer destination already owns a trajectory"
                 )
 
             binding = state.latent_imports.get(product.buffer_id)
@@ -1943,19 +1761,16 @@ def _stage_input_products(
                 )
 
             # The reserved import becomes a live trajectory at the transferred
-            # solver step, replacing the destination's empty progress.
+            # solver step, which the pool records as the slot's committed step.
             assert latent_pool is not None
             latent_pool.adopt_import(
                 binding,
                 generation=product.generation,
-                step=value.step,
+                step_index=value.step_index,
                 height=value.height,
                 width=value.width,
             )
             row.latent.imported = True
-            request.progress = replace(
-                calls.require_progress(request), flow_step=value.step
-            )
             continue
 
         consumers = tuple(
@@ -1968,7 +1783,7 @@ def _stage_input_products(
                 "transferred product has no batch consumer"
             )
 
-        devices = {model_runner.call_devices(call)[0] for call in consumers}
+        devices = {model_executor.call_devices(call)[0] for call in consumers}
         if len(devices) != 1:
             raise invalid_descriptor(
                 "transferred product spans multiple consumer devices"

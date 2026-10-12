@@ -7,8 +7,8 @@ import torch
 
 from uniserve.cache import Config, State, mha
 from uniserve.quantization import Quantizer
-from uniserve.runtime import PrefixCache
-from uniserve.runtime.prefix_cache import CacheTable, plan_units
+from uniserve.runtime import KVCache
+from uniserve.runtime.kv_cache import CacheTable, plan_units
 
 pytestmark = pytest.mark.unit
 
@@ -28,13 +28,18 @@ def _hybrid_config():
 
 def test_homogeneous_pool_keeps_the_per_layer_stack_layout():
     config = Config({f"layers.{index}": _layer(8) for index in range(3)})
-    with PrefixCache(config, num_units=5, block_size=4, device="cpu") as cache:
+    with KVCache(
+        config,
+        plan_units(config, block_size=4),
+        num_units=5,
+        device="cpu",
+    ) as cache:
         planes = cache.planes
         # One group: one unit per page holding every layer as a column, one
         # table, and pages of exactly ``block_size`` tokens.
         assert planes.columns == 3
         assert [
-            (group.page_tokens, group.units_per_page) for group in planes.groups
+            (group.block_size, group.units_per_page) for group in planes.groups
         ] == [(4, 1)]
         assert cache.tables == (CacheTable(0, 0),)
         stack = cache.planes_of(0, "key")
@@ -53,8 +58,11 @@ def test_homogeneous_pool_keeps_the_per_layer_stack_layout():
 
 
 def test_hybrid_groups_read_column_planes_of_one_unit_pool():
-    with PrefixCache(
-        _hybrid_config(), num_units=6, block_size=4, device="cpu"
+    with KVCache(
+        _hybrid_config(),
+        plan_units(_hybrid_config(), block_size=4),
+        num_units=6,
+        device="cpu",
     ) as cache:
         planes = cache.planes
         windowed, full = planes.groups
@@ -65,10 +73,10 @@ def test_hybrid_groups_read_column_planes_of_one_unit_pool():
         assert planes.plane_bytes == 4 * 2 * 16 * 4
         assert (
             windowed.window,
-            windowed.page_tokens,
+            windowed.block_size,
             windowed.units_per_page,
         ) == (16, 8, 5)
-        assert (full.window, full.page_tokens, full.units_per_page) == (
+        assert (full.window, full.block_size, full.units_per_page) == (
             None,
             4,
             1,
@@ -141,7 +149,7 @@ def test_quantized_units_carry_one_scale_per_column_and_field():
         # A windowed row that does not divide the plane into a power-of-two
         # page.
         ({"a": _layer(16), "b": _layer(12, window=8)}, {"block_size": 4}),
-        # A page size that is not a power of two.
+        # A block size that is not a power of two.
         ({"a": _layer(8)}, {"block_size": 3}),
         # Layers that do not share one storage quantizer.
         (
@@ -157,14 +165,17 @@ def test_unit_planning_rejects_unrepresentable_layouts(layers, options):
 
 def _cache(quantized=False, device="cpu"):
     config = Config({"attention": mha.Config(2, 2, (0, 1), torch.float32)})
-    return PrefixCache(
+    return KVCache(
         config,
+        plan_units(
+            config,
+            block_size=4,
+            quantization={
+                "attention": Quantizer("fp8", axis=0) if quantized else None
+            },
+        ),
         num_units=3,
-        block_size=4,
         device=device,
-        quantization={
-            "attention": Quantizer("fp8", axis=0) if quantized else None
-        },
     )
 
 
@@ -293,15 +304,18 @@ def test_aliases_copy_from_original_block_values():
 @pytest.mark.parametrize("quantized", (False, True))
 def test_zero_units_preserves_other_units_and_layers(device, quantized):
     config = Config({name: _layer(16) for name in ("attention", "other")})
-    with PrefixCache(
+    with KVCache(
         config,
+        plan_units(
+            config,
+            block_size=4,
+            quantization={
+                name: Quantizer("fp8", axis=0) if quantized else None
+                for name in config.layers
+            },
+        ),
         num_units=5,
-        block_size=4,
         device=device,
-        quantization={
-            name: Quantizer("fp8", axis=0) if quantized else None
-            for name in config.layers
-        },
     ) as cache:
         state, other = cache.state("attention"), cache.state("other")
         key = (
@@ -381,7 +395,12 @@ def test_recycled_units_of_mixed_types_read_finite_in_every_group():
             "narrow": mha.Config(2, 8, (0, 1), torch.bfloat16),
         }
     )
-    with PrefixCache(config, num_units=3, block_size=4, device="cpu") as cache:
+    with KVCache(
+        config,
+        plan_units(config, block_size=4),
+        num_units=3,
+        device="cpu",
+    ) as cache:
         # A finite FP32 value whose low half is a BF16 NaN: the narrow
         # group's view of the same bytes is not finite.
         bits = torch.full((4, 2, 8), 0x3F807FC0, dtype=torch.int32)
@@ -408,7 +427,7 @@ def test_slot_zero_is_writable_and_minus_one_does_not_initialize(quantized):
             [[10000.0, 10000.0], [10000.0, 10000.0]],
         ]
     )
-    state.update(key, -key, indices=torch.tensor([0, 1, -1]))
+    state.update(key, -key, slot_mapping=torch.tensor([0, 1, -1]))
     expected = key[:2].clone()
     actual = state.read((0,), start=0, length=2)
     torch.testing.assert_close(actual[0], expected, rtol=0, atol=0)
@@ -417,7 +436,7 @@ def test_slot_zero_is_writable_and_minus_one_does_not_initialize(quantized):
     assert state.initialized["value"].tolist() == [True, False, False]
     for index in (-2, 12):
         with pytest.raises(ValueError, match="out of bounds"):
-            state.update(key[:1], key[:1], indices=torch.tensor([index]))
+            state.update(key[:1], key[:1], slot_mapping=torch.tensor([index]))
 
 
 def test_fp8_partial_copy_preserves_uncovered_values_and_transfers_encoding():

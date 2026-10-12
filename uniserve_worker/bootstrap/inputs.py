@@ -98,18 +98,6 @@ def video_denoiser(model: nn.Module, config: WorkerConfig):
     return placed[0]
 
 
-# Video tasks whose request calls the worker executes: generation from the
-# prompt alone, from keyframes, and from references.
-EXECUTED_VIDEO_TASKS = frozenset({"t2va", "fl2va", "ref2va"})
-
-
-def executed_video_tasks(denoiser: VideoDenoiser) -> tuple[str, ...]:
-    """The denoiser's tasks the worker executes, in the denoiser's order."""
-    return tuple(
-        task for task in denoiser.tasks if task in EXECUTED_VIDEO_TASKS
-    )
-
-
 def _max_frames(model: nn.Module, config: WorkerConfig) -> int:
     """Frames of the longest video the deployment serves.
 
@@ -131,13 +119,9 @@ def _max_frames(model: nn.Module, config: WorkerConfig) -> int:
 def _canvases(
     denoiser: VideoDenoiser, config: WorkerConfig
 ) -> tuple[image.Config, ...]:
-    """Canvases the deployment prepares: its own, or the denoiser's."""
-    return (
-        tuple(
-            image.Config(height, width)
-            for height, width in config.video_frame_sizes
-        )
-        or denoiser.canvases
+    """Canvases the deployment prepares: its selection of the denoiser's."""
+    return denoiser.select_canvases(
+        config.video_resolutions, config.video_aspect_ratios
     )
 
 
@@ -146,31 +130,35 @@ def condition_capacity(
 ) -> int:
     """Packed condition rows a worker provisions for one request.
 
-    Only a conditioned task carries conditions, so a deployment whose
-    denoiser executes none provisions none, whatever ``max_condition_rows``
-    grants. A deployment that states no capacity provisions the largest
-    condition set its denoiser admits (``VideoDenoiser.max_conditions``) at
-    its longest duration, on the prepared canvas where that set packs the
-    most rows, so it refuses no request for its conditions.
+    A denoiser that admits no condition (``VideoDenoiser.max_conditions``
+    is empty on every prepared canvas) gets none, whatever
+    ``max_condition_rows`` grants. A deployment that states no capacity
+    provisions the largest condition set its denoiser admits at its longest
+    duration, on the prepared canvas where that set packs the most rows, so
+    it refuses no request for its conditions.
 
     Raises:
-        ValueError: Without a stated capacity, the errors of
-            ``_max_frames`` and ``VideoDenoiser.make_size``.
+        ValueError: The errors of ``_max_frames`` and, without a stated
+            capacity, ``VideoDenoiser.make_size``.
     """
-    if not set(executed_video_tasks(denoiser)) - {"t2va"}:
+    frames = denoiser.legal_frame_count(_max_frames(model, config))
+    admitted = {
+        canvas: denoiser.max_conditions(frames, canvas)
+        for canvas in _canvases(denoiser, config)
+    }
+    if not any(admitted.values()):
         return 0
     if config.max_condition_rows is not None:
         return config.max_condition_rows
 
-    frames = denoiser.legal_frame_count(_max_frames(model, config))
     return max(
         denoiser.make_size(
             frames,
-            config.max_sequence_tokens,
+            config.max_model_len,
             canvas=canvas,
-            conditions=denoiser.max_conditions(frames, canvas),
+            conditions=conditions,
         ).condition_rows
-        for canvas in _canvases(denoiser, config)
+        for canvas, conditions in admitted.items()
     )
 
 
@@ -180,9 +168,10 @@ def media_builder(model: nn.Module, config: WorkerConfig):
     The frame budget is ``max_video_seconds`` at the post-processor's output
     frame rate, rounded half to even to whole frames, and admitted frame
     counts start at ``min_video_seconds`` converted the same way; the text
-    budget is ``max_sequence_tokens``, divided into
+    budget is ``max_model_len``, divided into
     ``video_text_capacities``. The deployment prepares the canvases of
-    ``video_frame_sizes``, or the denoiser's own without any.
+    ``video_resolutions`` at ``video_aspect_ratios``, or every canvas the
+    denoiser generates without any.
 
     Returns:
         The builder, or ``None`` for a model without a ``VideoDenoiser``.
@@ -190,8 +179,8 @@ def media_builder(model: nn.Module, config: WorkerConfig):
     Raises:
         ValueError: The model has a ``VideoDenoiser`` but no
             ``VideoPostprocessor`` to supply its frame rate, either
-            capability is ambiguous, or the denoiser does not offer a
-            canvas of ``video_frame_sizes``.
+            capability is ambiguous, or the denoiser does not generate a
+            canvas the deployment names (``VideoDenoiser.select_canvases``).
     """
     denoiser = video_denoiser(model, config)
     if denoiser is None:
@@ -205,14 +194,11 @@ def media_builder(model: nn.Module, config: WorkerConfig):
     return MediaBuilder(
         denoiser,
         max_frames=max_frames,
-        max_text_tokens=config.max_sequence_tokens,
+        max_text_tokens=config.max_model_len,
         min_frames=1
         if config.min_video_seconds is None
         else round(config.min_video_seconds * output.frame_rate),
         text_capacities=config.video_text_capacities,
         condition_rows=condition_capacity(model, denoiser, config),
-        canvases=tuple(
-            image.Config(height, width)
-            for height, width in config.video_frame_sizes
-        ),
+        canvases=_canvases(denoiser, config),
     )

@@ -13,7 +13,7 @@ once warmup has run.
 Two kinds of worker are sized differently. A token worker (no
 ``VideoPostprocessor`` and no media request state) derives its bounds from
 the queue depth and batch bounds and, without a configured
-``kv_token_capacity``, gives paged KV what remains of the device grant. A
+``max_total_tokens``, gives paged KV what remains of the device grant. A
 request-tensor worker holds fixed per-request state and products; on CUDA,
 its request-slot count is fitted collectively so every rank of the worker
 agrees on it.
@@ -47,12 +47,10 @@ from uniserve.runtime.device import (
     device_storage_budget,
     process_device_bytes,
 )
+from uniserve.runtime.kv_cache import Planes
 from uniserve.tensors import BufferConfig
-from uniserve_worker.bootstrap.cache import (
-    page_size,
-    plan_cache,
-    table_widths,
-)
+from uniserve_worker import _uniserve_ipc as _ipc
+from uniserve_worker.bootstrap.cache import resolved_block_size, table_widths
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import (
     capability,
@@ -71,41 +69,29 @@ from uniserve_worker.model_executor.resources import (
 from uniserve_worker.protocol.call import MediaCall
 from uniserve_worker.protocol.tensor import OutputInfo
 from uniserve_worker.storage.kv_cache import KVCacheManager
+from uniserve_worker.storage.latent_pool import LatentPool
 from uniserve_worker.storage.tensor_store import (
     TensorStore,
-    device_product_capacity_bytes,
 )
 
-# ``ArenaCapacity.tensor_store`` allows this many generic persistent products
-# per call slot of the arena, plus ``_DEVICE_PRODUCT_RETIREMENT_BATCHES``
-# further batches of ``max_batch_calls`` calls.
-_DEVICE_PRODUCTS_PER_CALL = 6
-_DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
-# Upper bound on the reads ``ArenaCapacity.transfer_tickets`` lets a rank
-# keep in flight for its queued calls; see ``request_tensor_arena_capacity``
-# for the floor a request-tensor rank keeps above it.
-_MAX_TRANSFER_ENTRIES = 256
-# A token worker's host-lane bound; request-tensor workers derive theirs.
-_HOST_LANE_INFLIGHT = 256
-# Relay-arena bytes budgeted per (request slot, relay lane) row across one
-# device's ``TensorStore`` relay arenas.
-_REQUEST_RELAY_ROW_BYTES = 18
 # Relay lanes beyond the unresolved-call window. ``Worker.__init__`` builds
 # ``TensorStore`` with ``relay_depth = max_unresolved_calls + 1`` to match.
 _REQUEST_RELAY_RETIREMENT_LANES = 1
 
 DEFAULT_NUM_UNITS_FALLBACK = 4096
-DEFAULT_MAX_BATCH_OPS = 1024
-DEFAULT_MAX_REQUEST_POOL_SIZE = 128
 
 
 def input_buffer_config(
     model: nn.Module,
     config: WorkerConfig,
     *,
+    planes: Planes,
     processor: ImageProcessor | None = None,
 ) -> TokenBufferConfig:
     """Size text input staging for one call on this worker.
+
+    ``planes`` is the rank's unit pool plan (``plan_cache``); its groups
+    bound the block tables each call stages.
 
     Rows are bounded by the request pool and by the worker's and every lane's
     call bound; with an image denoiser, the row bound is multiplied by the
@@ -181,8 +167,8 @@ def input_buffer_config(
         max_tokens=call_tokens,
         max_text_tokens=text_tokens,
         table_widths=table_widths(
-            plan_cache(text, config),
-            max_sequence_tokens=config.max_sequence_tokens,
+            planes,
+            max_sequence_tokens=config.max_model_len,
             max_query_tokens=call_tokens,
         ),
         hidden_size=text.backbone.hidden_size,
@@ -327,39 +313,33 @@ def local_product_storage_bytes(
 ) -> int:
     """Size the persistent products this rank backs, from its placement.
 
-    A rank backs every product it produces and every product a consumer it
-    holds reads, each at its complete declared extent. The engine reserves a
-    request's products whole when it admits the request, and the store returns
-    a product's storage only once every reader on this rank has retired it, so
-    a product that streams in rounds of media units is still backed whole: the
-    rounds a consumer has not yet read stay bound while later rounds land.
-    Producers and remote consumers each need the complete logical allocation
-    because disjoint regions may subsequently be imported into it. Alignment
-    follows BufferPool's allocation rules.
+    A rank backs every product of a component it executes and every product a
+    consumer it holds reads, each at its complete declared extent. The engine
+    reserves a request's products whole in the pool of each such rank when it
+    admits the request, and the store returns a product's storage only once
+    every reader on this rank has retired it, so a product that streams in
+    rounds of media units is still backed whole: the rounds a consumer has not
+    yet read stay bound while later rounds land. Producers and remote
+    consumers each need the complete allocation because disjoint regions may
+    subsequently be imported into it. Alignment follows BufferPool's
+    allocation rules.
 
-    A rank produces an entry's products when it is one of the producer's
-    ``output_ranks``. Empty ``bindings`` count every entry's products.
+    A rank executes a component when it is one of its members, whether or
+    not it publishes the component's products: every member is handed a span
+    for each persistent output of the call it executes. Empty ``bindings``
+    count every entry's products. The engine's `MediaStorage` derives the same
+    sets from the component placement.
 
     Returns:
         Bytes of one request's products backed on this rank.
     """
     consumers: dict[str, set[str]] = {}
-    # These are the concrete persistent Tensor consumers of the video path.
-    # Denoising state is resident; encoders consume decoded output buffers.
-    for source_call, destination_call in (
-        (MediaCall.MEDIA_READING, MediaCall.VISION_ENCODING),
-        (MediaCall.MEDIA_READING, MediaCall.LATENT_ENCODING),
-        (MediaCall.VISION_ENCODING, MediaCall.TEXT_ENCODING),
-        (MediaCall.LATENT_ENCODING, MediaCall.LATENT_PREPARATION),
-        (MediaCall.TEXT_ENCODING, MediaCall.LATENT_PREPARATION),
-        (MediaCall.DENOISING, MediaCall.VIDEO_DECODING),
-        (MediaCall.DENOISING, MediaCall.AUDIO_DECODING),
-        (MediaCall.VIDEO_DECODING, MediaCall.VIDEO_ENCODING),
-        (MediaCall.AUDIO_DECODING, MediaCall.AUDIO_ENCODING),
-        (MediaCall.VIDEO_ENCODING, MediaCall.MUXING),
-    ):
-        source = media_components.get(source_call)
-        destination = media_components.get(destination_call)
+    # The persistent tensor edges of the video graph, which the schema states
+    # once (`MediaCall::readers`): denoising state is resident, so its
+    # readers are not among them.
+    for source_call, destination_call in _ipc.product_edges():
+        source = media_components.get(MediaCall(source_call))
+        destination = media_components.get(MediaCall(destination_call))
         if source is not None and destination is not None:
             consumers.setdefault(source, set()).add(destination)
 
@@ -367,10 +347,7 @@ def local_product_storage_bytes(
     for entry, outputs in entry_outputs.items():
         if bindings:
             producer = bindings.get(entry)
-            produces = (
-                producer is not None
-                and producer.process_group.rank in producer.output_ranks
-            )
+            produces = producer is not None and producer.owns
             consumes = any(
                 consumer in bindings and bindings[consumer].owns
                 for consumer in consumers.get(entry, ())
@@ -420,47 +397,6 @@ def latent_trajectory_bytes(
     return units * width * element_bytes
 
 
-def latent_pool_capacity_bytes(
-    *,
-    request_pool_size: int,
-    num_pages: int,
-    page_units: int,
-    latent_width: int,
-    dtype_bytes: int,
-    staging: bool = True,
-) -> int:
-    """Calculate double-buffered latent pool storage.
-
-    Covers latent pages, step storage when the pool stages steps, page
-    tables, and timestep metadata. The result must equal the
-    ``persistent_bytes`` of the ``LatentPool`` built from the same
-    arguments: ``Worker.__init__`` refuses a pool whose allocation disagrees
-    with ``ArenaCapacity.latent_pool_bytes``.
-
-    Raises:
-        ValueError: A dimension is below one or ``num_pages`` is below two.
-    """
-    slots = int(request_pool_size)
-    pages = int(num_pages)
-    units = int(page_units)
-    width = int(latent_width)
-    element_bytes = int(dtype_bytes)
-    if min(slots, units, width, element_bytes) < 1 or pages < 2:
-        raise ValueError("latent pool dimensions are invalid")
-
-    # One page stays reserved as the sentinel; only usable pages hold
-    # trajectories.
-    usable_pages = pages - 1
-    # Two banks of every page, sentinel included; one int64 page index per
-    # usable page; one float32 timestep per one-based slot plus an unused
-    # row zero.
-    storage = 2 * pages * units * width * element_bytes
-    step_buffer = usable_pages * units * width * element_bytes if staging else 0
-    page_table = usable_pages * 8
-    timesteps = (slots + 1) * 4
-    return storage + step_buffer + page_table + timesteps
-
-
 @dataclass(frozen=True, slots=True)
 class LatentPoolPlan:
     """The latent pool a worker's denoiser advances its samples in.
@@ -482,15 +418,20 @@ class LatentPoolPlan:
 
     @property
     def capacity_bytes(self) -> int:
-        """Device bytes the ``LatentPool`` of this plan allocates."""
-        return latent_pool_capacity_bytes(
+        """Device bytes the ``LatentPool`` of this plan allocates.
+
+        Raises:
+            ValueError: As ``LatentPool.buffers``.
+        """
+        buffers = LatentPool.buffers(
             request_pool_size=self.request_pool_size,
             num_pages=self.num_pages,
             page_units=self.page_units,
             latent_width=self.latent_width,
-            dtype_bytes=self.dtype.itemsize,
+            dtype=self.dtype,
             staging=self.staging,
         )
+        return sum(config.nbytes for config in buffers.values())
 
 
 def latent_pool_plan(
@@ -503,7 +444,7 @@ def latent_pool_plan(
     resolved.
 
     An image denoiser's pages hold ``block_size`` patchified latent tokens,
-    enough for ``kv_token_capacity`` tokens, when set, and at least one
+    enough for ``max_total_tokens`` tokens, when set, and at least one
     image. A video denoiser's pages hold ``page_units`` sample elements each,
     a fixed run of pages per request slot. Both reserve one extra sentinel
     page.
@@ -529,9 +470,9 @@ def latent_pool_plan(
             raise unsupported_setup(
                 f"unsupported latent dtype {worker_config.model_dtype!r}"
             )
-        page_units = page_size(worker_config)
+        page_units = resolved_block_size(worker_config)
         units = active_latent_capacity_tokens(
-            flow.max_tokens, worker_config.kv_token_capacity
+            flow.max_tokens, worker_config.max_total_tokens
         )
         return LatentPoolPlan(
             request_pool_size=slots,
@@ -559,19 +500,15 @@ def latent_pool_plan(
 
 @dataclass(frozen=True, slots=True)
 class ArenaCapacity:
-    """Budgets latent storage, device products, transfers, and CPU tasks.
+    """Budgets device products, transfers, and CPU tasks.
 
     All budgets are for one worker arena.
 
     Attributes:
-        latent_pool_bytes: Exact ``LatentPool`` allocation, or zero when this
-            rank holds no latent pool.
-        tensor_store: ``TensorStore`` capacity in resident generic persistent
-            products per device.
-        device_product_bytes: Device bytes of ``TensorStore``'s scalar
-            product backing plus its request-relay arenas, summed over the
-            worker's devices for a token worker and sized for one device for
-            a request-tensor worker; also the store's relay byte bound.
+        device_product_bytes: Device bytes of ``TensorStore``'s request-relay
+            arenas, summed over the worker's devices for a token worker and
+            sized for one device for a request-tensor worker; also the
+            store's relay byte bound.
         transfer_bytes: Byte budget of the rank's ``TransferCapacity``, which
             ``Worker.__init__`` scales further for request-tensor workers.
         transfer_tickets: Read tickets of the rank's ``TransferCapacity``.
@@ -579,8 +516,6 @@ class ArenaCapacity:
             except on a rank holding host components, which runs one task.
     """
 
-    latent_pool_bytes: int
-    tensor_store: int
     device_product_bytes: int
     transfer_bytes: int
     transfer_tickets: int
@@ -610,7 +545,6 @@ def request_tensor_arena_capacity(
     queue_depth: int,
     product_bytes_per_request: int,
     concurrent_imports: int = 0,
-    latent_pool_bytes: int = 0,
 ) -> ArenaCapacity:
     """Bound product, relay and transfer storage for fixed request tensors.
 
@@ -629,23 +563,15 @@ def request_tensor_arena_capacity(
     # resident request's concurrent artifact imports when those are more.
     slots = max(depth * max_calls, state_slots * int(concurrent_imports))
     unresolved_window = request_tensor_window(depth, state_slots)
-    tensor_store = _DEVICE_PRODUCTS_PER_CALL * (
-        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_calls
-    )
     # Relay arenas index one-based request slots directly, so they hold one
     # extra row.
     relay_bytes = (
         (state_slots + 1)
         * (max(1, unresolved_window) + _REQUEST_RELAY_RETIREMENT_LANES)
-        * _REQUEST_RELAY_ROW_BYTES
+        * _ipc.relay_row_bytes()
     )
     return ArenaCapacity(
-        latent_pool_bytes=int(latent_pool_bytes),
-        tensor_store=tensor_store,
-        device_product_bytes=(
-            device_product_capacity_bytes(tensor_store, 1, max_value_bytes=1)
-            + relay_bytes
-        ),
+        device_product_bytes=relay_bytes,
         transfer_bytes=max(1, state_slots * product_bytes_per_request),
         # Read tickets bound the reads in flight: a ticket returns when its
         # read retires, and a batch whose imports need more than are free
@@ -654,9 +580,7 @@ def request_tensor_arena_capacity(
         # the group producing it, so the rank keeps at least its own group's
         # world size: the products it reads in several regions come from its
         # own group's sequence-parallel or distributed components.
-        transfer_tickets=max(
-            int(worker_config.world_size), min(slots, _MAX_TRANSFER_ENTRIES)
-        ),
+        transfer_tickets=max(int(worker_config.world_size), slots),
         host_lane_inflight=state_slots * (unresolved_window + 1),
     )
 
@@ -681,7 +605,7 @@ def artifact_import_regions(
     if binding is None or decoder is None or builder is None:
         return 0
     ranks = len(binding.config.ranks)
-    units = len(decoder.frame_slices(builder.maximum.num_frames))
+    units = len(decoder.clips(builder.maximum.num_frames))
     return ceil_div(units, ranks) * max(0, ranks - 1)
 
 
@@ -690,12 +614,7 @@ def model_arena_capacity(
     worker_config: WorkerConfig,
     *,
     queue_depth: int,
-    completion_payload_bytes: int,
     num_units: int,
-    request_pool_size: int,
-    num_latent_pages: int,
-    latent_page_units: int,
-    latent_width: int,
     max_latent_feature_bytes: int,
     max_vision_feature_bytes: int,
     unit_bytes: int,
@@ -704,7 +623,7 @@ def model_arena_capacity(
 ) -> ArenaCapacity:
     """Derive arena bounds from worker settings.
 
-    Covers device-product, transfer, latent, and CPU arenas. A request-tensor
+    Covers device-product, transfer, and CPU arenas. A request-tensor
     worker (a ``VideoPostprocessor`` or non-empty ``state_buffers``) is sized
     by ``request_tensor_arena_capacity`` from its placement; of the keyword
     arguments, only ``queue_depth``, ``bindings`` and ``state_buffers``
@@ -713,13 +632,11 @@ def model_arena_capacity(
     state of ``bindings``.
 
     Raises:
-        ValueError: A runtime bound or latent-pool dimension is invalid, or
-            an image denoiser's ``model_dtype`` is not FP16, BF16 or FP32.
+        ValueError: A runtime bound is invalid.
     """
     depth = int(queue_depth)
-    payload_bytes = int(completion_payload_bytes)
     max_calls = int(worker_config.max_batch_calls)
-    if depth < 1 or payload_bytes < 1 or max_calls < 1:
+    if depth < 1 or max_calls < 1:
         raise ValueError("model arena sizing requires positive runtime bounds")
 
     slots = depth * max_calls
@@ -729,17 +646,8 @@ def model_arena_capacity(
         )
 
     if capability(model, VideoPostprocessor) is not None or state_buffers:
-        # A rank that holds a standalone denoiser's request state advances
-        # its samples in the latent pool.
-        plan = latent_pool_plan(model, worker_config)
         return request_tensor_arena_capacity(
             worker_config,
-            latent_pool_bytes=plan.capacity_bytes
-            if plan is not None
-            and holds_samples(
-                state_buffers, media_builder(model, worker_config)
-            )
-            else 0,
             queue_depth=depth,
             product_bytes_per_request=local_product_storage_bytes(
                 resolve_outputs(model, worker_config),
@@ -753,47 +661,20 @@ def model_arena_capacity(
             ),
         )
 
-    transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
-    flow = image_builder(model)
+    # One ticket per queued call: ``queue_depth`` batches of up to
+    # ``max_batch_calls`` calls are in flight at once, and a call holds at
+    # most one transfer entry and one host-lane task.
+    transfer_tickets = slots
 
-    latent_pool_bytes = 0
-    latent_transfer_bytes = 0
-    if flow is not None:
-        dtype_bytes = {
-            "float16": 2,
-            "bfloat16": 2,
-            "float32": 4,
-        }.get(str(worker_config.model_dtype).removeprefix("torch.").lower())
-        if dtype_bytes is None:
-            raise ValueError(
-                f"unsupported latent dtype {worker_config.model_dtype!r}"
-            )
-        latent_pool_bytes = latent_pool_capacity_bytes(
-            request_pool_size=int(request_pool_size),
-            num_pages=int(num_latent_pages),
-            page_units=int(latent_page_units),
-            latent_width=int(latent_width),
-            dtype_bytes=dtype_bytes,
-        )
-        latent_transfer_bytes = latent_trajectory_bytes(
-            flow.max_tokens,
-            int(latent_width),
-            dtype_bytes,
-        )
     # Every ticket is budgeted for the largest single transfer: the whole KV
-    # pool, one image's latent trajectory, or one latent or vision feature.
+    # pool, or one latent (an image's whole trajectory) or vision feature.
     max_transfer_bytes = max(
         int(num_units) * int(unit_bytes),
-        latent_transfer_bytes,
         int(max_latent_feature_bytes),
         int(max_vision_feature_bytes),
         1,
     )
 
-    device_product_slots = (
-        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_calls
-    )
-    tensor_store = _DEVICE_PRODUCTS_PER_CALL * device_product_slots
     device_count = len(
         {
             str(worker_config.device),
@@ -802,39 +683,32 @@ def model_arena_capacity(
     )
     # Resident images and tensor products borrow scheduler-assigned storage
     # from BufferPool, whose complete grant ``build_worker_layout`` counts.
-    # TensorStore owns scalar backing and request relays separately, with
-    # relay arenas on each device.
-    device_product_bytes = device_product_capacity_bytes(
-        tensor_store,
-        device_count,
-        max_value_bytes=1,
-    )
-    device_product_bytes += (
-        (int(request_pool_size) + 1)
+    # TensorStore owns only its request relays, with relay arenas on each
+    # device.
+    device_product_bytes = (
+        (int(worker_config.max_request_pool_size) + 1)
         * (call_window(depth, max_calls) + _REQUEST_RELAY_RETIREMENT_LANES)
-        * _REQUEST_RELAY_ROW_BYTES
+        * _ipc.relay_row_bytes()
         * device_count
     )
 
     return ArenaCapacity(
-        latent_pool_bytes=latent_pool_bytes,
-        tensor_store=tensor_store,
         device_product_bytes=device_product_bytes,
         transfer_bytes=max_transfer_bytes * transfer_tickets,
         transfer_tickets=transfer_tickets,
-        host_lane_inflight=_HOST_LANE_INFLIGHT,
+        host_lane_inflight=slots,
     )
 
 
 def units_for_tokens(pages: Sequence[tuple[int, int]], tokens: int) -> int:
     """Return the units whole pages of ``tokens`` tokens occupy in every group.
 
-    ``pages`` holds each group's ``(page_tokens, units_per_page)``; each group
+    ``pages`` holds each group's ``(block_size, units_per_page)``; each group
     counts the whole pages ``tokens`` fills, rounded down.
     """
     return sum(
-        int(tokens) // int(page_tokens) * int(units_per_page)
-        for page_tokens, units_per_page in pages
+        int(tokens) // int(block_size) * int(units_per_page)
+        for block_size, units_per_page in pages
     )
 
 
@@ -854,36 +728,34 @@ def device_total_bytes(device: str | torch.device) -> int:
 def derive_runtime_kv_capacity(
     *,
     pages: Sequence[tuple[int, int]],
-    kv_token_capacity: int | None,
+    max_total_tokens: int | None,
     unit_bytes: int,
     device: Any = None,
     available_bytes: int | None = None,
     floor: int = 1,
     default_units: int | None = None,
-    resident_copies: int = 1,
     co_resident_units: int = 0,
 ) -> RuntimeKVCapacity:
     """Size one KV unit pool from explicit tokens or a host-owned byte grant.
 
-    ``pages`` holds each cache group's ``(page_tokens, units_per_page)``. The
+    ``pages`` holds each cache group's ``(block_size, units_per_page)``. The
     unit count, which includes the unit-zero sentinel, comes from the first
     source present:
 
-    - ``kv_token_capacity``: the units whole pages of that many tokens
+    - ``max_total_tokens``: the units whole pages of that many tokens
       occupy in every group;
     - ``available_bytes``: the whole units the grant holds, less
-      ``co_resident_units`` units of other fixed allocations, divided among
-      ``resident_copies`` pools;
+      ``co_resident_units`` units of other fixed allocations;
     - without a device or on one other than CUDA, ``default_units`` or
       ``DEFAULT_NUM_UNITS_FALLBACK``.
 
     The pool holds at least ``floor`` units and at least the sentinel plus
     one page of every group, the least any request can be admitted with.
     Automatic CUDA sizing requires a granted budget. Whenever a grant is
-    given, the resulting pools and co-resident units must fit it.
+    given, the pool and co-resident units must fit it.
 
     Raises:
-        ValueError: A dimension is out of range, ``kv_token_capacity`` or
+        ValueError: A dimension is out of range, ``max_total_tokens`` or
             ``available_bytes`` is invalid, a grant yields fewer than the
             minimum units or is exceeded, or a CUDA device has no grant.
     """
@@ -893,7 +765,6 @@ def derive_runtime_kv_capacity(
         or any(min(shape) < 1 for shape in pages)
         or size < 1
         or floor < 1
-        or resident_copies < 1
         or co_resident_units < 0
     ):
         raise ValueError("KV capacity dimensions must be positive")
@@ -901,12 +772,12 @@ def derive_runtime_kv_capacity(
         raise ValueError("KV storage grant must not be negative")
     minimum = max(int(floor), 1 + sum(int(per_page) for _, per_page in pages))
 
-    if kv_token_capacity is not None:
-        if kv_token_capacity <= 0:
+    if max_total_tokens is not None:
+        if max_total_tokens <= 0:
             raise ValueError("configured KV token capacity must be positive")
-        units = max(minimum, units_for_tokens(pages, kv_token_capacity))
+        units = max(minimum, units_for_tokens(pages, max_total_tokens))
     elif available_bytes is not None:
-        units = (available_bytes // size - co_resident_units) // resident_copies
+        units = available_bytes // size - co_resident_units
         if units < minimum:
             raise ValueError(
                 "device storage grant cannot hold the required KV pool"
@@ -925,8 +796,7 @@ def derive_runtime_kv_capacity(
 
     if (
         available_bytes is not None
-        and (resident_copies * units + co_resident_units) * size
-        > available_bytes
+        and (units + co_resident_units) * size > available_bytes
     ):
         raise ValueError(
             "configured KV storage exceeds the device storage grant"
@@ -937,15 +807,12 @@ def derive_runtime_kv_capacity(
 
 __all__ = [
     "ArenaCapacity",
-    "DEFAULT_MAX_BATCH_OPS",
-    "DEFAULT_MAX_REQUEST_POOL_SIZE",
     "DEFAULT_NUM_UNITS_FALLBACK",
     "RuntimeKVCapacity",
     "derive_runtime_kv_capacity",
     "device_total_bytes",
     "graph_table_widths",
     "LatentPoolPlan",
-    "latent_pool_capacity_bytes",
     "latent_pool_plan",
     "latent_trajectory_bytes",
     "model_arena_capacity",
@@ -970,11 +837,11 @@ def resolve_request_capacity(
     On a CUDA device, the grant measured now becomes ``pool_storage_bytes``;
     ``Worker.__init__`` calls this after the runner has bound its persistent
     inputs and workspaces, so they are already excluded. A request-tensor
-    worker also receives the largest slot count, from
-    ``min_request_pool_size`` up to ``max_request_pool_size`` and a third of
-    ``queue_depth``, whose request state, products, relays and latent pool fit
-    on every rank of ``capacity_group``, and its batch bounds are clamped to
-    that count. On any other device the configuration is returned unchanged.
+    worker also receives the largest slot count, from one up to
+    ``max_request_pool_size`` and a third of ``queue_depth``, whose request
+    state, products, relays and latent pool fit on every rank of
+    ``capacity_group``, and its batch bounds are clamped to that count. On
+    any other device the configuration is returned unchanged.
 
     Raises:
         WorkerError: With ``UNSUPPORTED_SETUP`` when a request-tensor worker
@@ -984,7 +851,7 @@ def resolve_request_capacity(
     """
     if canonical_device(worker_config.device).type == "cuda":
         available, _free = device_storage_budget(
-            worker_config.device, worker_config.kv_storage_fraction
+            worker_config.device, worker_config.mem_fraction_static
         )
         worker_config = replace(worker_config, pool_storage_bytes=available)
         schema = (
@@ -1040,7 +907,7 @@ def resolve_request_capacity(
                 maximum=min(
                     worker_config.max_request_pool_size, queue_depth // 3
                 ),
-                minimum=worker_config.min_request_pool_size,
+                minimum=1,
                 available_bytes=available,
                 auxiliary_bytes=auxiliary_bytes,
             )
@@ -1063,21 +930,21 @@ def graph_table_widths(
     a window of history and one call's queries intersect. Every captured
     text graph uses these widths, so graph shapes vary only in rows and
     tokens. Empty without a ``CausalLM``, a KV pool, or a positive
-    ``max_sequence_tokens``.
+    ``max_model_len``.
     """
     if capability(model, CausalLM) is None or pool is None:
         return ()
-    if worker_config.max_sequence_tokens < 1:
+    if worker_config.max_model_len < 1:
         return ()
     widths = table_widths(
         pool.cache.planes,
-        max_sequence_tokens=worker_config.max_sequence_tokens,
+        max_sequence_tokens=worker_config.max_model_len,
         max_query_tokens=worker_config.max_batch_tokens,
     )
     # Unit 0 is the pool's padding sentinel, so one group's table can hold
     # at most every remaining unit, a whole page at a time.
     limits = tuple(
-        max(1, (int(pool.info.num_units) - 1) // group.units_per_page)
+        max(1, (int(pool.num_units) - 1) // group.units_per_page)
         for group in pool.cache.groups
         for _ in range(group.units_per_page)
     )
@@ -1098,7 +965,7 @@ def check_startup_storage(
     devices; on each CUDA device, the part not yet resident in
     ``tensor_store`` must fit both its current storage budget and, together
     with everything the process holds on the device
-    (``process_device_bytes``), the ``kv_storage_fraction`` share of the
+    (``process_device_bytes``), the ``mem_fraction_static`` share of the
     device.
 
     Raises:
@@ -1122,10 +989,10 @@ def check_startup_storage(
         if canonical_device(device).type != "cuda":
             continue
         available, free = device_storage_budget(
-            device, worker_config.kv_storage_fraction
+            device, worker_config.mem_fraction_static
         )
         grant = int(
-            device_total_bytes(device) * worker_config.kv_storage_fraction
+            device_total_bytes(device) * worker_config.mem_fraction_static
         )
         remaining = max(0, product_bytes - tensor_store.resident_bytes(device))
         process_bytes = process_device_bytes(device)

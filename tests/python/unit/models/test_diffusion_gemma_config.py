@@ -17,6 +17,7 @@ from tests.python.fixtures.model_metadata import (
     diffusion_gemma_metadata,
     read_diffusion_gemma,
 )
+from uniserve import loading
 from uniserve_models import diffusion_gemma
 
 pytestmark = pytest.mark.unit
@@ -54,6 +55,23 @@ def test_metadata_normalizes_layers_windows_and_canvas_tokens(tmp_path):
         diffusion.end_of_turn_id,
         diffusion.eos_token_ids,
     ) == (4, 0, 106, (1, 106))
+
+
+def test_a_canvas_token_the_vocabulary_lacks_is_refused(tmp_path):
+    metadata = diffusion_gemma_metadata()
+    (tmp_path / "config.json").write_text(json.dumps(metadata))
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "pad_token": "<pad>",
+                "mask_token": "<mask>",
+                "eot_token": "<turn|>",
+            }
+        )
+    )
+    (tmp_path / "vocab.json").write_text(json.dumps({"<pad>": 0, "<mask>": 4}))
+    with pytest.raises(ValueError, match="does not define.*<turn\\|>"):
+        diffusion_gemma.read_config(tmp_path, loading.Config(), sources={})
 
 
 @pytest.mark.parametrize(

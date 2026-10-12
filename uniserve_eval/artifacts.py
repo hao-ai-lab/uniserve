@@ -21,7 +21,6 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from .transport.images import inspect_image_bytes
 from .types import DecodedImage
 
 
@@ -125,28 +124,20 @@ class ArtifactWriter:
         return path
 
     def write_image_sample(self, image: DecodedImage) -> Path:
-        """Validate and store a content-addressed image sample.
+        """Store a content-addressed image sample.
 
-        The bytes are decoded again and must reproduce the metadata recorded
-        in `image`, so a persisted sample always matches the request record
-        that references it.
+        `image` comes from `inspect_image_bytes`, which decoded its bytes and
+        derived the metadata the request record holds, so the stored file
+        matches the record that references it.
 
         Returns:
             The sample path under `samples/`. An existing file with identical
             bytes is reused without rewriting.
 
         Raises:
-            ImageOutputError: If `inspect_image_bytes` rejects the bytes or
-                the declared MIME type.
-            ValueError: If the decoded metadata differs from `image`, or an
-                existing sample of the same name holds different bytes.
+            ValueError: If an existing sample of the same name holds
+                different bytes.
         """
-        inspected = inspect_image_bytes(image.data, declared_mime=image.mime)
-        if inspected.metadata_dict() != image.metadata_dict():
-            raise ValueError(
-                "generated image metadata does not match its response bytes"
-            )
-
         path = self.samples_dir / image.sample_filename
         if path.exists():
             if path.read_bytes() != image.data:

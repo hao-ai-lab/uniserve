@@ -22,7 +22,7 @@ from uniserve_worker.transport.vmm_pool import PoolExhaustedError
 #: Mechanisms that carry a product where it lies on a device.
 DEVICE_MECHANISMS = ("local", "cuda_vmm")
 #: Mechanisms that carry a product as host bytes.
-HOST_MECHANISMS = ("local", "shm", "channel")
+HOST_MECHANISMS = ("local", "posix_shm", "channel")
 
 
 if TYPE_CHECKING:

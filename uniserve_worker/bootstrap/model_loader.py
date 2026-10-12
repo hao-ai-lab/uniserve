@@ -54,7 +54,7 @@ from uniserve_worker.config.deployment import (
     WorkerProcessArgs,
 )
 from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.errors import unsupported_setup
 from uniserve_worker.model_executor.component_binding import (
     Call,
     ComponentBinding,
@@ -72,8 +72,7 @@ class WorkerModel:
             components have no numerical calls, it is the weight-less
             meta-device description.
         config: The execution configuration. For a checkpoint model it is
-            resolved by ``loaded_worker_config``, and a numerical worker also
-            applies the launch's ``kv_cache_dtype`` override.
+            resolved by ``loaded_worker_config``.
         tokenizer: The loaded tokenizer; ``None`` for the stub model, on a
             host worker, or for a checkpoint without one.
         image_processor: The model's image preprocessing, if any.
@@ -89,7 +88,6 @@ class WorkerModel:
     image_processor: ImageProcessor | None = None
     flow_prompt: FlowPrompt | None = None
     entry_points: Mapping[str, ComponentEntry] | None = None
-    model_name: str | None = None
 
 
 def prepare_worker_model(
@@ -196,12 +194,12 @@ def _weight_config(source, options, execution) -> weights.Config:
     ``options`` is the launch's ``quantization_config``. Exactly one source
     selects the base weight configuration: ``components`` selectors passed to
     the model package's ``weight_config`` factory (with ``mode`` or
-    ``quant_method`` as its preset, ``default`` without one); a named
-    precision in ``source.precisions``; a ``quant_method`` among the generic
-    formats, applied to every module; or, with no selector, the checkpoint's
-    own weights. ``ignored_layers`` then maps each listed module path to no
-    quantization, and the dtype comes from ``execution.model_dtype``.
-    ``kv_cache_dtype`` is accepted here but applied by ``load_worker_model``.
+    ``quant_method`` as its preset, the factory's own default without one); a
+    named precision in ``source.precisions``; a ``quant_method`` among the
+    generic formats, applied to every module; or, with no selector, the
+    checkpoint's own weights. ``ignored_layers`` then maps each listed module
+    path to no quantization, and the dtype comes from
+    ``execution.model_dtype``.
 
     Raises:
         ValueError: An unknown key, both ``mode`` and ``quant_method``,
@@ -216,7 +214,6 @@ def _weight_config(source, options, execution) -> weights.Config:
         "quant_method",
         "components",
         "ignored_layers",
-        "kv_cache_dtype",
     }
     if unknown:
         raise ValueError(
@@ -253,11 +250,9 @@ def _weight_config(source, options, execution) -> weights.Config:
                 "this model exposes complete precision presets "
                 "without component selectors"
             )
-        result = factory(
-            source.model,
-            preset="default" if selected is None else selected,
-            **components,
-        )
+        # Without a selector the factory applies its own default preset.
+        preset = {} if selected is None else {"preset": selected}
+        result = factory(source.model, **preset, **components)
     elif selected is None:
         result = source.weights
     elif selected in source.precisions:
@@ -437,7 +432,6 @@ def load_worker_model(
         experts=partition,
     )
     model = loaded.model
-    model_name = f"{type(model).__module__}.{type(model).__qualname__}"
     if dedicated:
         # Keep the actual loaded expert modules in numerical traversal order.
         # The worker owns their invocation; no model capability or KV cache
@@ -450,14 +444,6 @@ def load_worker_model(
         model, config.execution, config.ipc.queue_depth
     )
 
-    # ``kv_cache_dtype`` in the launch's quantization_config overrides the
-    # KV storage dtype; ``_weight_config`` accepts the key but ignores it.
-    override = config.model.quantization_config.get("kv_cache_dtype")
-    if override is not None:
-        if not isinstance(override, str):
-            raise invalid_descriptor("worker KV dtype is unsupported")
-        worker_config = replace(worker_config, kv_cache_dtype=override)
-
     logger.info("loaded numerical model %s", type(model).__qualname__)
     return WorkerModel(
         model,
@@ -468,7 +454,6 @@ def load_worker_model(
         source.image_processor,
         source.flow_prompt,
         {} if dedicated else source.entry_points,
-        model_name,
     )
 
 
@@ -535,20 +520,18 @@ def loaded_worker_config(
 
     Media request slots follow from the worker's publication lifetime.
     A resident media slot occupies three positions of the worker's batch
-    queue, one reserved pipeline position and two unresolved outputs, and a
-    media worker keeps at least two slots resident. The same three-position
-    bound governs ``request_tensor_window`` and ``resolve_request_capacity``
-    in ``uniserve_worker.bootstrap.capacity``.
+    queue, one reserved pipeline position and two unresolved outputs. The
+    same three-position bound governs ``request_tensor_window`` and
+    ``resolve_request_capacity`` in ``uniserve_worker.bootstrap.capacity``.
 
     Only a model containing a ``VideoDecoder`` is adjusted: its batch bounds
-    and maximum request-pool size become the slot count, its minimum
-    request-pool size becomes two, and it drops the KV token capacity,
-    attention backend and generation device. Any other model's configuration
-    is returned unchanged.
+    and maximum request-pool size become the slot count, and it drops the KV
+    token capacity, attention backend and generation device. Any other
+    model's configuration is returned unchanged.
 
     Raises:
-        WorkerError: With ``UNSUPPORTED_SETUP`` when the queue depth or
-            ``max_batch_calls`` leaves fewer than two slots.
+        WorkerError: With ``UNSUPPORTED_SETUP`` when the queue depth leaves
+            no slot of three positions.
         ValueError: The errors of ``video_denoiser`` and
             ``condition_capacity``.
     """
@@ -568,20 +551,19 @@ def loaded_worker_config(
 
     if any(isinstance(module, VideoDecoder) for module in model.modules()):
         state_slots = min(config.max_batch_calls, queue_depth // 3)
-        if state_slots < 2:
+        if state_slots < 1:
             raise unsupported_setup(
-                "resident media execution requires two slots of three queue "
-                f"positions each; queue depth {queue_depth} holds "
-                f"{queue_depth // 3}"
+                "resident media execution requires three queue positions "
+                f"per request slot; queue depth {queue_depth} holds "
+                f"{queue_depth // 3} slots"
             )
         config = replace(
             config,
-            kv_token_capacity=None,
+            max_total_tokens=None,
             attention_backend=None,
             max_batch_calls=state_slots,
             max_batch_tokens=state_slots,
             max_request_pool_size=state_slots,
-            min_request_pool_size=2,
             generation_device=None,
         )
     return config

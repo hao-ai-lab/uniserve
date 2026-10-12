@@ -9,7 +9,8 @@ import torch
 from uniserve.cache import Config, mha
 from uniserve.nn import RotaryEmbedding
 from uniserve.quantization import Quantizer
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
+from uniserve.runtime.kv_cache import plan_units
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -31,16 +32,20 @@ def test_rotary_factors_follow_positions_on_another_device():
 
 @pytest.mark.parametrize("quantized", (False, True))
 def test_cache_reset_follows_backing_on_another_device(quantized):
+    cache_config = Config({"attention": mha.Config(1, 16, (0,), torch.float32)})
     with (
         torch.cuda.device(0),
-        PrefixCache(
-            Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
+        KVCache(
+            cache_config,
+            plan_units(
+                cache_config,
+                block_size=4,
+                quantization={
+                    "attention": Quantizer("fp8", axis=0) if quantized else None
+                },
+            ),
             num_units=3,
-            block_size=4,
             device="cuda:1",
-            quantization={
-                "attention": Quantizer("fp8", axis=0) if quantized else None
-            },
         ) as cache,
     ):
         state = cache.state("attention")
@@ -63,24 +68,28 @@ def test_cache_reset_follows_backing_on_another_device(quantized):
 def test_cache_updates_follow_backing_and_preserve_existing_values_on_another_device(  # noqa: E501
     quantized,
 ):
+    cache_config = Config({"attention": mha.Config(1, 16, (0,), torch.float32)})
     with (
         torch.cuda.device(0),
-        PrefixCache(
-            Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
+        KVCache(
+            cache_config,
+            plan_units(
+                cache_config,
+                block_size=4,
+                quantization={
+                    "attention": Quantizer("fp8", axis=0) if quantized else None
+                },
+            ),
             num_units=3,
-            block_size=4,
             device="cuda:1",
-            quantization={
-                "attention": Quantizer("fp8", axis=0) if quantized else None
-            },
         ) as cache,
     ):
         state = cache.state("attention")
         first = torch.full((1, 1, 16), 448.0, device="cuda:1")
         state.write((0,), start=0, key=first, value=-first)
         current = torch.full((3, 1, 16), 896.0, device="cuda:1")
-        indices = torch.tensor([1, 4, -1], device="cuda:1")
-        state.update(current, -current, indices=indices)
+        slot_mapping = torch.tensor([1, 4, -1], device="cuda:1")
+        state.update(current, -current, slot_mapping=slot_mapping)
         expected = torch.zeros(12, 1, 16)
         expected[0] = 448
         expected[[1, 4]] = 896

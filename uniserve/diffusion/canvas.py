@@ -382,9 +382,7 @@ def start_canvas(state: CanvasState, *, vocab_size: int) -> None:
         kernels = _kernels()
         require_kernel(
             "start_canvas",
-            None
-            if kernels.supported(state.canvas.device)
-            else "the canvas kernels require an SM100 device",
+            kernels.unsupported_device(state.canvas.device),
             canvas=state.canvas,
         )
         kernels.start(
@@ -503,13 +501,11 @@ def advance_canvas(
         kernels = _kernels()
         require_kernel(
             "advance_canvas",
-            None
-            if kernels.supported(state.canvas.device)
-            and length % 32 == 0
-            and 0 < length <= 1024
-            and len(sampling.eos_ids) <= 8
-            else "the canvas kernels need an SM100 device, a canvas length "
-            "divisible by 32 up to 1024 and at most 8 end-of-sequence ids",
+            kernels.unsupported_advance(
+                state.canvas.device,
+                canvas_length=length,
+                eos_ids=sampling.eos_ids,
+            ),
             canvas=state.canvas,
         )
         kernels.advance(

@@ -8,7 +8,7 @@ import json
 import math
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -48,104 +48,153 @@ class Config:
                     "checkpoint sources must stay inside their root"
                 )
 
-    def resolve(self, root: Path, *, io: IOConfig) -> Source:
-        """Locate this source's files under root and return a resolved Source.
+    def select(
+        self, names: Iterable[str], *, root: Path, io: IOConfig
+    ) -> tuple[str, ...]:
+        """Choose this source's checkpoint files among root-relative names.
 
-        Explicit filenames win in declaration order; otherwise an index file
-        selects shards, then any matching weight files. ignore_patterns are
-        matched against root-relative paths.
+        ``names`` lists the checkpoint's files as root-relative POSIX paths
+        that ``io.ignore_patterns`` does not exclude: a local directory
+        listing and a Hub repository listing select the same files. Explicit
+        filenames win in declaration order. Otherwise, for each accepted
+        format in turn, one index selects the shards it maps, and without an
+        index every weight file directly in the source directory is
+        selected, except training state saved alongside the model.
+
+        An index is read from ``root``, so a Hub caller fetches it first.
+        Returns the selected names in sorted order, or none when the source
+        holds no file of the accepted formats.
+
+        Raises:
+            ValueError: The source directory holds several indexes of one
+                format, or an index is malformed (see ``_index_shards``).
+            FileNotFoundError: An index maps a shard ``names`` lacks.
         """
-        root = Path(root)
-        directory = root / self.directory
-        available = frozenset(
-            path
-            for path in directory.rglob("*")
-            if path.is_file()
-            and not any(
-                fnmatch.fnmatchcase(path.relative_to(root).as_posix(), pattern)
-                or PurePosixPath(path.relative_to(root)).match(pattern)
-                for pattern in io.ignore_patterns
-            )
-        )
-        files = tuple(
-            sorted(path for path in available if path.parent == directory)
+        listed = frozenset(names)
+        directory = PurePosixPath(self.directory)
+        files = sorted(
+            name for name in listed if PurePosixPath(name).parent == directory
         )
         formats = ("safetensors", "pt") if io.format == "auto" else (io.format,)
         suffixes = {"safetensors": {".safetensors"}, "pt": {".pt", ".bin"}}
 
         if self.filenames:
-            chosen = next(
-                (
-                    directory / name
-                    for name in self.filenames
-                    if directory / name in files
-                    and any(
-                        Path(name).suffix in suffixes[format]
-                        for format in formats
-                    )
-                ),
-                None,
-            )
-            if chosen is None:
-                if io.mode == "dummy":
-                    return Source(self.name, root, (), self.prefix)
-                raise FileNotFoundError(
-                    f"source {self.name!r} requires one of {self.filenames!r}"
-                )
-            return Source(self.name, root, (chosen,), self.prefix)
+            for filename in self.filenames:
+                name = (directory / filename).as_posix()
+                if name in files and any(
+                    PurePosixPath(name).suffix in suffixes[format]
+                    for format in formats
+                ):
+                    return (name,)
+            return ()
 
-        # Training-state files shipped in published checkpoints are not weights.
-        excluded = {
-            "optimizer.pt",
-            "optimizer.bin",
-            "training_args.bin",
-            "scheduler.pt",
-            "scaler.pt",
-        }
         for format in formats:
             pattern = (
                 "*.safetensors.index.json"
                 if format == "safetensors"
                 else "*.bin.index.json"
             )
-            indexes = tuple(path for path in files if path.match(pattern))
+            indexes = [
+                name
+                for name in files
+                if fnmatch.fnmatchcase(PurePosixPath(name).name, pattern)
+            ]
             if len(indexes) > 1:
                 raise ValueError(
                     f"source {self.name!r} has multiple {format} indexes"
                 )
             if indexes:
-                mapping = json.loads(indexes[0].read_text()).get("weight_map")
-                if not isinstance(mapping, dict) or not mapping:
-                    raise ValueError(
-                        "checkpoint index requires a nonempty weight_map"
+                selected = tuple(
+                    sorted(
+                        (directory / shard).as_posix()
+                        for shard in _index_shards(root / indexes[0])
                     )
-                names = sorted(set(mapping.values()))
-                for name in names:
-                    relative = PurePosixPath(name)
-                    if relative.is_absolute() or ".." in relative.parts:
-                        raise ValueError(
-                            "checkpoint index paths must stay inside their "
-                            "directory"
-                        )
-                selected = tuple(directory / name for name in names)
-                if any(path not in available for path in selected):
+                )
+                if not listed.issuperset(selected):
                     raise FileNotFoundError(
                         "checkpoint index references a missing or excluded "
                         "shard"
                     )
-                return Source(self.name, root, selected, self.prefix)
+                return selected
+
             selected = tuple(
-                path
-                for path in files
-                if path.suffix in suffixes[format] and path.name not in excluded
+                name
+                for name in files
+                if PurePosixPath(name).suffix in suffixes[format]
+                and PurePosixPath(name).name not in _TRAINING_STATE
             )
             if selected:
-                return Source(self.name, root, selected, self.prefix)
-        if io.mode == "dummy":
-            return Source(self.name, root, (), self.prefix)
+                return selected
+        return ()
+
+    def resolve(self, root: Path, *, io: IOConfig) -> Source:
+        """Locate this source's files under root and return a resolved Source.
+
+        Applies :meth:`select` to the files under the source directory, less
+        those whose root-relative paths match ``io.ignore_patterns``. A dummy
+        read accepts a source without files; any other mode requires one.
+        """
+        root = Path(root)
+        directory = root / self.directory
+        names = []
+        for path in directory.rglob("*"):
+            name = path.relative_to(root).as_posix()
+            if path.is_file() and not any(
+                fnmatch.fnmatchcase(name, pattern)
+                or PurePosixPath(name).match(pattern)
+                for pattern in io.ignore_patterns
+            ):
+                names.append(name)
+
+        selected = self.select(names, root=root, io=io)
+        if selected or io.mode == "dummy":
+            return Source(
+                self.name,
+                root,
+                tuple(root / name for name in selected),
+                self.prefix,
+            )
+        if self.filenames:
+            raise FileNotFoundError(
+                f"source {self.name!r} requires one of {self.filenames!r}"
+            )
         raise FileNotFoundError(
             f"source {self.name!r} has no {io.format} weights under {directory}"
         )
+
+
+# Training-state files shipped in published checkpoints are not weights.
+_TRAINING_STATE = frozenset(
+    {
+        "optimizer.pt",
+        "optimizer.bin",
+        "training_args.bin",
+        "scheduler.pt",
+        "scaler.pt",
+    }
+)
+
+
+def _index_shards(path: Path) -> tuple[PurePosixPath, ...]:
+    """Read the shard files a sharded checkpoint index maps weights to.
+
+    The paths are relative to the index's directory.
+
+    Raises:
+        ValueError: The index has no nonempty ``weight_map`` object, or a
+            shard path leaves the index's directory.
+    """
+    index = json.loads(path.read_text(encoding="utf-8"))
+    mapping = index.get("weight_map") if isinstance(index, dict) else None
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("checkpoint index requires a nonempty weight_map")
+
+    shards = tuple(PurePosixPath(name) for name in set(mapping.values()))
+    if any(shard.is_absolute() or ".." in shard.parts for shard in shards):
+        raise ValueError(
+            "checkpoint index paths must stay inside their directory"
+        )
+    return shards
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,8 +205,7 @@ class Source:
     locally, as ``(name, shape, dtype)`` entries copied from those files'
     headers, with safetensors dtype names such as ``"BF16"``. Such entries
     carry metadata but no values, so only dummy reads, which generate values
-    from metadata alone, accept a source with headers, and a checksum
-    manifest verifies the local files only.
+    from metadata alone, accept a source with headers.
     """
 
     name: str
@@ -203,7 +251,6 @@ class Source:
                 "checkpoint headers describe tensors without local values; "
                 "only dummy reads accept them"
             )
-        _checksums(self, io.checksum_manifest)
         suffixes = {path.suffix for path in self.files}
         supported = (
             {".safetensors", ".pt", ".bin"}
@@ -497,9 +544,7 @@ class Reader:
             raise RuntimeError("checkpoint reader is closed")
 
     def _open(self):
-        if self.io.mode != "dummy" and (
-            self.io.prefetch if self.io.prefetch is not None else self.io.mmap
-        ):
+        if self.io.mode != "dummy" and self.io.mmap:
             for path in self.source.files:
                 _advise(path, "POSIX_FADV_WILLNEED")
         count = self.io.num_threads or (1 if self.io.mmap else 8)
@@ -624,9 +669,6 @@ class Reader:
         self._files.clear()
         self._states.clear()
         self._stack.close()
-        if self.io.drop_cache_after_load:
-            for path in self.source.files:
-                _advise(path, "POSIX_FADV_DONTNEED")
 
     def __enter__(self):
         self._require_open()
@@ -832,24 +874,3 @@ def _advise(path, kind):
     if advice is not None and hasattr(os, "posix_fadvise"):
         with path.open("rb") as handle:
             os.posix_fadvise(handle.fileno(), 0, 0, advice)
-
-
-def _checksums(source, manifest):
-    """Verify every source file against a sha256 manifest, when one is given."""
-    if manifest is None:
-        return
-    value = json.loads(manifest.read_text())
-    if isinstance(value, dict) and isinstance(value.get("files"), dict):
-        value = value["files"]
-    if not isinstance(value, dict):
-        raise ValueError("checksum manifest requires a relative-path mapping")
-
-    for path in source.files:
-        name = path.relative_to(source.root).as_posix()
-        expected = value.get(name)
-        if not isinstance(expected, str):
-            raise ValueError(f"checksum manifest has no entry for {name!r}")
-        with path.open("rb") as handle:
-            actual = hashlib.file_digest(handle, "sha256").hexdigest()
-        if actual != expected.lower().removeprefix("sha256:"):
-            raise ValueError(f"checksum mismatch for checkpoint file {name!r}")

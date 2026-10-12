@@ -20,9 +20,10 @@ from uniserve.nn.attention import (
 from uniserve.runtime import (
     CUDAStream,
     ExecutionContext,
-    PrefixCache,
+    KVCache,
     initialize_process_groups,
 )
+from uniserve.runtime.kv_cache import plan_units
 
 pytestmark = pytest.mark.integration
 
@@ -69,8 +70,11 @@ def _run(rank, rendezvous):
                     )
                 }
             )
-            with PrefixCache(
-                config, num_units=1, block_size=16, device="cpu"
+            with KVCache(
+                config,
+                plan_units(config, block_size=16),
+                num_units=1,
+                device="cpu",
             ) as cache:
                 with ExecutionContext(
                     layer, cache=cache, attention="torch"
@@ -187,8 +191,11 @@ def _context(rank, rendezvous, gpu):
                 stream.wait(torch.cuda.current_stream(device))
             with (
                 stream if stream is not None else nullcontext(),
-                PrefixCache(
-                    config, num_units=3, block_size=16, device=device
+                KVCache(
+                    config,
+                    plan_units(config, block_size=16),
+                    num_units=3,
+                    device=device,
                 ) as cache,
             ):
                 with ExecutionContext(

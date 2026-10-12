@@ -1,9 +1,8 @@
-"""Sparse attention masks, native query partitions and head composition."""
+"""Sparse attention masks and native query partitions."""
 
 import pytest
 import torch
 import torch.nn.functional as F
-from uniserve_kernels.attention.vsa_tiles import compose_to_head_shards
 
 from uniserve.nn.attention import vsa
 from uniserve.runtime import ExecutionContext
@@ -20,7 +19,7 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
         rows, heads, 4, width, device="cuda", dtype=torch.bfloat16
     )
     query, key, value, _ = projected.unbind(2)
-    valid_sizes = torch.tensor(
+    variable_block_sizes = torch.tensor(
         [64, 17, 64, 0], device="cuda", dtype=torch.int32
     )
     indices = torch.zeros((heads, 4, 4), device="cuda", dtype=torch.int32)
@@ -32,7 +31,11 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
     )
     module = vsa.BlockAttention(width**-0.5)
     batch = vsa.BlockInput(
-        vsa.Pattern(((2, 2, 2, 2),), 0, 0, 64), indices, counts, valid_sizes, 0
+        vsa.Pattern(((2, 2, 2, 2),), 0, 0, 64),
+        indices,
+        counts,
+        variable_block_sizes,
+        0,
     )
     with ExecutionContext(module) as context:
         context.prepare(None)
@@ -52,7 +55,7 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
     ).to(torch.bfloat16)
     valid_queries = torch.arange(
         rows, device="cuda"
-    ) % tile < valid_sizes.repeat_interleave(tile)
+    ) % tile < variable_block_sizes.repeat_interleave(tile)
     # The established BF16 attention tolerance covers softmax/MMA rounding;
     # padded query outputs are not part of the model's valid-token contract.
     torch.testing.assert_close(
@@ -169,45 +172,6 @@ def test_sparse_query_partitions_preserve_complete_key_attention(heads):
     torch.testing.assert_close(full.double(), reference, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("members", [2, 4, 8])
-def test_fused_composition_restores_each_rows_head_interval(members):
-    torch.manual_seed(456)
-    local_rows, local_heads, width = 64, 7, 128
-    rows = local_rows * members
-    attended = torch.randn(
-        (1, local_heads, rows, width), device="cuda", dtype=torch.bfloat16
-    )
-    gate = torch.randn(
-        (rows, local_heads, width), device="cuda", dtype=torch.bfloat16
-    )
-    compressed = torch.randn((local_heads, rows // 64, width), device="cuda")
-    outputs = tuple(
-        torch.zeros(
-            (local_rows, members * local_heads, width),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        for _ in range(members)
-    )
-    # The independent formula permits fused or separate floating-point
-    # arithmetic within the BF16 output error bound.
-    expected = attended[0].transpose(
-        0, 1
-    ).double() + gate.double() * compressed.transpose(
-        0, 1
-    ).double().repeat_interleave(64, dim=0)
-    for source in range(members):
-        compose_to_head_shards(attended, gate, compressed, outputs, source)
-    for member, actual in enumerate(outputs):
-        row_interval = expected[member * local_rows : (member + 1) * local_rows]
-        torch.testing.assert_close(
-            actual.double(),
-            row_interval.repeat(1, members, 1),
-            rtol=2e-2,
-            atol=2e-2,
-        )
-
-
 @pytest.mark.parametrize("heads", [7, 14])
 def test_block128_attention_attends_selected_blocks_of_valid_keys(heads):
     from uniserve_kernels.attention import vsa_native
@@ -239,7 +203,7 @@ def test_block128_attention_attends_selected_blocks_of_valid_keys(heads):
     keys = torch.where(selected, torch.arange(tiles, device="cuda"), tiles)
     indices = keys.sort(-1).values.clamp_max(tiles - 1).to(torch.int32)
 
-    module = vsa.BlockAttention(width**-0.5, tile_size=tile)
+    module = vsa.BlockAttention(width**-0.5)
     batch = vsa.BlockInput(
         vsa.Pattern(((tiles,) * tiles,), 0, 0, tile),
         indices,

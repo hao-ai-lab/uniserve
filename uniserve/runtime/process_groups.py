@@ -201,8 +201,8 @@ def initialize_process_groups(
     """Select the rank's device and join or create its physical process world.
 
     A new world forms at ``rendezvous`` or through the torch ``init_method``
-    URL, which are exclusive; without either, ``MASTER_ADDR`` and
-    ``MASTER_PORT`` name a TCP init method. Both are ignored when the process
+    URL, which are exclusive; without either, torch's ``env://`` default reads
+    ``MASTER_ADDR`` and ``MASTER_PORT``. Both are ignored when the process
     already has a world, which is borrowed.
 
     ``experts`` is ``(rank, size, rendezvous)`` of the deployment's expert
@@ -318,15 +318,6 @@ def initialize_process_groups(
         )
         environment._groups.append(dist.group.WORLD)
     elif world_size > 1:
-        if not init_method:
-            port = os.environ.get("MASTER_PORT")
-            if not port:
-                raise ValueError(
-                    "MASTER_PORT or an explicit init_method is required"
-                )
-            init_method = (
-                f"tcp://{os.environ.get('MASTER_ADDR', '127.0.0.1')}:{port}"
-            )
         dist.init_process_group(
             backend=backend,
             init_method=init_method,

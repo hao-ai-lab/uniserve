@@ -18,7 +18,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ImageParams, ImageParamsError, RequestId, SamplingParams, SamplingParamsError};
+use crate::{
+    ImageParams, ImageParamsError, MediaCall, RequestId, SamplingParams, SamplingParamsError,
+};
 
 /// Output constraint applied to the default generation paradigm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -82,7 +84,7 @@ pub struct MultimodalInputs {
 /// Canvas token `j` sits at the model position that follows the prompt's
 /// logical positions by `j`. Every canvas token attends to the whole prompt
 /// and to every token of its own row, and the pass writes no KV. The rows of
-/// one request are independent computations over the same prompt.
+/// one request are independent calls over the same prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadoutRow {
     /// Canvas token ids.
@@ -103,7 +105,7 @@ pub struct ReadoutSlot {
     pub candidates: Vec<u32>,
 }
 
-/// Block-diffusion sampling of a generating request.
+/// Block-diffusion sampling of a deployment's canvases.
 ///
 /// Text is generated in blocks of `canvas_length` tokens. A block starts as
 /// uniformly random tokens and is denoised for at most `max_steps` steps: a
@@ -114,6 +116,9 @@ pub struct ReadoutSlot {
 /// entropy is below `confidence_threshold`. The block's argmax canvas is then
 /// committed to the request's context as causal prompt, and the next block
 /// follows it. Every draw follows the request's `SamplingParams::seed`.
+///
+/// The deployment's launch configuration owns the sampling: every request a
+/// block-diffusion runtime generates, rather than reads out, runs under it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CanvasSampling {
     /// Tokens of one block.
@@ -139,7 +144,7 @@ impl CanvasSampling {
     /// Returns the first parameter the scheduler cannot plan with, if any:
     /// an empty canvas or step limit, or a non-finite sampling value. The
     /// worker's sampler checks the sampling values' domain itself.
-    fn invalid_parameter(&self) -> Option<&'static str> {
+    pub fn invalid_parameter(&self) -> Option<&'static str> {
         if self.canvas_length == 0 {
             Some("canvas_length")
         } else if self.max_steps == 0 {
@@ -189,7 +194,7 @@ impl ImageInput {
             && self
                 .encoders
                 .iter()
-                .all(|input| input.encoder == ImageIngestStep::VitEncode)
+                .all(|input| input.encoder == MediaCall::VisionEncoding)
     }
 }
 
@@ -200,8 +205,9 @@ impl ImageInput {
 /// (see [`ImageEncoderInput::kv_token_capacity`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageEncoderInput {
-    /// Model encoder consuming this image. List order determines context write order.
-    pub encoder: ImageIngestStep,
+    /// Encoding call consuming this image: [`MediaCall::VisionEncoding`] or
+    /// [`MediaCall::LatentEncoding`]. List order determines context write order.
+    pub encoder: MediaCall,
     /// Exact KV tokens this encoder writes, when known before execution.
     pub num_kv_tokens: Option<u32>,
     /// Upper bound on a worker-selected KV length. When both it and
@@ -210,23 +216,13 @@ pub struct ImageEncoderInput {
     pub max_kv_tokens: Option<u32>,
 }
 
-/// One image ingest worker step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImageIngestStep {
-    /// Encodes image pixels into a latent representation.
-    VaeEncode,
-    /// Encodes image content into vision features.
-    VitEncode,
-}
-
 /// Derives the cache identity of one ordered image encoder.
 ///
 /// `step_index` is the encoder's index in `ImageInput::encoders`. The engine
 /// derives the key when it looks up a cached product before encoding and
 /// again when it stores the encoder's product, so both must use the same
 /// index for a stored product to be found.
-pub fn encoder_cache_key(image_hash: u64, step_index: usize, step: ImageIngestStep) -> u64 {
+pub fn encoder_cache_key(image_hash: u64, step_index: usize, encoder: MediaCall) -> u64 {
     // Apply FNV-1a to the complete domain tuple in a fixed byte order. Including
     // the stage index distinguishes repeated encoder kinds within one image input.
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -234,10 +230,7 @@ pub fn encoder_cache_key(image_hash: u64, step_index: usize, step: ImageIngestSt
         .to_le_bytes()
         .into_iter()
         .chain((step_index as u64).to_le_bytes())
-        .chain([match step {
-            ImageIngestStep::VaeEncode => 1,
-            ImageIngestStep::VitEncode => 2,
-        }])
+        .chain([encoder as u8])
     {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -399,14 +392,14 @@ impl ImageGenerationConfig {
     pub fn required_features(
         &self,
         constraint: GenerationConstraint,
-        context_image_steps: impl IntoIterator<Item = ImageIngestStep>,
+        context_image_steps: impl IntoIterator<Item = MediaCall>,
     ) -> GenerationFeatures {
         // Understanding execution is the common control path for every request.
         let mut needs = GenerationFeatures::UNDERSTANDING;
 
         // Context images require the encoder stages declared by their inputs.
         for step in context_image_steps {
-            needs.insert(step.required_feature());
+            needs.insert(encoder_feature(step));
         }
 
         if self.generates_images(constraint) {
@@ -417,20 +410,20 @@ impl ImageGenerationConfig {
         // materialization.
         if self.feeds_back_images(constraint) {
             for step in self.feedback_encoders.iter().map(|input| input.encoder) {
-                needs.insert(step.required_feature());
+                needs.insert(encoder_feature(step));
             }
         }
         needs
     }
 }
 
-impl ImageIngestStep {
-    /// Returns the runtime feature that executes this encoder stage.
-    const fn required_feature(self) -> GenerationFeatures {
-        match self {
-            Self::VaeEncode => GenerationFeatures::LATENT_ENCODE,
-            Self::VitEncode => GenerationFeatures::VISION_ENCODE,
-        }
+/// Returns the runtime feature that executes one image encoding call; a call
+/// that encodes no image requires none.
+const fn encoder_feature(encoder: MediaCall) -> GenerationFeatures {
+    match encoder {
+        MediaCall::LatentEncoding => GenerationFeatures::LATENT_ENCODE,
+        MediaCall::VisionEncoding => GenerationFeatures::VISION_ENCODE,
+        _ => GenerationFeatures::empty(),
     }
 }
 
@@ -484,9 +477,9 @@ impl std::fmt::Display for GenerationFeatures {
 
 /// Worker and scheduler limits needed to compile a bounded generation graph.
 ///
-/// The server supplies the loaded model's requirements, and the engine's
-/// `resolve_generation_limits` intersects them with the capacities the worker
-/// reports. Zero in any numeric field other than `commit_marker_tokens`
+/// The server supplies the loaded model's sizing facts, and the engine's
+/// `resolve_generation_limits` takes the served features from the workers'
+/// call kinds and clamps the capacities to what they report. Zero in any numeric field other than `commit_marker_tokens`
 /// declares no capacity for that resource;
 /// [`GenerationRequest::validate_resources`] rejects requests that need it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -498,12 +491,13 @@ pub struct GenerationLimits {
     pub max_latent_units: u64,
     /// Pixel-to-latent spatial downsample factor.
     pub latent_downsample: u32,
-    /// Maximum VAE grid tokens for a worker-selected length. It is also the
-    /// divisor that turns `max_latent_feature_bytes` into bytes per latent
-    /// unit in [`GenerationRequest::image_latent_bytes`].
+    /// Maximum VAE grid tokens for a worker-selected length.
     pub max_vae_grid_tokens: u32,
     /// Maximum vision grid tokens for a worker-selected length.
     pub max_vit_grid_tokens: u32,
+    /// Bytes of one latent unit of a generated image, as the model's VAE
+    /// states them ([`GenerationRequest::image_latent_bytes`]).
+    pub latent_bytes_per_unit: u64,
     /// Maximum VAE feature product size in bytes.
     pub max_latent_feature_bytes: u64,
     /// Maximum vision feature product size in bytes.
@@ -571,7 +565,7 @@ impl GenerationRequest {
     ///
     /// Sums the prompt, the `max_und_tokens` budget, each context image's
     /// encoder KV bounds, the feedback encoder bounds once per
-    /// `ImageParams::max_images` when completed images feed back, and the
+    /// `max_images` when completed images feed back, and the
     /// negative prompt when the Gen branch is reachable. Saturation preserves
     /// conservative admission for host-sized token budgets.
     ///
@@ -593,7 +587,7 @@ impl GenerationRequest {
         let feedback =
             if self.continues_after_image() && self.image_generation.feedback_source.is_some() {
                 encoder_kv_bound(&self.image_generation.feedback_encoders, limits)?
-                    .saturating_mul(self.image.max_images as usize)
+                    .saturating_mul(self.max_images as usize)
             } else {
                 0
             };
@@ -672,16 +666,13 @@ impl GenerationRequest {
         Ok(units)
     }
 
-    /// Allocation bytes for one image latent using the loaded model's byte density.
-    ///
-    /// The density is `max_latent_feature_bytes / max_vae_grid_tokens`,
-    /// rounded up to whole bytes per latent unit.
+    /// Allocation bytes for one image latent: its units at the loaded
+    /// model's `latent_bytes_per_unit`.
     ///
     /// # Errors
     ///
     /// Returns every [`GenerationRequest::image_latent_units`] error, and
-    /// `MissingRuntimeBound` naming `max_latent_feature_bytes` when either
-    /// `max_latent_feature_bytes` or `max_vae_grid_tokens` is zero.
+    /// `MissingRuntimeBound` naming `latent_bytes_per_unit` when it is zero.
     pub fn image_latent_bytes(
         &self,
         limits: &GenerationLimits,
@@ -690,15 +681,12 @@ impl GenerationRequest {
             return Ok(0);
         }
         let units = self.image_latent_units(limits)?;
-        if limits.max_vae_grid_tokens == 0 || limits.max_latent_feature_bytes == 0 {
+        if limits.latent_bytes_per_unit == 0 {
             return Err(GenerationResourceError::MissingRuntimeBound {
-                resource: "max_latent_feature_bytes",
+                resource: "latent_bytes_per_unit",
             });
         }
-        let bytes_per_unit = limits
-            .max_latent_feature_bytes
-            .div_ceil(u64::from(limits.max_vae_grid_tokens));
-        Ok(units.saturating_mul(bytes_per_unit))
+        Ok(units.saturating_mul(limits.latent_bytes_per_unit))
     }
 
     /// Checks reachable encoder work, image geometry, and guidance against loaded capacity.
@@ -727,12 +715,12 @@ impl GenerationRequest {
         .then_some(self.image_generation.feedback_encoders.as_slice());
         for (step, bytes, resource) in [
             (
-                ImageIngestStep::VaeEncode,
+                MediaCall::LatentEncoding,
                 limits.max_latent_feature_bytes,
                 "max_latent_feature_bytes",
             ),
             (
-                ImageIngestStep::VitEncode,
+                MediaCall::VisionEncoding,
                 limits.max_vision_feature_bytes,
                 "max_vision_feature_bytes",
             ),
@@ -806,8 +794,9 @@ impl ImageEncoderInput {
         limits: &GenerationLimits,
     ) -> Result<u32, GenerationResourceError> {
         let capacity = match self.encoder {
-            ImageIngestStep::VaeEncode => limits.max_vae_grid_tokens,
-            ImageIngestStep::VitEncode => limits.max_vit_grid_tokens,
+            MediaCall::LatentEncoding => limits.max_vae_grid_tokens,
+            MediaCall::VisionEncoding => limits.max_vit_grid_tokens,
+            _ => 0,
         };
         let tokens = self
             .num_kv_tokens
@@ -819,16 +808,6 @@ impl ImageEncoderInput {
             });
         }
         Ok(tokens)
-    }
-}
-
-impl ImageIngestStep {
-    /// Returns the stable call name used by resource diagnostics.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::VaeEncode => "vae_encode",
-            Self::VitEncode => "vit_encode",
-        }
     }
 }
 
@@ -927,6 +906,10 @@ pub struct GenerationRequest {
     pub sampling: SamplingParams,
     /// Image-generation parameters.
     pub image: ImageParams,
+    /// Maximum images the request may generate. It bounds the media work and
+    /// feedback resources the request can reach, which the scheduler reserves
+    /// at admission; the worker never reads it.
+    pub max_images: u16,
     /// Maximum understanding tokens generated by the request.
     pub max_und_tokens: usize,
     /// Text sequences that terminate generation.
@@ -947,22 +930,12 @@ pub struct GenerationRequest {
     /// makes the request a generating one.
     #[serde(default)]
     pub readout: Vec<ReadoutRow>,
-    /// Block-diffusion sampling of a generating request, whose text is
-    /// denoised in canvases rather than decoded token by token; `None`
-    /// decodes autoregressively.
-    #[serde(default)]
-    pub canvas: Option<CanvasSampling>,
 }
 
 impl GenerationRequest {
     /// Returns whether the request reads canvas slots instead of generating.
     pub fn is_readout(&self) -> bool {
         !self.readout.is_empty()
-    }
-
-    /// Returns whether the request generates its text in denoised canvases.
-    pub fn is_canvas_generation(&self) -> bool {
-        self.canvas.is_some()
     }
 
     /// Returns the number of candidate log-probabilities a readout reports:
@@ -975,24 +948,36 @@ impl GenerationRequest {
             .sum()
     }
 
-    /// Returns the runtime features the request's computation reaches.
+    /// Returns the runtime features the request's call reaches.
     ///
-    /// A readout or a canvas-generating request needs token denoising and
-    /// the encoders of its context images; any other request needs what its
-    /// generation graph reaches (`ImageGenerationConfig::required_features`).
+    /// A readout needs token denoising and the encoders of its context
+    /// images; any other request needs what its generation graph reaches
+    /// (`ImageGenerationConfig::required_features`). A request a
+    /// block-diffusion runtime generates in canvases needs
+    /// [`GenerationRequest::canvas_features`] instead.
     pub fn required_features(&self) -> GenerationFeatures {
-        let context_steps = self
-            .multimodal_inputs
-            .images
-            .iter()
-            .flat_map(|image| image.encoders.iter().map(|input| input.encoder));
-        if self.is_readout() || self.is_canvas_generation() {
-            return context_steps.fold(GenerationFeatures::TOKEN_DENOISING, |needs, step| {
-                needs | step.required_feature()
-            });
+        if self.is_readout() {
+            return self.canvas_features();
         }
         self.image_generation
-            .required_features(self.constraint, context_steps)
+            .required_features(self.constraint, self.context_encoders())
+    }
+
+    /// Returns the features of denoising canvases over the request's context:
+    /// token denoising and the encoders of the context images.
+    pub fn canvas_features(&self) -> GenerationFeatures {
+        self.context_encoders()
+            .fold(GenerationFeatures::TOKEN_DENOISING, |needs, step| {
+                needs | encoder_feature(step)
+            })
+    }
+
+    /// Returns the encoder steps of the request's context images.
+    fn context_encoders(&self) -> impl Iterator<Item = MediaCall> + '_ {
+        self.multimodal_inputs
+            .images
+            .iter()
+            .flat_map(|image| image.encoders.iter().map(|input| input.encoder))
     }
 
     /// Validates image conditions, input positions, and sampling.
@@ -1010,16 +995,15 @@ impl GenerationRequest {
         } else if self.max_und_tokens == 0 && !self.finishes_after_image() {
             return Err(GenerationRequestError::ZeroMaxUndTokens);
         }
-        if let Some(canvas) = &self.canvas {
-            validate_canvas(self, canvas)?;
-        }
-
         self.sampling
             .validate()
             .map_err(GenerationRequestError::InvalidSampling)?;
         self.image
             .validate()
             .map_err(GenerationRequestError::InvalidImage)?;
+        if self.max_images == 0 {
+            return Err(GenerationRequestError::ZeroMaxImages);
+        }
         if self.decodes_text() && self.sampling.min_tokens > self.max_und_tokens {
             return Err(GenerationRequestError::MinTokensExceedsMaximum {
                 min_tokens: self.sampling.min_tokens,
@@ -1104,24 +1088,6 @@ impl GenerationRequest {
     }
 }
 
-/// Validates a canvas-generating request: it generates text only, names the
-/// seed its draws follow, and its sampling parameters are in range.
-fn validate_canvas(
-    request: &GenerationRequest,
-    canvas: &CanvasSampling,
-) -> Result<(), GenerationRequestError> {
-    if request.is_readout() || request.generates_images() {
-        return Err(GenerationRequestError::CanvasGeneratesTextOnly);
-    }
-    if request.sampling.seed.is_none() {
-        return Err(GenerationRequestError::UnseededCanvas);
-    }
-    match canvas.invalid_parameter() {
-        Some(parameter) => Err(GenerationRequestError::InvalidCanvasSampling { parameter }),
-        None => Ok(()),
-    }
-}
-
 /// Validates a readout's canvas rows: it generates no tokens or images, and
 /// every row holds tokens and reads at least one slot inside itself, each
 /// with at least one candidate.
@@ -1167,6 +1133,14 @@ fn validate_image_encoders(
         return Err(GenerationRequestError::ZeroImageLogicalPositions);
     }
     for input in inputs {
+        if !matches!(
+            input.encoder,
+            MediaCall::VisionEncoding | MediaCall::LatentEncoding
+        ) {
+            return Err(GenerationRequestError::NotAnImageEncoder {
+                call: input.encoder,
+            });
+        }
         if input.num_kv_tokens == Some(0) || input.max_kv_tokens == Some(0) {
             return Err(GenerationRequestError::ZeroImageKvBound);
         }
@@ -1191,6 +1165,12 @@ pub enum GenerationRequestError {
     /// An image input, or configured image feedback, declares no encoder stages.
     #[error("image input has no encoders")]
     MissingImageEncoders,
+    /// An image encoder is neither a vision nor a latent encoding call.
+    #[error("{} is not an image encoder", call.as_str())]
+    NotAnImageEncoder {
+        /// The call the input names.
+        call: MediaCall,
+    },
     /// An input image carries no encoded payload.
     #[error("image payload must not be empty")]
     EmptyImagePayload,
@@ -1256,24 +1236,23 @@ pub enum GenerationRequestError {
     /// A readout row's slot positions do not strictly increase.
     #[error("readout slots must be listed in increasing position order")]
     UnorderedReadoutSlots,
-    /// A canvas-generating request also reads slots or generates images.
+    /// A request a block-diffusion runtime generates in canvases generates
+    /// text only.
     #[error("a canvas-generating request generates text only")]
     CanvasGeneratesTextOnly,
-    /// A canvas-generating request names no seed for its draws.
+    /// A request a block-diffusion runtime generates in canvases names no
+    /// seed for its draws.
     #[error("a canvas-generating request requires a sampling seed")]
     UnseededCanvas,
-    /// A block-diffusion sampling parameter is out of range.
-    #[error("block-diffusion sampling parameter `{parameter}` is out of range")]
-    InvalidCanvasSampling {
-        /// Name of the parameter.
-        parameter: &'static str,
-    },
     /// Text sampling parameters are invalid.
     #[error("invalid sampling parameters: {0}")]
     InvalidSampling(#[source] SamplingParamsError),
     /// Image-generation parameters are invalid.
     #[error("invalid image parameters: {0}")]
     InvalidImage(#[source] ImageParamsError),
+    /// The request's image budget is zero.
+    #[error("max_images must be at least 1")]
+    ZeroMaxImages,
     /// Minimum-token floor exceeds the generation budget.
     #[error("min_tokens ({min_tokens}) exceeds max_und_tokens ({max_und_tokens})")]
     MinTokensExceedsMaximum {
@@ -1310,6 +1289,7 @@ mod tests {
             latent_downsample: 16,
             max_vae_grid_tokens: 64,
             max_vit_grid_tokens: 64,
+            latent_bytes_per_unit: (1 << 20) / 64,
             max_latent_feature_bytes: 1 << 20,
             max_vision_feature_bytes: 1 << 20,
             commit_marker_tokens: 2,
@@ -1334,12 +1314,12 @@ mod tests {
             num_feedback_positions: 1,
             feedback_encoders: vec![
                 ImageEncoderInput {
-                    encoder: ImageIngestStep::VaeEncode,
+                    encoder: MediaCall::LatentEncoding,
                     num_kv_tokens: None,
                     max_kv_tokens: Some(64),
                 },
                 ImageEncoderInput {
-                    encoder: ImageIngestStep::VitEncode,
+                    encoder: MediaCall::VisionEncoding,
                     num_kv_tokens: None,
                     max_kv_tokens: Some(64),
                 },
@@ -1360,12 +1340,12 @@ mod tests {
                     num_positions: 1,
                     encoders: vec![
                         ImageEncoderInput {
-                            encoder: ImageIngestStep::VaeEncode,
+                            encoder: MediaCall::LatentEncoding,
                             num_kv_tokens: None,
                             max_kv_tokens: Some(64),
                         },
                         ImageEncoderInput {
-                            encoder: ImageIngestStep::VitEncode,
+                            encoder: MediaCall::VisionEncoding,
                             num_kv_tokens: Some(32),
                             max_kv_tokens: None,
                         },
@@ -1375,6 +1355,7 @@ mod tests {
             constraint,
             sampling: SamplingParams::default(),
             image: ImageParams::default(),
+            max_images: 1,
             max_und_tokens: 16,
             include_stop_token: false,
             stop_strings: vec!["stop".into()],
@@ -1387,7 +1368,6 @@ mod tests {
             },
             image_generation: policy,
             readout: Vec::new(),
-            canvas: None,
         }
     }
 
@@ -1406,11 +1386,11 @@ mod tests {
 
     #[test]
     fn encoder_cache_keys_are_stable_and_step_scoped() {
-        let first = encoder_cache_key(17, 0, ImageIngestStep::VaeEncode);
-        assert_eq!(first, encoder_cache_key(17, 0, ImageIngestStep::VaeEncode));
-        assert_ne!(first, encoder_cache_key(18, 0, ImageIngestStep::VaeEncode));
-        assert_ne!(first, encoder_cache_key(17, 1, ImageIngestStep::VaeEncode));
-        assert_ne!(first, encoder_cache_key(17, 0, ImageIngestStep::VitEncode));
+        let first = encoder_cache_key(17, 0, MediaCall::LatentEncoding);
+        assert_eq!(first, encoder_cache_key(17, 0, MediaCall::LatentEncoding));
+        assert_ne!(first, encoder_cache_key(18, 0, MediaCall::LatentEncoding));
+        assert_ne!(first, encoder_cache_key(17, 1, MediaCall::LatentEncoding));
+        assert_ne!(first, encoder_cache_key(17, 0, MediaCall::VisionEncoding));
     }
 
     #[test]
@@ -1451,7 +1431,7 @@ mod tests {
         let mut request = complete_request();
         request.cache.read = true;
         request.cache.write = true;
-        request.image.max_images = 2;
+        request.max_images = 2;
         request
             .validate_resources(&runtime_limits())
             .expect("supported image input");
@@ -1484,12 +1464,12 @@ mod tests {
             num_positions: 1,
             encoders: vec![
                 ImageEncoderInput {
-                    encoder: ImageIngestStep::VaeEncode,
+                    encoder: MediaCall::LatentEncoding,
                     num_kv_tokens: Some(1_026),
                     max_kv_tokens: None,
                 },
                 ImageEncoderInput {
-                    encoder: ImageIngestStep::VitEncode,
+                    encoder: MediaCall::VisionEncoding,
                     num_kv_tokens: Some(1_371),
                     max_kv_tokens: None,
                 },
@@ -1516,7 +1496,9 @@ mod tests {
         limits.max_vit_grid_tokens = 0;
         assert_eq!(
             request.validate_resources(&limits),
-            Err(GenerationResourceError::UnboundedImageKv { call: "vit_encode" })
+            Err(GenerationResourceError::UnboundedImageKv {
+                call: "vision_encoding"
+            })
         );
 
         // The remaining cases keep the unbounded ViT input, which resolves to
@@ -1596,6 +1578,17 @@ mod tests {
             Err(GenerationRequestError::MissingImageEncoders)
         );
 
+        // An image is encoded by a vision or a latent encoding call, nothing
+        // else.
+        let mut not_an_encoder = complete_request();
+        not_an_encoder.multimodal_inputs.images[0].encoders[0].encoder = MediaCall::Denoising;
+        assert_eq!(
+            not_an_encoder.validate(),
+            Err(GenerationRequestError::NotAnImageEncoder {
+                call: MediaCall::Denoising
+            })
+        );
+
         // Exact contributions and capacities are validated before admission.
         for (tokens, capacity, error) in [
             (Some(0), None, GenerationRequestError::ZeroImageKvBound),
@@ -1626,7 +1619,7 @@ mod tests {
         let mut injected = complete_request();
         injected.multimodal_inputs.images[0].encoders.truncate(1);
         injected.multimodal_inputs.images[0].encoders[0] = ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: None,
             max_kv_tokens: Some(64),
         };
@@ -1660,6 +1653,13 @@ mod tests {
                 ImageParamsError::CfgIntervalOrder { .. }
             ))
         ));
+
+        let mut zero_images = complete_request();
+        zero_images.max_images = 0;
+        assert_eq!(
+            zero_images.validate(),
+            Err(GenerationRequestError::ZeroMaxImages)
+        );
 
         let mut invalid_floor = complete_request();
         invalid_floor.sampling.min_tokens = invalid_floor.max_und_tokens + 1;
@@ -1696,7 +1696,7 @@ mod tests {
         request.max_und_tokens = 0;
         request.image_generation = ImageGenerationConfig::default();
         request.multimodal_inputs.images[0].encoders.truncate(1);
-        request.multimodal_inputs.images[0].encoders[0].encoder = ImageIngestStep::VitEncode;
+        request.multimodal_inputs.images[0].encoders[0].encoder = MediaCall::VisionEncoding;
         request.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
         request.readout = vec![
             ReadoutRow {

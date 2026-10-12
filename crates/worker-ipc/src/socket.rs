@@ -79,7 +79,7 @@ impl FrameReader {
     /// Returns whether the peer closed the connection. Fails on a read error,
     /// on a header that fails validation, and on a close that leaves a partial
     /// frame; frames completed before the failure stay in `ready`.
-    fn fill(&mut self, stream: &mut TcpStream, bound: usize) -> IpcResult<bool> {
+    fn fill(&mut self, stream: &mut TcpStream) -> IpcResult<bool> {
         let mut chunk = [0u8; 64 * 1024];
         let mut closed = false;
         loop {
@@ -93,7 +93,7 @@ impl FrameReader {
                 }
                 Ok(read) => {
                     self.buffer.extend_from_slice(&chunk[..read]);
-                    self.split(bound)?;
+                    self.split()?;
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
@@ -113,7 +113,7 @@ impl FrameReader {
     }
 
     /// Forms every whole frame the buffer now holds.
-    fn split(&mut self, bound: usize) -> IpcResult<()> {
+    fn split(&mut self) -> IpcResult<()> {
         loop {
             if self.buffer.len() < HEADER_BYTES {
                 return Ok(());
@@ -124,9 +124,9 @@ impl FrameReader {
             let len = header.len as usize;
 
             // Validate as soon as the header is complete, before waiting for its
-            // payload, so a foreign version or an over-bound length fails
-            // without buffering the bytes it announces.
-            header.validate(bound)?;
+            // payload, so a foreign version fails without buffering the bytes
+            // it announces.
+            header.validate()?;
             if self.buffer.len() < HEADER_BYTES + len {
                 return Ok(());
             }
@@ -160,10 +160,10 @@ impl FrameWriter {
     /// Queues one frame after stamping and checking its header.
     ///
     /// Fails with a transport error when the header is invalid or the payload
-    /// exceeds `bound`, and otherwise with [`IpcError::WouldBlock`] when
-    /// `depth` frames are already queued.
-    fn enqueue(&mut self, header: Header, payload: &[u8], bound: usize) -> IpcResult<()> {
-        let header = header.for_payload(payload.len(), bound)?;
+    /// exceeds the header's `u32` length, and otherwise with
+    /// [`IpcError::WouldBlock`] when `depth` frames are already queued.
+    fn enqueue(&mut self, header: Header, payload: &[u8]) -> IpcResult<()> {
+        let header = header.for_payload(payload.len())?;
         if self.pending.len() >= self.depth {
             return Err(IpcError::WouldBlock);
         }
@@ -317,8 +317,6 @@ pub struct SocketClient {
     /// identities: a later response with the same identity replaces an
     /// untaken one.
     inbox: HashMap<u64, Frame>,
-    /// Largest payload either direction may carry.
-    bound: usize,
     /// Terminal IO failure, reported after complete responses have been delivered.
     failure: Option<String>,
     /// Descriptor the engine's worker-death watcher fires on.
@@ -328,15 +326,9 @@ pub struct SocketClient {
 impl SocketClient {
     /// Connects to the address a rank reported at registration.
     ///
-    /// `bound` is the largest payload in bytes in either direction, `depth`
-    /// the number of frames the send queue holds, and `timeout` bounds the TCP
-    /// connect only.
-    pub fn connect(
-        address: &str,
-        bound: usize,
-        depth: usize,
-        timeout: Duration,
-    ) -> IpcResult<Self> {
+    /// `depth` is the number of frames the send queue holds, and `timeout`
+    /// bounds the TCP connect only.
+    pub fn connect(address: &str, depth: usize, timeout: Duration) -> IpcResult<Self> {
         let target: SocketAddr = address.parse().map_err(|_| {
             IpcError::Transport(format!("rank channel address {address} is not an address"))
         })?;
@@ -357,7 +349,6 @@ impl SocketClient {
             reader: FrameReader::new(),
             writer: FrameWriter::new(depth),
             inbox: HashMap::new(),
-            bound,
             failure: None,
             local: LocalWake::new()?,
         })
@@ -402,7 +393,7 @@ impl SocketClient {
         // Flush first so frames the socket has since accepted free queue
         // capacity before the depth check.
         self.writer.flush(&mut self.stream)?;
-        self.writer.enqueue(header, payload, self.bound)?;
+        self.writer.enqueue(header, payload)?;
         self.writer.flush(&mut self.stream)?;
         Ok(header.message_id)
     }
@@ -498,7 +489,7 @@ impl SocketClient {
     /// `Ok` in every case.
     fn pump(&mut self) -> IpcResult<()> {
         if self.failure.is_none() {
-            self.failure = match self.reader.fill(&mut self.stream, self.bound) {
+            self.failure = match self.reader.fill(&mut self.stream) {
                 Ok(false) => self
                     .writer
                     .flush(&mut self.stream)
@@ -525,8 +516,6 @@ pub struct SocketServer {
     stream: Option<TcpStream>,
     reader: FrameReader,
     writer: FrameWriter,
-    /// Largest payload either direction may carry.
-    bound: usize,
     /// Terminal IO failure, reported after buffered requests have been taken.
     failure: Option<String>,
     /// The address the engine connects to, as it travels in the registration.
@@ -541,7 +530,7 @@ impl SocketServer {
     /// Registration reports an address that must already exist, so binding and
     /// accepting are separate: the rank reports as soon as the address is real
     /// and accepts when the engine connects.
-    pub fn bind(host: &str, bound: usize, depth: usize) -> IpcResult<Self> {
+    pub fn bind(host: &str, depth: usize) -> IpcResult<Self> {
         let listener = TcpListener::bind((host, 0))
             .map_err(|error| IpcError::Transport(format!("binding a rank channel: {error}")))?;
         let address = listener
@@ -555,7 +544,6 @@ impl SocketServer {
             stream: None,
             reader: FrameReader::new(),
             writer: FrameWriter::new(depth),
-            bound,
             failure: None,
             address,
             local: LocalWake::new()?,
@@ -653,7 +641,7 @@ impl SocketServer {
             return Ok(Some(frame));
         }
         if self.failure.is_none() {
-            self.failure = match self.reader.fill(stream, self.bound) {
+            self.failure = match self.reader.fill(stream) {
                 Ok(false) => self
                     .writer
                     .flush(stream)
@@ -725,7 +713,7 @@ impl SocketServer {
             .as_mut()
             .ok_or_else(|| IpcError::Transport("rank channel is not connected".into()))?;
         self.writer.flush(stream)?;
-        self.writer.enqueue(header, payload, self.bound)?;
+        self.writer.enqueue(header, payload)?;
         self.writer.flush(stream)
     }
 }
@@ -734,11 +722,10 @@ impl SocketServer {
 mod tests {
     use super::*;
 
-    fn connected(bound: usize, depth: usize) -> (SocketClient, TcpStream) {
+    fn connected(depth: usize) -> (SocketClient, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = SocketClient::connect(
             &listener.local_addr().unwrap().to_string(),
-            bound,
             depth,
             Duration::from_secs(5),
         )
@@ -753,7 +740,7 @@ mod tests {
         // The peer writes one complete frame a byte at a time, then a frame cut
         // short, then closes. The complete response must still be delivered;
         // only the truncated one fails, and the channel then reports death.
-        let (mut client, mut peer) = connected(1024, 2);
+        let (mut client, mut peer) = connected(2);
         let header = Header {
             message_id: 1,
             len: 5,
@@ -785,27 +772,20 @@ mod tests {
     }
 
     #[test]
-    fn socket_rejects_incompatible_or_oversized_frames() {
-        for header in [
-            Header {
-                version: crate::IPC_VERSION + 1,
-                ..Header::default()
-            },
-            Header {
-                len: 1025,
-                ..Header::default()
-            },
-        ] {
-            // Only the header is sent: it must be refused before any payload
-            // arrives.
-            let (mut client, mut peer) = connected(1024, 1);
-            peer.write_all(&encode_header(&header)).unwrap();
-            assert!(
-                client
-                    .recv_response_timeout(0, Duration::from_secs(5))
-                    .is_err()
-            );
-        }
+    fn socket_rejects_incompatible_frames() {
+        let header = Header {
+            version: crate::IPC_VERSION + 1,
+            ..Header::default()
+        };
+        // Only the header is sent: it must be refused before any payload
+        // arrives.
+        let (mut client, mut peer) = connected(1);
+        peer.write_all(&encode_header(&header)).unwrap();
+        assert!(
+            client
+                .recv_response_timeout(0, Duration::from_secs(5))
+                .is_err()
+        );
     }
 
     /// A local wake is reported by the first drain after it fires, wakes
@@ -814,7 +794,7 @@ mod tests {
     /// poll.
     #[test]
     fn a_local_wake_is_reported_once_and_rearms_after_each_drain() {
-        let (mut client, _peer) = connected(1024, 1);
+        let (mut client, _peer) = connected(1);
         let wake = client.death_wake();
         let readable = |client: &SocketClient| {
             let mut descriptor = [libc::pollfd {
@@ -847,7 +827,7 @@ mod tests {
     #[test]
     fn a_stalled_peer_applies_backpressure_and_partial_writes_resume() {
         let size = 1 << 20;
-        let (mut client, mut peer) = connected(size, 1);
+        let (mut client, mut peer) = connected(1);
         let capacity: libc::c_int = 4096;
         // Restrict the real socket send buffer so this workload must span writes.
         assert_eq!(
@@ -916,7 +896,7 @@ mod tests {
         // The channel's contract is that a frame arrives as it was sent, under
         // the identity it carried, so the engine can match a result to the
         // batch it answers.
-        let mut server = SocketServer::bind("127.0.0.1", 1 << 20, 8).expect("rank binds");
+        let mut server = SocketServer::bind("127.0.0.1", 8).expect("rank binds");
         let address = server.address().to_string();
 
         let accepted = std::thread::spawn(move || {
@@ -938,8 +918,8 @@ mod tests {
             request
         });
 
-        let mut client = SocketClient::connect(&address, 1 << 20, 8, Duration::from_secs(5))
-            .expect("engine connects");
+        let mut client =
+            SocketClient::connect(&address, 8, Duration::from_secs(5)).expect("engine connects");
         let sent = Header {
             message_id: 77,
             ..Header::default()

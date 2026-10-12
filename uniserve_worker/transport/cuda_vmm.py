@@ -19,13 +19,10 @@ sweeps them.
 from __future__ import annotations
 
 import concurrent.futures
-import logging
 import os
 import sys
 import threading
-import time
 import uuid
-from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cache
@@ -37,7 +34,6 @@ from uniserve.runtime import EventPool
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
     DESCRIPTOR_HANDLE_BYTES,
-    FABRIC_HANDLE_BYTES,
     CudaVmmTransfer,
     Locator,
     WorkerEndpoint,
@@ -73,8 +69,6 @@ from uniserve_worker.transport.vmm_pool import (
 
 if TYPE_CHECKING:
     import torch
-
-_LOG = logging.getLogger(__name__)
 
 
 @cache
@@ -144,10 +138,6 @@ class _CudaSource:
             self.retirement.set_result(None)
 
 
-# Fabric-exported allocations one transport keeps mapped for its reads.
-_FABRIC_IMPORTS = 256
-
-
 class CudaVmmTransport(Transport):
     """Device publications a consumer imports by their shareable handle.
 
@@ -204,16 +194,6 @@ class CudaVmmTransport(Transport):
         # Whether a publication has to state readiness without an interprocess
         # event, which only a consumer on another host requires.
         self._cross_host_consumers = bool(cross_host_consumers)
-        # What publishing costs this rank. A crossing publication drains the
-        # producer's stream, because a consumer on another host can wait on no
-        # fence this rank records, and that wait is on the batch's critical
-        # path. The payloads are counted with it, since the cost of a crossing
-        # is only interpretable against what it carries.
-        self._published = 0
-        self._payload_bytes = 0
-        self._largest_payload = 0
-        self._synchronize_seconds = 0.0
-        self._longest_synchronize = 0.0
         # Publications whose fence has drained but whose consumers have not all
         # acknowledged. Their chunks are held until reap() finds them settled.
         self._unacknowledged: list[_CudaSource] = []
@@ -221,7 +201,6 @@ class CudaVmmTransport(Transport):
         # was copied into its chunk, and the chunk is what waits for the
         # consumers, swept separately in reap().
         self._publications = Publications[_CudaSource](
-            capacity=256,
             reclaim=self._reclaim,
             drain=self._drain,
             # A device publication's chunk is held by the pool until its
@@ -236,11 +215,11 @@ class CudaVmmTransport(Transport):
             name="uniserve-cuda-read",
             event_pool=event_pool,
         )
-        # Byte mappings of fabric-exported allocations this rank has read,
-        # least recently read first (`_fabric_import`).
-        self._fabric_imports: OrderedDict[
+        # Byte mappings of fabric-exported allocations this rank has read
+        # (`_fabric_import`), kept until the transport closes.
+        self._fabric_imports: dict[
             tuple[str, str, bytes, int], torch.Tensor
-        ] = OrderedDict()
+        ] = {}
         self._fabric_import_lock = threading.Lock()
 
         with _endpoint_lock:
@@ -261,9 +240,9 @@ class CudaVmmTransport(Transport):
         therefore kept for later reads of the same allocation. A fabric
         handle names one physical allocation for as long as any import holds
         it, so a kept mapping never aliases another allocation; it does keep
-        an allocation its producer has released alive until it is dropped.
-        At most `_FABRIC_IMPORTS` are kept, the least recently read dropped
-        first, and a read's views retain their mapping beyond that.
+        an allocation its producer has released alive until the transport
+        closes. Producers publish from their fixed arenas and pools, so the
+        set of mappings is bounded by those allocations.
         """
         import torch
         from uniserve_kernels.peer_storage import import_handle
@@ -277,7 +256,6 @@ class CudaVmmTransport(Transport):
         with self._fabric_import_lock:
             mapped = self._fabric_imports.get(key)
             if mapped is not None:
-                self._fabric_imports.move_to_end(key)
                 return mapped
         imported = import_handle(
             torch.empty(0, dtype=torch.uint8, device=device),
@@ -288,9 +266,6 @@ class CudaVmmTransport(Transport):
             # Another read thread may have imported the same allocation
             # meanwhile; the first mapping kept serves both.
             mapped = self._fabric_imports.setdefault(key, imported)
-            self._fabric_imports.move_to_end(key)
-            while len(self._fabric_imports) > _FABRIC_IMPORTS:
-                self._fabric_imports.popitem(last=False)
         return mapped
 
     def _descriptor_grants(self) -> DescriptorGrants:
@@ -500,17 +475,8 @@ class CudaVmmTransport(Transport):
             # still gates the source's release on this rank.
             interprocess = not self._cross_host_consumers
             if not interprocess:
-                started = time.perf_counter()
                 with profile_range("vmm_publish_synchronize"):
                     torch.cuda.current_stream(first.device).synchronize()
-                waited = time.perf_counter() - started
-                self._synchronize_seconds += waited
-                self._longest_synchronize = max(
-                    self._longest_synchronize, waited
-                )
-            self._published += 1
-            self._payload_bytes += nbytes
-            self._largest_payload = max(self._largest_payload, nbytes)
             event = self._events.acquire(
                 first.device, interprocess=interprocess
             )
@@ -632,17 +598,6 @@ class CudaVmmTransport(Transport):
             raise invalid_descriptor(
                 "CUDA VMM read requires a CUDA VMM locator"
             )
-        # A device product reaches another host as a fabric handle and not as
-        # a process descriptor, which names an allocation only within the host
-        # that exported it. The head refuses an edge whose devices cannot
-        # export one, so this is the rank restating what it was given.
-        if (
-            locator.source.node != self.source.node
-            and len(locator.transport.allocation_handle) != FABRIC_HANDLE_BYTES
-        ):
-            raise invalid_descriptor(
-                "a device product crosses hosts only as a fabric handle"
-            )
         if device.type != "cuda":
             raise invalid_descriptor(
                 "CUDA VMM destination must be a CUDA device"
@@ -699,10 +654,7 @@ class CudaVmmTransport(Transport):
                     # and producer fence directly; no IPC mapping is needed.
                     with _endpoint_lock:
                         owner = _endpoints.get(handle.endpoint)
-                    if (
-                        not isinstance(owner, CudaVmmTransport)
-                        or owner.source != locator.source
-                    ):
+                    if not isinstance(owner, CudaVmmTransport):
                         raise invalid_descriptor(
                             "CUDA publication has no live local owner"
                         )
@@ -871,21 +823,6 @@ class CudaVmmTransport(Transport):
         return retirement
 
     def close(self) -> None:
-        if self._published:
-            _LOG.info(
-                "cuda_vmm transport retired: published=%d crossing=%s "
-                "payload_total=%d payload_mean=%d payload_max=%d "
-                "synchronize_ms_total=%.3f synchronize_ms_max=%.3f "
-                "synchronize_ms_mean=%.3f",
-                self._published,
-                self._cross_host_consumers,
-                self._payload_bytes,
-                self._payload_bytes // self._published,
-                self._largest_payload,
-                self._synchronize_seconds * 1e3,
-                self._longest_synchronize * 1e3,
-                self._synchronize_seconds * 1e3 / self._published,
-            )
         try:
             self._reads.close()
         finally:

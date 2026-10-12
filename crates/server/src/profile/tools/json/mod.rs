@@ -23,7 +23,7 @@
 //! included. A published call is never withdrawn; after a later failure only
 //! the input following its streamed arguments is returned.
 
-pub use qwen::Qwen3XmlToolParser;
+pub use qwen::Qwen25ToolParser;
 
 mod qwen;
 

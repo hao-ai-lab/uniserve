@@ -41,7 +41,7 @@ def block_sparse_attention(
     out: torch.Tensor,
     indices: torch.Tensor,
     counts: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
     *,
     scale: float,
     block: int,
@@ -67,5 +67,12 @@ def block_sparse_attention(
     the current CUDA stream and writes ``out`` in place.
     """
     _extension(block).forward(
-        query, key, value, out, indices, counts, valid_sizes, float(scale)
+        query,
+        key,
+        value,
+        out,
+        indices,
+        counts,
+        variable_block_sizes,
+        float(scale),
     )

@@ -19,7 +19,6 @@ from uniserve.nn import _binding
 from uniserve.nn.attention import Attention
 from uniserve.nn.attention._parallel import (
     AttentionBuffers,
-    OutputBuffers,
     ParallelAttention,
 )
 from uniserve.nn.attention.vsa import BlockAttention
@@ -143,8 +142,8 @@ class ExecutionContext(Generic[SizeT]):
     tensor stored in the physical row order that kernel reads.
 
     ``stream`` is a borrowed :class:`CUDAStream`. Its communication owner
-    holds the communicators, registered windows and window storage every
-    context on the stream shares; this context never retires them.
+    holds the communicators and gather pools every context on the stream
+    shares; this context never retires them.
     ``scratch``, when given, is a borrowed :class:`Scratch` whose other
     borrowers run on the same stream; the caller closes it after every
     borrower retires. Without it the context owns a private one.
@@ -161,7 +160,7 @@ class ExecutionContext(Generic[SizeT]):
     opens a step around every forward that reaches them (see
     ``uniserve.runtime.expert_exchange``) and retires it after this context.
 
-    ``tiles`` maps ``SpatialEncoder`` modules to borrowed operators, each
+    ``tiles`` maps ``TiledEncoder`` modules to borrowed operators, each
     returning exactly that encoder's ``encode_tile`` of any tile, such as the
     replay of a graph captured at the tile shape; the encoders' calls within
     this context encode their tiles through them. Their owner keeps them
@@ -257,12 +256,9 @@ class ExecutionContext(Generic[SizeT]):
             tuple[object, ...], tuple[str, VsaOperator]
         ] = {}
         self._moe: dict[int, MoEBinding] = {}
-        self._vsa_output: dict[ParallelAttention, OutputBuffers] = {}
         self._vsa_context: dict[ParallelAttention, AttentionBuffers] = {}
         self._context_backing: dict[tuple[object, ...], AttentionBuffers] = {}
-        self._vsa_transport: dict[
-            tuple[object, ...], tuple[OutputBuffers, AttentionBuffers | None]
-        ] = {}
+        self._vsa_storage: dict[tuple[object, ...], AttentionBuffers] = {}
         self._exchange: dict[int, ExchangeBuffers] = {}
         self._chunks: dict[int, _binding.ChunkStorage] = {}
         self._gather_pools: dict[Communicator, GatherPool] = {}
@@ -332,114 +328,42 @@ class ExecutionContext(Generic[SizeT]):
         # on this serialized context shares one backing.
         return self.scratch("moe", requirements, device)
 
-    def _vsa_buffers(self, slot, requirements, device):
-        # Two projection slots permit one layer's output consumption to overlap
-        # the next layer's input preparation. Each context owns its own pair.
-        return self.scratch(("vsa", slot), requirements, device)
-
     def _vsa_exchange(self, layer, rows, heads, head_dim, dtype):
-        parallel = getattr(layer, "parallel", None)
-        if parallel is None:
-            return None
+        """Bind the gathered K/V storage of a context-partitioned VSA layer.
 
-        # Exchange storage serves every query length up to its rows
-        # (``ParallelAttention`` borrows compact leading views), so a
-        # transport prepared for more rows serves this call too.
+        ``rows`` are the layer's rows of one context interval. Context storage
+        serves every row count up to its own (``ParallelAttention`` borrows
+        compact leading views), so one prepared for more rows serves this
+        call too.
+        """
+        parallel = layer.context_parallel
+        group = parallel.context_group
         key = next(
             (
                 key
-                for key in self._vsa_transport
-                if key[:3]
-                == (
-                    parallel.ulysses_group,
-                    parallel.context_group,
-                    parallel.key_group,
-                )
-                and key[3] >= rows
-                and key[4:] == (heads, head_dim, dtype)
+                for key in self._vsa_storage
+                if key[0] == group
+                and key[1] >= rows
+                and key[2:] == (heads, head_dim, dtype)
             ),
-            (
-                parallel.ulysses_group,
-                parallel.context_group,
-                parallel.key_group,
-                rows,
-                heads,
-                head_dim,
-                dtype,
-            ),
+            (group, rows, heads, head_dim, dtype),
         )
-        if key not in self._vsa_transport:
+        if key not in self._vsa_storage:
             if capturing(self._device):
                 raise RuntimeError(
                     "prepare VSA communication storage before capture"
                 )
-            from .attention_storage import (
-                allocate_context_storage,
-                allocate_output_storage,
-            )
+            from .attention_storage import allocate_context_storage
 
-            def allocate():
-                return allocate_output_storage(
-                    (parallel,),
-                    rows=rows,
-                    heads=heads,
-                    head_dim=head_dim,
-                    dtype=dtype,
-                )
-
-            group = parallel.ulysses_group
-            # Registration hands NCCL a window its zero-CTA all-to-all can
-            # use, and only symmetric storage backs one: a layer whose context
-            # partition composes peer rows. Its storage belongs to the stream,
-            # whose communicator retains the window; other storage belongs to
-            # this context and takes the ordinary collective. The send buffer
-            # is this rank's own destination either way, since where peer
-            # storage exists its own entry is that same storage.
-            if (
-                self.stream is not None
-                and group.size > 1
-                and parallel.context_group.size > 1
-                and group._require().group_name
-                in self.stream.communication.communicators
-            ):
-
-                def registered():
-                    outputs = allocate()
-                    buffers = outputs.views[parallel]
-                    return (
-                        buffers,
-                        outputs.allocations,
-                        (buffers.local, buffers.receive),
-                    )
-
-                # Only registered() stores values under "vsa_output" keys.
-                output = cast(
-                    OutputBuffers,
-                    self.stream.communication.windows(
-                        ("vsa_output", key), group, registered
-                    ),
-                )
-            else:
-                outputs = allocate()
-                self._allocations.extend(outputs.allocations)
-                output = outputs.views[parallel]
-
-            contexts = allocate_context_storage(
+            self._vsa_storage[key] = allocate_context_storage(
                 (parallel,),
-                rows=rows,
+                rows=cast(int, key[1]),
                 heads=heads,
                 head_dim=head_dim,
                 dtype=dtype,
-                block_size=64,
-            )
-            self._vsa_transport[key] = (output, contexts.get(parallel))
+            )[parallel]
 
-        output, context = self._vsa_transport[key]
-        self._vsa_output[parallel] = output
-        if context is not None:
-            self._vsa_context[parallel] = context
-
-        return parallel
+        self._vsa_context[parallel] = self._vsa_storage[key]
 
     def _open(self):
         if self._closed:
@@ -505,7 +429,6 @@ class ExecutionContext(Generic[SizeT]):
                 prepare(size, out=self.constants)
 
             representations = {"": (self._device, self._dtype)}
-            vsa_slot = 0
             for path, child in module.named_modules():
                 inherited = representations[path.rpartition(".")[0]]
                 device, dtype = _representation(child, inherited)
@@ -600,11 +523,9 @@ class ExecutionContext(Generic[SizeT]):
                         self._vsa_backend,
                         self.scratch,
                         self._attention_workspace,
-                        partial(self._vsa_buffers, vsa_slot % 2),
                         self._vsa_exchange,
                         self._vsa_operators,
                     )
-                    vsa_slot += 1
 
                 if isinstance(child, Attention):
                     state = table = None
@@ -687,7 +608,7 @@ class ExecutionContext(Generic[SizeT]):
             return None
 
         key = (
-            parallel.key_group,
+            parallel.context_group,
             rows,
             layer.local_kv_heads,
             layer.head_dim,
@@ -700,7 +621,6 @@ class ExecutionContext(Generic[SizeT]):
                 heads=layer.local_kv_heads,
                 head_dim=layer.head_dim,
                 dtype=dtype,
-                block_size=1,
             )[parallel]
 
         buffers = self._context_backing[key]
@@ -853,12 +773,8 @@ class ExecutionContext(Generic[SizeT]):
             scope.enter_context(stream_collective_scope(collectives))
             if self._transfers is not None:
                 scope.enter_context(self._transfers.activate())
-            from uniserve.nn.attention._parallel import (
-                context_scope,
-                output_scope,
-            )
+            from uniserve.nn.attention._parallel import context_scope
 
-            scope.enter_context(output_scope(self._vsa_output))
             scope.enter_context(context_scope(self._vsa_context))
             _install(scope, _binding.matmul, self._operators)
             _install(scope, _binding.merged_matmul, self._merged)
@@ -867,7 +783,7 @@ class ExecutionContext(Generic[SizeT]):
             _install(scope, _binding.moe, self._moe)
             _install(scope, _binding.attention_storage, self._exchange)
             _install(scope, _binding.linear_chunks, self._chunks)
-            _install(scope, _binding.spatial_tiles, self._tiles)
+            _install(scope, _binding.tile_operators, self._tiles)
             if self.weights is not None:
                 scope.enter_context(self.weights.activate())
             yield
@@ -907,17 +823,16 @@ class ExecutionContext(Generic[SizeT]):
                 self._vsa,
                 self._vsa_operators,
                 self._moe,
-                self._vsa_output,
                 self._vsa_context,
                 self._context_backing,
-                self._vsa_transport,
+                self._vsa_storage,
                 self._exchange,
                 self._chunks,
                 self._gather_pools,
             ):
                 values.clear()
             self._allocations.clear()
-            # Communicators and registered windows outlive this context: they
+            # Communicators and gather pools outlive this context: they
             # belong to its stream, and a later context on the same stream
             # reuses them rather than issuing a bootstrap its peers have no
             # reason to join.

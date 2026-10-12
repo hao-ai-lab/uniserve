@@ -17,12 +17,8 @@ from .config import Config
 # come from the SigLIP config, so its inputs hold whole patches.
 _BAGEL_VIT_MIN_SIZE = 224
 
-# The VAE stride is one flow token in pixels (autoencoder downsample times
-# latent patch size) for BAGEL's default config; these constants do not follow
-# ``Config``.
 _BAGEL_VAE_MIN_SIZE = 512
 _BAGEL_VAE_MAX_SIZE = 1024
-_BAGEL_VAE_STRIDE = 16
 
 # Both towers share one per-image pixel budget.
 _BAGEL_MAX_IMAGE_PIXELS = 14 * 14 * 9 * 1024
@@ -47,7 +43,9 @@ def image_processor(config: Config) -> ImageProcessor:
             resize=StrideResize(
                 max_size=_BAGEL_VAE_MAX_SIZE,
                 min_size=_BAGEL_VAE_MIN_SIZE,
-                stride=_BAGEL_VAE_STRIDE,
+                # One flow token in pixels: the autoencoder's downsampling
+                # times the latent patch size.
+                stride=config.vae.downsample * config.latent_patch_size,
                 max_pixels=_BAGEL_MAX_IMAGE_PIXELS,
             ),
         ),
@@ -60,6 +58,6 @@ def image_processor(config: Config) -> ImageProcessor:
     )
 
 
-# BAGEL has no guidance prompt framing beyond its chat template. Without one,
-# the worker's ``resolve_prefix`` rejects a generation prompt override.
+# BAGEL has no guidance prompt framing beyond its chat template: its
+# unconditional prefix is the request's negative token ids or empty.
 flow_prompt = None

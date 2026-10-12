@@ -17,12 +17,12 @@ def test_paged_kv_write_replays_dynamic_rows_in_cuda_graph(
 ):
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(71)
-    pages, page_size, heads, head_dim = 5, 4, 8, 128
+    pages, block_size, heads, head_dim = 5, 4, 8, 128
     rows = 3
     initial_k, initial_v = (
         torch.randn(
             pages,
-            page_size,
+            block_size,
             heads,
             head_dim,
             dtype=torch.bfloat16,

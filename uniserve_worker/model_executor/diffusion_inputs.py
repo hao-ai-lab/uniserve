@@ -18,7 +18,6 @@ from uniserve.diffusion import Branch, normal_noise
 from uniserve.media import image
 from uniserve.model import ImageDenoiser, LatentInput
 from uniserve.processing import BranchSource, FlowPrompt
-from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.model_executor.input_batch import AttentionRow
 
 
@@ -30,14 +29,19 @@ class ImageBuilder:
     the worker inserts a generated image into a continuing conversation.
     """
 
-    # Language positions a generated image spans in the conversation:
-    # ``uniserve_worker.execution.image`` places the closing framing token
-    # this far past the opening one, and ``uniserve_worker.execution.token``
-    # advances the request's logical position by it after the image.
-    rope_advance = 2
-
     def __init__(self, denoiser: ImageDenoiser):
         self.denoiser = denoiser
+
+    @property
+    def rope_advance(self) -> int:
+        """Language positions a generated image spans in the conversation.
+
+        ``uniserve_worker.execution.image`` places the closing marker token
+        this far past the position before the image, and
+        ``uniserve_worker.execution.token`` advances the request's logical
+        position by it after the image.
+        """
+        return self.denoiser.rope_advance
 
     @property
     def framing(self) -> int:
@@ -173,7 +177,6 @@ def resolve_prefix(
     prompt: FlowPrompt | None,
     source: BranchSource,
     *,
-    image_prompt: str,
     negative_prompt: str,
     negative_token_ids: tuple[int, ...],
     tokenizer: Any | None,
@@ -182,36 +185,22 @@ def resolve_prefix(
 
     Returns:
         The branch's prefix token ids and whether the branch instead reuses
-        the request's own conditioning KV. The conditioned branch reuses it
-        when ``image_prompt`` is blank; the negative branch uses
-        ``negative_token_ids`` when present. Otherwise the model's
-        ``FlowPrompt`` encodes the branch text (the image prompt, the negative
-        prompt, or empty text for ``BranchSource.START``), and without a
-        ``FlowPrompt`` the prefix is empty.
-
-    Raises:
-        WorkerError: An ``invalid_descriptor`` error when a non-blank
-            ``image_prompt`` targets a model without a ``FlowPrompt``.
+        the request's own conditioning KV. The conditioned branch always
+        reuses it; the negative branch uses ``negative_token_ids`` when
+        present. Otherwise the model's ``FlowPrompt`` encodes the branch text
+        (the negative prompt, or empty text for ``BranchSource.START``), and
+        without a ``FlowPrompt`` the prefix is empty.
     """
-    if source is BranchSource.CONDITIONING and not image_prompt.strip():
+    if source is BranchSource.CONDITIONING:
         return (), True
     if source is BranchSource.NEGATIVE_OR_START and negative_token_ids:
         return negative_token_ids, False
-
     if prompt is None:
-        if source is BranchSource.CONDITIONING:
-            raise invalid_descriptor(
-                "this model does not accept a generation prompt override"
-            )
         return (), False
 
-    if source is BranchSource.CONDITIONING:
-        text = image_prompt.strip()
-        conditioned = True
-    elif source is BranchSource.NEGATIVE_OR_START:
-        text = negative_prompt.strip()
-        conditioned = False
-    else:
-        text = ""
-        conditioned = False
-    return prompt.encode(tokenizer, text=text, conditioned=conditioned), False
+    text = (
+        negative_prompt.strip()
+        if source is BranchSource.NEGATIVE_OR_START
+        else ""
+    )
+    return prompt.encode(tokenizer, text=text), False

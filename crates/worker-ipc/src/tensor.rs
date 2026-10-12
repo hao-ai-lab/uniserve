@@ -12,9 +12,8 @@
 //! The validators here are the wire contract: the codec runs them, through
 //! `Batch::validate` and `BatchOutput::validate`, whenever it encodes or
 //! decodes a batch or a batch result. The Python worker's
-//! `uniserve_worker.protocol` package reimplements these checks and the
-//! descriptor size estimate bounded by [`MAX_TRANSFER_HANDLE_BYTES`], so the
-//! two sides must change together.
+//! `uniserve_worker.protocol` package reimplements these checks, so the two
+//! sides must change together.
 
 use super::*;
 
@@ -41,6 +40,30 @@ pub enum DType {
 }
 
 impl DType {
+    /// Every element type in declaration order, which is its discriminant.
+    pub const ALL: [Self; 7] = [
+        Self::U8,
+        Self::I32,
+        Self::I64,
+        Self::F16,
+        Self::BF16,
+        Self::F32,
+        Self::I16,
+    ];
+
+    /// Returns the spelling the Python worker's `DType` members carry.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::U8 => "u8",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::F16 => "f16",
+            Self::BF16 => "bf16",
+            Self::F32 => "f32",
+            Self::I16 => "i16",
+        }
+    }
+
     /// Storage width of one element in bytes.
     pub fn element_bytes(self) -> u64 {
         tensor_dtype(self).1
@@ -105,7 +128,7 @@ impl ShapeBound {
 }
 
 /// Identity, element type, and bounded capacity of a tensor that survives its
-/// producing computation. Actual geometry and locations are published separately.
+/// producing call. Actual geometry and locations are published separately.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TensorRef {
     /// Request that owns the value.
@@ -436,7 +459,7 @@ pub struct KvGroupTransfer {
     pub start: u32,
     /// Tokens per source page. With quantized storage it also determines how
     /// many scale rows the carried tokens span.
-    pub page_tokens: u32,
+    pub block_size: u32,
     /// Published KV tensors: keys, values, and scales when the storage is
     /// quantized, in that order.
     pub tensors: Vec<TensorTransfer>,
@@ -447,11 +470,11 @@ impl KvGroupTransfer {
     fn validate(&self, base_extent: u32, published_extent: u32) -> ValidationResult<()> {
         let Self {
             start,
-            page_tokens,
+            block_size,
             tensors,
         } = self;
         ensure_valid!(
-            *page_tokens > 0 && base_extent <= *start && *start <= published_extent,
+            *block_size > 0 && base_extent <= *start && *start <= published_extent,
             "KV group transfer interval is invalid"
         );
         ensure_valid!(
@@ -497,8 +520,8 @@ impl KvGroupTransfer {
             // holds `start`, so a partially filled boundary page contributes
             // its already installed tokens to the count.
             let scales = &tensors[2];
-            let tokens = u64::from(start % page_tokens) + u64::from(published_extent - start);
-            let pages = tokens.div_ceil(u64::from(*page_tokens));
+            let tokens = u64::from(start % block_size) + u64::from(published_extent - start);
+            let pages = tokens.div_ceil(u64::from(*block_size));
             ensure_valid!(
                 scales.shape.len() == 4
                     && scales.shape[..3] == [pages, 2, key.shape[1]]
@@ -547,9 +570,6 @@ pub struct KvTransfer {
 impl KvTransfer {
     /// Validate source/base identities and every group's raw K/V/scale
     /// geometry, including rank shards.
-    ///
-    /// Also bounds the descriptor by [`MAX_TRANSFER_HANDLE_BYTES`] as
-    /// estimated by [`KvTransfer::encoded_size_bound`].
     pub fn validate(&self) -> ValidationResult<()> {
         let Self {
             groups,
@@ -581,10 +601,6 @@ impl KvTransfer {
         for group in groups {
             group.validate(*base_extent, *published_extent)?;
         }
-        ensure_valid!(
-            self.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
-            "KV transfer exceeds its descriptor byte bound"
-        );
         Ok(())
     }
 
@@ -597,17 +613,6 @@ impl KvTransfer {
     /// for rebinding or pruning their locators.
     pub fn tensors_mut(&mut self) -> impl Iterator<Item = &mut TensorTransfer> {
         self.groups.iter_mut().flat_map(|group| &mut group.tensors)
-    }
-
-    /// Conservative wire size, including every shard and replica locator.
-    /// The Python worker's `KvTransfer.encoded_size_bound` computes a
-    /// parallel estimate.
-    pub fn encoded_size_bound(&self) -> usize {
-        // Each group record adds its interval and page size to the envelope.
-        transfer_encoded_size(self.tensors())
-            .saturating_add(32usize.saturating_mul(self.groups.len()))
-            .saturating_add(self.destination.len())
-            .saturating_add(self.compute_dtype.len())
     }
 
     /// Merge reports for one immutable publication without exposing a partial update.
@@ -626,7 +631,7 @@ impl KvTransfer {
                 && self.compute_dtype == other.compute_dtype
                 && self.groups.len() == other.groups.len()
                 && self.groups.iter().zip(&other.groups).all(|(left, right)| {
-                    left.start == right.start && left.page_tokens == right.page_tokens
+                    left.start == right.start && left.block_size == right.block_size
                 }),
             "KV locations disagree on publication metadata"
         );
@@ -690,8 +695,8 @@ pub enum TransferHandle {
         width: u32,
         /// Logical latent allocation units.
         latent_units: u32,
-        /// Denoising step represented by the tensor.
-        step: u32,
+        /// Denoising step index represented by the tensor.
+        step_index: u32,
         /// Published latent tensor.
         tensor: TensorTransfer,
     },
@@ -720,74 +725,10 @@ impl TransferHandle {
         }
     }
 
-    /// Conservative size bound for the complete wire descriptor, including replicas.
-    pub fn encoded_size_bound(&self) -> usize {
-        transfer_encoded_size(self.tensors())
-    }
-
     /// Returns every physical shard and replica carried by this product.
     pub fn locators(&self) -> impl Iterator<Item = &Locator> {
         self.tensors().iter().flat_map(|tensor| &tensor.locations)
     }
-}
-
-/// Conservative estimate of a descriptor's encoded size, used to enforce
-/// [`MAX_TRANSFER_HANDLE_BYTES`].
-///
-/// The integer constants are per-record overhead allowances rather than exact
-/// FlatBuffers sizes; only string and list lengths are measured. The Python
-/// worker checks its own estimate, `_tensor_transfers_size`, when it commits a
-/// call's outputs; a Python estimate below this one lets the worker emit a
-/// descriptor that this side rejects.
-fn transfer_encoded_size<'a>(tensors: impl IntoIterator<Item = &'a TensorTransfer>) -> usize {
-    let mut size = 512usize;
-    for tensor in tensors {
-        size = size
-            .saturating_add(64)
-            .saturating_add(8usize.saturating_mul(tensor.shape.len()));
-        for location in &tensor.locations {
-            let source = &location.source;
-            size = size
-                .saturating_add(256)
-                .saturating_add(location.dtype.len())
-                .saturating_add(location.device.len())
-                .saturating_add(16usize.saturating_mul(location.shape.len()))
-                .saturating_add(source.worker_id.len())
-                .saturating_add(source.node.len())
-                .saturating_add(source.address_space.len())
-                .saturating_add(source.incarnation.len());
-            let native = match &location.transport {
-                TransferTransport::Local { endpoint, .. } => endpoint.len().saturating_add(16),
-                TransferTransport::PosixShm { endpoint, name } => {
-                    endpoint.len().saturating_add(name.len()).saturating_add(16)
-                }
-                TransferTransport::CudaVmm {
-                    endpoint,
-                    publication_id,
-                    ready_event_handle,
-                    allocation_handle,
-                    tensor_stride,
-                    span_lengths,
-                    storage_offsets_bytes,
-                    ..
-                } => endpoint
-                    .len()
-                    .saturating_add(publication_id.len())
-                    .saturating_add(ready_event_handle.len())
-                    .saturating_add(allocation_handle.len())
-                    .saturating_add(8usize.saturating_mul(tensor_stride.len()))
-                    .saturating_add(8usize.saturating_mul(storage_offsets_bytes.len()))
-                    .saturating_add(12usize.saturating_mul(span_lengths.len()))
-                    .saturating_add(64),
-                // The bytes are the product, not the handle: their budget is
-                // the channel's capacity and the rank channel's message caps,
-                // so only the locator's framing counts toward the handle bound.
-                TransferTransport::Channel { endpoint, .. } => endpoint.len().saturating_add(24),
-            };
-            size = size.saturating_add(native);
-        }
-    }
-    size
 }
 
 /// Appends `source`'s locators to the matching tensors of `destination`,
@@ -836,9 +777,9 @@ impl TensorPublication {
     ///
     /// The engine merges reports of one product, such as per-rank reports,
     /// this way. The product identities and the variant's semantic metadata
-    /// must match, and the merged publication must stay within
-    /// [`MAX_TRANSFER_HANDLE_BYTES`] and pass [`TensorPublication::validate`];
-    /// on any error `self` is left unchanged.
+    /// must match, and the merged publication must pass
+    /// [`TensorPublication::validate`]; on any error `self` is left
+    /// unchanged.
     pub fn merge_locations(&mut self, other: &Self) -> ValidationResult<()> {
         ensure_valid!(
             self.product == other.product,
@@ -880,31 +821,27 @@ impl TensorPublication {
                     height,
                     width,
                     latent_units,
-                    step,
+                    step_index,
                     ..
                 },
                 TransferHandle::Latent {
                     height: other_height,
                     width: other_width,
                     latent_units: other_latent_units,
-                    step: other_step,
+                    step_index: other_step_index,
                     ..
                 },
             ) => {
                 height == other_height
                     && width == other_width
                     && latent_units == other_latent_units
-                    && step == other_step
+                    && step_index == other_step_index
             }
             _ => false,
         };
         ensure_valid!(agrees, "product locations disagree on semantic metadata");
         let mut candidate = self.clone();
         merge_tensor_locations(candidate.value.tensors_mut(), other.value.tensors())?;
-        ensure_valid!(
-            candidate.value.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
-            "merged tensor locations exceed their descriptor byte bound"
-        );
         candidate.validate()?;
         *self = candidate;
         Ok(())
@@ -916,12 +853,6 @@ impl TensorPublication {
         validate_transfer_handle(&self.product, &self.value)
     }
 }
-
-/// Maximum estimated encoded size in bytes of one transfer descriptor, as
-/// computed by `TransferHandle::encoded_size_bound` and
-/// `KvTransfer::encoded_size_bound`. The Python worker's
-/// `uniserve_worker.protocol.transfer` module defines the same value.
-pub const MAX_TRANSFER_HANDLE_BYTES: usize = 64 * 1024;
 
 impl Locator {
     /// Validates common tensor bounds and transport-specific opening metadata.
@@ -999,12 +930,6 @@ impl Locator {
                         && tensor_stride.iter().all(|stride| *stride >= 0),
                     "CUDA VMM transfer handle is incomplete"
                 );
-                let opaque_bytes = ready_event_handle.len() + allocation_handle.len();
-
-                ensure_valid!(
-                    opaque_bytes <= MAX_TRANSFER_HANDLE_BYTES,
-                    "CUDA VMM transfer handles exceed their byte bound"
-                );
             }
             TransferTransport::Channel { endpoint, payload } => {
                 ensure_valid!(!endpoint.is_empty(), "channel transfer endpoint is empty");
@@ -1024,8 +949,7 @@ impl Locator {
 ///
 /// Checks the variant's semantic metadata, then the tensor's locators, dtype,
 /// and actual shape against `product`, then the logical byte size against the
-/// product's byte bound, and finally the descriptor size estimate against
-/// [`MAX_TRANSFER_HANDLE_BYTES`].
+/// product's byte bound.
 fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> ValidationResult<()> {
     // Product-family metadata must agree before inspecting physical locators.
     match handle {
@@ -1112,10 +1036,6 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
     ensure_valid!(
         total_bytes <= byte_bound,
         "transfer values exceed their product byte bound"
-    );
-    ensure_valid!(
-        handle.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
-        "transfer handle exceeds its byte bound"
     );
     Ok(())
 }

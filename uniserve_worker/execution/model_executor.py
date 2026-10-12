@@ -90,12 +90,13 @@ from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.config.execution import LaneConfig, WorkerConfig
 from uniserve_worker.errors import (
     ComputeError,
+    ErrorCode,
     InputError,
     ResourceError,
     WorkerError,
-    WorkerErrorCode,
     classify,
     invalid_descriptor,
+    unsupported_setup,
 )
 from uniserve_worker.execution.conditions import (
     CONDITION_PRODUCTS,
@@ -305,7 +306,7 @@ class ModelExecutor:
         # method) borrow on that entry's stream; see ``prepare_module``.
         self._module_scratch: dict[tuple[str, str, str], Scratch] = {}
         # Replays of the still-frame tile encodings startup captured, by
-        # ``SpatialEncoder``; every context prepared afterwards binds them
+        # ``TiledEncoder``; every context prepared afterwards binds them
         # (see ``capture_tiles``).
         self._tile_operators: dict[
             nn.Module, Callable[[torch.Tensor], torch.Tensor]
@@ -343,7 +344,7 @@ class ModelExecutor:
         # An expert-only rank's executions, one per microbatch exchange.
         self._expert_executions: tuple[Execution, ...] = ()
         # A standalone denoiser's component, binding and call, the request
-        # bank and latent pool its ladders gather through, and the one
+        # bank and latent pool its bound steps gather through, and the one
         # runner that serves every layout the media builder admits.
         self._denoiser = None
         self.diffusion_bank: Mapping[str, torch.Tensor] = {}
@@ -429,9 +430,7 @@ class ModelExecutor:
             )
         ]
         if len(calls) != 1:
-            raise InputError(
-                f"computation {kind.value} requires one local capability"
-            )
+            raise InputError(f"call {kind.value} requires one local capability")
         return calls[0].module
 
     def _module_call(self, name, method=None, path=None):
@@ -443,7 +442,7 @@ class ModelExecutor:
         executor is closed and ``InputError`` unless exactly one call matches.
         """
         if self._closed:
-            raise RuntimeError("model runner is closed")
+            raise RuntimeError("model executor is closed")
         entries = [
             (binding, call)
             for (entry, entry_path, entry_method), (
@@ -604,9 +603,6 @@ class ModelExecutor:
                 owner = CUDAStream(
                     device=binding.device,
                     stream=torch.cuda.Stream(device=binding.device),
-                    sm_count=torch.cuda.get_device_properties(
-                        binding.device
-                    ).multi_processor_count,
                 )
             # Weights and runtime backing are initialized before their first
             # borrowed use. Later calls depend on tensor fences, not other
@@ -735,9 +731,6 @@ class ModelExecutor:
                             CUDAStream(
                                 device=target,
                                 stream=torch.cuda.Stream(device=target),
-                                sm_count=torch.cuda.get_device_properties(
-                                    target
-                                ).multi_processor_count,
                                 event_slots=event_slots,
                             ),
                         )
@@ -1003,13 +996,13 @@ class ModelExecutor:
 
     @property
     def denoises(self) -> bool:
-        """Whether this rank advances a standalone denoiser's ladders."""
+        """Whether this rank advances a standalone denoiser's bound steps."""
         return self._denoiser is not None
 
     def bind_diffusion_storage(
         self, bank: Mapping[str, torch.Tensor], pool: LatentPool
     ) -> None:
-        """Borrow the storage the standalone denoiser's ladders gather.
+        """Borrow the storage the standalone denoiser's bound steps gather.
 
         The request bank holds each request's state and the latent pool its
         samples. The runner borrows both when it is built, so they are bound
@@ -1053,7 +1046,7 @@ class ModelExecutor:
         policy and the component's stream allow.
         """
         if self._denoiser is None or self.latent_pool is None:
-            raise InputError("rank does not own denoising computation")
+            raise InputError("rank does not own denoising call")
         if self._diffusion is None:
             builder = cast("MediaBuilder", self.media_builder)
             name, binding, call = self._denoiser
@@ -1129,8 +1122,8 @@ class ModelExecutor:
         serving[layout] = None
         return entry
 
-    def run_denoising(self, ladder, index, bank):
-        """Run one denoising step of a bound ladder and time it.
+    def run_denoising(self, steps, index, bank):
+        """Run one denoising step of bound steps and time it.
 
         ``bank`` holds the request's committed samples; see
         ``DiffusionRunner.step``.
@@ -1141,7 +1134,7 @@ class ModelExecutor:
             f"uniserve.model.denoise rank={self.worker_config.rank} "
             "work=denoiser"
         ):
-            values, path = runner.step(ladder, index, bank)
+            values, path = runner.step(steps, index, bank)
         return replace(
             ModelRunner.result(values),
             stats=_observations("denoiser", started, path),
@@ -1288,14 +1281,14 @@ class ModelExecutor:
         """Bind staged input resources and graph budgets for every capability.
 
         Creates one capability runner per (entry, path, lane) covering a
-        computation kind, with its input buffers, execution context, decode /
+        call kind, with its input buffers, execution context, decode /
         prefill capture shapes, and CUDA graph storage pools: private ones,
         except that the text and canvas runners of one lane stream share
         theirs. Prefill buckets reach the text tokens ``input_config`` stages
         per call, and ``max_calls`` and ``request_slots`` bound their live
         rows. Callable once: a second call raises ``RuntimeError`` when the
         first bound any entry. Raises ``ValueError`` when two staged entries
-        of one component cover the same computation kind, and as
+        of one component cover the same call kind, and as
         ``_initialize_streams`` does.
         """
         from uniserve_worker.model_executor.canvas_runner import (
@@ -1328,13 +1321,7 @@ class ModelExecutor:
         # plus one image's feature span, and at most the tokens the pool's
         # units cover.
         max_rows = min(max_calls, request_slots)
-        pool_rows = (kv_cache.info.num_units - 1) // kv_cache.row_units
-        decode_sizes = decode_captures(
-            config,
-            max_rows=max_rows,
-            row_units=kv_cache.row_units,
-            num_units=kv_cache.info.num_units,
-        )
+        pool_rows = (kv_cache.num_units - 1) // kv_cache.row_units
         feature_injection = (
             self.processor is not None
             and self.processor.feature_injection is not None
@@ -1342,7 +1329,9 @@ class ModelExecutor:
         if self.image_builder is not None:
             from uniserve.media import image
 
-            self.flow_cfg_branches = (1, 2, 3)
+            self.flow_cfg_branches = tuple(
+                range(1, self.image_builder.denoiser.guidance_branches + 1)
+            )
             self.flow_captures = select_flow_captures(
                 config.flow_graph_shapes,
                 config.flow_graph_batch_sizes,
@@ -1419,27 +1408,18 @@ class ModelExecutor:
                     if lane is None
                     else min(max_rows, lane.max_batch_calls or max_rows)
                 )
-                # Graph pools exist only on CUDA, where every decode call
-                # replays a captured bucket; a lane with none can serve no
-                # decode call there.
+                # Graph pools exist only on CUDA; a decode or prefill call
+                # no captured bucket holds runs eagerly.
                 decode = (
-                    tuple(value for value in decode_sizes if value <= rows)
+                    decode_captures(
+                        config,
+                        max_rows=rows,
+                        row_units=kv_cache.row_units,
+                        num_units=kv_cache.num_units,
+                    )
                     if ForwardMode.DECODE in kinds and target.type == "cuda"
                     else ()
                 )
-                if (
-                    ForwardMode.DECODE in kinds
-                    and target.type == "cuda"
-                    and config.graph_policy != "off"
-                    and not decode
-                ):
-                    raise ValueError(
-                        f"no configured decode graph size fits {rows} rows "
-                        f"and a KV pool of {kv_cache.info.num_units} units, "
-                        f"whose rows hold {kv_cache.row_units} units each"
-                    )
-                # Graph pools exist only on CUDA, where every prefill call
-                # replays a captured bucket.
                 prefill = (
                     prefill_captures(
                         config,
@@ -1453,10 +1433,10 @@ class ModelExecutor:
                         device_causality=self.attention.device_causality,
                         pool=(
                             tuple(
-                                (group.page_tokens, group.units_per_page)
+                                (group.block_size, group.units_per_page)
                                 for group in kv_cache.shapes
                             ),
-                            kv_cache.info.num_units - 1,
+                            kv_cache.num_units - 1,
                         ),
                     )
                     if ForwardMode.PREFILL in kinds and target.type == "cuda"
@@ -1528,7 +1508,7 @@ class ModelExecutor:
                             else None,
                             weights=self.expert_weights,
                         )
-                        # Text staging counts canonical tokens. Spatial codecs
+                        # Text staging counts canonical tokens. VAEs
                         # and vision towers expand those into different query
                         # domains, so their layer plans use the actual numerical
                         # shapes encountered during preparation/eager execution.
@@ -1609,7 +1589,7 @@ class ModelExecutor:
                         continue
                     if key in self._forward_calls:
                         raise ValueError(
-                            f"computation {key} has multiple lane bindings"
+                            f"call {key} has multiple lane bindings"
                         )
                     self._forward_calls[key] = entry
             if token_runner and self.worker_config.expert_microbatches > 1:
@@ -1755,14 +1735,11 @@ class ModelExecutor:
         )
 
     def _bind_expert_steps(self):
-        """Bind forwards reaching experts to a common transfer catalog.
+        """Bind forwards reaching experts to the exchange's transfer catalog.
 
         Every local numerical graph captures the transfer capacities that
-        hold its tokens. All ranks must share the same catalog, including
-        ranks whose next step has no local work.
-
-        Raises:
-            RuntimeError: The ranks' step plans differ.
+        hold its tokens. The deployment gives every rank the same catalog,
+        including ranks whose next step has no local work.
         """
         exchange = self.experts
         if exchange is None:
@@ -1780,29 +1757,6 @@ class ModelExecutor:
                 peer.expert_step = True
                 peer.expert_order = len(self._expert_runners)
             self._expert_runners.append(entry)
-
-        # Warmup executes collectives too. Equal transfer catalogs alone do
-        # not establish that peers capture the same local numerical calls.
-        plan = (
-            exchange.capacities,
-            self.worker_config.expert_microbatches,
-            tuple(entry.capture_plan() for entry in self._expert_runners),
-        )
-        plans = [None] * exchange.group.size
-        torch.distributed.all_gather_object(
-            plans, plan, group=exchange.group._require()
-        )
-        sources = (
-            plans[: exchange.attention_ranks]
-            if exchange.attention_ranks
-            else plans
-        )
-        if any(other != sources[0] for other in sources) or any(
-            other[:2] != sources[0][:2] for other in plans
-        ):
-            raise RuntimeError(
-                f"expert-parallel ranks have different capture plans: {plans}"
-            )
 
     def join_expert_step(self, *, leaving: bool = False) -> bool:
         """Take part in the next expert step when this rank has no forward.
@@ -1846,6 +1800,30 @@ class ModelExecutor:
                     stream.stream
                 )
         return True
+
+    def output_rank(self, component: str) -> int:
+        """Return the rank that publishes a component's host products.
+
+        Host products belong to the component's first member rank, the rank
+        whose reports the engine's `WorkerGroup` joins a call's results on
+        whenever the call runs there. A call whose units are dealt to other
+        ranks publishes no host product, and the engine joins it on the
+        first rank it is dealt to. Cooperative numerical outputs may reside
+        on other ranks. A single-rank worker without the component resolves
+        to rank 0.
+
+        Raises:
+            WorkerError: `unsupported_setup` when the component is not
+                configured and the worker has more than one rank.
+        """
+        binding = self.bindings.get(component)
+        if binding is not None:
+            return binding.config.ranks[0]
+        if self.worker_config.world_size == 1:
+            return 0
+        raise unsupported_setup(
+            f"component {component!r} has no publication owner"
+        )
 
     def call_devices(self, call):
         """Return ``(compute, staged, output)`` devices for one call.
@@ -2041,15 +2019,14 @@ class ModelExecutor:
                 entry.peers[index].microbatch_joins = joins
 
     def complete_startup(self):
-        """Seal startup: check captured-graph storage budgets and stream grants.
+        """Seal startup: check captured-graph storage budgets.
 
         Afterwards no runner captures: the staged entries capture no
         further batch graphs, module entries, including ones prepared later,
         evaluate signatures without a resident graph eagerly, and the
         denoiser runner refuses capture (see ``ModelRunner``), so the graph
         storage is sealed (``GraphStorage.seal``). Raises ``CUDAGraphError``
-        when graph residency exceeds its budget, and ``CUDAError`` when a
-        lane stream has lost its SM partition.
+        when graph residency exceeds its budget.
         """
         self.graph_storage.check()
         # Resident storage by device and, for graph pools, by runner kind,
@@ -2086,8 +2063,6 @@ class ModelExecutor:
                 used / 2**30,
             )
 
-        for _, stream in self._lane_streams:
-            stream.verify()
         self.graph_storage.seal()
 
         # Warmup and capture have now prepared the call sites and resolved
@@ -2128,7 +2103,7 @@ class ModelExecutor:
         did not exercise choose their kernels while serving. The process's
         choice count keeps the check per call to one integer comparison;
         records are gathered only after it changes, and the table is logged
-        only when they include a new call site or kernel (a computation
+        only when they include a new call site or kernel (a call
         prepared again at another size repeats known records).
         """
         choices = kernel_choices()
@@ -2215,7 +2190,7 @@ class ModelExecutor:
         if aborted:
             from uniserve.runtime.resources import retain_until_exit
 
-            # Each stream owner retains its communicators, windows and native
+            # Each stream owner retains its communicators and native
             # stream without waiting for peers or the device.
             retain_until_exit(self)
             close_resources(
@@ -2290,16 +2265,14 @@ class ModelExecutor:
         # The token buffer holds the longest prompt at its text capacity.
         return runner.prepare_tokens(
             tokens,
-            capacity=self._text_capacity(
-                self.worker_config.max_sequence_tokens
-            ),
+            capacity=self._text_capacity(self.worker_config.max_model_len),
         )
 
     @contextmanager
     def preparing_inputs(
         self, transfers: tuple[tuple[torch.Tensor, torch.Tensor], ...]
     ) -> Iterator[None]:
-        """Overlap reserved input copies with computation, then join order.
+        """Overlap reserved input copies with call, then join order.
 
         Each ``(destination, source)`` pair is copied on the executor's
         preparation stream while the body runs on the current stream. The
@@ -2481,10 +2454,10 @@ class ModelExecutor:
         ``_execution_failure`` classifies when execution or validation fails.
         """
         if self._closed:
-            raise RuntimeError("model runner is closed")
+            raise RuntimeError("model executor is closed")
         tasks = rows
         if not tasks:
-            raise ValueError("model runner received an empty call")
+            raise ValueError("model executor received an empty call")
 
         # Only token forward modes and denoising are eligible for CUDA graphs;
         # other staged kinds run eagerly.
@@ -2513,7 +2486,7 @@ class ModelExecutor:
         entry = self._forward_calls.get((calls[0].component, forward_mode))
         if entry is None:
             raise InputError(
-                f"model runner has no {calls[0].kind.value!r} binding "
+                f"model executor has no {calls[0].kind.value!r} binding "
                 f"for {calls[0].component!r}",
                 phase="input_staging",
                 route=forward_mode.value,
@@ -2600,7 +2573,6 @@ class ModelExecutor:
                             eligible=graph_eligible,
                             borrow_output=borrow_output,
                         )
-                        output.validate_for(populated[0])
                     else:
                         output = entry.run_microbatches(
                             batches,
@@ -2736,8 +2708,8 @@ def _execution_failure(
         return error
     classified = classify(error)
     if isinstance(error, CUDAGraphError) or classified.code in {
-        WorkerErrorCode.RESOURCE_ERROR,
-        WorkerErrorCode.FATAL_WORKER_FAILURE,
+        ErrorCode.RESOURCE_ERROR,
+        ErrorCode.FATAL_WORKER_FAILURE,
     }:
         return ResourceError(
             str(error) or type(error).__name__,

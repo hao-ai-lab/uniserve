@@ -173,9 +173,7 @@ def generate(
         )
         for name, value in request.items():
             value.copy_(staged[name])
-        schedules = denoiser.make_schedules(
-            denoiser.num_steps, shift=None, device=device
-        )
+        schedules = denoiser.make_schedules(device=device)
         samples = {name: request[name] for name in denoiser.modalities}
         for step in range(denoiser.num_steps):
             inputs = DenoiserInput(
@@ -211,28 +209,28 @@ def generate(
             for name, config in postprocessor.state_buffers(output).items()
         }
         prepared = None
-        for window in decoder.frame_slices(num_frames):
-            # Each window is unpacked from the whole latent and decoded at
-            # its segment, which the context is prepared for.
-            segment = decoder.segment(output, window)
-            if segment != prepared:
-                decoding.prepare(segment)
-                prepared = segment
-            config = decoder.window_input(segment)
-            window_latents = torch.empty(
+        for clip in decoder.clips(num_frames):
+            # Each clip's input is unpacked from the whole latent and decoded
+            # at its clip output, which the context is prepared for.
+            clip_output = decoder.clip_output(output, clip)
+            if clip_output != prepared:
+                decoding.prepare(clip_output)
+                prepared = clip_output
+            config = decoder.clip_input(clip_output)
+            clip_input = torch.empty(
                 config.shape, dtype=config.dtype, device=device
             )
             decoder.unpack_latents(
-                latents["video"], window, output, out=window_latents
+                latents["video"], clip, output, out=clip_input
             )
             with decoding.activate():
                 (decoded,) = decoder.decode(
-                    (window_latents,), segments=(segment,)
+                    (clip_input,), clip_outputs=(clip_output,)
                 )
             with processing.activate():
                 rgb = postprocessor(
-                    (decoder.place(decoded, window, output),),
-                    frames=(window,),
+                    (decoder.place(decoded, clip, output),),
+                    clips=(clip,),
                     sizes=(output,),
                     state=overlap,
                     constants=processing.constants,

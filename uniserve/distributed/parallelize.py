@@ -11,7 +11,6 @@ from torch.distributed.tensor import Replicate, Shard
 from uniserve.nn.attention._parallel import ParallelAttention
 from uniserve.nn.attention.config import AttentionParallelConfig
 from uniserve.nn.attention.layer import Attention
-from uniserve.nn.attention.vsa import Attention as VsaAttention
 from uniserve.nn.attention.vsa import SegmentAttention
 from uniserve.nn.linear import (
     ColumnParallelLinear,
@@ -78,7 +77,7 @@ def _communication_axes(module, mesh, attention):
         if isinstance(child, (Denoiser, TransformerDecoder)):
             add("pp")
             add(*tokens)
-        if isinstance(child, (Attention, VsaAttention, SegmentAttention)):
+        if isinstance(child, (Attention, SegmentAttention)):
             add(head)
             add(context)
         if isinstance(child, FusedMoE):
@@ -465,33 +464,19 @@ def parallelize_(
                         "VSA cannot change its mathematical partition"
                     )
                 continue
-            # Segment VSA attends the complete sequence for this rank's head
-            # shard and returns rows to their Ulysses owners; it has no
-            # context partition of its keys.
-            if attention.context is not None:
-                raise ValueError("segment VSA has no context partition")
+            # Segment VSA attends its context interval's queries to the keys
+            # of the whole sequence for this rank's head shard and returns
+            # rows to their Ulysses owners.
             child.exchange = HeadExchange(
                 mesh.get_group(
                     () if attention.heads is None else attention.heads.axis
                 )
             )
-            child._parallel_mesh, child._attention_parallel = mesh, attention
-            continue
-        if isinstance(child, VsaAttention):
-            bound = getattr(child, "_parallel_mesh", None)
-            if bound is not None and (
-                bound != mesh or child._attention_parallel != attention
-            ):
-                raise ValueError("VSA cannot change its mathematical partition")
-            if bound is None:
-                child.mesh = mesh
-                child.parallel = ParallelAttention(
+            if attention.context is not None:
+                child.context_parallel = ParallelAttention(
                     mesh=mesh, parallel=attention
                 )
-                child._parallel_mesh, child._attention_parallel = (
-                    mesh,
-                    attention,
-                )
+            child._parallel_mesh, child._attention_parallel = mesh, attention
             continue
         if isinstance(child, Attention):
             bound = getattr(child, "_parallel_mesh", None)

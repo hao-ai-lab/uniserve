@@ -34,7 +34,7 @@ occupy the GPU with 256-row tiles.
 
 Key tiles. A work tile streams 128-key tiles: prefix tiles first, then the
 tiles of its own block. Prefix tiles start at the page containing the
-tile's smallest lower bound; each is assembled from ``128 / page_tokens``
+tile's smallest lower bound; each is assembled from ``128 / block_size``
 page slots. Each CTA stages the 64 keys of its K half per 128-wide head-dim
 chunk, and its contiguous head-dim half of V per pair of chunks and 64-key
 half of the tile. Every stage is 64 rows by two 64-dim swizzle atoms,
@@ -167,7 +167,7 @@ class PrefixBlockAttentionSm100:
             128 at head dim 512.
         group_size: Query heads per KV head ``G``; must divide the CTA rows
             (``tile_rows / 2``).
-        page_tokens: Tokens per cache page; 16, 32 or 64.
+        block_size: Tokens per cache page; 16, 32 or 64.
         query_window: If true, row ``i`` of a block reads prefix keys from
             ``P + i - window`` (an image block whose history window follows
             the query position); otherwise every row reads from
@@ -195,7 +195,7 @@ class PrefixBlockAttentionSm100:
         head_dim: int,
         tile_rows: int,
         group_size: int,
-        page_tokens: int,
+        block_size: int,
         query_window: bool,
         has_window: bool,
         has_prefix_start: bool,
@@ -212,12 +212,12 @@ class PrefixBlockAttentionSm100:
                 "tile_rows must be 256 or 128 at head_dim 256 and 128 at "
                 "head_dim 512"
             )
-        if page_tokens not in (16, 32, 64):
-            raise ValueError("page_tokens must be 16, 32 or 64")
+        if block_size not in (16, 32, 64):
+            raise ValueError("block_size must be 16, 32 or 64")
 
         self.head_dim = head_dim
         self.group_size = group_size
-        self.page_tokens = page_tokens
+        self.block_size = block_size
         self.query_window = query_window
         self.has_window = has_window
         self.has_prefix_start = has_prefix_start
@@ -255,8 +255,8 @@ class PrefixBlockAttentionSm100:
         # stage is filled by TMA boxes of (64 dims, rows, 2 atoms).
         self.atom_dims = 64
         self.half_keys = self.tile_keys // 2
-        self.slots_per_tile = self.tile_keys // page_tokens
-        self.slots_per_half = self.half_keys // page_tokens
+        self.slots_per_tile = self.tile_keys // block_size
+        self.slots_per_half = self.half_keys // block_size
         # A CTA's V head dims are the contiguous half [v * D / 2, (v + 1) *
         # D / 2): PV chunk c's column n is head dim (n // 64) * D / 2 + 64 c
         # + n % 64. A V stage holds two consecutive chunks of one 64-key
@@ -343,7 +343,7 @@ class PrefixBlockAttentionSm100:
         """Build tensor views and TMA descriptors, then launch the kernel.
 
         ``query``/``output`` are ``[tokens, Hq, D]``, ``key``/``value``
-        ``[tokens, Hkv, D]``, caches ``[pages, page_tokens, Hkv, D]``,
+        ``[tokens, Hkv, D]``, caches ``[pages, block_size, Hkv, D]``,
         ``block_table`` ``[B, W]`` int32, ``query_offsets`` ``[B + 1]``,
         ``prefix_lengths``/``start_page``/``prefix_start`` ``[B]`` int32 and
         ``lse`` ``[tokens, Hq]`` FP32. ``num_m_blocks`` bounds the work tiles
@@ -413,7 +413,7 @@ class PrefixBlockAttentionSm100:
             cute.make_layout(
                 (
                     self.atom_dims,
-                    self.page_tokens,
+                    self.block_size,
                     atoms,
                     kv_heads,
                     key_cache.shape[0],
@@ -432,7 +432,7 @@ class PrefixBlockAttentionSm100:
             cute.make_layout(
                 (
                     self.atom_dims,
-                    self.page_tokens,
+                    self.block_size,
                     atoms,
                     kv_heads,
                     value_cache.shape[0],
@@ -516,10 +516,10 @@ class PrefixBlockAttentionSm100:
                 stride=(1, self.atom_dims, self.atom_dims * self.half_keys),
             ),
         )
-        # A page slot is page_tokens rows of a stage: one TMA box when the
+        # A page slot is block_size rows of a stage: one TMA box when the
         # slot fills the stage, one per atom otherwise.
-        slot = cute.composition(ring, (self.atom_dims, self.page_tokens, 2))
-        slot_tile = (self.atom_dims, self.page_tokens, 2)
+        slot = cute.composition(ring, (self.atom_dims, self.block_size, 2))
+        slot_tile = (self.atom_dims, self.block_size, 2)
         stage_tile = (self.atom_dims, self.half_keys, 2)
 
         load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
@@ -671,11 +671,11 @@ class PrefixBlockAttentionSm100:
         )
 
         # Prefix tiles cover pages [lower_first // page, ceil(P / page)).
-        prefix_base = (lower_first // self.page_tokens) * self.page_tokens
+        prefix_base = (lower_first // self.block_size) * self.block_size
         prefix_tiles = Int32(0)
         if lower_first < prefix_len:
-            page_end = (prefix_len + self.page_tokens - 1) // self.page_tokens
-            prefix_span = page_end * self.page_tokens - prefix_base
+            page_end = (prefix_len + self.block_size - 1) // self.block_size
+            prefix_span = page_end * self.block_size - prefix_base
             prefix_tiles = (prefix_span + self.tile_keys - 1) // self.tile_keys
         current_tiles = (query_len + self.tile_keys - 1) // self.tile_keys
         if const_expr(self.has_causal):
@@ -1111,7 +1111,7 @@ class PrefixBlockAttentionSm100:
                 cute.make_layout(self.kv_stage, stride=cute.cosize(ring.outer)),
             ),
         )
-        slot_tile = (self.atom_dims, self.page_tokens, 2)
+        slot_tile = (self.atom_dims, self.block_size, 2)
         stage_tile = (self.atom_dims, self.half_keys, 2)
         s_slots = cute.group_modes(cute.flat_divide(s_ring, slot_tile), 0, 3)
         s_whole = cute.group_modes(cute.flat_divide(s_ring, stage_tile), 0, 3)
@@ -1258,7 +1258,7 @@ class PrefixBlockAttentionSm100:
     def lane_slots(self, key_tile: Int32, lookup):
         """Page slot ``lane`` of prefix tile ``key_tile`` for this lane.
 
-        Each lane below ``128 / page_tokens`` looks up one slot, so a tile's
+        Each lane below ``128 / block_size`` looks up one slot, so a tile's
         block table reads proceed in parallel and are shuffled to the
         issuing lane; other lanes, and tiles that are not prefix tiles,
         return an out-of-range page.
@@ -1270,7 +1270,7 @@ class PrefixBlockAttentionSm100:
         shift = Int32(0)
         if key_tile < prefix_tiles and lane < self.slots_per_tile:
             physical, shift = self.page_slot(
-                prefix_base // self.page_tokens
+                prefix_base // self.block_size
                 + key_tile * self.slots_per_tile
                 + lane,
                 batch,
@@ -1294,12 +1294,12 @@ class PrefixBlockAttentionSm100:
     ):
         """Return ``(physical page, row shift)`` for one prefix page slot.
 
-        Pages at or past ``ceil(P / page_tokens)``, and logical pages outside
+        Pages at or past ``ceil(P / block_size)``, and logical pages outside
         the sequence's block table row, map to page ``num_pages``, which the
         TMA unit reads as zeros. The last page is shifted down by its
         unwritten row count so that only written rows are read.
         """
-        page_end = (prefix_len + self.page_tokens - 1) // self.page_tokens
+        page_end = (prefix_len + self.block_size - 1) // self.block_size
         column = logical_page - first_page
         physical = num_pages
         shift = Int32(0)
@@ -1310,7 +1310,7 @@ class PrefixBlockAttentionSm100:
         ):
             physical = block_table[batch, column]
             if logical_page == page_end - 1:
-                shift = prefix_len - page_end * self.page_tokens
+                shift = prefix_len - page_end * self.block_size
         return physical, shift
 
     @no_type_check
@@ -1329,14 +1329,14 @@ class PrefixBlockAttentionSm100:
     ):
         """Copy one page slot into slot ``slot`` of a ring stage.
 
-        The box is rows ``[-shift, page_tokens - shift)`` of page
+        The box is rows ``[-shift, block_size - shift)`` of page
         ``physical`` over head-dim atoms ``2 * pair`` and ``2 * pair + 1``;
         rows before the page start read as zeros.
         """
         g = cute.domain_offset(
             (0, shift, 0, 0), tensor[None, None, None, kv_head, None]
         )
-        g = cute.flat_divide(g, (self.atom_dims, self.page_tokens, 2))
+        g = cute.flat_divide(g, (self.atom_dims, self.block_size, 2))
         smem, gmem = cpasync.tma_partition(
             atom, 0, cute.make_layout(1), s_slots, cute.group_modes(g, 0, 3)
         )
@@ -1682,11 +1682,9 @@ class PrefixBlockAttentionSm100:
                 lower = self.lower_bound(
                     query_pos, prefix_len, batch, prefix_start, window
                 )
-                page_end = (
-                    prefix_len + self.page_tokens - 1
-                ) // self.page_tokens
-                tail_start = (page_end - 1) * self.page_tokens
-                tail_shift = page_end * self.page_tokens - prefix_len
+                page_end = (prefix_len + self.block_size - 1) // self.block_size
+                tail_start = (page_end - 1) * self.block_size
+                tail_shift = page_end * self.block_size - prefix_len
                 # Prefix tokens below this bound are free of the shifted
                 # last page and its zero-filled leading rows.
                 clean_end = prefix_len
@@ -1700,7 +1698,7 @@ class PrefixBlockAttentionSm100:
                 # before the last page, [lower, tail_start), and the last
                 # page's written rows at or above the bound.
                 tail_first = cutlass.max(tail_start, lower) + tail_shift
-                tail_end = tail_start + self.page_tokens
+                tail_end = tail_start + self.block_size
 
                 row_max = -Float32.inf
                 row_sum = Float32(0.0)

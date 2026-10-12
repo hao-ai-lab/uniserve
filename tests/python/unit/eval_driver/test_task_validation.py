@@ -106,7 +106,7 @@ def test_t2i_requests_and_validation_use_exact_image_count() -> None:
     assert task.validate(records).checks["exact_image_count"] is False
 
 
-def test_interleave_sends_no_count_and_checks_point_average() -> None:
+def test_interleave_sends_no_count_and_requires_images_in_the_run() -> None:
     point = BenchmarkPoint(
         name="interleave",
         server="server",
@@ -147,9 +147,9 @@ def test_interleave_sends_no_count_and_checks_point_average() -> None:
     assert validation.statistics["images_per_request"] == 1.5
     assert validation.statistics["zero_image_requests"] == 1
 
-    multimodal.images = 2
-    multimodal.decoded_images = [image, image]
-    assert (
-        task.validate([text_only, multimodal]).checks["minimum_average_images"]
-        is False
-    )
+    # Individual answers may hold no image, but a run without any did not
+    # exercise interleaving.
+    assert task.validate([text_only]).checks["produced_images"] is False
+    multimodal.images = 1
+    multimodal.decoded_images = [image]
+    assert task.validate([text_only, multimodal]).valid is True

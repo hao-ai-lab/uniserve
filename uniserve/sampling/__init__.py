@@ -32,7 +32,6 @@ class SamplingParams:
     n_logprobs: int = 0
     return_prompt_logprobs: bool = False
     n_prompt_logprobs: int = 0
-    logprob_token_ids: tuple[int, ...] = ()
     bad_words_ids: tuple[tuple[int, ...], ...] = ()
     allowed_token_ids: tuple[int, ...] | None = None
     typical_p: float = 1.0

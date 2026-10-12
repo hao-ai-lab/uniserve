@@ -60,7 +60,7 @@ def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() 
     assert pool.reserved == 0
 
 
-def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
+def test_buffer_pool_binds_each_buffer_at_its_engine_offset() -> None:
     reference = TensorRef(
         request_key=RequestKey(1, 1, 1),
         producer_call_id=CallId(1, 0),
@@ -69,73 +69,67 @@ def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(32),)),
     )
-    second = replace(reference, producer_call_id=CallId(2, 0))
-    third = replace(reference, producer_call_id=CallId(3, 0))
-    buffers = BufferPool(byte_capacity=512, devices=("cpu",), compact=True)
-    first_binding = buffers.bind(
+    neighbour = replace(reference, producer_call_id=CallId(2, 0))
+    beyond = replace(reference, producer_call_id=CallId(3, 0))
+    buffers = BufferPool(byte_capacity=512, devices=("cpu",))
+    first = buffers.bind(
         reference,
-        BufferAllocation(reference.buffer_id, 4096, 512),
+        BufferAllocation(reference.buffer_id, 256, 128),
         device="cpu",
         dtype=torch.float32,
         shape=(32,),
     )
-    second_binding = buffers.bind(
-        second,
-        BufferAllocation(second.buffer_id, 8192, 512),
-        device="cpu",
-        dtype=torch.float32,
-        shape=(32,),
-    )
-    first_binding.tensor.fill_(1)
-    second_binding.tensor.fill_(2)
-
     try:
-        torch.testing.assert_close(
-            first_binding.tensor,
-            torch.full_like(first_binding.tensor, 1),
-            rtol=0,
-            atol=0,
-        )
-        with pytest.raises(WorkerError, match="exceeds the worker buffer pool"):
+        # The binding occupies the engine's span, not a place the pool chose.
+        first.tensor.fill_(1)
+        assert (first.offset, first.bytes) == (256, 128)
+
+        with pytest.raises(WorkerError, match="overlaps a live worker buffer"):
             buffers.bind(
-                third,
-                BufferAllocation(third.buffer_id, 12288, 512),
+                neighbour,
+                BufferAllocation(neighbour.buffer_id, 320, 128),
                 device="cpu",
                 dtype=torch.float32,
                 shape=(32,),
             )
-        buffers.release(first_binding)
-        third_binding = buffers.bind(
-            third,
-            BufferAllocation(third.buffer_id, 12288, 512),
+        with pytest.raises(WorkerError, match="exceeds the worker buffer pool"):
+            buffers.bind(
+                beyond,
+                BufferAllocation(beyond.buffer_id, 448, 128),
+                device="cpu",
+                dtype=torch.float32,
+                shape=(32,),
+            )
+
+        # A span below the live one binds beside it without disturbing it.
+        below = buffers.bind(
+            neighbour,
+            BufferAllocation(neighbour.buffer_id, 0, 128),
             device="cpu",
             dtype=torch.float32,
             shape=(32,),
         )
-        third_binding.tensor.fill_(3)
+        below.tensor.fill_(2)
         torch.testing.assert_close(
-            second_binding.tensor,
-            torch.full_like(second_binding.tensor, 2),
-            rtol=0,
-            atol=0,
+            first.tensor, torch.full_like(first.tensor, 1), rtol=0, atol=0
         )
-        buffers.release(third_binding)
+        buffers.release(below)
     finally:
-        buffers.release(second_binding)
+        buffers.release(first)
         buffers.close()
 
 
 def _table(pool, units):
     """Return a slot table of whole pages of ``units`` in the one group."""
     shape = pool.shapes[0]
-    return GroupTable(shape, 0, tuple(units), len(units) * shape.page_tokens)
+    return GroupTable(shape, 0, tuple(units), len(units) * shape.block_size)
 
 
 @pytest.mark.parametrize(
     "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
 )
 @pytest.mark.parametrize("abandoned", (False, True))
-def test_kv_computation_retains_pages_through_output_completion_and_reuse(
+def test_kv_call_retains_pages_through_output_completion_and_reuse(
     device: str, abandoned: bool
 ) -> None:
     cache = mha_pool(
@@ -146,11 +140,11 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
         total_layers=1,
         total_kv_heads=1,
         num_pages=3,
-        page_size=4,
+        block_size=4,
         device=device,
     )
     events = EventPool()
-    outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
+    outputs = OutputPool(capacity=1, event_pool=events)
     request = RequestKey(1, 1, 1)
     values = torch.arange(1, 5, dtype=torch.float32, device=device).reshape(
         4, 1, 1
@@ -180,7 +174,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
             torch.testing.assert_close(actual, independent, rtol=0, atol=0)
         assert not cache.retirement_ready(requests=(request,))
         # Releasing another product of this request does not retire its KV
-        # computation. The execution fence still protects page reuse above.
+        # call. The execution fence still protects page reuse above.
         assert cache.retirement_ready(
             buffers=(BufferId(request, CallId(2, 0), 0, 2),)
         )
@@ -229,7 +223,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
             assert torch.count_nonzero(actual).item() == 0
 
         # A subsequent lease over the same bounded output storage must retain
-        # its own computation even though the preceding future is complete.
+        # its own call even though the preceding future is complete.
         next_output = outputs.acquire(1, token_capacity=8, devices=(device,))
         next_completion = next_output.completion_future()
         cache.retain_execution(
@@ -251,7 +245,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
 def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reuse(  # noqa: E501
 ) -> None:
     events = EventPool()
-    outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
+    outputs = OutputPool(capacity=1, event_pool=events)
     transport = make_transport(
         "local", byte_capacity=4096, ticket_capacity=2, event_pool=events
     )
@@ -263,7 +257,7 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         total_layers=1,
         total_kv_heads=1,
         num_pages=5,
-        page_size=4,
+        block_size=4,
         device="cpu",
     )
     buffer = BufferId(
@@ -372,7 +366,7 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(
         )
         if storage == "encoder"
         else TensorStore(
-            capacity=1, byte_capacity=1, buffer_pool=buffers, event_pool=events
+            byte_capacity=1, buffer_pool=buffers, event_pool=events
         )
     )
     product = TensorRef(
@@ -449,7 +443,7 @@ def test_a_retired_segment_no_consumer_began_reading_returns_at_once() -> None:
     """
     events = EventPool()
     transport = make_transport(
-        "shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
     )
     try:
         value = torch.arange(8, dtype=torch.float32)
@@ -468,7 +462,6 @@ def test_a_deferred_write_commits_when_its_host_work_publishes_it() -> None:
     """A write host work fills later packs without it and commits with it."""
     buffers = BufferPool(byte_capacity=16, devices=("cpu",))
     store = TensorStore(
-        capacity=2,
         request_capacity=0,
         relay_depth=0,
         buffer_pool=buffers,
@@ -534,7 +527,6 @@ def test_resident_bytes_cover_only_storage_the_store_allocates() -> None:
     buffers = BufferPool(byte_capacity=64, devices=("cpu",))
     request_slots, relay_depth = 1, 2
     store = TensorStore(
-        capacity=1,
         byte_capacity=32,
         request_capacity=request_slots,
         relay_depth=relay_depth,
@@ -583,7 +575,6 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
 ) -> None:
     buffers = BufferPool(byte_capacity=16, devices=("cpu",))
     store = TensorStore(
-        capacity=2,
         request_capacity=1 if relay else 0,
         relay_depth=2 if relay else 0,
         buffer_pool=buffers,
@@ -661,7 +652,7 @@ def test_tensor_publication_enforces_its_logical_region_and_representation() -> 
     buffers = BufferPool(byte_capacity=24, devices=("cpu",))
     events = EventPool()
     store = TensorStore(
-        capacity=1, byte_capacity=16, buffer_pool=buffers, event_pool=events
+        byte_capacity=16, buffer_pool=buffers, event_pool=events
     )
     reference = TensorRef(
         request_key=RequestKey(1, 1, 1),
@@ -737,7 +728,7 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
                 1,
                 staging,
                 generation=3,
-                step=2,
+                step_index=2,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -749,12 +740,14 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
         ready = Event()
         ticket.add_done_callback(ready.set)
         assert ready.wait(5)
-        pool.adopt_import(write, generation=3, step=2, height=16, width=176)
+        pool.adopt_import(
+            write, generation=3, step_index=2, height=16, width=176
+        )
         actual = pool.gather_current(
             1,
             staging,
             generation=3,
-            step=2,
+            step_index=2,
             latent_units=11,
             height=16,
             width=176,
@@ -765,7 +758,7 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
                 1,
                 pool.stage(((1, 3, 4),), (11,))[0],
                 generation=3,
-                step=2,
+                step_index=2,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -796,9 +789,7 @@ def latent_output():
         key = RequestKey(1, slot, 1)
         return LatentUpdate(
             request_pool_idx=slot,
-            params=LatentParams(
-                key, CallId(1, 0), pages, units, height, width, 0, 0
-            ),
+            params=LatentParams(key, CallId(1, 0), pages, units, height, width),
             generation=1,
         )
 
@@ -846,7 +837,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
                 request_pool_idx=1,
                 page_table=pages,
                 generation=1,
-                step=0,
+                step_index=0,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -876,7 +867,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         pool.write_inactive(
             1,
             staging,
-            expected_step=0,
+            expected_step_index=0,
             expected_generation=1,
             latent_units=11,
             height=16,
@@ -885,7 +876,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         second = latent_output(1, pages, 11, 16, 176)
         second.expected_generation = 1
         second.generation = 2
-        second.step = 1
+        second.step_index = 1
         pool.validate_updates((second,))
         pool.apply_updates((second,))
         for value in borrowed:
@@ -897,7 +888,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
                 1,
                 staging,
                 generation=2,
-                step=1,
+                step_index=1,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -919,7 +910,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
             pool.write_inactive(
                 1,
                 staging,
-                expected_step=1,
+                expected_step_index=1,
                 expected_generation=2,
                 latent_units=11,
                 height=16,
@@ -934,7 +925,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         pool.write_inactive(
             1,
             staging,
-            expected_step=1,
+            expected_step_index=1,
             expected_generation=2,
             latent_units=11,
             height=16,
@@ -942,9 +933,9 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         )
         third = latent_output(1, pages, 11, 16, 176)
         third.expected_generation = 2
-        third.expected_step = 1
+        third.expected_step_index = 1
         third.generation = 3
-        third.step = 2
+        third.step_index = 2
         pool.validate_updates((third,))
         pool.apply_updates((third,))
         torch.testing.assert_close(
@@ -952,7 +943,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
                 1,
                 staging,
                 generation=3,
-                step=2,
+                step_index=2,
                 latent_units=11,
                 height=16,
                 width=176,
@@ -988,7 +979,7 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
 
     events = EventPool()
     transport = make_transport(
-        "shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
     )
     pool = LatentPool(
         request_pool_size=2,
@@ -1056,7 +1047,7 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
                 2,
                 independent,
                 generation=1,
-                step=0,
+                step_index=0,
                 latent_units=4,
                 height=16,
                 width=64,
@@ -1120,7 +1111,7 @@ def test_latent_staging_preserves_live_trajectories(latent_output) -> None:
             actual = pool.gather_current(
                 slot,
                 staging,
-                step=0,
+                step_index=0,
                 generation=1,
                 latent_units=7,
                 height=16,
@@ -1147,7 +1138,7 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
         total_layers=1,
         total_kv_heads=1,
         num_pages=2,
-        page_size=4,
+        block_size=4,
         device="cpu",
         table_width=1,
     )
@@ -1221,7 +1212,7 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
     events = EventPool()
     # Slots 0 and 1 share this host; slot 2 is on another host.
     transports = make_transports(
-        ("local", "shm", "channel"),
+        ("local", "posix_shm", "channel"),
         byte_capacity=1 << 20,
         ticket_capacity=8,
         event_pool=events,
@@ -1231,10 +1222,10 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
     value = torch.arange(16, dtype=torch.int16).reshape(8, 2)
     try:
         cases = {
-            (1,): {"local", "shm"},
+            (1,): {"local", "posix_shm"},
             (2,): {"local", "channel"},
-            (1, 2): {"local", "shm", "channel"},
-            (): {"local", "shm", "channel"},
+            (1, 2): {"local", "posix_shm", "channel"},
+            (): {"local", "posix_shm", "channel"},
         }
         for consumers, expected in cases.items():
             locations = publish_tensor(
@@ -1253,7 +1244,7 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
                 # their words; the channel and local copies retire with the
                 # release alone.
                 for location in locations:
-                    if location.backend == "shm":
+                    if location.backend == "posix_shm":
                         mapping = open_shared_storage(
                             location.transport.name,
                             segment.HEADER_BYTES + location.nbytes,
@@ -1264,7 +1255,7 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
                         finally:
                             mapping.close()
                     transports[location.backend].release(location)
-                transports["shm"].reap()
+                transports["posix_shm"].reap()
     finally:
         for transport in transports.values():
             transport.close()

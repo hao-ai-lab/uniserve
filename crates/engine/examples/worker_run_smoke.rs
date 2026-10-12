@@ -18,12 +18,12 @@ use std::time::{Duration, Instant};
 
 use uniserve_core::EngineCoreOutput;
 use uniserve_core::{
-    GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, RequestId,
-    SamplingParams,
+    GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, ModelDtype,
+    RequestId, SamplingParams,
 };
 use uniserve_engine::{
-    Command, EngineHandle, Scheduler, SpecialTokenIds, WorkerExecutor, WorkerGroup, WorkerId,
-    WorkerProcessArgs,
+    Command, EngineHandle, Scheduler, SchedulerConfig, SimEngine, WorkerExecutor, WorkerGroup,
+    WorkerId, WorkerProcessArgs,
 };
 
 type Rxs = HashMap<RequestId, uniserve_engine::EventRx>;
@@ -39,6 +39,7 @@ fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<
         constraint,
         sampling: SamplingParams::default(),
         image: ImageParams::default(),
+        max_images: 1,
         max_und_tokens: 16,
         include_stop_token: false,
         stop_strings: Vec::new(),
@@ -47,7 +48,6 @@ fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<
         cache: Default::default(),
         image_generation: policy,
         readout: Vec::new(),
-        canvas: None,
     };
     let rx = handle.submit(request).map_err(|e| anyhow::anyhow!(e))?;
     rxs.insert(RequestId(id), rx);
@@ -107,13 +107,11 @@ fn main() -> anyhow::Result<()> {
         )
         .ranks,
         queue_depth: 2,
-        req_slot_cap: 1 << 20,
-        resp_slot_cap: 8 << 20,
-        kv_token_capacity: None,
+        max_total_tokens: None,
         block_size: Some(256),
         max_batch_calls: 32,
         max_batch_tokens: 8192,
-        attention_backend: uniserve_engine::AttentionBackend::Auto,
+        attention_backend: "auto".into(),
         transfer: Default::default(),
         ..worker_config
     })?;
@@ -124,7 +122,17 @@ fn main() -> anyhow::Result<()> {
     // Commands sent through a handle built with this waker interrupt the
     // executor's idle park, which round 2 exercises.
     let waker = engine.command_waker();
-    let sched = Scheduler::new(Box::new(engine), SpecialTokenIds::default(), 32)?;
+    let sched = Scheduler::new(
+        Box::new(engine),
+        // The stub model's end-of-text id is the simulator's.
+        SimEngine::special_tokens(),
+        SchedulerConfig {
+            max_batch: 32,
+            ..Default::default()
+        },
+        ModelDtype::BFloat16,
+        SimEngine::generation_limits(),
+    )?;
 
     let (tx, rx) = crossbeam_channel::unbounded::<Command>();
     let handle = EngineHandle::with_waker(tx, waker);

@@ -20,6 +20,7 @@ from uniserve import loading
 from uniserve.loading import checkpoint
 from uniserve.nn.rope import ProportionalScaling
 from uniserve_models.rotary import Rotary, read_rotary
+from uniserve_models.tokenizer import read_vocabulary, token_id
 
 __all__ = [
     "Config",
@@ -410,17 +411,17 @@ def _special_tokens(root: Path) -> dict[str, int]:
     """Resolve the canvas's special tokens from the tokenizer's declarations.
 
     ``tokenizer_config.json`` names the mask, pad and end-of-turn tokens;
-    ``tokenizer.json`` lists their ids among its added tokens.
+    the tokenizer's vocabulary (``tokenizer.read_vocabulary``) gives their
+    ids.
     """
     declared = json.loads((root / "tokenizer_config.json").read_text())
-    added = json.loads((root / "tokenizer.json").read_text())["added_tokens"]
-    vocabulary = {token["content"]: token["id"] for token in added}
+    vocabulary = read_vocabulary(root)
     result = {}
     for role in ("mask_token", "pad_token", "eot_token"):
         token = declared.get(role)
-        if not isinstance(token, str) or token not in vocabulary:
-            raise ValueError(f"DiffusionGemma tokenizer lacks its {role}")
-        result[role] = vocabulary[token]
+        if not isinstance(token, str):
+            raise ValueError(f"DiffusionGemma tokenizer declares no {role}")
+        result[role] = token_id(vocabulary, token)
     return result
 
 
@@ -442,8 +443,6 @@ def read_config(
             inconsistent special tokens.
     """
     config = json.loads((root / "config.json").read_text())
-    if config.get("model_type") != "diffusion_gemma":
-        raise ValueError("DiffusionGemma requires model_type diffusion_gemma")
     text = config.get("text_config")
     vision = config.get("vision_config")
     if not isinstance(text, Mapping) or not isinstance(vision, Mapping):

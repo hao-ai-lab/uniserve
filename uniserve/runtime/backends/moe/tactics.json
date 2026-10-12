@@ -10,7 +10,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 1,
    "tactic": [
     160,
@@ -39,7 +39,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 2,
    "tactic": [
     140,
@@ -68,7 +68,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 4,
    "tactic": [
     196,
@@ -97,7 +97,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 8,
    "tactic": [
     162,
@@ -126,7 +126,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 16,
    "tactic": [
     196,
@@ -155,7 +155,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 32,
    "tactic": [
     196,
@@ -184,7 +184,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 64,
    "tactic": [
     162,
@@ -213,7 +213,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 128,
    "tactic": [
     147,
@@ -242,7 +242,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 256,
    "tactic": [
     148,
@@ -271,7 +271,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 384,
    "tactic": [
     148,
@@ -300,7 +300,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 512,
    "tactic": [
     194,
@@ -329,7 +329,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 768,
    "tactic": [
     120,
@@ -358,7 +358,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 1024,
    "tactic": [
     45,
@@ -387,7 +387,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 1536,
    "tactic": [
     120,
@@ -416,7 +416,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 2048,
    "tactic": [
     148,
@@ -445,7 +445,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 3072,
    "tactic": [
     137,
@@ -474,7 +474,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 4096,
    "tactic": [
     37,
@@ -503,7 +503,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 6144,
    "tactic": [
     23,
@@ -532,7 +532,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 8192,
    "tactic": [
     121,
@@ -561,7 +561,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 12288,
    "tactic": [
     109,
@@ -590,7 +590,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 16384,
    "tactic": [
     121,
@@ -619,7 +619,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 1,
    "tactic": [
     null
@@ -647,7 +647,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 2,
    "tactic": [
     [
@@ -699,7 +699,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 4,
    "tactic": [
     [
@@ -751,7 +751,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 8,
    "tactic": [
     [
@@ -803,7 +803,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 16,
    "tactic": [
     [
@@ -855,7 +855,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 32,
    "tactic": [
     [
@@ -907,7 +907,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 64,
    "tactic": [
     [
@@ -959,7 +959,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 128,
    "tactic": [
     [
@@ -1011,7 +1011,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 256,
    "tactic": [
     [
@@ -1063,7 +1063,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 384,
    "tactic": [
     [
@@ -1115,7 +1115,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 512,
    "tactic": [
     [
@@ -1167,7 +1167,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 768,
    "tactic": [
     [
@@ -1219,7 +1219,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 1024,
    "tactic": [
     [
@@ -1271,7 +1271,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 1536,
    "tactic": [
     [
@@ -1323,7 +1323,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 2048,
    "tactic": [
     [
@@ -1375,7 +1375,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 3072,
    "tactic": [
     [
@@ -1427,7 +1427,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 4096,
    "tactic": [
     [
@@ -1479,7 +1479,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 6144,
    "tactic": [
     [
@@ -1531,7 +1531,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 8192,
    "tactic": [
     [
@@ -1583,7 +1583,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 12288,
    "tactic": [
     [
@@ -1635,7 +1635,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 16384,
    "tactic": [
     [
@@ -1687,7 +1687,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 1,
    "tactic": [
     null
@@ -1715,7 +1715,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 2,
    "tactic": [
     [
@@ -1764,7 +1764,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 4,
    "tactic": [
     null
@@ -1792,7 +1792,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 8,
    "tactic": [
     null
@@ -1820,7 +1820,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 16,
    "tactic": [
     null
@@ -1848,7 +1848,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 32,
    "tactic": [
     null
@@ -1876,7 +1876,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 64,
    "tactic": [
     null
@@ -1904,7 +1904,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 128,
    "tactic": [
     null
@@ -1932,7 +1932,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 256,
    "tactic": [
     null
@@ -1960,7 +1960,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 384,
    "tactic": [
     null
@@ -1988,7 +1988,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 512,
    "tactic": [
     null
@@ -2016,7 +2016,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 768,
    "tactic": [
     [
@@ -2065,7 +2065,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 1024,
    "tactic": [
     null
@@ -2093,7 +2093,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 1536,
    "tactic": [
     [
@@ -2142,7 +2142,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 2048,
    "tactic": [
     [
@@ -2191,7 +2191,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 3072,
    "tactic": [
     [
@@ -2240,7 +2240,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 4096,
    "tactic": [
     [
@@ -2289,7 +2289,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 6144,
    "tactic": [
     [
@@ -2338,7 +2338,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 8192,
    "tactic": [
     [
@@ -2387,7 +2387,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 12288,
    "tactic": [
     [
@@ -2436,7 +2436,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 16384,
    "tactic": [
     [
@@ -2485,7 +2485,7 @@
    "hidden": 2816,
    "intermediate": 704,
    "top_k": 8,
-   "activation": "gelu_tanh",
+   "activation": "gelu_pytorch_tanh",
    "tokens": 2688,
    "tactic": [
     [

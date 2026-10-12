@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(feature = "testing", test))]
 use uniserve_worker_ipc::DEFAULT_COMPONENT;
-use uniserve_worker_ipc::{ForwardMode, MediaCall};
+use uniserve_worker_ipc::MediaCall;
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,9 +25,9 @@ use crate::handle::{EngineHandle, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
+    DEFAULT_MAX_NUM_SEQS,
 };
-use crate::scheduler::{MAX_FLOW_PREFIX_ROWS, MAX_NUM_SEQS, flow_prefix_rows};
+use crate::scheduler::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats, SchedulingPolicy};
 use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
@@ -35,10 +35,9 @@ use anyhow::Context as _;
 #[cfg(test)]
 use uniserve_core::ComponentDistribution;
 use uniserve_core::{
-    CommandWaker, ComponentConfig, GenerationLimits, ModelDtype, ParallelConfig, Request,
-    RequestId, RuntimeFamily,
+    CommandWaker, ComponentConfig, GenerationLimits, ModelDtype, ParallelConfig, Request, RequestId,
 };
-use uniserve_worker_ipc::WorkerInfo;
+use uniserve_worker_ipc::{VIDEO_CODEC_COMPONENT, VIDEO_DECODER_COMPONENT, WorkerInfo};
 
 /// One cooperative member's physical execution endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,30 +76,67 @@ pub struct WorkerConfig {
     /// the group.
     pub ranks: Vec<WorkerRank>,
     /// Components keyed by name, each listing indices into `ranks`.
+    ///
+    /// The video decoder and the video codec are always distributed by
+    /// temporal units with one unit per rank, so a deployment states neither
+    /// field for them and reading one completes them
+    /// ([`VIDEO_DECODER_COMPONENT`], [`VIDEO_CODEC_COMPONENT`]).
+    #[serde(deserialize_with = "deserialize_components")]
     pub components: BTreeMap<String, ComponentConfig>,
     /// Maximum number of physical runs in flight per rank, launched as
     /// `WorkerProcessArgs::queue_depth`.
     pub queue_depth: usize,
-    /// Per-rank share of device storage available to this worker process.
+    /// Per-rank share of device memory available to this worker process for
+    /// static allocations (weights and KV cache).
     ///
     /// When set, `EngineCore::new` launches the group's ranks with it as
-    /// `WorkerProcessArgs::kv_storage_fraction` instead of the engine-wide
-    /// default. Deployment files spell the field `memory_fraction`.
+    /// `WorkerProcessArgs::mem_fraction_static` instead of the engine-wide
+    /// default, which `--mem-fraction-static` sets.
     ///
     /// Distinct WorkerGroups may share one physical GPU. Their configured
     /// shares must leave enough aggregate headroom for the device runtime;
     /// validation checks each group alone, never the sum across groups, and
-    /// accepts the range [`WorkerConfig::validate_storage_fraction`] states.
+    /// accepts the range [`WorkerConfig::validate_mem_fraction_static`] states.
     #[serde(default)]
-    #[serde(rename = "memory_fraction")]
-    pub storage_fraction: Option<f64>,
+    pub mem_fraction_static: Option<f64>,
+}
+
+/// Reads a worker group's components and completes the placement of the video
+/// decoder and the video codec.
+///
+/// Each of them runs one local instance per member rank and takes one
+/// independent media unit per rank per round, which is the only placement
+/// the worker accepts for them. A deployment that states it is read as
+/// written; one that states another unit count is refused.
+fn deserialize_components<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, ComponentConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut components = BTreeMap::<String, ComponentConfig>::deserialize(deserializer)?;
+    for name in [VIDEO_DECODER_COMPONENT, VIDEO_CODEC_COMPONENT] {
+        let Some(component) = components.get_mut(name) else {
+            continue;
+        };
+        if component.units_per_rank != 1 {
+            return Err(serde::de::Error::custom(format!(
+                "component {name} takes one media unit per rank, not {}",
+                component.units_per_rank
+            )));
+        }
+        component
+            .distribution
+            .get_or_insert(uniserve_core::ComponentDistribution::TemporalUnits);
+    }
+    Ok(components)
 }
 
 impl WorkerConfig {
     /// Validates one WorkerGroup in isolation.
     ///
     /// Fails when the identity is not a valid `WorkerId`, `queue_depth` is
-    /// zero, `validate_storage_fraction` refuses a set `storage_fraction`, or
+    /// zero, `validate_mem_fraction_static` refuses a set `mem_fraction_static`, or
     /// `validate_members` rejects the ranks and components.
     pub fn validate(&self) -> anyhow::Result<()> {
         WorkerId::new(self.id.0.clone())?;
@@ -109,8 +145,8 @@ impl WorkerConfig {
             "worker {} queue depth must be positive",
             self.id
         );
-        if let Some(fraction) = self.storage_fraction {
-            Self::validate_storage_fraction(fraction)
+        if let Some(fraction) = self.mem_fraction_static {
+            Self::validate_mem_fraction_static(fraction)
                 .map_err(|error| anyhow::anyhow!("worker {}: {error}", self.id))?;
         }
         Self::validate_members(&self.ranks, &self.components)?;
@@ -121,19 +157,19 @@ impl WorkerConfig {
         Ok(())
     }
 
-    /// Checks a per-process device storage fraction: a group's
-    /// `storage_fraction` or the engine-wide
-    /// `WorkerProcessArgs::kv_storage_fraction` default.
+    /// Checks a per-process static memory fraction: a group's
+    /// `mem_fraction_static` or the engine-wide
+    /// `WorkerProcessArgs::mem_fraction_static` default.
     ///
     /// Each rank grants itself this share of every device's total storage,
     /// less what its process already holds and never more than the device
     /// has free, so any finite value in (0, 1] is meaningful, 1 granting the
     /// whole device. The worker refuses any other value at startup; checking
     /// here refuses it before a rank is launched.
-    pub fn validate_storage_fraction(fraction: f64) -> anyhow::Result<()> {
+    pub fn validate_mem_fraction_static(fraction: f64) -> anyhow::Result<()> {
         anyhow::ensure!(
             fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
-            "storage fraction {fraction} must be finite and in (0, 1]"
+            "mem_fraction_static {fraction} must be finite and in (0, 1]"
         );
         Ok(())
     }
@@ -250,7 +286,7 @@ impl WorkerConfig {
     ///
     /// `components` must already be resolved for `rank_count`; this assigns
     /// rank identity and nothing else. The group is named `model` and has no
-    /// storage fraction of its own. Nothing is validated here, and an empty
+    /// `mem_fraction_static` of its own. Nothing is validated here, and an empty
     /// `hosts` yields no ranks.
     pub fn placed(
         hosts: &[String],
@@ -285,7 +321,7 @@ impl WorkerConfig {
             ranks: placement,
             components,
             queue_depth,
-            storage_fraction: None,
+            mem_fraction_static: None,
         }
     }
 
@@ -325,7 +361,7 @@ impl WorkerConfig {
                 ranks: ranks.to_vec(),
                 components: placed.components.clone(),
                 queue_depth,
-                storage_fraction: None,
+                mem_fraction_static: None,
             })
             .collect()
     }
@@ -335,8 +371,6 @@ impl WorkerConfig {
 /// or one per data-parallel replica.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Request runtime selected for this configuration.
-    pub runtime_family: RuntimeFamily,
     /// Model generation requirements, intersected with loaded worker capacities.
     pub generation_limits: GenerationLimits,
     /// Maximum number of calls assembled into a single forward batch.
@@ -346,22 +380,21 @@ pub struct EngineConfig {
     /// Maximum number of concurrently running requests. `EngineCore::new`
     /// sizes every worker's request pool from it.
     pub max_num_seqs: usize,
+    /// Most requests, waiting or finished with undelivered events, the
+    /// scheduler holds before it rejects a submission as overloaded; `None`
+    /// queues without bound.
+    pub max_num_waiting: Option<usize>,
     /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
-    /// Per-step budget of text prefill tokens allowed to join a decode batch
-    /// as one mixed extend+decode forward. `0` disables mixing.
-    pub mixed_prefill_tokens: usize,
     /// Reuse and retain prompt KV prefixes across requests. Disabling this
     /// does not remove the KV storage needed within an active request.
     pub prefix_cache: bool,
     /// Waiting queue policy for admitting/scheduling requests.
     pub scheduler_policy: SchedulingPolicy,
-    /// Maximum model context length reported to the frontend.
-    pub max_model_len: u32,
     /// Static computation components and physical rank membership.
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
-    /// `encoder->prefill=shm,prefill->decode=cuda_vmm`. Participating worker
+    /// `encoder->prefill=posix_shm,prefill->decode=cuda_vmm`. Participating worker
     /// ranks receive the selected transport. Before process launch,
     /// `EngineCore::new` binds a default for every ordered rank pair, within
     /// and across WorkerGroups, that no configured edge covers, derived from
@@ -414,16 +447,14 @@ impl EngineConfig {
             ..WorkerProcessArgs::default()
         };
         Self {
-            runtime_family: RuntimeFamily::Umm,
-            generation_limits: crate::scheduler::unbounded_umm_generation_limits(),
+            generation_limits: crate::sim::SimEngine::generation_limits(),
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
+            max_num_waiting: None,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
-            mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
-            max_model_len: 8192,
             workers: vec![WorkerConfig::placed(
                 &["localhost".to_owned()],
                 "cpu",
@@ -465,8 +496,6 @@ pub struct EngineCore {
     model_name: String,
     model_dtype: ModelDtype,
     generation_limits: GenerationLimits,
-    max_model_len: u32,
-    runtime_family: RuntimeFamily,
     /// Engine-dead latch: set after `Scheduler::run` returns a fatal exit
     /// (executor or worker failure). A scheduler thread panic does not set it.
     dead: Arc<AtomicBool>,
@@ -518,7 +547,7 @@ impl EngineCore {
     ///
     /// Fails when the size is zero or does not divide the groups, when the
     /// replicas are not the same deployment on different ranks (group count,
-    /// rank counts, components, queue depth and storage fraction must match
+    /// rank counts, components, queue depth and mem_fraction_static must match
     /// position by position), when a configured edge crosses replicas or
     /// names an unconfigured worker, or for any reason `EngineCore::new`
     /// names.
@@ -543,7 +572,7 @@ impl EngineCore {
                     group.ranks.len() == first.ranks.len()
                         && group.components == first.components
                         && group.queue_depth == first.queue_depth
-                        && group.storage_fraction == first.storage_fraction,
+                        && group.mem_fraction_static == first.mem_fraction_static,
                     "data-parallel replicas must place the same groups: worker {} \
                      differs from worker {}",
                     group.id,
@@ -554,9 +583,10 @@ impl EngineCore {
 
         let disaggregated = !expert_workers.is_empty();
         anyhow::ensure!(
-            (1..=4).contains(&config.worker_process.expert_microbatches)
+            config.worker_process.expert_microbatches >= 1
                 && (config.worker_process.expert_microbatches == 1 || disaggregated),
-            "one to four expert microbatches require disaggregated placement when greater than one"
+            "expert microbatches must number at least one and require disaggregated placement \
+             when greater than one"
         );
         if disaggregated {
             anyhow::ensure!(
@@ -641,13 +671,13 @@ impl EngineCore {
         // Every group holds a request row for each running request the
         // scheduler may keep resident, plus the rows a runtime keeps outside
         // that limit. Only the loaded capabilities decide that reserve
-        // (`flow_prefix_rows`), so the launch sizes for the largest one.
-        let max_num_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
-        let max_request_pool_size = u32::try_from(max_num_seqs + MAX_FLOW_PREFIX_ROWS)
+        // (`guidance_prefix_rows`), so the launch sizes for the largest one.
+        let max_num_seqs = config.max_num_seqs.max(1);
+        let max_request_pool_size = u32::try_from(max_num_seqs + MAX_GUIDANCE_PREFIX_ROWS)
             .context("max_num_seqs exceeds the worker request-pool field")?;
 
         // Each group launches from the shared defaults with its own identity,
-        // placement, components, queue depth, and storage fraction, plus its
+        // placement, components, queue depth, and mem_fraction_static, plus its
         // replica's resolved transfer edges and the components of every group
         // of its replica (`peers`), from which the group resolves the ranks,
         // possibly in other groups, that read its products.
@@ -667,9 +697,9 @@ impl EngineCore {
                     peers: peers.clone(),
                     queue_depth: worker.queue_depth,
                     max_request_pool_size,
-                    kv_storage_fraction: worker
-                        .storage_fraction
-                        .unwrap_or(config.worker_process.kv_storage_fraction),
+                    mem_fraction_static: worker
+                        .mem_fraction_static
+                        .unwrap_or(config.worker_process.mem_fraction_static),
                     transfer: transfer.clone(),
                     expert_parallel: config.expert_parallel.map(|exchange| {
                         crate::worker::ExpertParallelPlacement {
@@ -694,9 +724,9 @@ impl EngineCore {
                 peers: BTreeMap::new(),
                 queue_depth: worker.queue_depth,
                 max_request_pool_size,
-                kv_storage_fraction: worker
-                    .storage_fraction
-                    .unwrap_or(config.worker_process.kv_storage_fraction),
+                mem_fraction_static: worker
+                    .mem_fraction_static
+                    .unwrap_or(config.worker_process.mem_fraction_static),
                 transfer: transfers[0].clone(),
                 expert_parallel: config.expert_parallel.map(|exchange| {
                     crate::worker::ExpertParallelPlacement {
@@ -739,7 +769,7 @@ impl EngineCore {
             // scheduler bounds their requests by the rows they report.
             let info = executor.info().runtime_info()?;
             let request_rows = info.request_slots as usize;
-            let needed_rows = max_num_seqs + flow_prefix_rows(&info);
+            let needed_rows = max_num_seqs + guidance_prefix_rows(&info);
             anyhow::ensure!(
                 !info.uses_kv() || request_rows >= needed_rows,
                 "the workers hold {request_rows} request rows, but {max_num_seqs} running \
@@ -758,7 +788,9 @@ impl EngineCore {
                 expert_parallel: None,
                 ..config.clone()
             };
-            cores.push(Self::assemble(replica_config, Box::new(executor), waker)?);
+            let core = Self::assemble(replica_config.clone(), Box::new(executor), waker)?;
+            crate::warmup::warm(&core, &replica_config)?;
+            cores.push(core);
         }
         Ok(cores)
     }
@@ -766,22 +798,13 @@ impl EngineCore {
     /// Builds the engine core from an executor supplied by a higher composition layer.
     ///
     /// The command waker is a no-op, so a command does not interrupt the
-    /// scheduler's idle park; `with_executor_and_waker` supplies a real one.
-    /// Neither constructor uses `config.workers` or `config.transfer`.
+    /// scheduler's idle park. The constructor uses neither `config.workers`
+    /// nor `config.transfer`.
     pub fn with_executor(
         config: EngineConfig,
         executor: Box<dyn Executor>,
     ) -> anyhow::Result<Self> {
         Self::assemble(config, executor, CommandWaker::noop())
-    }
-
-    /// Builds the engine core from an executor with an event-driven command waker.
-    pub fn with_executor_and_waker(
-        config: EngineConfig,
-        executor: Box<dyn Executor>,
-        command_waker: CommandWaker,
-    ) -> anyhow::Result<Self> {
-        Self::assemble(config, executor, command_waker)
     }
 
     /// Assembles scheduler state and transport channels around an initialized executor.
@@ -804,19 +827,18 @@ impl EngineCore {
                     .map(|units| (call, units))
             })
             .collect();
-        let mut sched = Scheduler::with_model_limits(
+        let mut sched = Scheduler::new(
             executor,
             ctrl,
             SchedulerConfig {
                 max_batch: config.max_batch,
                 max_num_batched_tokens: config.max_num_batched_tokens.max(1),
                 max_num_seqs: config.max_num_seqs.max(1),
+                max_num_waiting: config.max_num_waiting,
                 long_prefill_threshold: config.long_prefill_threshold.max(1),
-                mixed_prefill_tokens: config.mixed_prefill_tokens,
                 policy: config.scheduler_policy,
-                ..Default::default()
+                canvas: config.worker_process.canvas_sampling,
             },
-            config.runtime_family,
             config.worker_process.model_dtype,
             config.generation_limits,
         )?;
@@ -852,8 +874,6 @@ impl EngineCore {
             model_name: config.worker_process.model,
             model_dtype,
             generation_limits,
-            max_model_len: config.max_model_len,
-            runtime_family: config.runtime_family,
             dead,
             next_id: AtomicU64::new(1),
             sched_thread: Mutex::new(Some(sched_thread)),
@@ -885,21 +905,6 @@ impl EngineCore {
         self.generation_limits.clone()
     }
 
-    /// Returns whether the reported capabilities include a decode or verify
-    /// forward; with several WorkerGroups, whether any group serves one.
-    ///
-    /// The server advertises request sampling controls only when this holds
-    /// (`EngineClient::served_sampling_controls`).
-    pub fn supports_token_sampling(&self) -> bool {
-        self.info.supported_calls.iter().any(|mode| {
-            matches!(
-                mode,
-                uniserve_worker_ipc::CallKind::Forward(ForwardMode::Decode)
-                    | uniserve_worker_ipc::CallKind::Forward(ForwardMode::Verify)
-            )
-        })
-    }
-
     /// Returns live scheduler statistics shared with the scheduler thread.
     pub fn stats(&self) -> &Arc<SchedulerStats> {
         &self.stats
@@ -913,16 +918,6 @@ impl EngineCore {
     /// Returns the model parameter data type.
     pub fn model_dtype(&self) -> ModelDtype {
         self.model_dtype
-    }
-
-    /// Returns the configured maximum model context length.
-    pub fn max_model_len(&self) -> u32 {
-        self.max_model_len
-    }
-
-    /// Returns the request runtime family.
-    pub const fn runtime_family(&self) -> RuntimeFamily {
-        self.runtime_family
     }
 
     /// Allocates the next internal scheduler request id.
@@ -1247,5 +1242,58 @@ mod tests {
         let entry = other.components.remove(DEFAULT_COMPONENT).unwrap();
         other.components.insert("divided".into(), entry);
         assert!(WorkerConfig::validate_all(&[worker, other]).is_ok());
+    }
+
+    /// The video decoder and codec are placed over their ranks one unit per
+    /// rank without a deployment saying so, so every shipped deployment
+    /// resolves them as temporal-unit components, with or without the field.
+    #[test]
+    fn shipped_deployments_resolve_the_video_decoder_and_codec_distribution() {
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/minimax_h3");
+        let mut files = 0;
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let workers: Vec<WorkerConfig> = serde_json::from_str(&text).unwrap();
+            WorkerConfig::validate_all(&workers).unwrap();
+
+            for name in [VIDEO_DECODER_COMPONENT, VIDEO_CODEC_COMPONENT] {
+                let placed = workers
+                    .iter()
+                    .filter_map(|worker| worker.components.get(name))
+                    .collect::<Vec<_>>();
+                assert!(!placed.is_empty(), "{path:?} places no {name}");
+                for component in placed {
+                    assert_eq!(
+                        component.distribution,
+                        Some(ComponentDistribution::TemporalUnits),
+                        "{path:?} {name}"
+                    );
+                    assert_eq!(component.units_per_rank, 1, "{path:?} {name}");
+                }
+            }
+            files += 1;
+        }
+        assert!(files > 0);
+    }
+
+    /// A deployment may still state the distribution the decoder always has,
+    /// and reading it gives the same placement; a second unit per rank is
+    /// not a placement the decoder has.
+    #[test]
+    fn stating_the_decoder_distribution_changes_nothing_and_extra_units_are_refused() {
+        let components = |decoder: &str| {
+            serde_json::from_str::<WorkerConfig>(&format!(
+                r#"{{"id": "model", "queue_depth": 2,
+                    "ranks": [{{"node": "n", "device": "cuda:0"}},
+                              {{"node": "n", "device": "cuda:1"}}],
+                    "components": {{"video_decoder": {decoder}}}}}"#
+            ))
+        };
+        let omitted = components(r#"{"ranks": [0, 1]}"#).unwrap();
+        let stated = components(r#"{"ranks": [0, 1], "distribution": "temporal_units"}"#).unwrap();
+        assert_eq!(omitted, stated);
+        assert!(omitted.validate().is_ok());
+        assert!(components(r#"{"ranks": [0, 1], "units_per_rank": 2}"#).is_err());
     }
 }

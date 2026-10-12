@@ -4,15 +4,16 @@
 //! two parts that have independent lifetimes:
 //!
 //! - The engine side (`engine_request_id`, `engine_pending`) is reserved by
-//!   `register`, claimed once by `claim_submission`, and released by
+//!   `register`, read by `reserved_id` to stamp the submitted request,
+//!   claimed once by `claim_submission`, and released by
 //!   `release_engine`, which `EngineClient::submit_generation` and
 //!   `submit_media` run when submission fails after the claim, or when the
 //!   engine event stream ends or its receiver is dropped.
-//! - The statistics side (`stats`) exists only for requests registered with a
-//!   `ModelEventIdentity`, which `ServingRuntime` supplies for every request.
-//!   The serving layer updates it through `mark_submitting`, `accept`, and
-//!   `observe`, and its `LifecycleGuard` retires it through `complete` into a
-//!   bounded history of terminal snapshots.
+//! - The statistics side (`stats`) exists only for requests registered with
+//!   lifecycle tracking, which `ServingRuntime` asks for on every request it
+//!   streams. The serving layer updates it through `mark_submitting`,
+//!   `accept`, and `observe`, and its `LifecycleGuard` retires it through
+//!   `complete`.
 //!
 //! A record leaves the active map only when it holds neither statistics nor a
 //! claimed engine side, so an external identifier cannot be registered again
@@ -27,13 +28,29 @@
 //! engine 0.
 
 use crate::serving::{
-    LifecycleTerminal, ModelEventIdentity, RequestLifecycleState, RequestOutput,
-    RequestStatsSnapshot, ServeRequestId,
+    LifecycleTerminal, RequestLifecycleState, RequestOutput, RuntimeTimings, ServeRequestId,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::sync::Notify;
 use uniserve_observability::{EngineLabels, METRICS};
+
+/// Lifecycle state, token usage, and timings of one tracked request.
+///
+/// `RequestRegistry` maintains it from the public events it observes and
+/// reads it once, in `complete`, for the request metrics.
+pub(crate) struct RequestStats {
+    /// Latest observed lifecycle phase.
+    pub(crate) state: RequestLifecycleState,
+    /// Number of prompt tokens submitted to the engine.
+    pub(crate) prompt_tokens: u32,
+    /// Number of generated tokens included in user-visible output.
+    pub(crate) visible_output_tokens: u32,
+    /// Number of generated tokens consumed by internal protocol sections.
+    pub(crate) internal_tokens: u32,
+    /// Request phase durations.
+    pub(crate) timings: RuntimeTimings,
+}
 
 struct RequestRecord {
     // The engine identifier reserved by `register`; `release_engine` clears
@@ -41,11 +58,11 @@ struct RequestRecord {
     // `release_engine`.
     engine_request_id: Option<uniserve_core::RequestId>,
     engine_pending: bool,
-    // `None` for a request registered without a `ModelEventIdentity`; such a
-    // record tracks only the engine side. With an identity, the statistics
-    // stay here until `complete` moves them to the completed history,
-    // independently of the engine receiver's lifetime.
-    stats: Option<RequestStatsSnapshot>,
+    // `None` for a request registered without lifecycle tracking; such a
+    // record tracks only the engine side. Otherwise the statistics stay here
+    // until `complete` takes them, independently of the engine receiver's
+    // lifetime.
+    stats: Option<RequestStats>,
     // Set by `accept`. Only a request the engine accepted has consumed engine
     // work, so only such a request is recorded in the request metrics.
     accepted: bool,
@@ -59,38 +76,25 @@ struct RequestRecord {
     usage_reported: bool,
 }
 
-#[derive(Default)]
-struct RequestRegistryState {
-    active: HashMap<ServeRequestId, RequestRecord>,
-    // Terminal snapshots, bounded by `RequestRegistry::completed_retention`;
-    // `completed_order` lists their identifiers oldest first for eviction.
-    completed: HashMap<ServeRequestId, RequestStatsSnapshot>,
-    completed_order: VecDeque<ServeRequestId>,
-}
-
 pub(crate) struct RequestRegistry {
-    state: Mutex<RequestRegistryState>,
+    active: Mutex<HashMap<ServeRequestId, RequestRecord>>,
     // Signalled after an engine side is released, a request completes, or
     // `mark_control` changes or removes a record. `notify_waiters` stores no
     // permit, so every waiter creates its `Notified` future before checking
     // the state it waits on.
     changed: Notify,
-    // Maximum number of terminal snapshots kept for `stats` lookups.
-    completed_retention: usize,
     // Labels of the request metric series completed requests are recorded
     // under; they match the series `StatsLogger` reads.
     metric_labels: EngineLabels,
 }
 
 impl RequestRegistry {
-    /// Creates an empty registry that retains the most recent 1024 terminal
-    /// snapshots and records completed requests under `model_name`, the
-    /// engine's model name, as engine 0.
+    /// Creates an empty registry that records completed requests under
+    /// `model_name`, the engine's model name, as engine 0.
     pub(crate) fn new(model_name: String) -> Self {
         Self {
-            state: Mutex::new(RequestRegistryState::default()),
+            active: Mutex::new(HashMap::new()),
             changed: Notify::new(),
-            completed_retention: 1024,
             metric_labels: EngineLabels {
                 model_name,
                 engine: 0,
@@ -98,9 +102,9 @@ impl RequestRegistry {
         }
     }
 
-    /// Locks the shared state and recovers it after poisoning.
-    fn lock(&self) -> std::sync::MutexGuard<'_, RequestRegistryState> {
-        self.state
+    /// Locks the active records and recovers them after poisoning.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ServeRequestId, RequestRecord>> {
+        self.active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -108,33 +112,28 @@ impl RequestRegistry {
     /// Reserves one external identity before preprocessing or engine submission.
     ///
     /// Returns `false` without changing anything when an active record already
-    /// holds `request_id`. Otherwise it discards any retained terminal snapshot
-    /// of an earlier request with the same identifier and inserts a record
-    /// whose engine side is reserved but unclaimed. With `identity`, the record
-    /// starts in `Compiling` with zero compile time until `mark_submitting`.
+    /// holds `request_id`. Otherwise it inserts a record whose engine side is
+    /// reserved but unclaimed. With `track_lifecycle`, the record carries
+    /// statistics that start in `Compiling` with zero compile time until
+    /// `mark_submitting`.
     pub(crate) fn register(
         &self,
         request_id: ServeRequestId,
         engine_request_id: uniserve_core::RequestId,
-        identity: Option<ModelEventIdentity>,
+        track_lifecycle: bool,
     ) -> bool {
-        let mut state = self.lock();
-        if state.active.contains_key(&request_id) {
+        let mut active = self.lock();
+        if active.contains_key(&request_id) {
             return false;
         }
-        state.completed.remove(&request_id);
-        state.completed_order.retain(|id| id != &request_id);
-        let stats = identity.map(|identity| {
-            let mut stats = RequestStatsSnapshot::submitting(
-                request_id.clone(),
-                identity.served_name,
-                identity.description,
-                0,
-            );
-            stats.state = RequestLifecycleState::Compiling;
-            stats
+        let stats = track_lifecycle.then(|| RequestStats {
+            state: RequestLifecycleState::Compiling,
+            prompt_tokens: 0,
+            visible_output_tokens: 0,
+            internal_tokens: 0,
+            timings: RuntimeTimings::default(),
         });
-        state.active.insert(
+        active.insert(
             request_id,
             RequestRecord {
                 engine_request_id: Some(engine_request_id),
@@ -148,7 +147,28 @@ impl RequestRegistry {
         true
     }
 
+    /// Returns the engine identifier reserved for `request_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::UnknownRequestId` when no active record holds
+    /// `request_id` or its engine side was already released.
+    pub(crate) fn reserved_id(
+        &self,
+        request_id: &str,
+    ) -> crate::engine_client::Result<uniserve_core::RequestId> {
+        self.lock()
+            .get(request_id)
+            .and_then(|record| record.engine_request_id)
+            .ok_or_else(|| crate::engine_client::Error::UnknownRequestId {
+                request_id: request_id.to_string(),
+            })
+    }
+
     /// Attaches exactly one engine receiver to the reserved request incarnation.
+    ///
+    /// `engine_request_id` is the identifier `reserved_id` returned; a record
+    /// that no longer holds it was released or replaced since.
     ///
     /// # Errors
     ///
@@ -161,9 +181,8 @@ impl RequestRegistry {
         request_id: &str,
         engine_request_id: uniserve_core::RequestId,
     ) -> crate::engine_client::Result<()> {
-        let mut state = self.lock();
-        let record = state
-            .active
+        let mut active = self.lock();
+        let record = active
             .get_mut(request_id)
             .filter(|record| record.engine_request_id == Some(engine_request_id))
             .ok_or_else(|| crate::engine_client::Error::UnknownRequestId {
@@ -189,9 +208,8 @@ impl RequestRegistry {
         request_id: &str,
         engine_request_id: uniserve_core::RequestId,
     ) {
-        let mut state = self.lock();
-        let Some(record) = state
-            .active
+        let mut active = self.lock();
+        let Some(record) = active
             .get_mut(request_id)
             .filter(|record| record.engine_request_id == Some(engine_request_id))
         else {
@@ -200,9 +218,9 @@ impl RequestRegistry {
         record.engine_pending = false;
         record.engine_request_id = None;
         if record.stats.is_none() {
-            state.active.remove(request_id);
+            active.remove(request_id);
         }
-        drop(state);
+        drop(active);
         self.changed.notify_waiters();
     }
 
@@ -213,7 +231,6 @@ impl RequestRegistry {
     pub(crate) fn mark_submitting(&self, request_id: &str, compile_us: u64) {
         if let Some(stats) = self
             .lock()
-            .active
             .get_mut(request_id)
             .and_then(|record| record.stats.as_mut())
         {
@@ -234,8 +251,8 @@ impl RequestRegistry {
     /// the transition to `Accepted` happen under one registry lock, so no
     /// control can be recorded between them.
     pub(crate) fn accept(&self, request_id: &str) -> bool {
-        let mut registry = self.lock();
-        let Some(record) = registry.active.get_mut(request_id) else {
+        let mut active = self.lock();
+        let Some(record) = active.get_mut(request_id) else {
             return false;
         };
         let Some(stats) = record.stats.as_mut() else {
@@ -266,16 +283,16 @@ impl RequestRegistry {
         request_id: &str,
         requested: RequestLifecycleState,
     ) -> Option<uniserve_core::RequestId> {
-        let mut registry = self.lock();
-        let record = registry.active.get_mut(request_id)?;
+        let mut active = self.lock();
+        let record = active.get_mut(request_id)?;
         let engine_request_id = record.engine_request_id.filter(|_| record.engine_pending);
         let Some(stats) = record.stats.as_mut() else {
             // A request without statistics that is controlled before submission
             // owns no output guard, so the record is removed here; a later
             // `claim_submission` then fails with `UnknownRequestId`.
             if !record.engine_pending {
-                registry.active.remove(request_id);
-                drop(registry);
+                active.remove(request_id);
+                drop(active);
                 self.changed.notify_waiters();
             }
             return engine_request_id;
@@ -290,7 +307,7 @@ impl RequestRegistry {
             (_, requested) => requested,
         };
         let changed = stats.state != previous;
-        drop(registry);
+        drop(active);
         if changed {
             self.changed.notify_waiters();
         }
@@ -304,7 +321,6 @@ impl RequestRegistry {
     pub(crate) fn control_terminal(&self, request_id: &str) -> Option<LifecycleTerminal> {
         match self
             .lock()
-            .active
             .get(request_id)
             .and_then(|record| record.stats.as_ref())
             .map(|stats| stats.state)
@@ -336,7 +352,6 @@ impl RequestRegistry {
     pub(crate) fn drop_terminal(&self, request_id: &str) -> LifecycleTerminal {
         match self
             .lock()
-            .active
             .get(request_id)
             .and_then(|record| record.stats.as_ref())
             .map(|stats| stats.state)
@@ -358,8 +373,8 @@ impl RequestRegistry {
         event: &RequestOutput,
         elapsed_us: u64,
     ) -> Option<LifecycleTerminal> {
-        let mut state = self.lock();
-        let record = state.active.get_mut(request_id)?;
+        let mut active = self.lock();
+        let record = active.get_mut(request_id)?;
         let stats = record.stats.as_mut()?;
 
         // External cancellation and abort state dominates every later stream
@@ -387,13 +402,9 @@ impl RequestRegistry {
             RequestOutput::Scheduled {
                 queued_at,
                 scheduled_at,
-                cache,
-                resources,
                 ..
             } => {
                 stats.state = RequestLifecycleState::Scheduled;
-                stats.cache = cache.clone();
-                stats.resources = resources.clone();
                 stats.timings.queue_us =
                     (*queued_at).zip(*scheduled_at).map(|(queued, scheduled)| {
                         ((scheduled - queued).max(0.0) * 1_000_000.0) as u64
@@ -429,7 +440,9 @@ impl RequestRegistry {
             | RequestOutput::OutputBlockEnd { .. }
             | RequestOutput::ToolCallStart { .. }
             | RequestOutput::ToolCallArgumentsDelta { .. }
-            | RequestOutput::ToolCallEnd { .. } => {
+            | RequestOutput::ToolCallEnd { .. }
+            | RequestOutput::ImageStep { .. }
+            | RequestOutput::ImageDone { .. } => {
                 stats.state = RequestLifecycleState::Streaming;
             }
             // Image begin and commit are public media progress boundaries.
@@ -447,32 +460,17 @@ impl RequestRegistry {
                     .first_visible_output_us
                     .get_or_insert(*event_elapsed);
             }
-            RequestOutput::ImageStep { .. } => {
-                stats.state = RequestLifecycleState::Streaming;
-                stats.image_steps = stats.image_steps.saturating_add(1);
-            }
-            RequestOutput::ImageDone { .. } => {
-                stats.state = RequestLifecycleState::Streaming;
-                stats.image_count = stats.image_count.saturating_add(1);
-            }
             // Terminal usage is the canonical aggregate produced by the assembler.
             RequestOutput::Usage {
                 prompt_tokens,
                 visible_output_tokens,
                 internal_tokens,
-                image_count,
-                image_steps,
-                cache,
-                resources,
                 timings,
+                ..
             } => {
                 stats.prompt_tokens = *prompt_tokens;
                 stats.visible_output_tokens = *visible_output_tokens;
                 stats.internal_tokens = *internal_tokens;
-                stats.image_count = *image_count;
-                stats.image_steps = *image_steps;
-                stats.cache = cache.clone();
-                stats.resources = resources.clone();
                 stats.timings = timings.clone();
                 record.usage_reported = true;
             }
@@ -489,7 +487,7 @@ impl RequestRegistry {
         None
     }
 
-    /// Moves an active request into retained terminal history with final timing.
+    /// Retires an active request's statistics with their final timing.
     ///
     /// Returns the recorded terminal state: a pending `Cancelling` or
     /// `Aborting` becomes `Cancelled` or `Aborted` regardless of `terminal`.
@@ -510,21 +508,20 @@ impl RequestRegistry {
         terminal: RequestLifecycleState,
         elapsed_us: u64,
     ) -> Option<RequestLifecycleState> {
-        let mut state = self.lock();
-        let record = state.active.get_mut(request_id)?;
+        let mut active = self.lock();
+        let record = active.get_mut(request_id)?;
         let mut stats = record.stats.take()?;
         let accepted = record.accepted;
         let finished_reason = record.finished_reason;
         let usage_reported = record.usage_reported;
         if !record.engine_pending {
-            state.active.remove(request_id);
+            active.remove(request_id);
         }
         let actual_terminal = match stats.state {
             RequestLifecycleState::Cancelling => RequestLifecycleState::Cancelled,
             RequestLifecycleState::Aborting => RequestLifecycleState::Aborted,
             _ => terminal,
         };
-        stats.state = actual_terminal;
         stats.timings.total_us = stats.timings.total_us.max(elapsed_us);
 
         let finished_reason = match actual_terminal {
@@ -545,43 +542,9 @@ impl RequestRegistry {
             }
         }
 
-        Self::insert_completed(&mut state, stats, self.completed_retention);
-        drop(state);
+        drop(active);
         self.changed.notify_waiters();
         Some(actual_terminal)
-    }
-
-    /// Appends a terminal snapshot as the newest history entry, replacing any
-    /// entry with the same identifier, and evicts the oldest entries beyond
-    /// `retention`.
-    fn insert_completed(
-        state: &mut RequestRegistryState,
-        stats: RequestStatsSnapshot,
-        retention: usize,
-    ) {
-        let request_id = stats.request_id.clone();
-        state.completed_order.retain(|id| id != &request_id);
-        state.completed.insert(request_id.clone(), stats);
-        state.completed_order.push_back(request_id);
-        while state.completed_order.len() > retention {
-            if let Some(expired) = state.completed_order.pop_front() {
-                state.completed.remove(&expired);
-            }
-        }
-    }
-
-    /// Returns the active statistics, or else the retained terminal snapshot.
-    ///
-    /// Returns `None` for a request without statistics, an unknown one, or one
-    /// whose snapshot was evicted from the bounded history.
-    pub(crate) fn stats(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        let state = self.lock();
-        state
-            .active
-            .get(request_id)
-            .and_then(|record| record.stats.as_ref())
-            .or_else(|| state.completed.get(request_id))
-            .cloned()
     }
 
     /// Returns the number of requests whose statistics are still active.
@@ -590,25 +553,9 @@ impl RequestRegistry {
     /// side is still claimed, are not counted.
     pub(crate) fn active_count(&self) -> usize {
         self.lock()
-            .active
             .values()
             .filter(|record| record.stats.is_some())
             .count()
-    }
-
-    /// Waits for a request to leave the active registry and returns its final statistics.
-    ///
-    /// The record leaves only when it holds neither statistics nor a claimed
-    /// engine side. The result follows `stats`, so it is `None` for a request
-    /// without statistics or one already evicted from the history.
-    pub(crate) async fn drain_request(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        loop {
-            let changed = self.changed.notified();
-            if !self.lock().active.contains_key(request_id) {
-                return self.stats(request_id);
-            }
-            changed.await;
-        }
     }
 
     /// Waits until the active registry is empty.
@@ -618,7 +565,7 @@ impl RequestRegistry {
     pub(crate) async fn drain(&self) {
         loop {
             let changed = self.changed.notified();
-            if self.lock().active.is_empty() {
+            if self.lock().is_empty() {
                 return;
             }
             changed.await;

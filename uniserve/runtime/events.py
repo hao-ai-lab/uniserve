@@ -16,11 +16,6 @@ class EventPoolError(RuntimeError):
     """Report invalid event ownership or stream ordering."""
 
 
-def _invariant(message: str) -> EventPoolError:
-    """Construct an error for invalid event-pool ownership or ordering."""
-    return EventPoolError(message)
-
-
 @dataclass(slots=True)
 class _EventState:
     """Track one CUDA event’s state.
@@ -100,7 +95,7 @@ class EventPool:
         with self._lock:
             state = self._require_locked(event, target)
             if not state.recorded or state.stream_id is None:
-                raise _invariant(
+                raise EventPoolError(
                     "completion notification requires a recorded producer event"
                 )
             # Independent producers must not queue behind each other's waits.
@@ -123,13 +118,13 @@ class EventPool:
         """Lease an unrecorded CUDA event for one device and timing mode."""
         target = canonical_device(device)
         if target.type != "cuda":
-            raise _invariant("device event requires a CUDA device")
+            raise EventPoolError("device event requires a CUDA device")
         device_name = str(target)
         key = (device_name, bool(timing), bool(interprocess))
         self.reap()
         with self._lock:
             if self._closed:
-                raise _invariant("device event pool is closed")
+                raise EventPoolError("device event pool is closed")
 
             available = self._available.get(key)
             event = (
@@ -142,7 +137,7 @@ class EventPool:
                 )
             )
             if id(event) in self._active:
-                raise _invariant(
+                raise EventPoolError(
                     "device event was reused while still referenced"
                 )
 
@@ -166,7 +161,7 @@ class EventPool:
         with self._lock:
             state = self._require_locked(event, target)
             if state.stream_id is not None and state.stream_id != stream_id:
-                raise _invariant(
+                raise EventPoolError(
                     "device event spans incompatible producer streams"
                 )
             state.stream = stream
@@ -186,7 +181,7 @@ class EventPool:
         with self._lock:
             state = self._require_locked(event, target)
             if state.recorded:
-                raise _invariant("device event was recorded more than once")
+                raise EventPoolError("device event was recorded more than once")
 
             stream = state.stream
             if stream is None:
@@ -213,7 +208,7 @@ class EventPool:
         target = canonical_device(device)
         references = int(count)
         if references < 1:
-            raise _invariant("device event retain count must be positive")
+            raise EventPoolError("device event retain count must be positive")
         with self._lock:
             state = self._require_locked(event, target)
             state.references += references
@@ -226,7 +221,7 @@ class EventPool:
         """
         references = int(count)
         if references < 1:
-            raise _invariant("device event release count must be positive")
+            raise EventPoolError("device event release count must be positive")
         with self._lock:
             state = self._active.get(id(event))
             if (
@@ -234,14 +229,16 @@ class EventPool:
                 or state.event is not event
                 or state.references < references
             ):
-                raise _invariant("device event reference accounting is invalid")
+                raise EventPoolError(
+                    "device event reference accounting is invalid"
+                )
 
             state.references -= references
             if state.references != 0:
                 return
 
             if not state.recorded or not bool(event.query()):
-                raise _invariant(
+                raise EventPoolError(
                     "device event was released before it became query-ready"
                 )
 
@@ -275,7 +272,7 @@ class EventPool:
                     or state.event is not event
                     or state.references < 1
                 ):
-                    raise _invariant(
+                    raise EventPoolError(
                         "deferred device event has invalid ownership"
                     )
 
@@ -335,7 +332,9 @@ class EventPool:
                     or state.event is not event
                     or state.references < 1
                 ):
-                    raise _invariant("deferred device event lost its ownership")
+                    raise EventPoolError(
+                        "deferred device event lost its ownership"
+                    )
                 state.references -= 1
                 if state.references == 0:
                     self._recycle_locked(state)
@@ -368,7 +367,9 @@ class EventPool:
             or state.event is not event
             or state.device_name != str(device)
         ):
-            raise _invariant("device event is not owned by its declared device")
+            raise EventPoolError(
+                "device event is not owned by its declared device"
+            )
         return state
 
 

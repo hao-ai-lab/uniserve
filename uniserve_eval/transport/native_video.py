@@ -30,9 +30,6 @@ import aiohttp
 
 from ..types import RequestRecord, TaskRequest
 
-# Every MiniMax-H3 output runs at 24 frames per second.
-_FPS = 24
-
 # Response headers in which a synchronous video route reports its timings.
 _TIMING_HEADERS = (
     "x-inference-time-s",
@@ -166,6 +163,8 @@ def _vllm_omni_request(
         # One offset per video, in the videos' order.
         extra["start_time_seconds"] = starts
 
+    from uniserve_models.minimax_h3 import packing
+
     shape = request.video_shape
     assert shape is not None
     fields = {
@@ -173,7 +172,8 @@ def _vllm_omni_request(
         "width": shape.width,
         "height": shape.height,
         "aspect_ratio": payload["target"]["aspect_ratio"],
-        "fps": _FPS,
+        # The model's output frame rate.
+        "fps": packing.FPS,
         "num_inference_steps": int(payload["num_inference_steps"]) - 1,
         "guidance_scale": 1.0,
         "flow_shift": float(payload["flow_shift"]),
@@ -209,13 +209,16 @@ def _fastvideo_request(
     them. References name local files by path in its typed reference
     fields; it has no keyframe or start-offset fields.
     """
+    from uniserve_models.minimax_h3 import packing
+
     points = int(payload["num_inference_steps"])
     shape = request.video_shape
     assert shape is not None
     body: dict[str, Any] = {
         **common,
         "size": f"{shape.width}x{shape.height}",
-        "fps": _FPS,
+        # The model's output frame rate.
+        "fps": packing.FPS,
         "num_inference_steps": (
             points - 1 if request.video_parallel_decoding else points
         ),

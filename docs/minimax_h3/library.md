@@ -6,7 +6,7 @@ Models are ordinary PyTorch modules. Text and latent encoders, denoisers, video 
 
 ## Generate from Python
 
-The eager library entry accepts a loaded model and a presented text prompt. This example uses a local base checkpoint, generates a portrait video and returns RGB frames, stereo PCM and final latents. The checkpoint and its active components must fit on the selected GPU.
+The eager library entry accepts a loaded model and a tokenized text prompt. This example uses a local base checkpoint, generates a portrait video and returns RGB frames, stereo PCM and final latents. The checkpoint and its active components must fit on the selected GPU.
 
 ```python
 from pathlib import Path
@@ -14,6 +14,7 @@ from pathlib import Path
 from transformers import AutoTokenizer
 
 from uniserve_models import loading
+from uniserve_models.minimax_h3 import config as h3_config
 from uniserve_models.minimax_h3 import processing, weight_config
 from uniserve_models.minimax_h3.generation import generate
 
@@ -33,32 +34,26 @@ config = loading.read_config(
 model = loading.load_model(
     config, device="cuda", weights=weight_config(config.model)
 ).model
-plan = processing.plan_request(
-    processing.Task.T2VA,
-    processing.Target(aspect_ratio="9:16", duration_seconds=4.0),
-    [],
-    processing.VisionConfig.from_processor(root / "processor"),
-)
-prompt = processing.present(
-    AutoTokenizer.from_pretrained(root / "tokenizer"),
-    plan,
+tokenizer = AutoTokenizer.from_pretrained(root / "tokenizer")
+prompt = tokenizer.encode(
     "A lighthouse keeper climbs a spiral staircase while waves crash below.",
+    add_special_tokens=False,
 )
 result = generate(
     model,
-    prompt_token_ids=prompt.token_ids,
-    num_frames=plan.num_frames,
-    canvas=plan.canvas,
+    prompt_token_ids=tuple(prompt),
+    num_frames=processing.frame_count(4.0),
+    canvas=h3_config.canvas(9, 16),
     seed=7,
 )
 ```
 
-`result.frames` contains `[frames, height, width, 3]` uint8 RGB; `result.audio` contains stereo int16 PCM at 32 kHz. Frame counts follow the model's temporal windows, so this four-second request produces 107 frames. `generate` supports text conditioning; keyframe and reference computation uses the encoders and denoiser's public calls directly.
+`result.frames` contains `[frames, height, width, 3]` uint8 RGB; `result.audio` contains stereo int16 PCM at 32 kHz. Frame counts follow the video VAE's 17-frame clips, so this four-second request produces 107 frames. `generate` supports text conditioning; keyframe and reference computation uses the encoders and denoiser's public calls directly.
 
 ## Layouts and conditions
 
-`processing.plan_request` sizes every condition of a request: a `ref2va` reference keeps its own size on the 32-pixel grid unless it exceeds its encoding size, an image's 2048-pixel short edge or a video's canvas, and `references=processing.ReferenceConfig(enlarge=True)` enlarges smaller ones to those sizes as the released pipeline does. A denoiser's `make_size` describes the request's frame count, canvas, prompt and ordered conditions. `layout_size` derives the numerical layout; `holds` checks whether a capacity layout can evaluate a request. Dense layouts pack keyframes and references into their declared prefix. Segment-sparse layouts retain each reference video segment's independent selection domain. Layout indices and latent buffers are borrowed tensors, without request identities or pool ownership.
+The serving path sizes every condition of a request before it reaches the denoiser: a `ref2va` reference keeps its own size on the 32-pixel grid unless it exceeds its encoding size, an image's 2048-pixel short edge or a video's canvas, and `--mm-processor-kwargs '{"enlarge_references":true}'` enlarges smaller ones to those sizes as the released pipeline does. A Python caller states each condition's size itself. A denoiser's `make_size` describes the request's frame count, canvas, prompt and ordered conditions. `layout_size` derives the numerical layout; `holds` checks whether a capacity layout can evaluate a request. Dense layouts pack keyframes and references into their declared prefix. Segment-sparse layouts retain each reference video segment's independent selection domain. Layout indices and latent buffers are borrowed tensors, without request identities or pool ownership.
 
-Visual conditions are encoded in independent temporal units and assembled in the declared latent order. A still image may also be encoded in bands of whole latent patch rows: `VideoEncoder.row_bands` partitions it, `encode(..., rows=...)` encodes one band from the tiles it depends on, and the bands assemble the whole encoding exactly. An `ExecutionContext` created with `tiles={encoder: operator}` encodes that `SpatialEncoder`'s tiles through a borrowed operator equal to its `encode_tile`, such as the replay of a graph captured at `VideoEncoder.still_tile`. Audio conditions supply whole stereo tracks. The denoiser's `encode_conditions`, `prepare_latents`, `prepare_state` and solver calls preserve the checkpoint's condition-noise order, modality schedules and output-head mathematics. Encoded conditions remain fixed while generated video and audio evolve.
+Visual conditions are encoded in independent temporal units and assembled in the declared latent order. A still image may also be encoded in bands of whole latent patch rows: `VideoEncoder.row_bands` partitions it, `encode(..., rows=...)` encodes one band from the tiles it depends on, and the bands assemble the whole encoding exactly. An `ExecutionContext` created with `tiles={encoder: operator}` encodes that `TiledEncoder`'s tiles through a borrowed operator equal to its `encode_tile`, such as the replay of a graph captured at `VideoEncoder.still_tile`. Audio conditions supply whole stereo tracks. The denoiser's `encode_conditions`, `prepare_latents`, `prepare_state` and solver calls preserve the checkpoint's condition-noise order, modality schedules and output-head mathematics. Encoded conditions remain fixed while generated video and audio evolve.
 
 For a partitioned model, load and bind component meshes through the public loader and execution context interfaces. Every participating rank executes the same numerical entry; runtime communication owns collective resources. Passing the server's capacity layout to `generate(..., layout=...)` also preserves the prompt padding and conditioning layout used by serving.

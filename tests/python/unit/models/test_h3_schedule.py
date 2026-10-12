@@ -4,7 +4,11 @@ import pytest
 import torch
 from diffusers.schedulers.scheduling_minimax_h3 import MiniMaxH3Scheduler
 
-from tests.python.fixtures.h3 import base_denoiser, dmd_denoiser
+from tests.python.fixtures.h3 import (
+    audio_vae_config,
+    base_denoiser,
+    dmd_denoiser,
+)
 from uniserve_models.minimax_h3.denoiser import Denoiser
 from uniserve_models.minimax_h3.packing import audio_latent_frames
 
@@ -14,12 +18,13 @@ pytestmark = pytest.mark.unit
 def test_fixed_modality_endpoints():
     with torch.device("meta"):
         model = Denoiser(dmd_denoiser())
-    schedules = model.make_schedules(4, shift=None, device="cpu")
+    schedules = model.make_schedules(device="cpu")
     assert tuple(schedules) == ("video", "audio")
     for name, shift in (("video", 12.0), ("audio", 3.0)):
-        # Each rung is an unshifted noise level on the 1000-step clock,
-        # shifted once per modality and materialized in double precision
-        # before rounding to FP32; the clean endpoint follows the last rung.
+        # Each rung is an unshifted noise level on the 1000-step training
+        # schedule, shifted once per modality and materialized in double
+        # precision before rounding to FP32; the clean endpoint follows the
+        # last rung.
         expected = tuple(
             shift * (rung / 1000) / (1 + (shift - 1) * (rung / 1000))
             for rung in (999, 749, 500, 250, 0)
@@ -37,21 +42,11 @@ def test_fixed_modality_endpoints():
         assert schedules[name].num_steps == 4
 
 
-@pytest.mark.parametrize(
-    "steps,shift", [(1, None), (2, None), (3, None), (5, None), (4, 1.0)]
-)
-def test_rejects_untrained_schedule(steps, shift):
-    with torch.device("meta"):
-        model = Denoiser(dmd_denoiser())
-    with pytest.raises(ValueError, match="evaluates the network 4 times"):
-        model.make_schedules(steps, shift=shift, device="cpu")
-
-
 def test_released_grid_matches_the_reference_scheduler():
     """The full-step schedule is the diffusers scheduler's, bit for bit."""
     with torch.device("meta"):
         model = Denoiser(base_denoiser())
-    schedules = model.make_schedules(49, shift=None, device="cpu")
+    schedules = model.make_schedules(device="cpu")
     for name, shift in (("video", 12.0), ("audio", 3.0)):
         reference = MiniMaxH3Scheduler(shift=shift)
         reference.set_timesteps(50, device="cpu")
@@ -79,11 +74,10 @@ def test_audio_track_decodes_exactly_the_generated_latent_timeline():
     count the denoiser generates, so the decoder never reads past the
     generated latents or leaves requested samples uncovered.
     """
-    from uniserve_models.minimax_h3 import audio_vae
     from uniserve_models.minimax_h3.decoding import AudioDecoder
 
     with torch.device("meta"):
-        decoder = AudioDecoder(audio_vae.Config(), sample_rate=32000)
+        decoder = AudioDecoder(audio_vae_config(), sample_rate=32000)
     for frames in range(107, 363, 17):
         samples = decoder.track_samples(frames, 24)
         assert samples == audio_latent_frames(frames) * decoder.latent_rate

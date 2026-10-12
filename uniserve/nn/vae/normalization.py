@@ -1,6 +1,6 @@
 """Latent normalization conventions of latent encoders and decoders.
 
-A codec's reference maps its native latent to the normalized latent a
+A VAE's reference maps its native latent to the normalized latent a
 generative model consumes, and back. ``LatentNormalization`` declares that
 pair of maps; ``LatentEncoder`` and ``LatentDecoder`` call it, so one encoding
 and decoding pipeline serves every convention. Each subclass reproduces its
@@ -17,7 +17,7 @@ from torch import nn
 
 
 class LatentNormalization(nn.Module):
-    """Map native codec latents to normalized latents and back.
+    """Map native VAE latents to normalized latents and back.
 
     ``normalize`` follows the posterior of an encoder; ``denormalize``
     precedes a decoder network. Both take and return tensors and keep any
@@ -37,13 +37,13 @@ class ChannelStatistics(LatentNormalization):
     """Standardize every latent channel by its mean and deviation in FP32.
 
     ``normalize`` first rounds the native latent to ``latent_dtype``, the
-    representation in which the codec's reference keeps its latents, then
+    representation in which the VAE's reference keeps its latents, then
     computes ``(latent - mean) / std`` in FP32; ``denormalize`` computes
     ``latent * std + mean`` in FP32. Mean and standard deviation are real,
     finite tensors of one shape with positive deviations that broadcast
     against the latent. They register as non-persistent buffers, so they
     retain real values during meta construction and loading moves their
-    backing with the codec.
+    backing with the VAE.
     """
 
     mean: torch.Tensor
@@ -99,7 +99,7 @@ class ScaleShift(LatentNormalization):
 
     ``normalize`` computes ``scale * (latent - shift)`` and ``denormalize``
     computes ``latent / scale + shift``, each in the dtype of its input, as
-    the latent diffusion codecs that define ``scale_factor`` and
+    the latent diffusion VAEs that define ``scale_factor`` and
     ``shift_factor`` evaluate them.
     """
 

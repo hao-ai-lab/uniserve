@@ -1,6 +1,6 @@
 """Worker completion records and response serialization.
 
-A rank reports each submitted batch as one `BatchOutput`: a `RequestOutput`
+A rank reports each submitted batch as one `BatchOutput`: a `CallOutput`
 per call plus the tensor products successful calls published. The execution
 package builds these records once every call's output has materialized on the
 host; `messages.finalize_response` serializes them with `to_mapping` for the
@@ -14,50 +14,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.errors import ErrorCode
 from uniserve_worker.protocol import identity, transfer
 from uniserve_worker.protocol.batch import TensorPublication
-from uniserve_worker.protocol.call import (
-    CallKind,
-    CallStatus,
-    ErrorCode,
-    ForwardMode,
-    TransferMode,
-    computation,
-)
-from uniserve_worker.protocol.validation import (
-    _bool,
-    _enum,
-    _map,
-    _optional_uint,
-    _seq,
-    _str,
-    _uint,
-    _uints,
-)
-
-
-def _logprob_entries(value: object) -> tuple[tuple[int, float, int], ...]:
-    """Decode ranked candidates as ``(token_id, logprob, rank)`` tuples."""
-    entries = []
-    for item in _seq(value, "logprob entries"):
-        data = _map(item, "logprob entry")
-        entries.append(
-            (
-                _uint(data.get("token_id"), "logprob.token_id"),
-                _logprob_value(data.get("logprob")),
-                _uint(data.get("rank"), "logprob.rank"),
-            )
-        )
-
-    return tuple(entries)
-
-
-def _logprob_value(value: object) -> float:
-    """Read a score, including negative infinity for zero-probability tokens."""
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise invalid_descriptor("logprob value must be numeric")
-    return float(value)
+from uniserve_worker.protocol.call import CallStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,22 +32,6 @@ class FinishFlags:
     length: bool = False
     stop: bool = False
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "finish_flags"
-    ) -> FinishFlags:
-        """Parse EOS, length-limit, and stop-sequence termination flags."""
-        data = _map(value, where)
-        return cls(
-            eos=_bool(data.get("eos", False), f"{where}.eos"),
-            length=_bool(data.get("length", False), f"{where}.length"),
-            stop=_bool(data.get("stop", False), f"{where}.stop"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize generation termination flags for IPC."""
-        return {"eos": self.eos, "length": self.length, "stop": self.stop}
-
 
 @dataclass(frozen=True, slots=True)
 class TimingCounters:
@@ -100,28 +44,6 @@ class TimingCounters:
     device_us: int = 0
     copy_us: int = 0
     host_us: int = 0
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "timing_counters"
-    ) -> TimingCounters:
-        """Parse non-negative microsecond timings; absent fields are zero."""
-        data = _map(value, where)
-        return cls(
-            queued_us=_uint(data.get("queued_us", 0), f"{where}.queued_us"),
-            device_us=_uint(data.get("device_us", 0), f"{where}.device_us"),
-            copy_us=_uint(data.get("copy_us", 0), f"{where}.copy_us"),
-            host_us=_uint(data.get("host_us", 0), f"{where}.host_us"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize execution-stage timings in microseconds for IPC."""
-        return {
-            "queued_us": self.queued_us,
-            "device_us": self.device_us,
-            "copy_us": self.copy_us,
-            "host_us": self.host_us,
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,24 +58,6 @@ class PosixShmArtifact:
 
     name: str
 
-    def __post_init__(self) -> None:
-        """Require a non-empty object name without a path separator."""
-        if not self.name or "/" in self.name:
-            raise invalid_descriptor(
-                "POSIX shared-storage artifact name is invalid"
-            )
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "artifact handle"
-    ) -> PosixShmArtifact:
-        """Parse a ``{"transport": "posix_shm", "value": {...}}`` handle."""
-        data = _map(value, where)
-        if data.get("transport") != "posix_shm":
-            raise invalid_descriptor(f"{where}.transport is invalid")
-        payload = _map(data.get("value"), f"{where}.value")
-        return cls(name=_str(payload.get("name"), f"{where}.value.name"))
-
     def to_mapping(self) -> dict[str, object]:
         """Serialize the shared-storage handle as a tagged transport value."""
         return {"transport": "posix_shm", "value": {"name": self.name}}
@@ -166,58 +70,34 @@ class MediaOutput:
     handle: PosixShmArtifact
     bytes: int
 
-    def __post_init__(self) -> None:
-        """Require a positive byte length."""
-        if self.bytes < 1:
-            raise invalid_descriptor("media output locator is invalid")
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "media_output"
-    ) -> MediaOutput:
-        """Parse a validated media artifact handle and byte extent."""
-        data = _map(value, where)
-        return cls(
-            handle=PosixShmArtifact.from_mapping(
-                data.get("handle"), f"{where}.handle"
-            ),
-            bytes=_uint(data.get("bytes"), f"{where}.bytes"),
-        )
-
     def to_mapping(self) -> dict[str, object]:
         """Serialize a completed media artifact for IPC."""
         return {"handle": self.handle.to_mapping(), "bytes": self.bytes}
 
 
 @dataclass(frozen=True, slots=True)
-class RequestOutput:
+class CallOutput:
     """One call's completion: status, accepted progress, tokens, and products.
 
     A successful call reports the request's coordinates after it ran; a
     predicated call did not run and reports the request's accepted
-    coordinates.
+    coordinates. The record is built to satisfy the wire's completion rules,
+    which the engine-side decoder checks once, with the call that answered.
     """
 
     request_key: identity.RequestKey
     call_id: identity.CallId
     status: CallStatus
-    # Allocation generations of the products the call emitted.
-    product_generations: tuple[int, ...]
     # Set exactly when status is ERROR.
     error_code: ErrorCode | None
     timing_counters: TimingCounters
-    # Kind of the call that produced this result; the engine requires it to
-    # match the submitted call.
-    kind: CallKind
-    # Logical position of the request's next input token.
-    position: int
     # Accepted KV prefix a successor may attend to, in tokens.
     kv_visible_len: int
     # KV extent execution initialized, in tokens, including rejected
     # speculative positions.
     kv_computed_len: int
     # Denoising steps completed for the request.
-    num_completed_steps: int
+    step_index: int
     # Token ids the sampler accepted.
     committed_tokens: tuple[int, ...]
     finish_flags: FinishFlags
@@ -237,178 +117,11 @@ class RequestOutput:
     # INVALID_REQUEST.
     error_message: str | None = None
 
-    def validate(self) -> None:
-        """Check that identity, status, coordinates, and outputs agree.
-
-        `PendingOutput.materialize` in `uniserve_worker.execution.output`
-        calls this on every completion it builds, and `from_mapping` on every
-        parsed one.
-
-        Raises:
-            WorkerError: The call id is not positive; a KV publication is
-                attached to anything but a successful KV_PUBLISH of this
-                call; the visible KV extent exceeds the computed one; a
-                coordinate is negative; the error code does not match the
-                status; a refused request's completion states no reason, or
-                another completion does; a completion other than a successful
-                token denoising carries candidate log-probabilities; or a
-                predicated completion carries tokens, logprobs, products, or
-                finish flags.
-        """
-        if self.call_id.batch_id < 1:
-            raise invalid_descriptor("completion call id must be positive")
-
-        if self.candidate_logprobs and (
-            self.status is not CallStatus.OK
-            or self.kind is not ForwardMode.TOKEN_DENOISING
-        ):
-            raise invalid_descriptor(
-                "candidate log-probabilities belong to a successful "
-                "token-denoising completion"
-            )
-
-        if self.kv_output is not None and (
-            self.status is not CallStatus.OK
-            or self.kind is not TransferMode.KV_PUBLISH
-            or self.kv_output.source.owner != self.request_key
-            or self.kv_output.source.producer_call_id != self.call_id
-        ):
-            raise invalid_descriptor(
-                "KV publication does not belong to its successful completion"
-            )
-
-        if self.kv_visible_len > self.kv_computed_len:
-            raise invalid_descriptor(
-                "completion selected KV length exceeds computed length"
-            )
-        if (
-            min(
-                self.position,
-                self.kv_visible_len,
-                self.kv_computed_len,
-                self.num_completed_steps,
-            )
-            < 0
-        ):
-            raise invalid_descriptor(
-                "completion execution coordinates must be non-negative"
-            )
-        if self.status is CallStatus.ERROR:
-            if self.error_code is None:
-                raise invalid_descriptor(
-                    "an error completion must carry an error code"
-                )
-        elif self.error_code is not None:
-            raise invalid_descriptor(
-                "a non-error completion must not carry an error code"
-            )
-        if (self.error_message is not None) != (
-            self.error_code is ErrorCode.INVALID_REQUEST
-        ):
-            raise invalid_descriptor(
-                "a refused request's completion, and only one, states why"
-            )
-        if self.status is CallStatus.PREDICATED and (
-            self.committed_tokens
-            or self.sampled_logprob is not None
-            or self.top_logprobs
-            or self.prompt_logprobs
-            or self.product_generations
-            or self.finish_flags.eos
-            or self.finish_flags.length
-            or self.finish_flags.stop
-        ):
-            raise invalid_descriptor(
-                "a predicated completion must select its parent without "
-                "semantic output"
-            )
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "completion"
-    ) -> RequestOutput:
-        """Parse a completion mapping and run `validate` on the result."""
-        data = _map(value, where)
-        record = cls(
-            request_key=identity.RequestKey.from_mapping(
-                data.get("request_key"), f"{where}.request_key"
-            ),
-            call_id=identity.CallId.from_mapping(
-                data.get("call_id"), f"{where}.call_id"
-            ),
-            status=_enum(CallStatus, data.get("status"), f"{where}.status"),
-            product_generations=_uints(
-                data.get("product_generations", ()),
-                f"{where}.product_generations",
-            ),
-            error_code=(
-                None
-                if data.get("error_code") is None
-                else _enum(ErrorCode, data["error_code"], f"{where}.error_code")
-            ),
-            error_message=None
-            if data.get("error_message") is None
-            else _str(data["error_message"], f"{where}.error_message"),
-            timing_counters=TimingCounters.from_mapping(
-                data.get("timing_counters"), f"{where}.timing_counters"
-            ),
-            kind=computation(data.get("code"), f"{where}.code"),
-            position=_uint(data.get("position"), f"{where}.position"),
-            kv_visible_len=_uint(
-                data.get("kv_visible_len"), f"{where}.kv_visible_len"
-            ),
-            kv_computed_len=_uint(
-                data.get("kv_computed_len"), f"{where}.kv_computed_len"
-            ),
-            num_completed_steps=_uint(
-                data.get("num_completed_steps"), f"{where}.num_completed_steps"
-            ),
-            sampled_logprob=(
-                None
-                if data.get("sampled_logprob") is None
-                else _logprob_value(data["sampled_logprob"])
-            ),
-            top_logprobs=_logprob_entries(data.get("top_logprobs", ())),
-            prompt_logprobs=tuple(
-                _logprob_entries(entries)
-                for entries in _seq(
-                    data.get("prompt_logprobs", ()), "prompt_logprobs"
-                )
-            ),
-            candidate_logprobs=tuple(
-                _logprob_value(value)
-                for value in _seq(
-                    data.get("candidate_logprobs", ()),
-                    f"{where}.candidate_logprobs",
-                )
-            ),
-            committed_tokens=_uints(
-                data.get("committed_tokens", ()), f"{where}.committed_tokens"
-            ),
-            finish_flags=FinishFlags.from_mapping(
-                data.get("finish_flags"), f"{where}.finish_flags"
-            ),
-            kv_output=None
-            if data.get("kv_output") is None
-            else transfer.KvTransfer.from_mapping(
-                data["kv_output"], f"{where}.kv_output"
-            ),
-            media_output=None
-            if data.get("media_output") is None
-            else MediaOutput.from_mapping(
-                data["media_output"], f"{where}.media_output"
-            ),
-        )
-
-        record.validate()
-        return record
-
     def to_mapping(self) -> dict[str, object]:
         """Encode the completion into the wire mapping the transport decodes.
 
         The request-key, finish-flag, and timing mappings are written
-        inline; they must stay identical to those records' `to_mapping`
-        output.
+        inline.
         """
         flags = self.finish_flags
         key = self.request_key
@@ -422,11 +135,9 @@ class RequestOutput:
             },
             "call_id": self.call_id.to_mapping(),
             "status": self.status.value,
-            "code": self.kind.value,
-            "position": self.position,
             "kv_visible_len": self.kv_visible_len,
             "kv_computed_len": self.kv_computed_len,
-            "num_completed_steps": self.num_completed_steps,
+            "step_index": self.step_index,
             "committed_tokens": list(self.committed_tokens),
             "sampled_logprob": self.sampled_logprob,
             "top_logprobs": [
@@ -452,8 +163,7 @@ class RequestOutput:
             "kv_output": None
             if self.kv_output is None
             else self.kv_output.to_mapping(),
-            "product_generations": list(self.product_generations),
-            "error_code": None if error_code is None else error_code.value,
+            "error_code": error_code,
             "error_message": self.error_message,
             "timing_counters": {
                 "queued_us": timing.queued_us,
@@ -544,133 +254,6 @@ class ForwardStats:
 
         return cls(**cast(Any, merged))
 
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "worker forward stats"
-    ) -> ForwardStats:
-        """Parse forward counters; absent fields default to zero or empty.
-
-        Raises:
-            WorkerError: `value` or a keyed field is not a mapping, a
-                mapping key is not a string, or a counter is not a
-                non-negative integer.
-        """
-        data = _map(value, where)
-
-        def counter_map(name: str) -> dict[str, int]:
-            """Parse one string-keyed map of nonnegative execution counters."""
-            values = _map(data.get(name, {}), f"{where}.{name}")
-            return {
-                _str(key, f"{where}.{name}.key"): _uint(
-                    raw, f"{where}.{name}.{key}"
-                )
-                for key, raw in values.items()
-            }
-
-        map_fields = {
-            name: counter_map(name)
-            for name in (
-                "mode_counts",
-                "mode_tokens",
-                "mode_us",
-                "component_us",
-                "attention_backend_counts",
-                "cuda_graph_runtime_mode_counts",
-                "spec_verify_path_counts",
-            )
-        }
-        scalar_fields = {
-            name: _uint(data.get(name, 0), f"{where}.{name}")
-            for name in (
-                "attention_launches",
-                "attention_us",
-                "cuda_graph_captures",
-                "cuda_graph_replays",
-                "cuda_graph_misses",
-                "cuda_graph_fallbacks",
-                "cuda_graph_unpadded_tokens",
-                "cuda_graph_padded_tokens",
-                "text_decode_token_relay_hits",
-                "text_decode_token_relay_misses",
-                "text_decode_position_relay_hits",
-                "text_decode_position_relay_misses",
-                "flashinfer_decode_plan_calls",
-                "flashinfer_decode_plan_reuses",
-                "flashinfer_decode_plan_rows",
-                "flashinfer_decode_plan_indices",
-                "flashinfer_decode_graph_plan_calls",
-                "flashinfer_decode_graph_plan_reuses",
-                "spec_verify_rows",
-                "spec_verify_draft_tokens",
-                "spec_verify_accepted_tokens",
-                "spec_verify_rejected_tokens",
-                "spec_verify_committed_tokens",
-            )
-        }
-
-        return cls(
-            mode_counts=map_fields["mode_counts"],
-            mode_tokens=map_fields["mode_tokens"],
-            mode_us=map_fields["mode_us"],
-            component_us=map_fields["component_us"],
-            attention_launches=scalar_fields["attention_launches"],
-            attention_us=scalar_fields["attention_us"],
-            attention_backend_counts=map_fields["attention_backend_counts"],
-            cuda_graph_captures=scalar_fields["cuda_graph_captures"],
-            cuda_graph_replays=scalar_fields["cuda_graph_replays"],
-            cuda_graph_misses=scalar_fields["cuda_graph_misses"],
-            cuda_graph_fallbacks=scalar_fields["cuda_graph_fallbacks"],
-            cuda_graph_unpadded_tokens=scalar_fields[
-                "cuda_graph_unpadded_tokens"
-            ],
-            cuda_graph_padded_tokens=scalar_fields["cuda_graph_padded_tokens"],
-            cuda_graph_runtime_mode_counts=map_fields[
-                "cuda_graph_runtime_mode_counts"
-            ],
-            text_decode_token_relay_hits=scalar_fields[
-                "text_decode_token_relay_hits"
-            ],
-            text_decode_token_relay_misses=scalar_fields[
-                "text_decode_token_relay_misses"
-            ],
-            text_decode_position_relay_hits=scalar_fields[
-                "text_decode_position_relay_hits"
-            ],
-            text_decode_position_relay_misses=scalar_fields[
-                "text_decode_position_relay_misses"
-            ],
-            flashinfer_decode_plan_calls=scalar_fields[
-                "flashinfer_decode_plan_calls"
-            ],
-            flashinfer_decode_plan_reuses=scalar_fields[
-                "flashinfer_decode_plan_reuses"
-            ],
-            flashinfer_decode_plan_rows=scalar_fields[
-                "flashinfer_decode_plan_rows"
-            ],
-            flashinfer_decode_plan_indices=scalar_fields[
-                "flashinfer_decode_plan_indices"
-            ],
-            flashinfer_decode_graph_plan_calls=scalar_fields[
-                "flashinfer_decode_graph_plan_calls"
-            ],
-            flashinfer_decode_graph_plan_reuses=scalar_fields[
-                "flashinfer_decode_graph_plan_reuses"
-            ],
-            spec_verify_rows=scalar_fields["spec_verify_rows"],
-            spec_verify_draft_tokens=scalar_fields["spec_verify_draft_tokens"],
-            spec_verify_accepted_tokens=scalar_fields[
-                "spec_verify_accepted_tokens"
-            ],
-            spec_verify_rejected_tokens=scalar_fields[
-                "spec_verify_rejected_tokens"
-            ],
-            spec_verify_committed_tokens=scalar_fields[
-                "spec_verify_committed_tokens"
-            ],
-            spec_verify_path_counts=map_fields["spec_verify_path_counts"],
-        )
-
     def to_mapping(self) -> dict[str, object]:
         """Serialize every counter field, copying mappings into plain dicts."""
         return {
@@ -692,46 +275,10 @@ class BatchOutput:
     """
 
     batch_id: int
-    completions: tuple[RequestOutput, ...] = ()
+    completions: tuple[CallOutput, ...] = ()
     products: tuple[TensorPublication, ...] = ()
     worker_exec_us: int | None = None
     forward_stats: ForwardStats | None = None
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "completion report"
-    ) -> BatchOutput:
-        """Parse a batch result mapping, validating each completion."""
-        data = _map(value, where)
-        return cls(
-            batch_id=_uint(data.get("batch_id"), f"{where}.batch_id"),
-            completions=tuple(
-                RequestOutput.from_mapping(
-                    item, f"{where}.completions[{index}]"
-                )
-                for index, item in enumerate(
-                    _seq(data.get("completions", ()), f"{where}.completions")
-                )
-            ),
-            products=tuple(
-                TensorPublication.from_mapping(
-                    item, f"{where}.products[{index}]"
-                )
-                for index, item in enumerate(
-                    _seq(data.get("products", ()), f"{where}.products")
-                )
-            ),
-            worker_exec_us=_optional_uint(
-                data.get("worker_exec_us"), f"{where}.worker_exec_us"
-            ),
-            forward_stats=(
-                None
-                if data.get("forward_stats") is None
-                else ForwardStats.from_mapping(
-                    data["forward_stats"], f"{where}.forward_stats"
-                )
-            ),
-        )
 
     def to_mapping(self) -> dict[str, object]:
         """Encode the result into the mapping the transport decodes."""

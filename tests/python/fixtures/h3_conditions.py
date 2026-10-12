@@ -1,9 +1,11 @@
 """Recorded MiniMax-H3 reference requests as a worker admits them.
 
 A recorded diffusers reference run holds its request and the official media
-it conditions on. These helpers probe that media, plan the request with
-``processing.plan_request``, the planner the server's rules are checked
-against, describe each condition as admission carries it, and read the
+it conditions on. Each recorded case states the sizes the reference
+conditioned it at (the canvas, the frame count, how every condition is
+prepared and what the conditioner reads of it, as the recorded run's
+``metadata.json``, ``presentation.json`` and condition latents show). These
+helpers describe each condition as admission carries it and read the
 conditions through the media reader into products sized as the engine
 reserves them.
 """
@@ -12,21 +14,19 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from fractions import Fraction
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
+from tests.python.fixtures.h3 import text_encoder_config
 from uniserve.media import image
 from uniserve.model import ConditionRole
 from uniserve_models import qwen3_vl
-from uniserve_models.minimax_h3 import processing, video_vae
-from uniserve_models.minimax_h3.encoder import TextEncoderConfig
-from uniserve_models.minimax_h3.encoding import VideoEncoder
+from uniserve_models.minimax_h3.packing import AUDIO_SAMPLE_RATE, FPS
 from uniserve_worker.execution.media_reader import read_conditions
 from uniserve_worker.media.reader import SHARED_MEMORY
 from uniserve_worker.protocol.video import (
@@ -36,21 +36,107 @@ from uniserve_worker.protocol.video import (
     MediaLocator,
     VideoClip,
     VideoCondition,
+    VideoTask,
 )
 
-_VISION = processing.VisionConfig(
-    **json.loads((Path(__file__).parent / "minimax_h3_plan.json").read_text())[
-        "vision"
-    ]
-)
 # The model's audio rate, the rate every soundtrack is resampled to.
-SAMPLE_RATE = 32_000
-FPS = 24
+SAMPLE_RATE = AUDIO_SAMPLE_RATE
+
+# The 16:9 canvas of the canvas rule: 24 x 42 denoiser tokens of 32 pixels,
+# which the conditioner reads as a 48 x 84 grid of 16-pixel patches merged
+# 2 x 2 into 1008 vision tokens.
+_CANVAS = image.Config(768, 1344)
+_CANVAS_ROWS = (768 // 32) * (1344 // 32)
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedRequest:
+    """What the reference generated: its task, canvas and frame count."""
+
+    task: VideoTask
+    canvas: image.Config
+    num_frames: int
+
+
+# The official soundtrack is 44.1 kHz. Five seconds keep its first 227,850
+# native samples, which resample to 165,334 samples at 32 kHz and pad to 207
+# audio latents per stereo channel.
+_SOUNDTRACK = AudioClip(
+    sample_rate=44_100, start_sample=0, source_samples=227_850, samples=165_334
+)
+_SOUNDTRACK_ROWS = 2 * 207
+
+
+def _keyframe(role: ConditionRole, source: MediaLocator) -> VideoCondition:
+    """A keyframe stretched onto the canvas: one image unit of one frame."""
+    return VideoCondition(
+        role=role,
+        source=source,
+        image=ImageFit(_CANVAS, 0, 0, _CANVAS),
+        video=None,
+        audio=None,
+        vision=ConditionVision((1, 48, 84), _CANVAS_ROWS),
+        latent_units=(_CANVAS_ROWS,),
+        audio_rows=0,
+    )
+
+
+def _image_reference(source: MediaLocator, image_bands: int) -> VideoCondition:
+    """A 16:9 image reference enlarged to its 2048-pixel short edge.
+
+    It is 64 patch rows of 114 patches. The patch rows divide evenly into the
+    bands a latent encoder of ``image_bands`` units takes.
+    """
+    size = image.Config(2048, 3648)
+    return VideoCondition(
+        role=ConditionRole.REFERENCE,
+        source=source,
+        image=ImageFit(size, 0, 0, size),
+        video=None,
+        audio=None,
+        vision=ConditionVision((1, 128, 228), 7296),
+        latent_units=(64 // image_bands * 114,) * image_bands,
+        audio_rows=0,
+    )
+
+
+def _video_reference(source: MediaLocator) -> VideoCondition:
+    """The official 16:9 clip's 124 frames with its soundtrack.
+
+    The video encoder encodes seven 17-frame windows of five latent frames
+    and a padded last one of two. The conditioner samples every twelfth frame
+    into six blocks of 1008 vision tokens.
+    """
+    return VideoCondition(
+        role=ConditionRole.REFERENCE,
+        source=source,
+        image=None,
+        video=VideoClip(_CANVAS, start_frame=0, frames=124, vae_frames=124),
+        audio=_SOUNDTRACK,
+        vision=ConditionVision(
+            (6, 48, 84), 6 * _CANVAS_ROWS, tuple(range(0, 121, 12))
+        ),
+        latent_units=(5 * _CANVAS_ROWS,) * 7 + (2 * _CANVAS_ROWS,),
+        audio_rows=_SOUNDTRACK_ROWS,
+    )
+
+
+def _audio_reference(source: MediaLocator) -> VideoCondition:
+    return VideoCondition(
+        role=ConditionRole.REFERENCE,
+        source=source,
+        image=None,
+        video=None,
+        audio=_SOUNDTRACK,
+        vision=None,
+        latent_units=(),
+        audio_rows=_SOUNDTRACK_ROWS,
+    )
 
 
 def vision_encoder() -> qwen3_vl.VisionEncoder:
     """The conditioner's vision encoder; packing reads no parameter."""
-    config = TextEncoderConfig()
+    config = text_encoder_config()
     with torch.device("meta"):
         return qwen3_vl.VisionEncoder(
             config.vision, config.pixels, dtype=torch.bfloat16
@@ -81,190 +167,6 @@ def published() -> Iterator:
 
 def media_file(root: Path, uri: str) -> Path:
     return root / "inputs" / "media" / Path(uri).name
-
-
-def _audio_facts(path: Path) -> processing.AudioFacts | None:
-    from diffusers.modular_pipelines.minimax_h3 import references
-
-    try:
-        waveform, rate = references._decode_audio_file(path)
-    except ValueError:
-        return None
-    return processing.AudioFacts(rate, int(waveform.shape[1]))
-
-
-def _video_facts(path: Path, ffmpeg: str) -> processing.VideoFacts:
-    """Probe a video's display aspect, frame rate, frames and soundtrack."""
-    stream = json.loads(
-        subprocess.run(
-            [
-                str(Path(ffmpeg).with_name("ffprobe")),
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-count_frames",
-                "-show_streams",
-                "-of",
-                "json",
-                str(path),
-            ],
-            capture_output=True,
-            check=True,
-            text=True,
-        ).stdout
-    )["streams"][0]
-    width, height = int(stream["width"]), int(stream["height"])
-    aspect = stream.get("sample_aspect_ratio", "1:1")
-    if aspect not in ("0:1", "N/A"):
-        numerator, denominator = (int(part) for part in aspect.split(":"))
-        width = width * numerator // denominator
-    if any(
-        int(data.get("rotation", 0)) % 180
-        for data in stream.get("side_data_list", ())
-    ):
-        width, height = height, width
-    return processing.VideoFacts(
-        display_width=width,
-        display_height=height,
-        width=width,
-        height=height,
-        frame_rate=Fraction(stream["avg_frame_rate"]),
-        frames=int(stream["nb_read_frames"]),
-        soundtrack=_audio_facts(path),
-    )
-
-
-def _facts(path: Path, kind: processing.ConditionType, ffmpeg: str):
-    from PIL import Image, ImageOps
-
-    if kind is processing.ConditionType.IMAGE:
-        with Image.open(path) as value:
-            width, height = ImageOps.exif_transpose(value).size
-        return processing.ImageFacts(width, height)
-    if kind is processing.ConditionType.AUDIO:
-        return _audio_facts(path)
-    return _video_facts(path, ffmpeg)
-
-
-def plan(request: dict, root: Path, ffmpeg: str):
-    """Plan a recorded request from its media's probed facts."""
-    conditions = []
-    for item in request["conditions"]:
-        kind = processing.ConditionType(item["type"])
-        conditions.append(
-            processing.Condition(
-                type=kind,
-                role=processing.Role(item["role"]),
-                media=_facts(media_file(root, item["uri"]), kind, ffmpeg),
-                frame_index=item.get("frame_index"),
-                start_seconds=item.get("start_time_seconds"),
-            )
-        )
-    target = processing.Target(**request["target"])
-    # The recorded runs come from the reference pipeline, which enlarges
-    # small references.
-    return processing.plan_request(
-        processing.Task(request["task"]),
-        target,
-        conditions,
-        _VISION,
-        references=processing.ReferenceConfig(enlarge=True),
-    )
-
-
-def _audio(clip: processing.AudioClip) -> AudioClip:
-    return AudioClip(
-        clip.sample_rate, clip.start_sample, clip.source_samples, clip.samples
-    )
-
-
-def describe(
-    plan: processing.ConditionPlan,
-    canvas: image.Config,
-    source: MediaLocator,
-    image_bands: int = 1,
-) -> VideoCondition:
-    """Describe one planned condition as admission carries it.
-
-    A reference image is encoded in ``image_bands`` bands of its patch rows,
-    as the server bands it for a latent encoder of that many units a round.
-    """
-    with torch.device("meta"):
-        encoder = VideoEncoder(video_vae.Config())
-    prepared, seen = plan.prepared, plan.vision
-    fit = video = audio = None
-    role = ConditionRole.REFERENCE
-    if isinstance(prepared, processing.KeyframeFit):
-        role = (
-            ConditionRole.FIRST_FRAME
-            if prepared.position is processing.FramePosition.FIRST
-            else ConditionRole.LAST_FRAME
-        )
-        crop = prepared.cover_crop
-        fit = (
-            ImageFit(canvas, 0, 0, canvas)
-            if crop is None
-            else ImageFit(
-                image.Config(crop.height, crop.width),
-                crop.left,
-                crop.top,
-                canvas,
-            )
-        )
-    elif isinstance(prepared, image.Config):
-        fit = ImageFit(prepared, 0, 0, prepared)
-    elif isinstance(prepared, processing.VideoClip):
-        video = VideoClip(
-            prepared.canvas,
-            prepared.start_frame,
-            prepared.frames,
-            prepared.vae_frames,
-        )
-        if prepared.soundtrack is not None:
-            audio = _audio(prepared.soundtrack)
-    else:
-        audio = _audio(prepared)
-
-    # Each temporal unit of the encoded pixels yields its latent frames'
-    # rows; a keyframe is one unit of one latent frame and a reference image
-    # one unit per band of its patch rows.
-    if isinstance(prepared, image.Config):
-        per_group = processing.rows_per_frame(prepared) // (
-            prepared.height // processing.CANVAS_MULTIPLE
-        )
-        units = tuple(
-            (band.stop - band.start) // encoder.row_group * per_group
-            for band in encoder.row_bands(prepared, image_bands)
-        )
-    elif fit is not None:
-        units = (processing.rows_per_frame(fit.size),)
-    elif video is not None:
-        units = tuple(
-            (window.stop - window.start)
-            * processing.rows_per_frame(video.canvas)
-            for window in encoder.latent_slices(video.vae_frames)
-        )
-    else:
-        units = ()
-    if isinstance(seen, processing.VideoVision):
-        view = ConditionVision(
-            seen.grid, seen.block_tokens * seen.grid[0], seen.frame_indices
-        )
-    elif seen is not None:
-        view = ConditionVision(seen.grid, seen.tokens)
-    else:
-        view = None
-    return VideoCondition(
-        role=role,
-        source=source,
-        image=fit,
-        video=video,
-        audio=audio,
-        vision=view,
-        latent_units=units,
-        audio_rows=plan.audio_rows,
-    )
 
 
 def read(conditions, vision, ffmpeg):
@@ -303,26 +205,40 @@ def read(conditions, vision, ffmpeg):
         patches=patches,
         vision=vision,
         sample_rate=SAMPLE_RATE,
+        frame_rate=FPS,
         ffmpeg=ffmpeg,
     )
     return pixels, samples, patches
 
 
-def recorded_request(
-    root: Path, case: str, ffmpeg: str, publish, image_bands: int = 1
-):
-    """Plan a recorded run's request and describe its conditions.
+def recorded_request(root: Path, case: str, publish, image_bands: int = 1):
+    """Describe a recorded run's request and its conditions.
 
-    Returns the run directory, the plan, each condition's media file and
-    the conditions as admission carries them, published with ``publish``,
-    reference images in ``image_bands`` bands.
+    Returns the run directory, the request's task, canvas and frame count,
+    each condition's media file and the conditions as admission carries
+    them, published with ``publish``, reference images in ``image_bands``
+    bands.
     """
     run = root / "reference" / "diffusers" / case / "seed42"
-    request = json.loads((run / "request.json").read_text())
-    planned = plan(request, root, ffmpeg)
-    paths = [media_file(root, item["uri"]) for item in request["conditions"]]
-    conditions = tuple(
-        describe(condition, planned.canvas, publish(path), image_bands)
-        for condition, path in zip(planned.conditions, paths, strict=True)
-    )
-    return run, planned, paths, conditions
+    items = json.loads((run / "request.json").read_text())["conditions"]
+    paths = [media_file(root, item["uri"]) for item in items]
+    sources = [publish(path) for path in paths]
+    if case == "fl2va_first_8s":
+        request = RecordedRequest(VideoTask.FL2VA, _CANVAS, 192)
+        conditions = (_keyframe(ConditionRole.FIRST_FRAME, sources[0]),)
+    elif case == "ref2va_image_audio_5s":
+        request = RecordedRequest(VideoTask.REF2VA, _CANVAS, 124)
+        conditions = (
+            _image_reference(sources[0], image_bands),
+            _audio_reference(sources[1]),
+        )
+    elif case == "ref2va_video_audio_5s":
+        request = RecordedRequest(VideoTask.REF2VA, _CANVAS, 124)
+        conditions = (
+            _video_reference(sources[0]),
+            _audio_reference(sources[1]),
+        )
+    else:
+        raise KeyError(f"no recorded sizes for the case {case!r}")
+    assert len(conditions) == len(paths)
+    return run, request, paths, conditions

@@ -107,6 +107,18 @@ This policy covers tests, builds, lint, type checks, benchmarks, smoke tests, he
 - Coverage is diagnostic information, not a target. Reject duplicate tests and coverage targets that incentivize prohibited tests.
 - Keep failures within their relevant scope. An unrelated failure does not redefine completion or trigger broader repairs unless it materially invalidates the requested behavior.
 
+## Long-Running Execution
+
+An expensive run is a commitment of time and resources whose setup must be proven before it is spent, and observed while it runs. The run must not be the first test of its own setup.
+
+- Establish the setup with the smallest slice that follows the same path as the full run, using the same launcher, inputs, environment, and reference. Read that slice's output yourself before launching the rest. Environment, inputs, leftover state, limits, and references fail cheaply and early when probed and expensively and late when they are not.
+- List what the run requires, such as environment variables, assets, free devices, locks, and clean shared storage, and confirm each is present before launching. Derive the run's time limit from its work, such as the number of cases times the cost of one case, rather than from a guess.
+- Order the work so the cheapest and most diverse cases run first and the most expensive run last, so a defect in the setup is found by a cheap case.
+- Read the run while it executes: the first result and the first anomaly as they appear. Stop the whole batch at the first deviation, diagnose the cause of the first failure, and do not rerun while the cause is unexplained.
+- For a run expected to last longer than fifteen minutes, schedule a recurring inspection every fifteen minutes that reads current observations, such as results so far, live output, resource state, and leftover processes, and stops the batch on any anomaly. Remove the schedule when the work ends. A run shorter than fifteen minutes is exempt: probe a slice first and read its first result directly.
+- Trust observations, not summaries. A report, a summary line, or a list of passing items is evidence only for what it names; compare it with what the change affects.
+- Make the runner own the state it leaves. Each item of a batch ends with its processes terminated and its shared resources released, so a timeout or crash cannot contaminate the next item. Record the first error of a failure, not only its count.
+
 ## Benchmarks, Conformance, and Evaluation
 
 - Fix the protocol before using outcomes: workload, sample set, prompts, dataset preprocessing, arrival and concurrency semantics, cache and prefix-cache behavior, sampling settings, precision, quality knobs, token and image limits, environment, reference implementation, metric definitions, and acceptance criteria.

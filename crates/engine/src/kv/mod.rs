@@ -12,7 +12,7 @@
 //! Key concepts:
 //!
 //! - Unit pool: the worker stores every cache group in one pool of equally
-//!   sized units. A group's logical page holds `page_tokens` tokens of every
+//!   sized units. A group's logical page holds `block_size` tokens of every
 //!   layer in the group and occupies `units_per_page` units, so groups with
 //!   different page shapes share one free queue and one capacity, and
 //!   admission and growth compare the sum of every group's unit demand with
@@ -45,7 +45,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use uniserve_core::{HashAlgo, KvCacheGroup, Modality, UnitId};
+use uniserve_core::{KvCacheGroup, Modality, UnitId};
 use uniserve_worker_ipc::WorkerEndpoint;
 
 mod encoder_cache;
@@ -54,58 +54,33 @@ mod freeq;
 pub(crate) use encoder_cache::EncoderCacheManager;
 use freeq::UnitMeta;
 
-/// Computes an incremental per-page prefix hash.
+/// Computes an incremental per-page prefix hash with 64-bit FNV-1a.
 ///
 /// `parent` is the hash of the preceding page (or the chain seed for the
 /// first page), so equal hashes identify equal complete prefixes up to hash
 /// collisions. `group_id` and `modality_tag` separate chains that hash the
-/// same tokens for different cache groups or modalities. Both algorithms
-/// produce a 64-bit key, so callers must still compare exact tokens before
+/// same tokens for different cache groups or modalities. FNV-1a is not
+/// collision resistant, so callers must still compare exact tokens before
 /// reusing a page.
-pub(crate) fn block_hash(
-    parent: u64,
-    group_id: u32,
-    modality_tag: u8,
-    tokens: &[u32],
-    algo: HashAlgo,
-) -> u64 {
+pub(crate) fn block_hash(parent: u64, group_id: u32, modality_tag: u8, tokens: &[u32]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001B3;
     let token_count = tokens.len() as u32;
-    match algo {
-        HashAlgo::Fnv1a => {
-            const OFFSET: u64 = 0xcbf29ce484222325;
-            const PRIME: u64 = 0x00000100000001B3;
-            let mut h = OFFSET;
-            let mix = |bytes: &[u8], h: &mut u64| {
-                for b in bytes {
-                    *h ^= u64::from(*b);
-                    *h = h.wrapping_mul(PRIME);
-                }
-            };
-            mix(&parent.to_le_bytes(), &mut h);
-            mix(&group_id.to_le_bytes(), &mut h);
-            mix(&[modality_tag], &mut h);
-            mix(&token_count.to_le_bytes(), &mut h);
-            for token in tokens {
-                mix(&token.to_le_bytes(), &mut h);
-            }
-            h
+    let mut h = OFFSET;
+    let mix = |bytes: &[u8], h: &mut u64| {
+        for b in bytes {
+            *h ^= u64::from(*b);
+            *h = h.wrapping_mul(PRIME);
         }
-        HashAlgo::Sha256 => {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(parent.to_le_bytes());
-            hasher.update(group_id.to_le_bytes());
-            hasher.update([modality_tag]);
-            hasher.update(token_count.to_le_bytes());
-            for token in tokens {
-                hasher.update(token.to_le_bytes());
-            }
-            // The page hash is the little-endian first eight digest bytes.
-            let digest: [u8; 32] = hasher.finalize().into();
-            let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = digest;
-            u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
-        }
+    };
+    mix(&parent.to_le_bytes(), &mut h);
+    mix(&group_id.to_le_bytes(), &mut h);
+    mix(&[modality_tag], &mut h);
+    mix(&token_count.to_le_bytes(), &mut h);
+    for token in tokens {
+        mix(&token.to_le_bytes(), &mut h);
     }
+    h
 }
 
 /// Returns the stable byte tag included in modality-specific prefix hashes.
@@ -601,7 +576,7 @@ impl fmt::Debug for BlockPool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GroupShape {
     /// Tokens per logical page.
-    pub(crate) page_tokens: usize,
+    pub(crate) block_size: usize,
     /// Units one logical page occupies.
     pub(crate) units_per_page: usize,
     /// History tokens any reader needs, or `None` for full attention.
@@ -612,7 +587,7 @@ impl GroupShape {
     /// Derives the scheduler shape of a worker-reported group.
     pub(crate) fn from_group(group: &KvCacheGroup) -> Self {
         Self {
-            page_tokens: group.page_tokens as usize,
+            block_size: group.block_size as usize,
             units_per_page: group.units_per_page as usize,
             window: group.kind.window().map(|window| window as usize),
         }
@@ -623,13 +598,13 @@ impl GroupShape {
     /// oldest history token of the window.
     fn first_needed_page(&self, read_start: usize) -> usize {
         self.window.map_or(0, |window| {
-            read_start.saturating_sub(window) / self.page_tokens
+            read_start.saturating_sub(window) / self.block_size
         })
     }
 
     /// Returns the logical pages that cover `tokens` tokens.
     fn pages_covering(&self, tokens: usize) -> usize {
-        tokens.div_ceil(self.page_tokens)
+        tokens.div_ceil(self.block_size)
     }
 }
 
@@ -664,7 +639,7 @@ impl BlockTable {
     /// Creates an empty table for one cache group.
     pub(crate) fn new(group_id: usize, shape: GroupShape) -> Self {
         assert!(
-            shape.page_tokens > 0 && shape.units_per_page > 0,
+            shape.block_size > 0 && shape.units_per_page > 0,
             "KV page shape must be positive"
         );
         Self {
@@ -693,7 +668,7 @@ impl BlockTable {
 
     /// Returns the absolute token extent the table covers.
     pub(crate) fn capacity_tokens(&self) -> usize {
-        self.end_page() * self.shape.page_tokens
+        self.end_page() * self.shape.block_size
     }
 
     /// Returns the held pages' units, page-major from `start_page`.
@@ -817,7 +792,7 @@ pub(crate) struct PrefixLookup {
     /// Empty when prefix caching does not apply to the request.
     pub(crate) page_hashes: Vec<Vec<u64>>,
     /// Leading prompt tokens acquired from the prefix cache; a multiple of
-    /// the largest page size.
+    /// the largest block size.
     pub(crate) cached_tokens: usize,
 }
 
@@ -825,7 +800,7 @@ pub(crate) struct PrefixLookup {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PrefixHit {
     /// Leading prompt tokens every group can reuse; a multiple of the
-    /// largest page size.
+    /// largest block size.
     pub(crate) cached_tokens: usize,
     /// Units of the pages a hit would acquire that are currently
     /// unreferenced (`Cached`).
@@ -854,19 +829,17 @@ struct PrefixSelection {
 pub(crate) struct KvCacheCoordinator {
     groups: Vec<GroupShape>,
     prefix_enabled: bool,
-    hash_algo: HashAlgo,
     /// Root of every hash chain; an isolation key is mixed into it.
     hash_seed: u64,
 }
 
 impl KvCacheCoordinator {
     /// Creates a coordinator for the given cache groups with prefix caching
-    /// enabled, FNV-1a hashing and a zero chain seed.
+    /// enabled and a zero chain seed.
     pub(crate) fn new(groups: Vec<GroupShape>) -> Self {
         Self {
             groups,
             prefix_enabled: true,
-            hash_algo: HashAlgo::Fnv1a,
             hash_seed: 0,
         }
     }
@@ -881,16 +854,11 @@ impl KvCacheCoordinator {
         self.prefix_enabled = enabled;
     }
 
-    /// Sets the prefix-cache hashing algorithm.
-    pub(crate) fn set_hash_algo(&mut self, algorithm: HashAlgo) {
-        self.hash_algo = algorithm;
-    }
-
-    /// Returns the largest page size of any group, in tokens.
-    fn max_page_tokens(&self) -> usize {
+    /// Returns the largest block size of any group, in tokens.
+    fn max_block_size(&self) -> usize {
         self.groups
             .iter()
-            .map(|group| group.page_tokens)
+            .map(|group| group.block_size)
             .max()
             .unwrap_or(1)
     }
@@ -949,7 +917,7 @@ impl KvCacheCoordinator {
     /// Returns the units a request that will reuse a `prefix_tokens`-long
     /// cached prefix allocates to hold `total_tokens` tokens.
     ///
-    /// The prefix is a multiple of every page size, and acquisition takes its
+    /// The prefix is a multiple of every block size, and acquisition takes its
     /// pages (a full group's whole prefix, a sliding group's window) from the
     /// cache, so each group allocates only the pages after it.
     pub(crate) fn units_after_prefix(&self, prefix_tokens: usize, total_tokens: usize) -> usize {
@@ -958,7 +926,7 @@ impl KvCacheCoordinator {
             .map(|group| {
                 let pages = group
                     .pages_covering(total_tokens)
-                    .saturating_sub(prefix_tokens / group.page_tokens);
+                    .saturating_sub(prefix_tokens / group.block_size);
                 pages * group.units_per_page
             })
             .sum()
@@ -984,7 +952,7 @@ impl KvCacheCoordinator {
             .map(|group| {
                 let pages = group.pages_covering(tokens);
                 let pages = group.window.map_or(pages, |window| {
-                    pages.min((window + chunk.max(1)).div_ceil(group.page_tokens) + 1)
+                    pages.min((window + chunk.max(1)).div_ceil(group.block_size) + 1)
                 });
                 pages * group.units_per_page
             })
@@ -1057,7 +1025,7 @@ impl KvCacheCoordinator {
         }
         for table in &mut allocation.tables {
             if let Some(window) = table.shape.window {
-                let bound = visible.saturating_sub(window) / table.shape.page_tokens;
+                let bound = visible.saturating_sub(window) / table.shape.block_size;
                 table.retire_before(bound);
             }
         }
@@ -1080,15 +1048,10 @@ impl KvCacheCoordinator {
             .map(|(group, shape)| {
                 let mut parent = seed;
                 prompt
-                    .chunks_exact(shape.page_tokens)
+                    .chunks_exact(shape.block_size)
                     .map(|tokens| {
-                        parent = block_hash(
-                            parent,
-                            group as u32,
-                            modality_tag(Modality::Und),
-                            tokens,
-                            self.hash_algo,
-                        );
+                        parent =
+                            block_hash(parent, group as u32, modality_tag(Modality::Und), tokens);
                         parent
                     })
                     .collect()
@@ -1098,7 +1061,7 @@ impl KvCacheCoordinator {
 
     /// Finds the longest prompt prefix every group can reuse.
     ///
-    /// The prefix length `M` is a multiple of the largest page size and
+    /// The prefix length `M` is a multiple of the largest block size and
     /// leaves at least one prompt token to compute, so prefill still produces
     /// the first sampled token's logits. A full-attention group needs every
     /// page before `M`; a sliding-window group needs only the pages
@@ -1115,7 +1078,7 @@ impl KvCacheCoordinator {
         hashes: &[Vec<u64>],
         source: &WorkerEndpoint,
     ) -> PrefixSelection {
-        let step = self.max_page_tokens();
+        let step = self.max_block_size();
         let mut tokens = prompt.len().saturating_sub(1) / step * step;
 
         // One lookup per complete prompt page and group; each hit records
@@ -1125,11 +1088,10 @@ impl KvCacheCoordinator {
             .iter()
             .enumerate()
             .map(|(group, shape)| {
-                let pages = (tokens / shape.page_tokens).min(hashes[group].len());
+                let pages = (tokens / shape.block_size).min(hashes[group].len());
                 (0..pages)
                     .map(|page| {
-                        let span =
-                            &prompt[page * shape.page_tokens..(page + 1) * shape.page_tokens];
+                        let span = &prompt[page * shape.block_size..(page + 1) * shape.block_size];
                         pool.lookup(hashes[group][page], group as u32, span, source)
                     })
                     .collect::<Vec<_>>()
@@ -1155,7 +1117,7 @@ impl KvCacheCoordinator {
             let previous = tokens;
             for (group, shape) in self.groups.iter().enumerate() {
                 let supported = |length: usize| {
-                    let end = length / shape.page_tokens;
+                    let end = length / shape.block_size;
                     let start = shape.first_needed_page(length).min(end);
                     misses[group][end] == misses[group][start]
                 };
@@ -1175,7 +1137,7 @@ impl KvCacheCoordinator {
             .iter()
             .enumerate()
             .map(|(group, shape)| {
-                let end = tokens / shape.page_tokens;
+                let end = tokens / shape.block_size;
                 let start = shape.first_needed_page(tokens).min(end);
                 let selected = hits[group][start..end]
                     .iter()
@@ -1284,8 +1246,7 @@ impl KvCacheCoordinator {
                     .enumerate()
                     .map(|(offset, (head, _))| {
                         let page = start + offset;
-                        let span =
-                            &prompt[page * shape.page_tokens..(page + 1) * shape.page_tokens];
+                        let span = &prompt[page * shape.block_size..(page + 1) * shape.block_size];
                         // `acquire` rechecks each page's identity.
                         pool.acquire(
                             *head,
@@ -1354,15 +1315,15 @@ impl KvCacheCoordinator {
 
         let computed = computed_tokens.min(prompt.len());
         for (group, (table, group_hashes)) in allocation.tables.iter().zip(hashes).enumerate() {
-            let page_tokens = table.shape.page_tokens;
-            let complete = (computed / page_tokens).min(group_hashes.len());
+            let block_size = table.shape.block_size;
+            let complete = (computed / block_size).min(group_hashes.len());
             for page in published[group]..complete {
                 // A page retired before publication (never, for a caller that
                 // publishes before releasing) cannot be published anymore.
                 let Some(reference) = table.page(page) else {
                     continue;
                 };
-                let tokens = &prompt[page * page_tokens..(page + 1) * page_tokens];
+                let tokens = &prompt[page * block_size..(page + 1) * block_size];
                 pool.publish(reference, group as u32, group_hashes[page], tokens, source);
             }
             published[group] = published[group].max(complete);
@@ -1386,17 +1347,17 @@ mod tests {
         Arc::new(uniserve_worker_ipc::WorkerInfo::default().endpoint)
     }
 
-    fn full(page_tokens: usize, units_per_page: usize) -> GroupShape {
+    fn full(block_size: usize, units_per_page: usize) -> GroupShape {
         GroupShape {
-            page_tokens,
+            block_size,
             units_per_page,
             window: None,
         }
     }
 
-    fn sliding(page_tokens: usize, units_per_page: usize, window: usize) -> GroupShape {
+    fn sliding(block_size: usize, units_per_page: usize, window: usize) -> GroupShape {
         GroupShape {
-            page_tokens,
+            block_size,
             units_per_page,
             window: Some(window),
         }
@@ -1446,7 +1407,7 @@ mod tests {
             .iter()
             .map(|page| {
                 let reference = pool.allocate(1, shape.units_per_page).unwrap().remove(0);
-                let tokens = &prompt[page * shape.page_tokens..(page + 1) * shape.page_tokens];
+                let tokens = &prompt[page * shape.block_size..(page + 1) * shape.block_size];
                 pool.publish(
                     &reference,
                     group as u32,
@@ -1707,7 +1668,6 @@ mod tests {
         let prompt = [1, 2, 3, 4, 5];
         let first = endpoint();
         let second = Arc::new(WorkerEndpoint {
-            worker_id: "replica".into(),
             incarnation: "replica-loaded".into(),
             ..first.as_ref().clone()
         });

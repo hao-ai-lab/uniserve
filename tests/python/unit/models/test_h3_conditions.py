@@ -14,10 +14,10 @@ from tests.python.fixtures.h3 import (
     base_denoiser,
     dmd_denoiser,
     omniref_denoiser,
+    transformer_config,
 )
 from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
-from uniserve_models.minimax_h3 import TransformerConfig
 from uniserve_models.minimax_h3.denoiser import Denoiser
 from uniserve_models.minimax_h3.inputs import DenoiserSize
 from uniserve_models.minimax_h3.packing import patchify_video
@@ -59,7 +59,7 @@ def test_each_denoiser_takes_the_conditions_of_its_tasks():
     # 64 x 36 patches and the keyframe's 1008.
     assert size.condition_rows == 4032 + 120 + 2304 + 1008
 
-    with pytest.raises(ValueError, match="sparse"):
+    with pytest.raises(ValueError, match="no keyframes"):
         _meta(dmd_denoiser()).make_size(
             124, 64, canvas=WIDE, conditions=(FIRST,)
         )
@@ -85,7 +85,7 @@ def test_visual_condition_draws_lead_in_packed_order():
 
 
 def _small() -> Denoiser:
-    transformer = TransformerConfig(
+    transformer = transformer_config(
         hidden_size=64,
         num_attention_heads=4,
         num_hidden_layers=1,
@@ -191,7 +191,7 @@ def test_reference_segments_take_whole_tiles():
 def test_reference_segment_state_follows_its_layout():
     model = Denoiser(
         omniref_denoiser(
-            TransformerConfig(
+            transformer_config(
                 hidden_size=64,
                 num_attention_heads=4,
                 num_hidden_layers=1,
@@ -222,7 +222,10 @@ def test_reference_segment_state_follows_its_layout():
     # The prompt, the clip's soundtrack and patches, and the generated 2 x
     # 207 audio rows and 37 x 24 x 42 video patches fill the tiles.
     prefix = 300 + 120 + 4032
-    assert int(out["valid_sizes"].sum()) == prefix + 2 * 207 + 37 * 24 * 42
+    assert (
+        int(out["variable_block_sizes"].sum())
+        == prefix + 2 * 207 + 37 * 24 * 42
+    )
     # The clip's video forms segment 0 and the generated video segment 1.
     assert set(out["tile_segments"].tolist()) == {-1, 0, 1}
     # Only the request's prefix rows gather the prefix source; every other
@@ -252,7 +255,7 @@ def test_a_condition_layout_holds_its_condition_rows():
 
 
 def test_a_condition_layout_respects_the_attention_kind():
-    with pytest.raises(ValueError, match="single-segment sparse"):
+    with pytest.raises(ValueError, match="takes no conditions"):
         model = _meta(dmd_denoiser())
         model.condition_layout(
             model.layout_size(model.make_size(124, 64, canvas=WIDE)), 64

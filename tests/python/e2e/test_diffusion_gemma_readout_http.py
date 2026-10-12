@@ -44,8 +44,8 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     server_process,
 )
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve_models import loading as models
-from uniserve_worker.config.execution import WorkerConfig
 
 pytestmark = [
     pytest.mark.e2e,
@@ -258,7 +258,7 @@ def test_distinct_images_beyond_the_encoder_cache_are_read(served):
     retained features.
     """
     base_url, _ = served
-    entries = WorkerConfig().encoder_cache_entries
+    entries = cpu_worker_config().encoder_cache_entries
     names = list(COLORS)
     with httpx.Client(timeout=600.0) as client:
         for index in range(entries + 8):

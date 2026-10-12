@@ -1,7 +1,7 @@
 [
   {
     "id": "text-0",
-    "memory_fraction": 0.26,
+    "mem_fraction_static": 0.26,
     "ranks": [
       { "node": "localhost", "device": "cuda:0" },
       { "node": "localhost", "device": "cuda:1" },
@@ -18,7 +18,7 @@
   },
   {
     "id": "text-1",
-    "memory_fraction": 0.26,
+    "mem_fraction_static": 0.26,
     "ranks": [
       { "node": "localhost", "device": "cuda:4" },
       { "node": "localhost", "device": "cuda:5" },
@@ -35,7 +35,7 @@
   },
   {
     "id": "flow-0",
-    "memory_fraction": 0.73,
+    "mem_fraction_static": 0.73,
     "ranks": [
       { "node": "localhost", "device": "cuda:0" },
       { "node": "localhost", "device": "cuda:1" },
@@ -51,22 +51,19 @@
       },
       "video_decoder": {
         "ranks": [0, 1, 2, 3],
-        "parallel_config": {},
-        "distribution": "temporal_units",
-        "units_per_rank": 1
+        "parallel_config": {}
       },
       "audio_decoder": {
         "ranks": [0, 1, 2, 3],
         "parallel_config": {},
-        "distribution": "temporal_units",
-        "units_per_rank": 1
+        "distribution": "temporal_units"
       }
     },
     "queue_depth": 6
   },
   {
     "id": "flow-1",
-    "memory_fraction": 0.73,
+    "mem_fraction_static": 0.73,
     "ranks": [
       { "node": "localhost", "device": "cuda:4" },
       { "node": "localhost", "device": "cuda:5" },
@@ -82,15 +79,12 @@
       },
       "video_decoder": {
         "ranks": [0, 1, 2, 3],
-        "parallel_config": {},
-        "distribution": "temporal_units",
-        "units_per_rank": 1
+        "parallel_config": {}
       },
       "audio_decoder": {
         "ranks": [0, 1, 2, 3],
         "parallel_config": {},
-        "distribution": "temporal_units",
-        "units_per_rank": 1
+        "distribution": "temporal_units"
       }
     },
     "queue_depth": 6
@@ -106,9 +100,7 @@
     "components": {
       "video_codec": {
         "ranks": [0, 1, 2, 3],
-        "parallel_config": {},
-        "distribution": "temporal_units",
-        "units_per_rank": 1
+        "parallel_config": {}
       }
     },
     "queue_depth": 6
@@ -124,9 +116,7 @@
     "components": {
       "video_codec": {
         "ranks": [0, 1, 2, 3],
-        "parallel_config": {},
-        "distribution": "temporal_units",
-        "units_per_rank": 1
+        "parallel_config": {}
       }
     },
     "queue_depth": 6

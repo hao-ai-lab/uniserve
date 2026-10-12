@@ -7,7 +7,7 @@ from collections.abc import Callable
 import torch
 
 from uniserve.model import PatchEncoder, VisionInput
-from uniserve.nn.vae import PatchAutoencoder, SpatialEncoder
+from uniserve.nn.vae import PatchAutoencoder, TiledEncoder
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.device import fill_cpu_ints
 from uniserve.runtime.resources import close_resources
@@ -19,21 +19,16 @@ from .cuda_graph import CUDAGraphRunner
 from .model_runner import ModelRunner
 from .output import ExecutionOutput
 
-# Most images one packed vision graph encodes. The largest graph's
-# activations bound the graph pool the vision graphs share (for
-# DiffusionGemma, 16 slots of 2520 patch rows), and a call with more images
-# replays it once per such group.
-MAX_PACKED_IMAGES = 16
 
-
-def packed_capacities(max_images: int) -> tuple[int, ...]:
+def packed_capacities(max_images: int, max_slots: int) -> tuple[int, ...]:
     """Slot counts of the packed vision graphs for calls of ``max_images``.
 
-    Every count from one to ``max_images``, capped at ``MAX_PACKED_IMAGES``,
-    so a call pads no empty slots below the cap. The graphs share one pixel
-    buffer and one pool, so each further count adds only its output.
+    Every count from one to ``max_images``, capped at the encoder's
+    ``max_slots``, so a call pads no empty slots below the cap and a larger
+    batch replays the largest graph once per group. The graphs share one
+    pixel buffer and one pool, so each further count adds only its output.
     """
-    return tuple(range(1, min(max_images, MAX_PACKED_IMAGES) + 1))
+    return tuple(range(1, min(max_images, max_slots) + 1))
 
 
 class EncoderRunner(ModelRunner):
@@ -46,7 +41,7 @@ class EncoderRunner(ModelRunner):
     group, and every packing of a capacity replays its graph.
 
     A video encoder's runner with graph pools captures the tile encoding of
-    a ``SpatialEncoder`` at startup (``capture_tile``), whose replay the
+    a ``TiledEncoder`` at startup (``capture_tile``), whose replay the
     entry's later contexts bind.
     """
 
@@ -137,8 +132,9 @@ class EncoderRunner(ModelRunner):
         encoder = self.model
         assert isinstance(encoder, PatchEncoder)
         assert encoder.max_patches is not None
+        assert encoder.max_slots is not None
         row = 3 * encoder.patch_size**2
-        capacities = packed_capacities(max_images)
+        capacities = packed_capacities(max_images, encoder.max_slots)
 
         # Only one packed call runs at a time on the runner's stream, so
         # every capacity reads the leading slots of one pixel buffer.
@@ -175,7 +171,7 @@ class EncoderRunner(ModelRunner):
 
     @torch.inference_mode()
     def capture_tile(
-        self, encoder: SpatialEncoder, pixels: torch.Tensor
+        self, encoder: TiledEncoder, pixels: torch.Tensor
     ) -> Callable[[torch.Tensor], torch.Tensor] | None:
         """Capture ``encoder``'s encoding of one tile and return its operator.
 

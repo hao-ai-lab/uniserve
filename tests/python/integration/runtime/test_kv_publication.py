@@ -37,14 +37,12 @@ from uniserve_worker.protocol.call import (
     TransferMode,
 )
 from uniserve_worker.protocol.identity import BufferId, CallId
-from uniserve_worker.protocol.output import BatchOutput
 from uniserve_worker.protocol.transfer import (
     KvTransfer,
     Locator,
     PosixShmTransfer,
 )
 from uniserve_worker.transport import segment
-from uniserve_worker.transport.endpoint import locator_digest
 from uniserve_worker.transport.shared_storage import open_shared_storage
 
 pytestmark = pytest.mark.integration
@@ -70,9 +68,8 @@ def _map_locations(publication: KvTransfer, locate) -> KvTransfer:
 def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
     """Copy a ready publication into a segment whose readiness the test holds.
 
-    The copy carries the digest of the locator that names it, so the reading
-    rank accepts it as the publication it was handed, and stays pending until
-    the test announces it.
+    The copy is named by the returned locator and stays pending until the
+    test announces it.
     """
     assert isinstance(locator.transport, PosixShmTransfer)
     source = open_shared_storage(
@@ -92,7 +89,7 @@ def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
     gated = replace(
         locator, transport=replace(locator.transport, name=storage.name)
     )
-    segment.initialize(storage.buf, locator_digest(gated))
+    segment.initialize(storage.buf)
     storage.buf[segment.HEADER_BYTES : segment.HEADER_BYTES + len(data)] = data
     return gated, storage
 
@@ -107,8 +104,10 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
     releases the storage, and readiness completes the installation.
     """
     with (
-        execution_worker(transfer_backends=("shm",)) as producer,
-        execution_worker(transfer_backends=("shm",), queue_depth=3) as worker,
+        execution_worker(transfer_backends=("posix_shm",)) as producer,
+        execution_worker(
+            transfer_backends=("posix_shm",), queue_depth=3
+        ) as worker,
     ):
         incoming = ar_params(45, block_ids=(0,))
         admission = ar_params(44, block_ids=(0,))
@@ -251,8 +250,8 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                 try:
                     response = ipc.receive()
                     assert response["message_id"] == 5, response
-                    completed = BatchOutput.from_mapping(response["result"])
-                    assert completed.completions[0].status is CallStatus.OK
+                    completed = response["result"]["completions"][0]
+                    assert completed["status"] == CallStatus.OK.value
 
                     acknowledge_held()
                     reader_held = False
@@ -265,9 +264,9 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     # physical import must wake the sleeping process itself.
                     response = ipc.receive()
                     assert response["message_id"] == 4, response
-                    report = BatchOutput.from_mapping(response["result"])
-                    assert report.completions[0].status is CallStatus.OK
-                    assert report.completions[0].kv_visible_len == 2
+                    installed = response["result"]["completions"][0]
+                    assert installed["status"] == CallStatus.OK.value
+                    assert installed["kv_visible_len"] == 2
                     for layer in worker.kv_cache.cache.config.layers:
                         expected = producer.kv_cache.cache.state(layer).read(
                             (1,), start=0, length=2
@@ -383,7 +382,6 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         ),
     )
     closure_record = closure_result.completions[0]
-    assert closure_record.position == 2
     assert closure_record.kv_visible_len == 3
     assert closure_record.kv_computed_len == 3
 
@@ -467,9 +465,9 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
 
 
 def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
-    released_consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
+    released_consumer = execution_worker(transfer_backends=("posix_shm",))
     admission = ar_params(42, block_ids=(0,))
     extend = token_call(
         admission.request_key,
@@ -591,8 +589,8 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
 def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> (  # noqa: E501
     None
 ):
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
+    producer = execution_worker(transfer_backends=("posix_shm",))
+    consumer = execution_worker(transfer_backends=("posix_shm",))
     admission = ar_params(43, block_ids=(0,))
     extend = token_call(
         admission.request_key,

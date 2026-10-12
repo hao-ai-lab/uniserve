@@ -9,20 +9,21 @@ that padding rows may read, and assigns the others. Each unit holds
 leading column axis in one allocation.
 
 Layers that share a history window and a K/V page shape form a group. A
-group's logical page holds ``page_tokens = plane_bytes / row_bytes`` tokens
+group's logical page holds ``block_size = plane_bytes / row_bytes`` tokens
 of every layer in the group and occupies ``units_per_page = layers /
 columns`` units: the group's ``k``-th layer in configuration order reads
 column ``k % columns`` of the page's ``k // columns``-th unit. A layer's key
 view is therefore ``plane(column, key)`` read as a contiguous ``[num_units,
-page_tokens, heads, dim]`` tensor whose block id is the unit id, and the
+block_size, heads, dim]`` tensor whose block id is the unit id, and the
 units of one page position ``k // columns`` of every page form one block
 table. Groups read the same bytes differently; the unit allocator guarantees
 that a unit belongs to one group at a time.
 
 A cache whose layers all share one group has one unit per page with one
-column per layer, ``page_tokens`` equal to ``block_size`` and one table, so
-each layer's view and the stacked allocation of each field are the
-``[layers, blocks, block_size, heads, dim]`` layout of a per-layer stack.
+column per layer, a group ``block_size`` equal to the planned ``block_size``
+and one table, so each layer's view and the stacked allocation of each field
+are the ``[layers, blocks, block_size, heads, dim]`` layout of a per-layer
+stack.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ class CacheGroup:
     Attributes:
         window: History tokens any reader of the group needs; ``None`` keeps
             the whole history.
-        page_tokens: Tokens stored per logical page; a power of two.
+        block_size: Tokens stored per logical page; a power of two.
         units_per_page: Units one logical page occupies.
         layers: Cache layer names in column order; layer ``k`` lies in
             column ``k % columns`` of a page's unit ``k // columns``.
@@ -62,7 +63,7 @@ class CacheGroup:
     """
 
     window: int | None
-    page_tokens: int
+    block_size: int
     units_per_page: int
     layers: tuple[str, ...]
     num_kv_heads: int
@@ -159,7 +160,7 @@ def plan_units(
 
     Layers group by history window, logical and local K/V heads, head width
     and stored element type, in order of first appearance. ``block_size`` is
-    the page size of the group with the widest token rows; its rows fill one
+    the block size of the group with the widest token rows; its rows fill one
     plane, and every other group's page holds as many tokens as fit that
     plane.
 
@@ -192,7 +193,7 @@ def plan_units(
         or block_size < 1
         or block_size & (block_size - 1)
     ):
-        raise ValueError("the K/V page size must be a power of two")
+        raise ValueError("the K/V block size must be a power of two")
 
     quantizers = {
         name: None if quantization is None else quantization.get(name)
@@ -232,15 +233,15 @@ def plan_units(
     for key, names in members.items():
         window, _, head_indices, head_dim, stored = key
         heads = len(head_indices)
-        page_tokens, remainder = divmod(plane_bytes, rows[key])
-        if remainder or page_tokens & (page_tokens - 1):
+        group_block_size, remainder = divmod(plane_bytes, rows[key])
+        if remainder or group_block_size & (group_block_size - 1):
             raise ValueError(
                 "K/V row sizes must divide the plane into power-of-two pages"
             )
         groups.append(
             CacheGroup(
                 window=window,
-                page_tokens=page_tokens,
+                block_size=group_block_size,
                 units_per_page=len(names) // columns,
                 layers=tuple(names),
                 num_kv_heads=heads,
@@ -251,7 +252,7 @@ def plan_units(
     return Planes(columns, plane_bytes, tuple(groups), quantizer is not None)
 
 
-class PrefixCache:
+class KVCache:
     """Allocate a K/V unit pool; callers own unit assignment and retirement.
 
     No layer, attention method, or numerical input receives this owning
@@ -261,26 +262,20 @@ class PrefixCache:
     def __init__(
         self,
         config: Config,
+        planes: Planes,
         *,
         num_units: int,
-        block_size: int,
         device: torch.device | str,
-        dtype: torch.dtype | None = None,
-        quantization: Mapping[str, Quantizer | None] | None = None,
     ) -> None:
         """Allocate and reset the pool's planes and bind every layer's state.
 
-        ``block_size``, ``dtype`` and ``quantization`` are interpreted as by
-        ``plan_units``; ``num_units`` counts every unit, sentinel included.
+        ``planes`` is the ``plan_units`` result for ``config``; the pool
+        takes its groups, storage types and quantization as planned.
+        ``num_units`` counts every unit, sentinel included.
         """
         self.config = config
         self.device = torch.device(device)
-        self.planes = plan_units(
-            config,
-            block_size=block_size,
-            dtype=dtype,
-            quantization=quantization,
-        )
+        self.planes = planes
         self.num_units = num_units
         # Groups storing different element types reinterpret each other's
         # stale bytes, which need not decode as finite (`recycle_units`).
@@ -296,28 +291,30 @@ class PrefixCache:
             # restart at zero.
             tensor.fill_(int(name.endswith(".scale")))
 
+        # Planned storage already names each group's element type, FP8
+        # included, so layers bind it as their logical storage dtype unless
+        # the planes are quantized, where layers decode to their compute
+        # dtype.
+        quantizer = Quantizer("fp8", axis=0) if planes.quantized else None
         self._states: dict[str, State] = {}
         self._tables: dict[str, int] = {}
         columns = self.planes.columns
         first_table = 0
-        for group_index, group in enumerate(self.planes.groups):
+        for group in self.planes.groups:
             for index, name in enumerate(group.layers):
                 row, column = divmod(index, columns)
                 layout = config.layers[name]
                 assert isinstance(layout, mha.Config)
-                quantizer = (
-                    None if quantization is None else quantization.get(name)
-                )
                 views = {}
                 for field in _FIELDS:
-                    # One plane read as [units, page tokens, heads, dim]; the
+                    # One plane read as [units, block size, heads, dim]; the
                     # block id of the view is the unit id.
                     views[f"{field}.values"] = (
                         self._fields[f"{field}.values"][column]
                         .view(group.dtype)
                         .view(
                             num_units,
-                            group.page_tokens,
+                            group.block_size,
                             group.num_kv_heads,
                             group.head_dim,
                         )
@@ -331,8 +328,8 @@ class PrefixCache:
                         ][column]
                 self._states[name] = layout.bind(
                     views,
-                    block_size=group.page_tokens,
-                    dtype=dtype,
+                    block_size=group.block_size,
+                    dtype=None if quantizer else group.dtype,
                     quantizer=quantizer,
                 )
                 self._tables[name] = first_table + row
@@ -368,7 +365,7 @@ class PrefixCache:
     def planes_of(self, group: int, field: str) -> torch.Tensor:
         """Borrow one field's planes as one group reads them.
 
-        Returns ``[columns, num_units, page_tokens, heads, dim]`` in the
+        Returns ``[columns, num_units, block_size, heads, dim]`` in the
         group's stored dtype for ``field`` ``"key"`` or ``"value"``: the
         group's layer ``k`` of a page's unit ``u`` is ``[k % columns, u]``.
         Writes through a layer's state are visible here and vice versa; the
@@ -382,7 +379,7 @@ class PrefixCache:
             .view(
                 columns,
                 self.num_units,
-                values.page_tokens,
+                values.block_size,
                 values.num_kv_heads,
                 values.head_dim,
             )

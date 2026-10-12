@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-//! Throughput benchmarks for incremental Qwen XML tool-call parsing.
+//! Throughput benchmarks for incremental Qwen2.5 tool-call parsing.
 //!
 //! Each fixture is split into fixed-size character chunks and streamed
-//! through `Qwen3XmlToolParser` incrementally, as the Qwen3 chat output stage
+//! through `Qwen25ToolParser` incrementally, as the Qwen3 chat output stage
 //! feeds assistant text. Throughput is reported in input bytes. The bench
 //! target requires the `test-util` feature for the shared parser fixtures in
 //! `profile::tools::test_utils`.
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use uniserve_server::profile::tools::test_utils::{split_by_chars, test_tools};
-use uniserve_server::profile::tools::{Qwen3XmlToolParser, Tool};
+use uniserve_server::profile::tools::{Qwen25ToolParser, Tool};
 
 mod utils;
 use utils::feed_parser;
@@ -37,12 +37,12 @@ fn mixed_fixture() -> String {
 }
 
 fn long_normal_text_fixture() -> String {
-    let line = "This is ordinary assistant text with no Qwen XML tool markers at all.\n";
+    let line = "This is ordinary assistant text with no Qwen tool markers at all.\n";
     line.repeat(LONG_NORMAL_TEXT_REPEATS)
 }
 
-fn native_parser(tools: &[Tool]) -> Qwen3XmlToolParser {
-    Qwen3XmlToolParser::new(tools)
+fn native_parser(tools: &[Tool]) -> Qwen25ToolParser {
+    Qwen25ToolParser::new(tools)
 }
 
 fn run_stream_group(
@@ -92,14 +92,14 @@ fn run_stream_group(
     group.finish();
 }
 
-fn bench_qwen3_xml(c: &mut Criterion) {
+fn bench_qwen25_tools(c: &mut Criterion) {
     let tools = test_tools();
     let mixed_text = mixed_fixture();
     let long_normal_text = long_normal_text_fixture();
 
     run_stream_group(
         c,
-        "qwen3_xml/mixed_text_tool_call",
+        "qwen25_tools/mixed_text_tool_call",
         &tools,
         &mixed_text,
         CHUNK_CHARS,
@@ -109,7 +109,7 @@ fn bench_qwen3_xml(c: &mut Criterion) {
 
     run_stream_group(
         c,
-        "qwen3_xml/long_normal_text",
+        "qwen25_tools/long_normal_text",
         &tools,
         &long_normal_text,
         CHUNK_CHARS,
@@ -118,5 +118,5 @@ fn bench_qwen3_xml(c: &mut Criterion) {
     );
 }
 
-criterion_group!(benches, bench_qwen3_xml);
+criterion_group!(benches, bench_qwen25_tools);
 criterion_main!(benches);

@@ -53,7 +53,6 @@ class _LocalSource:
         tensor: The detached published views.
         event: Producer fence recorded at publication; None for a CPU source.
         capacity: Budget the publication's bytes are reserved against.
-        locator: The exact locator the publication was registered under.
         readers: Copies and borrowed views taken and not yet finished.
         released: New reads are revoked, by `release` or `close`.
         reclaiming: Hand-back has started; `retirement` completes once the
@@ -64,7 +63,6 @@ class _LocalSource:
     tensor: torch.Tensor | tuple[torch.Tensor, ...]
     event: torch.cuda.Event | None
     capacity: TransferCapacity
-    locator: Locator
     readers: int = 0
     released: bool = False
     reclaiming: bool = False
@@ -123,10 +121,6 @@ class LocalTransport(Transport):
 
         Local copies and borrowed views use the same ownership.
         """
-        if locator.source != self.source:
-            raise invalid_descriptor(
-                "local publication belongs to another rank incarnation"
-            )
         handle = locator.transport
         if (
             not isinstance(handle, LocalTransfer)
@@ -137,10 +131,8 @@ class LocalTransport(Transport):
             )
         with self._lock:
             source = self._table.get(handle.key)
-            if source is None or locator != source.locator:
-                raise invalid_descriptor(
-                    "local publication changed its registered view"
-                )
+            if source is None:
+                raise invalid_descriptor("local publication is not registered")
             return source.retirement
 
     def publish(
@@ -188,7 +180,7 @@ class LocalTransport(Transport):
                 offset=offset,
                 device=str(first.device),
             )
-            self._table[key] = _LocalSource(t, event, self.capacity, locator)
+            self._table[key] = _LocalSource(t, event, self.capacity)
         return locator
 
     def set_completion_wake(self, wake: Any) -> None:
@@ -204,7 +196,7 @@ class LocalTransport(Transport):
         region: tuple[slice, ...] | None = None,
         reservation: ReadReservation | None = None,
     ) -> TransferTicket:
-        """Borrow or copy from a verified publisher in this address space.
+        """Borrow or copy from the publisher in this address space.
 
         The producer owns publication bytes and their event. The destination
         owns copy capacity; a borrowed view retains its producer's event pool
@@ -222,13 +214,8 @@ class LocalTransport(Transport):
 
         with _endpoint_lock:
             owner = _endpoints.get(handle.endpoint)
-        if (
-            not isinstance(owner, LocalTransport)
-            or owner.source != locator.source
-        ):
-            raise invalid_descriptor(
-                "local publication belongs to another rank incarnation"
-            )
+        if not isinstance(owner, LocalTransport):
+            raise invalid_descriptor("local publication has no live owner")
 
         with owner._lock:
             source = owner._table.get(handle.key)
@@ -241,10 +228,6 @@ class LocalTransport(Transport):
             if device != first.device:
                 raise invalid_descriptor(
                     "local binding requires the source device"
-                )
-            if locator != source.locator:
-                raise invalid_descriptor(
-                    "local locator changed its registered view"
                 )
             if region is not None:
                 if not _slices.within(region, locator.shape):
@@ -336,10 +319,6 @@ class LocalTransport(Transport):
 
         Existing copies and borrowed views are retained.
         """
-        if locator.source != self.source:
-            raise invalid_descriptor(
-                "local publication belongs to another rank incarnation"
-            )
         handle = locator.transport
         if (
             not isinstance(handle, LocalTransfer)

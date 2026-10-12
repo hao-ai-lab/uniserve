@@ -3,9 +3,9 @@
 //! The `_uniserve_ipc` extension module exposes `Server`, which owns the
 //! rank's `RankServer` (iceoryx2 shared storage for a rank on the head's
 //! host, a TCP socket for a rank elsewhere); `StreamSignal`, which turns CUDA
-//! stream completion into a readable eventfd; `service_name`; and the
-//! `atomic_store_u32` / `atomic_load_u32` accessors for shared-storage segment
-//! header words. The hand-written stub `uniserve_worker/_uniserve_ipc.pyi`
+//! stream completion into a readable eventfd; `ErrorCode`, the schema's
+//! failure classes; `service_name`; and the `atomic_store_u32` /
+//! `atomic_load_u32` accessors for shared-storage segment header words. The hand-written stub `uniserve_worker/_uniserve_ipc.pyi`
 //! describes the same Python surface and must stay consistent with it.
 //!
 //! # Boundary conversions
@@ -25,11 +25,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod convert;
+mod error_code;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use error_code::PyErrorCode;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -277,19 +279,14 @@ impl PyStreamSignal {
 #[pymethods]
 impl PyServer {
     #[new]
-    #[pyo3(signature = (service_name, max_payload = 1048576, max_inflight = 1, transport = SHARED_STORAGE_CHANNEL))]
-    /// Binds this rank's channel with bounded payload and inflight capacity.
+    #[pyo3(signature = (service_name, max_inflight = 1, transport = SHARED_STORAGE_CHANNEL))]
+    /// Binds this rank's channel with a bounded number of requests in flight.
     ///
     /// `transport` is the mechanism the placement calls for: a rank on the
     /// head's host serves shared storage, and a rank elsewhere serves a socket,
     /// where `service_name` is the host to bind rather than a service.
-    fn new(
-        service_name: &str,
-        max_payload: usize,
-        max_inflight: usize,
-        transport: &str,
-    ) -> PyResult<Self> {
-        let inner = RankServer::bind(transport, service_name, max_payload, max_inflight)
+    fn new(service_name: &str, max_inflight: usize, transport: &str) -> PyResult<Self> {
+        let inner = RankServer::bind(transport, service_name, max_inflight)
             .map_err(|err| py_runtime(format!("failed to bind IPC service: {err:#}")))?;
         let completion_wake = inner.completion_wake();
         Ok(Self {
@@ -535,6 +532,51 @@ fn service_name(id: &str) -> String {
     uniserve_worker_ipc::service_name(id)
 }
 
+#[pyfunction]
+/// Returns the spelling of every call kind in the schema's order, the order
+/// of a worker report's supported calls.
+fn call_kinds() -> Vec<&'static str> {
+    uniserve_worker_ipc::CallKind::ALL
+        .into_iter()
+        .map(uniserve_worker_ipc::CallKind::as_str)
+        .collect()
+}
+
+#[pyfunction]
+/// Returns the spelling of every call kind whose successful completion
+/// advances its request's state.
+fn state_advancing_calls() -> Vec<&'static str> {
+    uniserve_worker_ipc::CallKind::ALL
+        .into_iter()
+        .filter(|kind| kind.advances_state())
+        .map(uniserve_worker_ipc::CallKind::as_str)
+        .collect()
+}
+
+#[pyfunction]
+/// Returns the bytes one request slot's lane holds of a call's relayed
+/// scalar outputs, from which a worker sizes its relay arenas.
+fn relay_row_bytes() -> u64 {
+    uniserve_worker_ipc::Call::relay_row_bytes()
+}
+
+#[pyfunction]
+/// Returns each `(producer, reader)` pair of media calls whose products travel
+/// through persistent tensor storage: a reader's inputs the producer declares,
+/// excluding the readers of resident denoiser state.
+fn product_edges() -> Vec<(&'static str, &'static str)> {
+    uniserve_worker_ipc::MediaCall::ALL
+        .into_iter()
+        .flat_map(|producer| {
+            producer
+                .readers()
+                .iter()
+                .filter(|reader| !reader.reads_resident_state())
+                .map(move |reader| (producer.as_str(), reader.as_str()))
+        })
+        .collect()
+}
+
 /// Resolves one aligned 32-bit word inside a writable buffer.
 ///
 /// A shared-storage segment's header words are read and written by different
@@ -589,13 +631,15 @@ fn atomic_load_u32(buffer: PyBuffer<u8>, offset: usize) -> PyResult<u32> {
 fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServer>()?;
     m.add_class::<PyStreamSignal>()?;
+    m.add_class::<PyErrorCode>()?;
+    m.add("SOCKET_CHANNEL", uniserve_worker_ipc::SOCKET_CHANNEL)?;
     m.add_function(wrap_pyfunction!(service_name, m)?)?;
+    m.add_function(wrap_pyfunction!(call_kinds, m)?)?;
+    m.add_function(wrap_pyfunction!(state_advancing_calls, m)?)?;
+    m.add_function(wrap_pyfunction!(product_edges, m)?)?;
+    m.add_function(wrap_pyfunction!(relay_row_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_store_u32, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_load_u32, m)?)?;
-    // Whether this extension was compiled with debug assertions, which an
-    // unoptimized (debug-profile) build has. The worker refuses to serve with
-    // such a build, since every call crosses this module.
-    m.add("DEBUG_BUILD", cfg!(debug_assertions))?;
     Ok(())
 }
 

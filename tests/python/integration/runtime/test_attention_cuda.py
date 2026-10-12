@@ -18,9 +18,10 @@ from uniserve.nn.attention import (
     VarlenInput,
     VisibleInput,
 )
-from uniserve.runtime import PrefixCache, TensorBuffers
+from uniserve.runtime import KVCache, TensorBuffers
 from uniserve.runtime.backends.attention import resolve
 from uniserve.runtime.backends.attention.torch import Backend as TorchBackend
+from uniserve.runtime.kv_cache import plan_units
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -73,8 +74,11 @@ def test_native_attention_matches_declared_visibility(
         for _ in range(2)
     )
     cache_layout = Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)})
-    with PrefixCache(
-        cache_layout, num_units=4, block_size=16, device=device
+    with KVCache(
+        cache_layout,
+        plan_units(cache_layout, block_size=16),
+        num_units=4,
+        device=device,
     ) as cache:
         state = cache.state("attention")
         state.write((0,), start=0, key=k[:2], value=v[:2])
@@ -126,7 +130,7 @@ def test_native_attention_matches_declared_visibility(
             # Compare the already committed cache so the reference invocation
             # does not perform a second write for the same numerical call.
             reference_batch = (
-                replace(batch, write_indices=None)
+                replace(batch, slot_mapping=None)
                 if representation == "paged"
                 else batch
             )
@@ -148,10 +152,11 @@ def test_paged_replay_reads_changed_causal_flags(provider):
         torch.randn(5, 2, 64, dtype=q.dtype, device=device, generator=generator)
         for _ in range(2)
     )
-    with PrefixCache(
-        Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
+    cache_config = Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)})
+    with KVCache(
+        cache_config,
+        plan_units(cache_config, block_size=16),
         num_units=4,
-        block_size=16,
         device=device,
     ) as cache:
         state = cache.state("attention")
@@ -187,7 +192,7 @@ def test_paged_replay_reads_changed_causal_flags(provider):
                     v,
                     replace(
                         batch,
-                        write_indices=None,
+                        slot_mapping=None,
                         causal=causal,
                         causal_values=None,
                     ),
@@ -228,11 +233,12 @@ def test_segmented_graph_keeps_nonfinite_values_within_their_sequence():
     segmented = SegmentedInput(
         batch.queries, batch.prefixes, batch.block_table, None, ends, True
     )
+    cache_config = Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)})
     with (
-        PrefixCache(
-            Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
+        KVCache(
+            cache_config,
+            plan_units(cache_config, block_size=16),
             num_units=2,
-            block_size=16,
             device=device,
         ) as cache,
         _prepare(TorchBackend(), cache.state("attention")) as operator,
@@ -281,10 +287,11 @@ def test_native_paged_replay_reads_changed_block_table_and_writes_slot_zero(
         torch.randn(1, 2, 64, dtype=q.dtype, device=device, generator=generator)
         for _ in range(2)
     )
-    with PrefixCache(
-        Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
+    cache_config = Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)})
+    with KVCache(
+        cache_config,
+        plan_units(cache_config, block_size=16),
         num_units=3,
-        block_size=16,
         device=device,
     ) as cache:
         state = cache.state("attention")
@@ -312,7 +319,7 @@ def test_native_paged_replay_reads_changed_block_table_and_writes_slot_zero(
             with torch.cuda.graph(graph, stream=stream):
                 native(q, k, v, batch, scale=0.125, out=out)
             batch.block_table.indices[0, 0] = 2
-            batch.write_indices[0] = 32
+            batch.slot_mapping[0] = 32
             v.mul_(3)
             native.bind(batch)
             graph.replay()
@@ -321,7 +328,7 @@ def test_native_paged_replay_reads_changed_block_table_and_writes_slot_zero(
                 q,
                 k,
                 v,
-                replace(batch, write_indices=None),
+                replace(batch, slot_mapping=None),
                 scale=0.125,
                 out=expected,
             )
@@ -372,10 +379,11 @@ def test_native_paged_output_views_preserve_values_on_replay(
         ].view_as(q)
     else:
         out = torch.empty_like(q)
-    with PrefixCache(
-        Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
+    cache_config = Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)})
+    with KVCache(
+        cache_config,
+        plan_units(cache_config, block_size=16),
         num_units=2,
-        block_size=16,
         device=device,
     ) as cache:
         state = cache.state("attention")
@@ -415,7 +423,7 @@ def test_native_paged_output_views_preserve_values_on_replay(
                 query,
                 k,
                 v,
-                replace(batch, write_indices=None),
+                replace(batch, slot_mapping=None),
                 scale=0.125,
                 out=expected,
             )
@@ -446,10 +454,11 @@ def test_paged_replay_preserves_masked_writes_and_live_sequence_boundaries(
         )[..., ::column_stride]
         for _ in range(2)
     )
-    with PrefixCache(
-        Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
+    cache_config = Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)})
+    with KVCache(
+        cache_config,
+        plan_units(cache_config, block_size=16),
         num_units=4,
-        block_size=16,
         device=device,
     ) as cache:
         state = cache.state("attention")
@@ -468,7 +477,7 @@ def test_paged_replay_preserves_masked_writes_and_live_sequence_boundaries(
             queries=replace(batch.queries, host=None),
             prefixes=replace(batch.prefixes, host=None),
         )
-        batch.write_indices[0] = -1
+        batch.slot_mapping[0] = -1
         with (
             _prepare(resolve("trtllm", device=device), state) as native,
             _prepare(TorchBackend(), state) as reference,
@@ -492,21 +501,21 @@ def test_paged_replay_preserves_masked_writes_and_live_sequence_boundaries(
                 causal=True,
                 device=device,
             )
-            changed.write_indices[1] = -1
+            changed.slot_mapping[1] = -1
             for name in ("queries", "prefixes"):
                 getattr(batch, name).values.copy_(getattr(changed, name).values)
                 getattr(batch, name).offsets.copy_(
                     getattr(changed, name).offsets
                 )
             batch.block_table.indices.copy_(changed.block_table.indices)
-            batch.write_indices.copy_(changed.write_indices)
+            batch.slot_mapping.copy_(changed.slot_mapping)
             k.mul_(2)
             v.mul_(3)
             before = tuple(tensor.clone() for tensor in (q, k, v))
             expected_state = tuple(
                 tensor.clone() for tensor in (state.key, state.value)
             )
-            slots = changed.write_indices.cpu().tolist()
+            slots = changed.slot_mapping.cpu().tolist()
             for target, source in zip(expected_state, (k, v), strict=True):
                 for row, slot in enumerate(slots):
                     if slot != -1:
@@ -517,7 +526,7 @@ def test_paged_replay_preserves_masked_writes_and_live_sequence_boundaries(
                 q,
                 k,
                 v,
-                replace(changed, write_indices=None),
+                replace(changed, slot_mapping=None),
                 scale=0.125,
                 out=expected,
             )
@@ -551,10 +560,11 @@ def test_visible_paged_replay_uses_changed_endpoints(provider, paged_keys):
         )
         for _ in range(2)
     )
-    with PrefixCache(
-        Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
+    cache_config = Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)})
+    with KVCache(
+        cache_config,
+        plan_units(cache_config, block_size=16),
         num_units=17,
-        block_size=16,
         device=device,
     ) as cache:
         state = cache.state("attention")
@@ -841,8 +851,11 @@ def test_native_history_window_matches_portable_reference(
         "size": TextSize(tokens, 2),
         "window": window,
     }
-    with PrefixCache(
-        layout, num_units=16, block_size=block_size, device=device
+    with KVCache(
+        layout,
+        plan_units(layout, block_size=block_size),
+        num_units=16,
+        device=device,
     ) as cache:
         state = cache.state("attention")
         for row, prefix in zip(blocks, prefixes, strict=True):
@@ -875,7 +888,7 @@ def test_native_history_window_matches_portable_reference(
                 actual.zero_()
                 graph.replay()
             reference_batch = (
-                replace(batch, write_indices=None)
+                replace(batch, slot_mapping=None)
                 if isinstance(batch, PagedInput)
                 else batch
             )

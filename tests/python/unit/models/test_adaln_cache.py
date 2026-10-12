@@ -4,13 +4,13 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve.nn import Modulation
+from uniserve.nn import AdaLNCache
 
 pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_streamed_modulation_preserves_projection_rows_and_step_groups(
+def test_streamed_adaln_cache_preserves_projection_rows_and_step_groups(
     dtype: torch.dtype,
 ) -> None:
     generator = torch.Generator().manual_seed(53)
@@ -26,7 +26,7 @@ def test_streamed_modulation_preserves_projection_rows_and_step_groups(
     )
     final_weight = torch.randn((32, 64), generator=generator).to(dtype)
     final_bias = torch.randn((32,), generator=generator).to(dtype)
-    plan = Modulation.from_projections(
+    plan = AdaLNCache.from_projections(
         inputs,
         zip(weights, biases, strict=True),
         (final_weight, final_bias),
@@ -55,12 +55,12 @@ def test_streamed_modulation_preserves_projection_rows_and_step_groups(
 
 
 @pytest.mark.parametrize("count", [1, 3])
-def test_modulation_rejects_incomplete_checkpoint_layer_sets(
+def test_adaln_cache_rejects_incomplete_checkpoint_layer_sets(
     count: int,
 ) -> None:
     projection = (torch.ones((8, 4)), None)
     with pytest.raises(ValueError, match="layer projections"):
-        Modulation.from_projections(
+        AdaLNCache.from_projections(
             torch.ones((4, 4)),
             iter([projection] * count),
             projection,
@@ -69,10 +69,10 @@ def test_modulation_rejects_incomplete_checkpoint_layer_sets(
         )
 
 
-def test_modulation_rejects_groups_outside_its_entries():
+def test_adaln_cache_rejects_groups_outside_its_entries():
     projection = (torch.ones((8, 4)), None)
     with pytest.raises(ValueError, match="one entry per step"):
-        Modulation.from_projections(
+        AdaLNCache.from_projections(
             torch.ones((2, 4)),
             iter([projection]),
             None,
@@ -86,7 +86,7 @@ def test_pipeline_layer_products_omit_final_projection():
     inputs = torch.randn(4, 8)
     weight = torch.randn(12, 8)
     groups = torch.tensor([[0, 1], [2, 3]])
-    plan = Modulation.from_projections(
+    plan = AdaLNCache.from_projections(
         inputs, [(weight, None)], None, groups=groups, layer_count=1
     )
     for step in range(2):

@@ -27,10 +27,10 @@
 //! no intermediary resolves on the server's behalf. Ports are not
 //! restricted.
 //!
-//! Each condition is capped by its media type (image 30 MiB, video 50 MiB,
-//! audio 15 MiB) and a request's media together by a total cap; a
-//! `Content-Length` above the cap is refused before the body is read and a
-//! body is abandoned as soon as it exceeds the cap.
+//! A request's media are capped together by one total (`--max-request-bytes`),
+//! which a single condition may use up; a `Content-Length` above the cap is
+//! refused before the body is read and a body is abandoned as soon as it
+//! exceeds the cap.
 
 use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -49,46 +49,20 @@ use reqwest::redirect;
 use thiserror_ext::AsReport as _;
 
 use super::VideoInputError;
-use super::plan::ConditionType;
 
-const MIB: u64 = 1 << 20;
-/// Default cap of one image condition.
-pub const IMAGE_BYTES: u64 = 30 * MIB;
-/// Default cap of one video condition.
-pub const VIDEO_BYTES: u64 = 50 * MIB;
-/// Default cap of one audio condition.
-pub const AUDIO_BYTES: u64 = 15 * MIB;
-
-/// Size caps on fetched media, in bytes.
+/// Size cap on fetched media, in bytes.
+///
+/// One condition may be as large as the request's whole media.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaLimits {
-    /// Cap of one image condition.
-    pub image_bytes: u64,
-    /// Cap of one video or video_audio condition.
-    pub video_bytes: u64,
-    /// Cap of one audio condition.
-    pub audio_bytes: u64,
     /// Cap of all media of one request (`--max-request-bytes`).
     pub total_bytes: u64,
 }
 
 impl MediaLimits {
-    /// The default per-type caps under a request total of `total_bytes`.
+    /// The limits of a request whose media total `total_bytes`.
     pub const fn new(total_bytes: u64) -> Self {
-        Self {
-            image_bytes: IMAGE_BYTES,
-            video_bytes: VIDEO_BYTES,
-            audio_bytes: AUDIO_BYTES,
-            total_bytes,
-        }
-    }
-
-    const fn cap(&self, condition_type: ConditionType) -> u64 {
-        match condition_type {
-            ConditionType::Image => self.image_bytes,
-            ConditionType::Video | ConditionType::VideoAudio => self.video_bytes,
-            ConditionType::Audio => self.audio_bytes,
-        }
+        Self { total_bytes }
     }
 }
 
@@ -219,22 +193,18 @@ impl MediaFetcher {
     /// Fetches the media of every condition, concurrently, under one
     /// request total.
     ///
-    /// `sources` holds each condition's type and URI in request order.
+    /// `uris` holds each condition's URI in request order.
     ///
     /// # Errors
     ///
     /// Returns [`VideoInputError::Invalid`] naming the first failing
     /// `conditions[i]` to finish.
-    pub async fn fetch_all(
-        &self,
-        sources: &[(ConditionType, &str)],
-    ) -> Result<Vec<FetchedMedia>, VideoInputError> {
+    pub async fn fetch_all(&self, uris: &[&str]) -> Result<Vec<FetchedMedia>, VideoInputError> {
         let budget = Budget(AtomicU64::new(self.limits.total_bytes));
         futures::future::try_join_all(
-            sources
-                .iter()
+            uris.iter()
                 .enumerate()
-                .map(|(index, &(kind, uri))| self.fetch(index, kind, uri, &budget)),
+                .map(|(index, &uri)| self.fetch(index, uri, &budget)),
         )
         .await
     }
@@ -242,12 +212,11 @@ impl MediaFetcher {
     async fn fetch(
         &self,
         index: usize,
-        condition_type: ConditionType,
         uri: &str,
         budget: &Budget,
     ) -> Result<FetchedMedia, VideoInputError> {
         let reject = |message: String| VideoInputError::condition(index, message);
-        let cap = self.limits.cap(condition_type);
+        let cap = self.limits.total_bytes;
         let scheme = uri
             .split_once(':')
             .map(|(scheme, _)| scheme.to_ascii_lowercase());
@@ -578,16 +547,10 @@ mod tests {
     use base64::Engine as _;
 
     use super::super::RequestField;
-    use super::super::plan::ConditionType;
     use super::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy, is_public};
 
     fn limits() -> MediaLimits {
-        MediaLimits {
-            image_bytes: 64,
-            video_bytes: 128,
-            audio_bytes: 32,
-            total_bytes: 160,
-        }
+        MediaLimits::new(64)
     }
 
     fn media_fetcher(media_directory: Option<&Path>, remote: RemoteMediaPolicy) -> MediaFetcher {
@@ -608,13 +571,9 @@ mod tests {
         }
     }
 
-    async fn fetch_one(
-        fetcher: &MediaFetcher,
-        kind: ConditionType,
-        uri: &str,
-    ) -> Result<Vec<u8>, String> {
+    async fn fetch_one(fetcher: &MediaFetcher, uri: &str) -> Result<Vec<u8>, String> {
         fetcher
-            .fetch_all(&[(kind, uri)])
+            .fetch_all(&[uri])
             .await
             .map(|mut media| media.remove(0).bytes.to_vec())
             .map_err(|error| {
@@ -630,20 +589,20 @@ mod tests {
         )
     }
 
-    /// Base64 `data:` URIs decode under the per-type cap; other encodings
+    /// Base64 `data:` URIs decode under the request total; other encodings
     /// and malformed payloads are refused.
     #[tokio::test]
     async fn data_uris_decode_under_the_cap() {
         let fetcher = media_fetcher(None, RemoteMediaPolicy::default());
         let media = fetcher
-            .fetch_all(&[(ConditionType::Image, &data_uri("Image/PNG", b"pixels"))])
+            .fetch_all(&[&data_uri("Image/PNG", b"pixels")])
             .await
             .unwrap();
         assert_eq!(media[0].bytes.as_ref(), b"pixels");
         assert_eq!(media[0].declared_type.as_deref(), Some("image/png"));
 
         let wrapped = "data:audio/wav;base64,cGl4\nZWxz";
-        let decoded = fetch_one(&fetcher, ConditionType::Audio, wrapped).await;
+        let decoded = fetch_one(&fetcher, wrapped).await;
         assert_eq!(decoded.unwrap(), b"pixels");
 
         for uri in [
@@ -653,37 +612,21 @@ mod tests {
             "data:image/png;base64".to_owned(),
             data_uri("image/png", &[7; 65]),
         ] {
-            let refused = fetch_one(&fetcher, ConditionType::Image, &uri).await;
+            let refused = fetch_one(&fetcher, &uri).await;
             assert!(refused.is_err(), "{uri}");
         }
-        // Each type has its own cap.
-        let audio = data_uri("audio/wav", &[7; 33]);
-        assert!(
-            fetch_one(&fetcher, ConditionType::Audio, &audio)
-                .await
-                .is_err()
-        );
-        let video = data_uri("video/mp4", &[7; 128]);
-        assert!(
-            fetch_one(&fetcher, ConditionType::Video, &video)
-                .await
-                .is_ok()
-        );
+        // One condition may take the whole total.
+        let whole = data_uri("video/mp4", &[7; 64]);
+        assert!(fetch_one(&fetcher, &whole).await.is_ok());
     }
 
     /// The media of a request share one total cap.
     #[tokio::test]
     async fn a_request_shares_one_total() {
         let fetcher = media_fetcher(None, RemoteMediaPolicy::default());
-        let video = data_uri("video/mp4", &[1; 100]);
-        let image = data_uri("image/png", &[2; 64]);
-        let error = fetcher
-            .fetch_all(&[
-                (ConditionType::Video, &video),
-                (ConditionType::Image, &image),
-            ])
-            .await
-            .unwrap_err();
+        let video = data_uri("video/mp4", &[1; 40]);
+        let image = data_uri("image/png", &[2; 40]);
+        let error = fetcher.fetch_all(&[&video, &image]).await.unwrap_err();
         assert!(error.to_string().contains("in total"), "{error}");
     }
 
@@ -698,21 +641,20 @@ mod tests {
         let media = root.path().join("media");
         std::fs::create_dir(&media).unwrap();
         std::fs::write(media.join("voice.wav"), b"voice").unwrap();
-        std::fs::write(media.join("large.wav"), [0; 33]).unwrap();
+        std::fs::write(media.join("large.wav"), [0; 65]).unwrap();
         std::os::unix::fs::symlink(&secret, media.join("escape.wav")).unwrap();
         std::os::unix::fs::symlink(media.join("voice.wav"), media.join("alias.wav")).unwrap();
 
         let fetcher = media_fetcher(Some(&media), RemoteMediaPolicy::default());
         let uri = |path: &Path| format!("file://{}", path.display());
-        let audio = ConditionType::Audio;
         assert_eq!(
-            fetch_one(&fetcher, audio, &uri(&media.join("voice.wav")))
+            fetch_one(&fetcher, &uri(&media.join("voice.wav")))
                 .await
                 .unwrap(),
             b"voice"
         );
         assert_eq!(
-            fetch_one(&fetcher, audio, &uri(&media.join("alias.wav")))
+            fetch_one(&fetcher, &uri(&media.join("alias.wav")))
                 .await
                 .unwrap(),
             b"voice"
@@ -726,16 +668,11 @@ mod tests {
             uri(&media.join("large.wav")),
             format!("file://example.com{}", media.join("voice.wav").display()),
         ] {
-            assert!(
-                fetch_one(&fetcher, audio, &refused).await.is_err(),
-                "{refused}"
-            );
+            assert!(fetch_one(&fetcher, &refused).await.is_err(), "{refused}");
         }
         // Whether a file exists outside the directory is not revealed.
         for outside_path in [secret.clone(), outside.path().join("missing.wav")] {
-            let error = fetch_one(&fetcher, audio, &uri(&outside_path))
-                .await
-                .unwrap_err();
+            let error = fetch_one(&fetcher, &uri(&outside_path)).await.unwrap_err();
             assert!(error.contains("outside the media directory"), "{error}");
         }
         // The directory may be named through a link to it.
@@ -743,25 +680,21 @@ mod tests {
         std::os::unix::fs::symlink(&media, &linked).unwrap();
         let through_link = media_fetcher(Some(&linked), RemoteMediaPolicy::default());
         for path in [linked.join("voice.wav"), media.join("voice.wav")] {
-            let read = fetch_one(&through_link, audio, &uri(&path)).await;
+            let read = fetch_one(&through_link, &uri(&path)).await;
             assert_eq!(read.unwrap(), b"voice");
         }
 
         let without_directory = media_fetcher(None, RemoteMediaPolicy::default());
-        let error = fetch_one(&without_directory, audio, &uri(&media.join("voice.wav")))
+        let error = fetch_one(&without_directory, &uri(&media.join("voice.wav")))
             .await
             .unwrap_err();
         assert!(error.contains("disabled"), "{error}");
         assert!(
-            fetch_one(&without_directory, audio, "ftp://example.com/a.wav")
+            fetch_one(&without_directory, "ftp://example.com/a.wav")
                 .await
                 .is_err()
         );
-        assert!(
-            fetch_one(&without_directory, audio, "voice.wav")
-                .await
-                .is_err()
-        );
+        assert!(fetch_one(&without_directory, "voice.wav").await.is_err());
     }
 
     async fn serve(router: Router) -> SocketAddr {
@@ -822,21 +755,11 @@ mod tests {
         let address = serve(media_server()).await;
         let url = |path: &str| format!("http://{address}{path}");
         let fetcher = media_fetcher(None, local_remote());
-        let image = ConditionType::Image;
 
-        let media = fetcher
-            .fetch_all(&[(image, &url("/image.png"))])
-            .await
-            .unwrap();
+        let media = fetcher.fetch_all(&[&url("/image.png")]).await.unwrap();
         assert_eq!(media[0].bytes.len(), 48);
         assert_eq!(media[0].declared_type.as_deref(), Some("image/png"));
-        assert_eq!(
-            fetch_one(&fetcher, image, &url("/hop/4"))
-                .await
-                .unwrap()
-                .len(),
-            48
-        );
+        assert_eq!(fetch_one(&fetcher, &url("/hop/4")).await.unwrap().len(), 48);
 
         for (path, reason) in [
             ("/large.png", "limit"),
@@ -847,17 +770,9 @@ mod tests {
             ("/to-file", "307"),
             ("/slow.png", "failed"),
         ] {
-            let error = fetch_one(&fetcher, image, &url(path)).await.unwrap_err();
+            let error = fetch_one(&fetcher, &url(path)).await.unwrap_err();
             assert!(error.contains(reason), "{path}: {error}");
         }
-        // The streamed body fits the larger video cap.
-        assert_eq!(
-            fetch_one(&fetcher, ConditionType::Video, &url("/streamed.png"))
-                .await
-                .unwrap()
-                .len(),
-            96
-        );
 
         let disabled = media_fetcher(
             None,
@@ -866,9 +781,7 @@ mod tests {
                 ..RemoteMediaPolicy::default()
             },
         );
-        let error = fetch_one(&disabled, image, &url("/image.png"))
-            .await
-            .unwrap_err();
+        let error = fetch_one(&disabled, &url("/image.png")).await.unwrap_err();
         assert!(error.contains("disabled"), "{error}");
     }
 
@@ -883,12 +796,7 @@ mod tests {
             format!("http://localhost:{}/image.png", address.port()),
             format!("http://[::1]:{}/image.png", address.port()),
         ] {
-            assert!(
-                fetch_one(&fetcher, ConditionType::Image, &uri)
-                    .await
-                    .is_err(),
-                "{uri}"
-            );
+            assert!(fetch_one(&fetcher, &uri).await.is_err(), "{uri}");
         }
     }
 

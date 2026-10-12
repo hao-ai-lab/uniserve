@@ -4,7 +4,7 @@
 //! and `response`, called by `encode_request` and `encode_response`, which
 //! first validate submitted batches, worker info, and batch outputs. The
 //! builders perform no checks of their own and cannot fail; they rely on that
-//! validation for narrowing casts such as the parallel degrees in `parallel`.
+//! validation for narrowing casts.
 //!
 //! FlatBuffers builds bottom-up: a table can reference only objects already
 //! written to the builder. Each function first serializes its strings,
@@ -18,8 +18,7 @@
 //! `allowed_token_ids` is written only when `Some`, because absence (no
 //! whitelist) and an empty vector mean different things, and `locator`
 //! writes only the vectors of the selected transport. The decoders read most
-//! absent vectors as empty, but reject an absent
-//! `WorkerInfo.transfer_backends` or `ComponentInfo.outputs`.
+//! absent vectors as empty, but reject an absent `ComponentInfo.outputs`.
 
 use super::*;
 use flatbuffers::WIPOffset;
@@ -75,18 +74,6 @@ fn tensor_ref<'a>(b: &mut FlatBufferBuilder<'a>, v: &TensorRef) -> WIPOffset<fbs
     )
 }
 
-fn rng<'a>(b: &mut FlatBufferBuilder<'a>, v: &Rng) -> WIPOffset<fbs::Rng<'a>> {
-    let draw_layout = draw_layout_to_fb(v.draw_layout);
-    fbs::Rng::create(
-        b,
-        &fbs::RngArgs {
-            seed: v.seed,
-            semantic_index_base: v.semantic_index_base,
-            draw_layout,
-        },
-    )
-}
-
 fn coordinates<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &CallCoordinates,
@@ -97,7 +84,6 @@ fn coordinates<'a>(
             logical_position: v.logical_position,
             kv_visible_len: v.kv_visible_len,
             kv_computed_len: v.kv_computed_len,
-            flow_step: v.flow_step,
         },
     )
 }
@@ -158,7 +144,6 @@ fn sampling<'a>(
         .allowed_token_ids
         .as_deref()
         .map(|ids| b.create_vector(ids));
-    let logprob_token_ids = Some(b.create_vector(&v.logprob_token_ids));
     let forced_token_ids = Some(b.create_vector(&v.forced_token_ids));
     fbs::SamplingParams::create(
         b,
@@ -182,7 +167,6 @@ fn sampling<'a>(
             return_logprobs: v.return_logprobs,
             return_prompt_logprobs: v.return_prompt_logprobs,
             n_prompt_logprobs: v.n_prompt_logprobs,
-            logprob_token_ids,
             typical_p: v.typical_p,
             forced_token_ids,
         },
@@ -197,14 +181,6 @@ fn image<'a>(
     let cfg_interval_lo = v.cfg_interval.0;
     let cfg_interval_hi = v.cfg_interval.1;
     let negative_prompt = Some(b.create_string(&v.negative_prompt));
-    let image_prompts = {
-        let items = v
-            .image_prompts
-            .iter()
-            .map(|s| b.create_string(s))
-            .collect::<Vec<_>>();
-        Some(b.create_vector(&items))
-    };
     fbs::ImageParams::create(
         b,
         &fbs::ImageParamsArgs {
@@ -220,42 +196,24 @@ fn image<'a>(
             width: v.width,
             seed: v.seed,
             negative_prompt,
-            max_images: v.max_images,
-            image_prompts,
-            retain_images: v.retain_images,
         },
     )
 }
 
-fn ar<'a>(
+fn generation<'a>(
     b: &mut FlatBufferBuilder<'a>,
-    v: &ArRequestParams,
-) -> WIPOffset<fbs::ArRequestParams<'a>> {
+    v: &GenerationParams,
+) -> WIPOffset<fbs::GenerationParams<'a>> {
     let sampling = Some(sampling(b, &v.sampling));
     let negative_token_ids = Some(b.create_vector(&v.negative_token_ids));
     let finish_token_ids = Some(b.create_vector(&v.finish_token_ids));
-    let canvas = v.canvas.as_ref().map(|canvas| {
-        fbs::CanvasSampling::create(
-            b,
-            &fbs::CanvasSamplingArgs {
-                canvas_length: canvas.canvas_length,
-                max_steps: canvas.max_steps,
-                entropy_bound: canvas.entropy_bound,
-                t_min: canvas.t_min,
-                t_max: canvas.t_max,
-                confidence_threshold: canvas.confidence_threshold,
-                stability_threshold: canvas.stability_threshold,
-            },
-        )
-    });
-    fbs::ArRequestParams::create(
+    fbs::GenerationParams::create(
         b,
-        &fbs::ArRequestParamsArgs {
+        &fbs::GenerationParamsArgs {
             sampling,
             negative_token_ids,
             finish_token_ids,
             initial_position: v.initial_position,
-            canvas,
         },
     )
 }
@@ -269,7 +227,6 @@ fn diffusion<'a>(
         &fbs::DiffusionSamplingParamsArgs {
             num_frames: v.num_frames,
             video_units: v.video_units,
-            num_inference_steps: v.num_inference_steps,
             seed: v.seed,
             width: v.width,
             height: v.height,
@@ -383,7 +340,7 @@ fn video_admission<'a>(
 
 fn admission<'a>(b: &mut FlatBufferBuilder<'a>, v: &NewRequest) -> WIPOffset<fbs::NewRequest<'a>> {
     let request_key = Some(request_key(b, &v.request_key));
-    let ar = v.ar.as_ref().map(|value| ar(b, value));
+    let generation = v.generation.as_ref().map(|value| generation(b, value));
     let image = v.image.as_ref().map(|value| image(b, value));
     let diffusion = v.diffusion.as_ref().map(|value| diffusion(b, value));
     let video = v.video.as_ref().map(|value| video_admission(b, value));
@@ -393,7 +350,7 @@ fn admission<'a>(b: &mut FlatBufferBuilder<'a>, v: &NewRequest) -> WIPOffset<fbs
         &fbs::NewRequestArgs {
             request_key,
             request_pool_idx: v.request_pool_idx,
-            ar,
+            generation,
             image,
             diffusion,
             prompt_token_ids,
@@ -457,8 +414,6 @@ fn latent_params<'a>(
             latent_units: v.latent_units,
             height: v.height,
             width: v.width,
-            start_step: v.start_step,
-            step_count: v.step_count,
         },
     )
 }
@@ -502,13 +457,11 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
     let call_id = fbs::CallId::new(v.call_id.batch_id, v.call_id.request_index);
     let coordinates = Some(coordinates(b, &v.coordinates));
     let component = Some(b.create_string(&v.component));
-    let code = computation_to_fb(v.code);
+    let code = call_kind_to_fb(v.kind);
 
     // The schema has no `Bounds` table: the bounds are scalar fields of the
     // `Call` table, which `call_from_table` reassembles.
     let max_tokens = v.bounds.max_tokens;
-    let max_kv_units = v.bounds.max_kv_units;
-    let max_latent_bytes = v.bounds.max_latent_bytes;
     let max_completion_bytes = v.bounds.max_completion_bytes;
     let max_transfer_bytes = v.bounds.max_transfer_bytes;
 
@@ -567,7 +520,6 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
         .map(|value| tensor_ref(b, value));
     let predicate = v.predicate.as_ref().map(|value| tensor_ref(b, value));
 
-    let rng = v.rng.as_ref().map(|value| rng(b, value));
     let sampling_state = v
         .sampling_state
         .as_ref()
@@ -595,10 +547,8 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             call_id: Some(&call_id),
             coordinates,
             component,
-            code: Some(&code),
+            kind: Some(&code),
             max_tokens,
-            max_kv_units,
-            max_latent_bytes,
             max_completion_bytes,
             max_transfer_bytes,
             inputs,
@@ -615,7 +565,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             completion_output,
             transition_output,
             predicate,
-            rng,
+            image_index: v.image_index.unwrap_or(0),
             sampling_state,
             input_token_ids,
             input_image,
@@ -646,15 +596,12 @@ fn endpoint<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &WorkerEndpoint,
 ) -> WIPOffset<fbs::WorkerEndpoint<'a>> {
-    let worker_id = Some(b.create_string(&v.worker_id));
     let node = Some(b.create_string(&v.node));
     let address_space = Some(b.create_string(&v.address_space));
     let incarnation = Some(b.create_string(&v.incarnation));
     fbs::WorkerEndpoint::create(
         b,
         &fbs::WorkerEndpointArgs {
-            worker_id,
-            rank: v.rank,
             node,
             address_space,
             incarnation,
@@ -786,7 +733,7 @@ fn kv_group_transfer<'a>(
         b,
         &fbs::KvGroupTransferArgs {
             start: v.start,
-            page_tokens: v.page_tokens,
+            block_size: v.block_size,
             tensors,
         },
     )
@@ -850,7 +797,7 @@ fn transfer_handle<'a>(
             height,
             width,
             latent_units,
-            step,
+            step_index,
             tensor,
         } => {
             let tensor = Some(tensor_transfer(b, tensor));
@@ -862,7 +809,7 @@ fn transfer_handle<'a>(
                         height: *height,
                         width: *width,
                         latent_units: *latent_units,
-                        step: *step,
+                        step_index: *step_index,
                         tensor,
                     },
                 )
@@ -1100,21 +1047,16 @@ fn media_output<'a>(
     )
 }
 
-fn completion<'a>(
-    b: &mut FlatBufferBuilder<'a>,
-    v: &RequestOutput,
-) -> WIPOffset<fbs::RequestOutput<'a>> {
+fn completion<'a>(b: &mut FlatBufferBuilder<'a>, v: &CallOutput) -> WIPOffset<fbs::CallOutput<'a>> {
     let request_key = Some(request_key(b, &v.request_key));
     let call_id = fbs::CallId::new(v.call_id.batch_id, v.call_id.request_index);
     let status = call_status_to_fb(v.status);
-    let product_generations = Some(b.create_vector(&v.product_generations));
     let error_code = v.error_code.map(error_code_to_fb);
     let error_message = v
         .error_message
         .as_deref()
         .map(|message| b.create_string(message));
     let timing_counters = Some(timing(b, &v.timing_counters));
-    let code = computation_to_fb(v.code);
     let committed_tokens = Some(b.create_vector(&v.committed_tokens));
     let top_logprobs = {
         let items = v.top_logprobs.iter().map(token_logprob).collect::<Vec<_>>();
@@ -1132,21 +1074,18 @@ fn completion<'a>(
     let media_output = v.media_output.as_ref().map(|value| media_output(b, value));
     let kv_output = v.kv_output.as_ref().map(|value| kv_transfer(b, value));
     let candidate_logprobs = Some(b.create_vector(&v.candidate_logprobs));
-    fbs::RequestOutput::create(
+    fbs::CallOutput::create(
         b,
-        &fbs::RequestOutputArgs {
+        &fbs::CallOutputArgs {
             request_key,
             call_id: Some(&call_id),
             status,
-            product_generations,
             error_code,
             error_message,
             timing_counters,
-            code: Some(&code),
-            position: v.position,
             kv_visible_len: v.kv_visible_len,
             kv_computed_len: v.kv_computed_len,
-            num_completed_steps: v.num_completed_steps,
+            step_index: v.step_index,
             committed_tokens,
             sampled_logprob: v.sampled_logprob,
             top_logprobs,
@@ -1258,13 +1197,11 @@ fn batch_output<'a>(
 }
 
 fn kv_group<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheGroup) -> WIPOffset<fbs::KvGroup<'a>> {
-    // `window` and `sink` are meaningful only for sliding-window groups; a
-    // full-attention group writes zeros, which `kv_group_from_table` ignores.
-    let (kind, window, sink) = match v.kind {
-        KvGroupKind::Full => (fbs::KvGroupKind::Full, 0, 0),
-        KvGroupKind::SlidingWindow { window, sink } => {
-            (fbs::KvGroupKind::SlidingWindow, window, sink)
-        }
+    // `window` is meaningful only for a sliding-window group; a
+    // full-attention group writes zero, which `kv_group_from_table` ignores.
+    let (kind, window) = match v.kind {
+        KvGroupKind::Full => (fbs::KvGroupKind::Full, 0),
+        KvGroupKind::SlidingWindow { window } => (fbs::KvGroupKind::SlidingWindow, window),
     };
     let layer_ids = Some(b.create_vector(&v.layer_ids));
     fbs::KvGroup::create(
@@ -1272,8 +1209,7 @@ fn kv_group<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheGroup) -> WIPOffset<fb
         &fbs::KvGroupArgs {
             kind,
             window,
-            sink,
-            page_tokens: v.page_tokens,
+            block_size: v.block_size,
             units_per_page: v.units_per_page,
             layer_ids,
             num_kv_heads: v.num_kv_heads,
@@ -1298,69 +1234,8 @@ fn kv_cache<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheInfo) -> WIPOffset<fbs
         b,
         &fbs::KVCacheInfoArgs {
             num_units: v.num_units,
-            unit_bytes: v.unit_bytes,
             dtype,
             groups,
-        },
-    )
-}
-
-/// Writes a component's parallel degrees.
-///
-/// The `as u32` casts cannot truncate for a validated `WorkerInfo`:
-/// `WorkerInfo::validate` requires positive degrees whose product fits `u32`.
-fn parallel<'a>(
-    b: &mut FlatBufferBuilder<'a>,
-    v: &uniserve_core::ParallelConfig,
-) -> WIPOffset<fbs::ParallelConfig<'a>> {
-    use uniserve_core::SequenceParallel;
-    let (sequence_parallel_type, sequence_parallel) = match v.sequence_parallel {
-        SequenceParallel::Local => (
-            fbs::SequenceParallel::LocalSequence,
-            fbs::LocalSequence::create(b, &fbs::LocalSequenceArgs {}).as_union_value(),
-        ),
-        SequenceParallel::Ulysses { ulysses_degree } => (
-            fbs::SequenceParallel::UlyssesSequence,
-            fbs::UlyssesSequence::create(
-                b,
-                &fbs::UlyssesSequenceArgs {
-                    ulysses_degree: ulysses_degree as u32,
-                },
-            )
-            .as_union_value(),
-        ),
-        SequenceParallel::Allgather { allgather_degree } => (
-            fbs::SequenceParallel::GatherSequence,
-            fbs::GatherSequence::create(
-                b,
-                &fbs::GatherSequenceArgs {
-                    allgather_degree: allgather_degree as u32,
-                },
-            )
-            .as_union_value(),
-        ),
-        SequenceParallel::Hybrid {
-            ulysses_degree,
-            allgather_degree,
-        } => (
-            fbs::SequenceParallel::HybridSequence,
-            fbs::HybridSequence::create(
-                b,
-                &fbs::HybridSequenceArgs {
-                    ulysses_degree: ulysses_degree as u32,
-                    allgather_degree: allgather_degree as u32,
-                },
-            )
-            .as_union_value(),
-        ),
-    };
-    fbs::ParallelConfig::create(
-        b,
-        &fbs::ParallelConfigArgs {
-            tensor_parallel_size: v.tensor_parallel_size as u32,
-            pipeline_parallel_size: v.pipeline_parallel_size as u32,
-            sequence_parallel_type,
-            sequence_parallel: Some(sequence_parallel),
         },
     )
 }
@@ -1394,26 +1269,6 @@ fn component_info<'a>(
     v: &crate::ComponentInfo,
 ) -> WIPOffset<fbs::ComponentInfo<'a>> {
     let name = Some(b.create_string(&v.name));
-    let ranks = {
-        let values = v
-            .config
-            .ranks
-            .iter()
-            .map(|&rank| rank as u64)
-            .collect::<Vec<_>>();
-        Some(b.create_vector(&values))
-    };
-    let parallel_config = Some(parallel(b, &v.config.parallel_config));
-    // Wire `Local` encodes an absent distribution; `distribution_from_fb`
-    // maps it back to `None`.
-    let distribution = match v.config.distribution {
-        None => fbs::ComponentDistribution::Local,
-        Some(uniserve_core::ComponentDistribution::TemporalUnits) => {
-            fbs::ComponentDistribution::TemporalUnits
-        }
-    };
-    // `WorkerInfo::validate` bounds `units_per_rank` to `u32`.
-    let units_per_rank = v.config.units_per_rank as u32;
     let outputs = {
         let items = v
             .outputs
@@ -1422,49 +1277,11 @@ fn component_info<'a>(
             .collect::<Vec<_>>();
         Some(b.create_vector(&items))
     };
-    fbs::ComponentInfo::create(
-        b,
-        &fbs::ComponentInfoArgs {
-            name,
-            ranks,
-            parallel_config,
-            distribution,
-            units_per_rank,
-            outputs,
-        },
-    )
+    fbs::ComponentInfo::create(b, &fbs::ComponentInfoArgs { name, outputs })
 }
 
 fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::WorkerInfo<'a>> {
-    let model_name = Some(b.create_string(&v.model_name));
     let endpoint = Some(endpoint(b, &v.endpoint));
-    let device = Some(b.create_string(&v.device));
-    let transfer_backends = {
-        let items = v
-            .transfer_backends
-            .iter()
-            .map(|s| b.create_string(s))
-            .collect::<Vec<_>>();
-        Some(b.create_vector(&items))
-    };
-    let model_dtype = Some(b.create_string(&v.model_dtype));
-    let attention_backend = Some(b.create_string(&v.attention_backend));
-    let weight_formats = {
-        let items = v
-            .weight_formats
-            .iter()
-            .map(|s| b.create_string(s))
-            .collect::<Vec<_>>();
-        Some(b.create_vector(&items))
-    };
-    let activation_formats = {
-        let items = v
-            .activation_formats
-            .iter()
-            .map(|s| b.create_string(s))
-            .collect::<Vec<_>>();
-        Some(b.create_vector(&items))
-    };
     let components = {
         let items = v
             .components
@@ -1478,7 +1295,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             .supported_calls
             .iter()
             .copied()
-            .map(computation_to_fb)
+            .map(call_kind_to_fb)
             .collect::<Vec<_>>();
         Some(b.create_vector(&items))
     };
@@ -1512,9 +1329,38 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
         let canvases = value
             .canvases
             .iter()
-            .map(|canvas| fbs::Canvas::new(canvas.width, canvas.height))
+            .map(|served| {
+                let aspect_ratio = Some(b.create_string(&served.aspect_ratio));
+                fbs::ServedCanvas::create(
+                    b,
+                    &fbs::ServedCanvasArgs {
+                        short_edge: served.short_edge,
+                        aspect_ratio,
+                        width: served.canvas.width,
+                        height: served.canvas.height,
+                    },
+                )
+            })
             .collect::<Vec<_>>();
         let canvases = Some(b.create_vector(&canvases));
+        let references = Some(fbs::ReferenceLimits::create(
+            b,
+            &fbs::ReferenceLimitsArgs {
+                images: value.references.images,
+                videos: value.references.videos,
+                audios: value.references.audios,
+                total: value.references.total,
+            },
+        ));
+        let frames = Some(fbs::FrameClips::create(
+            b,
+            &fbs::FrameClipsArgs {
+                min_frames: value.frames.min_frames,
+                clip_frames: value.frames.clip_frames,
+                clip_latent_frames: value.frames.clip_latent_frames,
+                tail_latent_frames: value.frames.tail_latent_frames,
+            },
+        ));
         fbs::VideoDenoiserInfo::create(
             b,
             &fbs::VideoDenoiserInfoArgs {
@@ -1522,26 +1368,41 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 schedule_points: value.schedule_points,
                 video_shift: value.video_shift,
                 audio_shift: value.audio_shift,
+                frame_rate: value.frame_rate,
+                audio_sample_rate: value.audio_sample_rate,
+                frames,
                 canvases,
+                references,
             },
         )
     });
+    let image_warmups = {
+        let values = v
+            .image_warmups
+            .iter()
+            .map(|shape| {
+                let negative_token_ids = Some(b.create_vector(&shape.negative_token_ids));
+                fbs::ImageWarmup::create(
+                    b,
+                    &fbs::ImageWarmupArgs {
+                        height: shape.height,
+                        width: shape.width,
+                        cfg_text_scale: shape.cfg_text_scale,
+                        cfg_img_scale: shape.cfg_img_scale,
+                        negative_token_ids,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        Some(b.create_vector(&values))
+    };
     fbs::WorkerInfo::create(
         b,
         &fbs::WorkerInfoArgs {
-            model_name,
             endpoint,
-            device,
-            transfer_backends,
             fabric_handles: v.fabric_handles,
-            world_size: v.world_size,
-            model_dtype,
-            attention_backend,
-            weight_formats,
-            activation_formats,
             components,
             supported_calls,
-            queue_depth: v.queue_depth,
             max_batch_calls: v.max_batch_calls,
             max_batch_tokens: v.max_batch_tokens,
             request_slots: v.request_slots,
@@ -1553,11 +1414,11 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             encoder_entry_bytes: v.encoder_entry_bytes,
             max_unresolved_calls: v.max_unresolved_calls,
             media_components,
-            num_inference_steps: v.num_inference_steps,
             host_lane_capacity: v.host_lane_capacity,
+            transfer_tickets: v.transfer_tickets,
             video_denoiser,
-            max_prefill_calls: v.max_prefill_calls,
-            max_decode_calls: v.max_decode_calls,
+            image_warmups,
+            canvas_step_rows: v.canvas_step_rows,
         },
     )
 }
@@ -1614,7 +1475,7 @@ pub(super) fn response<'a>(
         WorkerResponse::Ok { .. } => {}
         WorkerResponse::Error { error, .. } => {
             args.message = Some(b.create_string(&error.message));
-            args.code = error.code.as_deref().map(|s| b.create_string(s));
+            args.code = Some(error_code_to_fb(error.code));
             // `fatal` is an optional scalar (`bool = null`): `Some` writes it
             // even when false, and `response_from_table` requires it on error
             // responses.

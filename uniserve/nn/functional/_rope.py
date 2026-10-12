@@ -142,7 +142,7 @@ def qk_norm_rope(
     eps: float,
     axis_dims,
     out=None,
-    rounding: Rounding = Rounding.ONCE,
+    rounding: Rounding,
 ):
     """Normalize Q/K over explicit RMS domains, then rotate each rotary axis.
 

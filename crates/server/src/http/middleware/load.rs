@@ -2,9 +2,9 @@
 //!
 //! The in-flight count lives in `AppState` (`server_load`). Only the generation
 //! routes in `TRACKED_HANDLERS` are counted and subject to the optional
-//! `max_concurrent_requests` limit. The video routes are not: both video
-//! submission routes are bounded by the job slots in
-//! `crate::video_jobs::VideoJobs` instead.
+//! `max_concurrent_requests` limit. Asynchronous video job creation returns at
+//! once and is not counted; its generation is bounded by the engine's
+//! admission.
 
 use std::sync::{Arc, Weak};
 
@@ -28,6 +28,7 @@ use crate::AppState;
 const TRACKED_HANDLERS: &[&str] = &[
     "/v1/chat/completions",
     "/v1/images/generations",
+    "/v1/videos/sync",
     SYSTEMONE_PATH,
 ];
 

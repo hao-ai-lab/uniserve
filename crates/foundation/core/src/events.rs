@@ -1,8 +1,8 @@
 //! Requests and lifecycle events exchanged across the public engine boundary.
 //!
-//! The server submits each engine request as a [`Request`], choosing the
-//! variant from the engine's [`RuntimeFamily`], and receives that request's
-//! [`EngineCoreOutput`] events in order. `Finished`, `Rejected`, and `Error`
+//! The server submits each engine request as a [`Request`], a token generation
+//! or a video diffusion, and receives that request's [`EngineCoreOutput`]
+//! events in order. `Finished`, `Rejected`, and `Error`
 //! are terminal: the engine's `EventRx` marks the request finished when it
 //! receives one of them.
 
@@ -139,9 +139,9 @@ pub enum EngineCoreOutput {
     },
     /// Publishes a materialized PNG image.
     ///
-    /// The engine reads `height`, `width`, and `bytes` from the validated PNG
-    /// payload; a payload that fails validation finishes the request with
-    /// [`FinishReason::Error`] instead.
+    /// The engine reads `height`, `width`, and `bytes` from the PNG header
+    /// and the payload length; a payload without a PNG header finishes the
+    /// request with [`FinishReason::Error`] instead.
     ImageDone {
         /// Request-local image identity.
         image_id: u32,
@@ -230,21 +230,6 @@ pub enum MediaKind {
     Audio,
 }
 
-/// Runtime family selected once for an engine configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeFamily {
-    /// Autoregressive text runtime.
-    Ar,
-    /// Diffusion-only media runtime.
-    Diffusion,
-    /// Unified multimodal understanding and generation runtime.
-    Umm,
-    /// Block-diffusion token runtime: prompt prefill and denoising passes
-    /// over token canvases that read the prompt's KV cache.
-    BlockDiffusion,
-}
-
 /// One caller-visible artifact retaining its immutable shared-storage mapping.
 #[derive(Debug, Clone)]
 pub struct ArtifactEvent {
@@ -303,8 +288,6 @@ pub struct DiffusionSamplingParams {
     pub num_frames: u32,
     /// Video media units the decoder reconstructs, independent of GPU rank count.
     pub video_units: u32,
-    /// Number of denoising steps in the trajectory.
-    pub num_inference_steps: u32,
     /// Deterministic request-level noise seed.
     pub seed: u64,
     /// Output raster width in pixels: the request's canvas.
@@ -343,7 +326,7 @@ impl DiffusionRequest {
     /// Checks the request's own consistency.
     ///
     /// The prompt is nonempty, its token count fits in `u32` and every token
-    /// has a tag; the frame, media-unit, and step counts and the canvas are
+    /// has a tag; the frame and media-unit counts and the canvas are
     /// positive; `t2va` has no conditions, `fl2va` only keyframes and
     /// `ref2va` at least one condition; every condition is consistent
     /// ([`VideoCondition::validate`]) and its media is published in `media`
@@ -361,7 +344,6 @@ impl DiffusionRequest {
 
         if self.sampling.num_frames == 0
             || self.sampling.video_units == 0
-            || self.sampling.num_inference_steps == 0
             || self.sampling.width == 0
             || self.sampling.height == 0
             || self.prompt_token_ids.len() > u32::MAX as usize
@@ -418,54 +400,41 @@ pub enum DiffusionRequestError {
 }
 
 /// Immutable request payload selected before it enters the engine.
+///
+/// The engine serves each kind on the workers whose capabilities cover it and
+/// refuses one they cannot serve.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "family", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
-    /// Autoregressive text request.
-    Ar(crate::GenerationRequest),
-    /// Diffusion media request.
+    /// Token generation: autoregressive text, interleaved text and images, or
+    /// block-diffusion canvases and readouts. Boxed, as it is several times
+    /// the size of a diffusion request.
+    Generation(Box<crate::GenerationRequest>),
+    /// Video diffusion.
     Diffusion(DiffusionRequest),
-    /// Unified multimodal request.
-    Umm(crate::GenerationRequest),
-    /// Block-diffusion token request, such as a canvas readout.
-    BlockDiffusion(crate::GenerationRequest),
 }
 
 impl From<crate::GenerationRequest> for Request {
-    /// Wraps an autoregressive generation request in the shared request enum.
+    /// Wraps a token generation request in the shared request enum.
     fn from(request: crate::GenerationRequest) -> Self {
-        Self::Ar(request)
+        Self::Generation(Box::new(request))
     }
 }
 
 impl Request {
-    /// Returns the request identifier shared by every runtime family.
-    pub const fn request_id(&self) -> RequestId {
+    /// Returns the request identifier.
+    pub fn request_id(&self) -> RequestId {
         match self {
-            Self::Ar(request) | Self::Umm(request) | Self::BlockDiffusion(request) => {
-                request.request_id
-            }
+            Self::Generation(request) => request.request_id,
             Self::Diffusion(request) => request.request_id,
         }
     }
 
-    /// Returns the scheduling priority shared by every runtime family.
-    pub const fn priority(&self) -> i32 {
+    /// Returns the scheduling priority.
+    pub fn priority(&self) -> i32 {
         match self {
-            Self::Ar(request) | Self::Umm(request) | Self::BlockDiffusion(request) => {
-                request.priority
-            }
+            Self::Generation(request) => request.priority,
             Self::Diffusion(request) => request.priority,
-        }
-    }
-
-    /// Returns the runtime family that owns this request.
-    pub const fn family(&self) -> RuntimeFamily {
-        match self {
-            Self::Ar(_) => RuntimeFamily::Ar,
-            Self::Diffusion(_) => RuntimeFamily::Diffusion,
-            Self::Umm(_) => RuntimeFamily::Umm,
-            Self::BlockDiffusion(_) => RuntimeFamily::BlockDiffusion,
         }
     }
 }

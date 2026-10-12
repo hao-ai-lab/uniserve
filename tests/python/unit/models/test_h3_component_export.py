@@ -38,7 +38,7 @@ def checkpoints(tmp_path):
         )
     )
     for directory in ("tokenizer", "processor"):
-        (base / directory).mkdir()
+        (base / directory).mkdir(exist_ok=True)
         (base / directory / "tokenizer_config.json").write_text("{}")
 
     export.mkdir()

@@ -5,49 +5,11 @@ import torch
 from torch import nn
 
 from tests.python.fixtures.diffusion import LinearDenoiser, Size
-from uniserve.execution import (
-    DenoisingRunner,
-    EncoderRunner,
-    ImageRunner,
-    ModelRunner,
-)
-from uniserve.media import image
-from uniserve.model import DenoiserInput, Encoder, ImageDecoder, LatentInput
-from uniserve.nn.vae import RGBDecoder
+from uniserve.execution import DenoisingRunner, ModelRunner
+from uniserve.model import DenoiserInput, LatentInput
 from uniserve.runtime import ExecutionContext
 
 pytestmark = pytest.mark.unit
-
-
-def test_encoder_runner_preserves_homogeneous_sample_order() -> None:
-    model = Encoder(nn.Identity())
-    inputs = (
-        torch.arange(6, dtype=torch.float32).reshape(2, 3),
-        torch.arange(3, dtype=torch.float32).reshape(1, 3),
-        torch.arange(6, 12, dtype=torch.float32).reshape(2, 3),
-    )
-
-    with ExecutionContext(model) as context:
-        runner = EncoderRunner(model, context=context)
-        runner.warmup(3)
-        output = runner.encode(inputs)
-
-    assert output is not None
-    for actual, expected in zip(output, inputs, strict=True):
-        torch.testing.assert_close(actual, expected)
-
-
-def test_image_runner_decodes_canonical_patch_rows() -> None:
-    model = ImageDecoder(RGBDecoder(patch_size=1))
-    size = image.Config(2, 2)
-    latent = torch.arange(12, dtype=torch.float32).reshape(4, 3)
-
-    with ExecutionContext(model) as context:
-        runner = ImageRunner(model, context=context)
-        (pixels,) = runner.decode((latent,), sizes=(size,))
-
-    expected = latent.reshape(2, 2, 3).permute(2, 0, 1)
-    torch.testing.assert_close(pixels, expected)
 
 
 def test_denoising_runner_advances_prepared_samples() -> None:

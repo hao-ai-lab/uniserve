@@ -5,7 +5,7 @@
 //! `Executor`. `WorkerExecutor` splits it into one `ExecutionBatch` per target
 //! worker and lowers each with `ExecutionBatch::into_protocol`, which gathers
 //! the per-call placement fields into the flat, call-indexed arrays of the
-//! wire `Batch`.
+//! wire `Batch` and the persistent spans of each rank's own buffer pool.
 
 use super::WorkerId;
 use std::collections::BTreeMap;
@@ -14,19 +14,48 @@ use uniserve_worker_ipc::{
     ForwardBatch, LatentParams, NewRequest, RequestKey, TensorPublication,
 };
 
-/// Physical placement selected by the scheduler for a computation.
+/// A persistent span in the buffer pool one rank of a worker backs.
 ///
-/// The computation itself is the shared IPC `Call`. These fields describe
+/// Each rank of a worker group has its own pool, so a buffer a worker holds
+/// has one span on every rank that backs it, each at that rank's offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RankBuffer {
+    /// Rank within the worker group whose pool the span addresses.
+    pub rank: u32,
+    /// The span, in that rank's pool.
+    pub allocation: BufferAllocation,
+}
+
+impl RankBuffer {
+    /// Places each of `allocations` at the same offset on every one of a
+    /// worker's `ranks`, for spans taken from a pool every rank shares the
+    /// layout of.
+    pub fn on_every_rank(allocations: &[BufferAllocation], ranks: u32) -> Vec<Self> {
+        allocations
+            .iter()
+            .flat_map(|allocation| {
+                (0..ranks).map(move |rank| Self {
+                    rank,
+                    allocation: *allocation,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Physical placement selected by the scheduler for a call.
+///
+/// The call itself is the shared IPC `Call`. These fields describe
 /// its worker and allocations, which are gathered into physical batch arrays.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestPlacement {
-    /// Worker routing stays outside the computation sent across IPC.
+    /// Worker routing stays outside the call sent across IPC.
     pub worker: WorkerId,
     /// Worker-local request row when a replicated route owns its own address
     /// space. Unset placements retain the admission's canonical row;
     /// `WorkerExecutor` applies the override to the `Start` it sends the worker.
     pub request_pool_idx: Option<u32>,
-    /// KV tables and newly acquired units used by this computation.
+    /// KV tables and newly acquired units used by this call.
     pub block_tables: Vec<BlockTable>,
     pub new_cache_units: Vec<CacheUnitAllocation>,
     /// Rows use a local call index until gathered into the physical batch:
@@ -35,9 +64,10 @@ pub struct RequestPlacement {
     pub forward: ForwardBatch,
     pub latent: Option<LatentParams>,
     pub decode: Option<DecodeRange>,
-    /// Worker-local persistent spans for the call's buffer inputs and outputs.
-    /// Request retirement retains every physical reader and writer allocation.
-    pub buffers: Vec<BufferAllocation>,
+    /// Persistent spans for the call's buffer inputs and outputs, on each
+    /// rank of the worker that backs them. Request retirement retains every
+    /// physical reader and writer allocation.
+    pub buffers: Vec<RankBuffer>,
     /// For a video request's call, the worker routed to each component that
     /// reads its products, keyed by component name, as the request's graph
     /// connects its calls; empty for a call whose products leave the graph.
@@ -134,15 +164,17 @@ impl ExecutionBatch {
         retired
     }
 
-    /// Validates call identities, execution ownership, and command payloads.
+    /// Validates the scheduler's own bookkeeping: call identities, execution
+    /// ownership and placement.
     ///
-    /// Requires at least one call or command; checks each call and its
-    /// placement, that call identities are unique and belong to this batch,
-    /// and that every `Start` is unique and names a request with a call in
-    /// this batch; and validates every command, input transfer, and KV input.
-    /// Wire-level constraints between calls (one kind and component per batch,
-    /// allocation tables matching their calls, non-overlapping spans) are left
-    /// to `Batch::validate`, which `into_protocol` runs.
+    /// Requires at least one call or command; checks that call identities are
+    /// unique and belong to this batch, that each placement describes its own
+    /// call, and that every `Start` is unique and names a request with a call
+    /// in this batch. The records themselves and the wire-level constraints
+    /// between calls (one kind and component per batch, allocation tables
+    /// matching their calls, non-overlapping spans) are checked once, by
+    /// `Batch::validate_unplaced`, which `into_protocol` runs, and by
+    /// `Batch::validate` on each rank's projection.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.requests.is_empty() || !self.commands.is_empty(),
@@ -152,10 +184,9 @@ impl ExecutionBatch {
         let mut requests = std::collections::HashSet::with_capacity(self.requests.len());
         let mut identities = std::collections::HashSet::with_capacity(self.requests.len());
         for (call, placement) in &self.requests {
-            call.validate()?;
             anyhow::ensure!(
                 call.call_id.batch_id == self.id,
-                "computation identity belongs to another logical batch"
+                "call identity belongs to another logical batch"
             );
             requests.insert(call.request_key);
             // `WorkerId`'s public field admits any string; only its
@@ -170,32 +201,23 @@ impl ExecutionBatch {
             // A placement describes one call, so its forward rows may only
             // name local call index zero.
             placement.forward.validate(1)?;
-            for table in &placement.block_tables {
-                table.validate()?;
-            }
-            for units in &placement.new_cache_units {
-                units.validate()?;
-            }
             if let Some(latent) = &placement.latent {
-                latent.validate()?;
                 anyhow::ensure!(
                     (latent.request_key, latent.call_id) == (call.request_key, call.call_id),
                     "logical call carries another call's latent execution"
                 );
             }
             if let Some(decode) = &placement.decode {
-                decode.validate()?;
                 anyhow::ensure!(
                     (decode.request_key, decode.call_id) == (call.request_key, call.call_id),
                     "logical call carries another call's decode execution"
                 );
             }
             for buffer in &placement.buffers {
-                buffer.validate()?;
                 anyhow::ensure!(
                     call.buffer_inputs()
                         .chain(call.buffer_outputs())
-                        .any(|tensor| tensor.buffer_id() == buffer.buffer),
+                        .any(|tensor| tensor.buffer_id() == buffer.allocation.buffer),
                     "logical call carries a buffer execution for an unrelated tensor"
                 );
             }
@@ -203,7 +225,6 @@ impl ExecutionBatch {
 
         let mut admitted = std::collections::HashSet::new();
         for admission in self.admissions() {
-            admission.validate()?;
             anyhow::ensure!(
                 admitted.insert(admission.request_key),
                 "logical batch repeats a request start"
@@ -214,31 +235,28 @@ impl ExecutionBatch {
             );
         }
 
-        for command in &self.commands {
-            command.validate()?;
-        }
-
-        for transfer in &self.input_transfers {
-            transfer.validate()?;
-        }
-        for publication in &self.kv_inputs {
-            publication.validate()?;
-        }
         Ok(())
     }
 }
 
 impl ExecutionBatch {
-    /// Lowers a logical batch into a validated wire batch.
+    /// Lowers a logical batch into a wire batch and the persistent spans of
+    /// its calls on each rank.
     ///
-    /// Concatenates the placements' tables, pages, latent parameters, decode
-    /// ranges, and buffer allocations in call order, and rebases each
-    /// placement's forward rows onto the call's position in `calls`.
-    /// `collective_seq` is the worker's next collective sequence, which
-    /// `WorkerExecutor` commits only after the worker accepts the batch. Fails
-    /// when adding the call's position to a forward row's call index overflows
-    /// `u32` or `Batch::validate` rejects the result.
-    pub(crate) fn into_protocol(self, collective_seq: u64) -> anyhow::Result<Batch> {
+    /// Concatenates the placements' tables, pages, latent parameters and
+    /// decode ranges in call order, and rebases each placement's forward rows
+    /// onto the call's position in `calls`. The wire batch carries no buffer
+    /// spans, because they address each rank's own pool: the spans are
+    /// returned beside it, in call order, for the worker group to project
+    /// onto its ranks. `collective_seq` is the worker's next collective
+    /// sequence, which `WorkerExecutor` commits only after the worker accepts
+    /// the batch. Fails when adding the call's position to a forward row's
+    /// call index overflows `u32` or `Batch::validate_unplaced` rejects the
+    /// result.
+    pub(crate) fn into_protocol(
+        self,
+        collective_seq: u64,
+    ) -> anyhow::Result<(Batch, Vec<RankBuffer>)> {
         let Self {
             id: batch_id,
             requests,
@@ -251,7 +269,7 @@ impl ExecutionBatch {
         let mut forward = ForwardBatch::default();
         let mut latent_params = Vec::new();
         let mut decode_ranges = Vec::new();
-        let mut buffer_allocations = Vec::new();
+        let mut rank_buffers = Vec::new();
         let mut calls = Vec::with_capacity(requests.len());
 
         for (call_index, (call, placement)) in requests.into_iter().enumerate() {
@@ -260,7 +278,7 @@ impl ExecutionBatch {
             forward.append(placement.forward, call_index as u32)?;
             latent_params.extend(placement.latent);
             decode_ranges.extend(placement.decode);
-            buffer_allocations.extend(placement.buffers);
+            rank_buffers.extend(placement.buffers);
             calls.push(call);
         }
 
@@ -273,12 +291,12 @@ impl ExecutionBatch {
             forward,
             latent_params,
             decode_ranges,
-            buffer_allocations,
+            buffer_allocations: Vec::new(),
             commands,
             input_products,
             kv_inputs,
         };
-        batch.validate()?;
-        Ok(batch)
+        batch.validate_unplaced()?;
+        Ok((batch, rank_buffers))
     }
 }

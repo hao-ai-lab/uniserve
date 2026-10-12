@@ -7,8 +7,9 @@
 //! drives worker processes, and `SimExecutor` (`crate::sim`).
 //!
 //! Besides the trait, this module owns the values that cross that boundary:
-//! [`ExecutorInfo`], which merges the pools' reported capabilities into the
-//! single capacity view the scheduler plans against; the result types a poll
+//! [`ExecutorInfo`], which merges the pools' reported capabilities, beside
+//! the placement the engine launched them with, into the single capacity view
+//! the scheduler plans against; the result types a poll
 //! returns; and [`TransferConfig`], the directed transfer edges between worker
 //! ranks and the placement they resolve against, from which the head derives
 //! each rank's launch descriptor fields (transfer mechanisms, acknowledgment
@@ -35,38 +36,56 @@ use uniserve_worker_ipc::{
 
 mod batch;
 
-pub use batch::{ExecutionBatch, RequestPlacement};
+pub use batch::{ExecutionBatch, RankBuffer, RequestPlacement};
+
+/// What the engine launched one pool with.
+///
+/// The engine decides these values and hands them to the worker at launch, so
+/// the worker's report does not carry them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoolPlacement {
+    /// Unresolved physical batches the pool admits at once, counted as at
+    /// least one.
+    pub queue_depth: usize,
+    /// The pool's components by name, each with its member ranks, parallel
+    /// degrees and distribution.
+    pub components: BTreeMap<String, ComponentConfig>,
+}
 
 /// Concrete pool information reported through the execution boundary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecutorInfo {
     /// Physical pool identities and their reported capabilities.
     pub workers: Vec<(WorkerId, WorkerInfo)>,
+    /// For each pool, what the engine launched it with. A pool absent from
+    /// the map is placed with no components and a queue depth of one.
+    ///
+    /// `WorkerExecutor::try_new` and `SimExecutor` fill this from their
+    /// launch; `from_workers` leaves it empty.
+    pub placements: BTreeMap<WorkerId, PoolPlacement>,
+    /// For each pool, the persistent buffer bytes each rank backs, in rank
+    /// order, as the ranks reported them. A pool absent from the map is one
+    /// rank backing its reported `buffer_pool_bytes`.
+    ///
+    /// Each rank has its own buffer pool, sized to the products of the
+    /// components it executes and the components that read them, so the
+    /// engine places a pool's buffers rank by rank.
+    pub rank_buffer_bytes: BTreeMap<WorkerId, Vec<u64>>,
     /// For each worker that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
     ///
-    /// `WorkerExecutor::try_new` fills this from the placement; `single` and
-    /// `from_workers` leave it empty. Scheduler admission restricts a video
+    /// `WorkerExecutor::try_new` fills this from the placement;
+    /// `from_workers` leaves it empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the worker chosen to decode.
     pub video_codecs: BTreeMap<WorkerId, BTreeSet<WorkerId>>,
 }
 
 impl ExecutorInfo {
-    /// Constructs capability information for one physical pool.
-    pub fn single(id: WorkerId, info: WorkerInfo) -> Self {
-        Self {
-            workers: vec![(id, info)],
-            video_codecs: BTreeMap::new(),
-        }
-    }
-
-    /// Validates and constructs capability information for multiple pools.
+    /// Constructs capability information for multiple pools.
     ///
-    /// Fails when `pools` is empty, repeats a pool id, contains a record that
-    /// fails `WorkerInfo::validate`, mixes models or checkpoint identities, or
-    /// holds replicas of one component that expose different numerical
-    /// outputs.
+    /// Fails when `pools` is empty, repeats a pool id, or holds replicas of
+    /// one component that expose different numerical outputs.
     pub fn from_workers(pools: Vec<(WorkerId, WorkerInfo)>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !pools.is_empty(),
@@ -74,14 +93,8 @@ impl ExecutorInfo {
         );
         let mut ids = std::collections::HashSet::new();
         let mut components: BTreeMap<&str, &uniserve_worker_ipc::ComponentInfo> = BTreeMap::new();
-        let model_name = &pools[0].1.model_name;
         for (id, info) in &pools {
             anyhow::ensure!(ids.insert(id), "executor info repeats pool id {id}");
-            info.validate()?;
-            anyhow::ensure!(
-                &info.model_name == model_name,
-                "worker {id} loaded a different model"
-            );
             for component in &info.components {
                 if let Some(other) = components.get(component.name.as_str()) {
                     anyhow::ensure!(
@@ -96,8 +109,49 @@ impl ExecutorInfo {
         }
         Ok(Self {
             workers: pools,
-            video_codecs: BTreeMap::new(),
+            ..Self::default()
         })
+    }
+
+    /// Returns the configuration the engine placed component `name` with on
+    /// `worker`, or `None` when the pool launched no such component.
+    pub fn component_config(&self, worker: &WorkerId, name: &str) -> Option<&ComponentConfig> {
+        self.placements.get(worker)?.components.get(name)
+    }
+
+    /// Returns the persistent buffer bytes each rank of `worker` backs, in
+    /// rank order; empty for a pool this info does not hold.
+    pub fn rank_buffer_bytes(&self, worker: &WorkerId) -> Vec<u64> {
+        if let Some(bytes) = self.rank_buffer_bytes.get(worker) {
+            return bytes.clone();
+        }
+        self.workers
+            .iter()
+            .find(|(id, _)| id == worker)
+            .map(|(_, info)| vec![info.buffer_pool_bytes])
+            .unwrap_or_default()
+    }
+
+    /// Returns the number of ranks `worker` launched; one for a pool this
+    /// info does not hold.
+    pub fn rank_count(&self, worker: &WorkerId) -> usize {
+        self.rank_buffer_bytes
+            .get(worker)
+            .map_or(1, Vec::len)
+            .max(1)
+    }
+
+    /// Returns the batches the pools admit in flight together: the sum of
+    /// their launched queue depths, each counted as at least one.
+    pub fn queue_depth(&self) -> usize {
+        self.workers
+            .iter()
+            .map(|(id, _)| {
+                self.placements
+                    .get(id)
+                    .map_or(1, |placement| placement.queue_depth.max(1))
+            })
+            .fold(0usize, usize::saturating_add)
     }
 
     /// Resolves which component serves each media call across every worker.
@@ -157,12 +211,11 @@ impl ExecutorInfo {
     pub fn media_lane_units(&self, call: MediaCall) -> Option<u32> {
         self.workers
             .iter()
-            .filter_map(|(_, info)| {
+            .filter_map(|(id, info)| {
                 let component = info.media_components.get(&call)?;
-                let find =
-                    |name: &String| info.components.iter().find(|binding| &binding.name == name);
-                let binding = find(component)?;
-                if binding.config.distribution.is_none() {
+                let find = |name: &String| self.component_config(id, name);
+                let config = find(component)?;
+                if config.distribution.is_none() {
                     return Some(1);
                 }
 
@@ -171,34 +224,19 @@ impl ExecutorInfo {
                     .get(&MediaCall::TextEncoding)
                     .filter(|_| call == MediaCall::LatentEncoding)
                     .and_then(find);
-                let unshared = binding
-                    .config
+                let unshared = config
                     .ranks
                     .iter()
-                    .filter(|rank| prompt.is_none_or(|prompt| !prompt.config.ranks.contains(rank)))
+                    .filter(|rank| prompt.is_none_or(|prompt| !prompt.ranks.contains(rank)))
                     .count();
                 let ranks = if unshared == 0 {
-                    binding.config.ranks.len()
+                    config.ranks.len()
                 } else {
                     unshared
                 };
-                u32::try_from(ranks * binding.config.units_per_rank.max(1)).ok()
+                u32::try_from(ranks * config.units_per_rank.max(1)).ok()
             })
             .min()
-    }
-
-    /// Returns the sole worker capability record.
-    ///
-    /// # Panics
-    ///
-    /// Panics unless the executor contains exactly one physical pool.
-    pub fn single_worker(&self) -> &WorkerInfo {
-        assert_eq!(
-            self.workers.len(),
-            1,
-            "executor does not contain exactly one physical pool"
-        );
-        &self.workers[0].1
     }
 
     /// Derives the runtime's immutable capacity view from concrete pools.
@@ -208,23 +246,22 @@ impl ExecutorInfo {
     /// A single pool's record is returned unchanged. With several pools, the
     /// record is cloned from the first pool that serves a KV forward call (or
     /// the first pool when none does), so fields the merge does not set, such
-    /// as the model identity and endpoint, come from that pool. Call support and
-    /// media routing are unions, queue depth is a sum, and most batch, slot,
-    /// and storage limits take the smallest nonzero value any pool reports.
+    /// as the endpoint, come from that pool. Call support and
+    /// media routing are unions, and most batch, slot, and storage limits
+    /// take the smallest nonzero value any pool reports.
     /// The exceptions are the KV cache, whose layout the KV pools must share
-    /// and whose block count is their smallest and per-token footprint their
-    /// largest; request slots of a deployment that muxes video,
-    /// the narrowest per-component sum of replica slots; and the diffusion
-    /// step count and latent page geometry, taken from the first denoising
-    /// pool and zero without one.
+    /// and whose unit count is their smallest; request slots of a deployment
+    /// that muxes video,
+    /// the narrowest per-component sum of replica slots; and the video
+    /// denoiser and latent page geometry, taken from the first denoising
+    /// pool and absent or zero without one.
     ///
     /// # Errors
     ///
     /// Fails when there are no pools. With several pools, it also fails when
     /// media routing conflicts or is incomplete, when a deployment that muxes
-    /// video reports no diffusion step count, when denoising pools disagree on the
-    /// step count, when KV pools disagree on cache layout or a routed KV pool
-    /// has no cache, when summed capacities overflow `u32`, or when the merged
+    /// video reports no video denoiser, when KV pools disagree on cache
+    /// layout or a routed KV pool has no cache, when summed capacities overflow `u32`, or when the merged
     /// record fails `WorkerInfo::validate`.
     pub fn runtime_info(&self) -> anyhow::Result<WorkerInfo> {
         anyhow::ensure!(
@@ -268,37 +305,19 @@ impl ExecutorInfo {
         let mut merged = self.workers[seed_index].1.clone();
         merged.media_components = self.media_routing()?;
         let denoising = routed(CallKind::Media(MediaCall::Denoising));
-        merged.num_inference_steps = denoising.map_or(0, |info| info.num_inference_steps);
-        // Every worker describes the deployment's placed denoiser alike; the
-        // denoising worker's description is the deployment's.
+        // The denoising worker owns the denoiser: its description is the
+        // deployment's.
         merged.video_denoiser = denoising.and_then(|info| info.video_denoiser.clone());
-        // A deployment that assembles video denoises over a fixed ladder,
-        // which the denoising worker reports.
+        // A deployment that assembles video denoises over the fixed schedule
+        // the denoising worker describes.
         anyhow::ensure!(
             !merged.media_components.contains_key(&MediaCall::Muxing)
-                || merged.num_inference_steps > 0,
-            "a deployment that muxes video reports no diffusion step count"
-        );
-        anyhow::ensure!(
-            self.workers.iter().all(|(_, info)| {
-                !info
-                    .supported_calls
-                    .contains(&CallKind::Media(MediaCall::Denoising))
-                    || info.num_inference_steps == merged.num_inference_steps
-            }),
-            "workers disagree on diffusion steps"
-        );
-        anyhow::ensure!(
-            self.workers
-                .iter()
-                .all(|(_, info)| info.video_denoiser.is_none()
-                    || info.video_denoiser == merged.video_denoiser),
-            "workers disagree on the deployment's video denoiser"
+                || merged.video_denoiser.is_some(),
+            "a deployment that muxes video reports no video denoiser"
         );
         // Every KV stage must agree on its groups' retention policies and page
         // shapes. Capacity is the narrowest pool because a request may
-        // traverse all routed KV stages with one set of unit ids, and the
-        // per-unit footprint is the largest any of them reports
+        // traverse all routed KV stages with one set of unit ids
         // (`KvCacheInfo::merge`).
         if let Some(first_index) = kv_indices.first().copied() {
             let mut kv_cache = self.workers[first_index]
@@ -321,20 +340,13 @@ impl ExecutorInfo {
             merged.kv_cache = None;
         }
 
-        // A call is supported when any pool serves it. Each pool contributes
-        // its own queue depth, counted as at least one. Unless noted at the
-        // field, the remaining limits take the smallest nonzero value, and are
-        // zero only when every pool reports zero.
+        // A call is supported when any pool serves it. Unless noted at the
+        // field, the limits take the smallest nonzero value, and are zero
+        // only when every pool reports zero.
         merged.supported_calls = CallKind::ALL
             .into_iter()
             .filter(|variant| routed(*variant).is_some())
             .collect();
-        merged.queue_depth = self
-            .workers
-            .iter()
-            .map(|(_, info)| info.queue_depth.max(1))
-            .try_fold(0u32, |total, depth| total.checked_add(depth))
-            .context("worker capacity exceeds the engine window")?;
         merged.max_batch_calls = self
             .workers
             .iter()
@@ -349,26 +361,6 @@ impl ExecutorInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
-        // A prefill call may reach any pool, so the narrowest prefill graph
-        // capacity binds; a pool without one leaves the batch bound.
-        merged.max_prefill_calls = self
-            .workers
-            .iter()
-            .map(|(_, info)| info.max_prefill_calls)
-            .filter(|limit| *limit > 0)
-            .min()
-            .unwrap_or(0)
-            .min(merged.max_batch_calls);
-        // Likewise, the narrowest decode graph capacity binds every decode
-        // call.
-        merged.max_decode_calls = self
-            .workers
-            .iter()
-            .map(|(_, info)| info.max_decode_calls)
-            .filter(|limit| *limit > 0)
-            .min()
-            .unwrap_or(0)
-            .min(merged.max_batch_calls);
         merged.request_slots = if merged.media_components.contains_key(&MediaCall::Muxing) {
             // A replicated media route owns an independent request-row bank in
             // every WorkerGroup. End-to-end concurrency is the narrowest sum
@@ -414,10 +406,28 @@ impl ExecutorInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
+        // A transfer call may be placed on any pool, so the narrowest
+        // transport binds the engine's window of reserved transfers.
+        merged.transfer_tickets = self
+            .workers
+            .iter()
+            .map(|(_, info)| info.transfer_tickets)
+            .filter(|limit| *limit > 0)
+            .min()
+            .unwrap_or(0);
         // Latent page geometry is the denoising pool's, zero without one.
         let flow = routed(CallKind::Media(MediaCall::Denoising));
         merged.latent_page_units = flow.map_or(0, |info| info.latent_page_units);
         merged.latent_pages = flow.map_or(0, |info| info.latent_pages);
+        // The flow runtime's captured shapes are the denoising pool's, and a
+        // canvas chunk is the widest any worker's token denoiser steps.
+        merged.image_warmups = flow.map_or_else(Vec::new, |info| info.image_warmups.clone());
+        merged.canvas_step_rows = self
+            .workers
+            .iter()
+            .map(|(_, info)| info.canvas_step_rows)
+            .max()
+            .unwrap_or(0);
         merged.buffer_pool_bytes = self
             .workers
             .iter()
@@ -478,7 +488,7 @@ fn check_video_tasks(info: &WorkerInfo) -> anyhow::Result<()> {
 #[derive(Debug, Clone)]
 pub struct CallResult {
     /// Validated completion values; media storage is carried by `media` below.
-    pub output: uniserve_worker_ipc::RequestOutput,
+    pub output: uniserve_worker_ipc::CallOutput,
     /// Claimed immutable output storage, or its request-local acquisition error.
     pub media: Result<Option<Arc<uniserve_core::SharedMedia>>, String>,
 }
@@ -673,7 +683,7 @@ pub enum TransferBackend {
     #[default]
     Local,
     /// Publishes products through POSIX shared storage.
-    Shm,
+    PosixShm,
     /// Publishes device products through CUDA VMM handles.
     CudaVmm,
     /// Carries a host product's bytes on the rank channel's data path.
@@ -689,7 +699,7 @@ impl TransferBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
-            Self::Shm => "shm",
+            Self::PosixShm => "posix_shm",
             Self::CudaVmm => "cuda_vmm",
             Self::Channel => "channel",
         }
@@ -710,7 +720,7 @@ impl FromStr for TransferBackend {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "local" => Ok(Self::Local),
-            "shm" => Ok(Self::Shm),
+            "posix_shm" => Ok(Self::PosixShm),
             "cuda_vmm" => Ok(Self::CudaVmm),
             "channel" => Ok(Self::Channel),
             _ => Err(TransferConfigError::message(format!(
@@ -840,7 +850,7 @@ impl TransferConfig {
                                 // namespace, so a host product that leaves its host
                                 // travels on the rank channel's data path.
                                 let host = if source.node == destination.node {
-                                    TransferBackend::Shm
+                                    TransferBackend::PosixShm
                                 } else {
                                     TransferBackend::Channel
                                 };
@@ -1050,7 +1060,10 @@ impl TransferConfig {
     /// `destination`: a location survives when the first edge matching its
     /// source and `destination` carries the mechanism it was published on, or,
     /// with no matching edge, when it is a local location on `destination`
-    /// itself. `WorkerGroup` calls this for each rank's projected batch.
+    /// itself. An endpoint's worker and rank are the ones `incarnations` holds for
+    /// its incarnation; a location whose source is not a live incarnation
+    /// matches no edge. `WorkerGroup` calls this for each rank's projected
+    /// batch.
     ///
     /// # Errors
     ///
@@ -1061,16 +1074,18 @@ impl TransferConfig {
     /// tensor keeps its filtered locations.
     pub(crate) fn bind_inputs(
         &self,
+        incarnations: &crate::worker::IncarnationRegistry,
         products: &mut [uniserve_worker_ipc::TensorPublication],
         kv_inputs: &mut [uniserve_worker_ipc::KvTransfer],
         destination: &uniserve_worker_ipc::WorkerEndpoint,
     ) -> Result<(), UnroutableInputs> {
+        let position = incarnations.position(destination);
         let mut unroutable = Vec::new();
         for payload in products.iter_mut() {
             let buffer = payload.product.buffer_id();
             let mut bound = true;
             for tensor in payload.value.tensors_mut() {
-                bound &= self.bind_locations(tensor, destination);
+                bound &= self.bind_locations(incarnations, tensor, destination, position.as_ref());
             }
             if !bound {
                 unroutable.push(buffer);
@@ -1079,7 +1094,7 @@ impl TransferConfig {
         for publication in kv_inputs.iter_mut() {
             let mut bound = true;
             for tensor in publication.tensors_mut() {
-                bound &= self.bind_locations(tensor, destination);
+                bound &= self.bind_locations(incarnations, tensor, destination, position.as_ref());
             }
             if !bound {
                 unroutable.push(publication.source);
@@ -1089,7 +1104,10 @@ impl TransferConfig {
             return Ok(());
         }
         Err(UnroutableInputs {
-            destination: format!("{}:{}", destination.worker_id, destination.rank),
+            destination: position.map_or_else(
+                || destination.incarnation.clone(),
+                |(worker, rank)| format!("{}:{rank}", worker.0),
+            ),
             buffers: unroutable,
         })
     }
@@ -1098,8 +1116,10 @@ impl TransferConfig {
     /// `bind_inputs` selects them, and reports whether any remain.
     fn bind_locations(
         &self,
+        incarnations: &crate::worker::IncarnationRegistry,
         tensor: &mut uniserve_worker_ipc::TensorTransfer,
         destination: &uniserve_worker_ipc::WorkerEndpoint,
+        destination_position: Option<&(WorkerId, u32)>,
     ) -> bool {
         use uniserve_worker_ipc::TransferTransport;
 
@@ -1109,21 +1129,27 @@ impl TransferConfig {
         tensor.locations.retain(|location| {
             let published = match &location.transport {
                 TransferTransport::Local { .. } => TransferBackend::Local,
-                TransferTransport::PosixShm { .. } => TransferBackend::Shm,
+                TransferTransport::PosixShm { .. } => TransferBackend::PosixShm,
                 TransferTransport::CudaVmm { .. } => TransferBackend::CudaVmm,
                 TransferTransport::Channel { .. } => TransferBackend::Channel,
             };
+            let source = incarnations.position(&location.source);
             self.edges
                 .iter()
                 .find(|edge| {
-                    edge.source_worker.0 == location.source.worker_id
+                    let (Some((source_worker, source_rank)), Some((worker, rank))) =
+                        (&source, destination_position)
+                    else {
+                        return false;
+                    };
+                    edge.source_worker == *source_worker
                         && edge
                             .source_rank
-                            .is_none_or(|rank| rank == location.source.rank)
-                        && edge.destination_worker.0 == destination.worker_id
+                            .is_none_or(|expected| expected == *source_rank)
+                        && edge.destination_worker == *worker
                         && edge
                             .destination_rank
-                            .is_none_or(|rank| rank == destination.rank)
+                            .is_none_or(|expected| expected == *rank)
                 })
                 .map_or_else(
                     || &location.source == destination && published == TransferBackend::Local,
@@ -1137,7 +1163,7 @@ impl TransferConfig {
     ///
     /// `mechanisms` names the edge's device mechanism, its host mechanism, or
     /// both joined by `+` with the device mechanism first, as in
-    /// `cuda_vmm+shm`. `local` serves both locations. Entries are separated by
+    /// `cuda_vmm+posix_shm`. `local` serves both locations. Entries are separated by
     /// commas, and an omitted rank covers every rank of that worker.
     ///
     /// The result holds no placement: `with_worker_defaults` fills
@@ -1237,7 +1263,7 @@ impl TransferConfig {
         for backend in backends {
             let slot = match backend {
                 TransferBackend::CudaVmm => &mut device,
-                TransferBackend::Shm | TransferBackend::Channel => &mut host,
+                TransferBackend::PosixShm | TransferBackend::Channel => &mut host,
                 TransferBackend::Local => unreachable!("local mechanisms return above"),
             };
             if slot.replace(backend).is_some() {
@@ -1299,8 +1325,8 @@ pub struct WorkerExecError {
     pub batch_id: Option<u64>,
     /// Whether the error invalidates the worker process or executor.
     pub fatal: bool,
-    /// Stable worker-defined error code, when classified.
-    pub code: Option<String>,
+    /// Failure class the worker assigned.
+    pub code: uniserve_worker_ipc::ErrorCode,
     /// Human-readable failure description.
     pub message: String,
     /// Execution phase in which the failure occurred, when known.
@@ -1364,7 +1390,10 @@ pub trait Executor: Send {
 mod tests {
     use super::*;
 
-    fn media_info(routes: &[(MediaCall, &str)], steps: u32) -> WorkerInfo {
+    /// A worker serving `routes`; the one that denoises describes the
+    /// deployment's fixed schedule.
+    fn media_info(routes: &[(MediaCall, &str)]) -> WorkerInfo {
+        let denoises = routes.iter().any(|(call, _)| *call == MediaCall::Denoising);
         WorkerInfo {
             media_components: routes
                 .iter()
@@ -1374,7 +1403,22 @@ mod tests {
                 .iter()
                 .map(|(call, _)| CallKind::Media(*call))
                 .collect(),
-            num_inference_steps: steps,
+            video_denoiser: denoises.then(|| VideoDenoiserInfo {
+                tasks: vec!["t2va".to_owned()],
+                schedule_points: 5,
+                video_shift: 12.0,
+                audio_shift: 3.0,
+                frame_rate: 24,
+                audio_sample_rate: 32_000,
+                frames: uniserve_worker_ipc::FrameClips {
+                    min_frames: 22,
+                    clip_frames: 17,
+                    clip_latent_frames: 5,
+                    tail_latent_frames: 2,
+                },
+                canvases: Vec::new(),
+                references: Default::default(),
+            }),
             ..WorkerInfo::default()
         }
     }
@@ -1382,11 +1426,9 @@ mod tests {
     fn media_pool(
         id: &str,
         routes: &[(MediaCall, &str)],
-        steps: u32,
         request_slots: u32,
     ) -> (WorkerId, WorkerInfo) {
-        let mut info = media_info(routes, steps);
-        info.endpoint.worker_id = id.to_owned();
+        let mut info = media_info(routes);
         info.request_slots = request_slots;
         info.components = routes
             .iter()
@@ -1395,7 +1437,6 @@ mod tests {
             .into_iter()
             .map(|name| uniserve_worker_ipc::ComponentInfo {
                 name: name.to_owned(),
-                config: ComponentConfig::parallel(vec![0], ParallelConfig::default()),
                 outputs: Vec::new(),
             })
             .collect();
@@ -1415,7 +1456,6 @@ mod tests {
                 (MediaCall::AudioEncoding, "muxer"),
                 (MediaCall::Muxing, "muxer"),
             ],
-            4,
             request_slots,
         )
     }
@@ -1442,9 +1482,9 @@ mod tests {
             (MediaCall::AudioDecoding, "audio_decoder"),
         ];
         let info = ExecutorInfo::from_workers(vec![
-            media_pool("text", &[(MediaCall::TextEncoding, "text_encoder")], 0, 8),
-            media_pool("flow-0", &flow, 4, 2),
-            media_pool("flow-1", &flow, 4, 2),
+            media_pool("text", &[(MediaCall::TextEncoding, "text_encoder")], 8),
+            media_pool("flow-0", &flow, 2),
+            media_pool("flow-1", &flow, 2),
             media_pool(
                 "host",
                 &[
@@ -1452,7 +1492,6 @@ mod tests {
                     (MediaCall::AudioEncoding, "muxer"),
                     (MediaCall::Muxing, "muxer"),
                 ],
-                0,
                 16,
             ),
         ])?;
@@ -1467,30 +1506,24 @@ mod tests {
     fn media_routing_is_the_union_over_workers() {
         // A model worker decodes and a host worker encodes and muxes; the
         // deployment's routing names every video call once.
-        let model = media_info(
-            &[
-                (MediaCall::TextEncoding, "text_encoder"),
-                (MediaCall::LatentPreparation, "denoiser"),
-                (MediaCall::Denoising, "denoiser"),
-                (MediaCall::VideoDecoding, "video_decoder"),
-                (MediaCall::AudioDecoding, "audio_decoder"),
-            ],
-            4,
-        );
-        let host = media_info(
-            &[
-                (MediaCall::VideoEncoding, "video_codec"),
-                (MediaCall::AudioEncoding, "muxer"),
-                (MediaCall::Muxing, "muxer"),
-            ],
-            0,
-        );
+        let model = media_info(&[
+            (MediaCall::TextEncoding, "text_encoder"),
+            (MediaCall::LatentPreparation, "denoiser"),
+            (MediaCall::Denoising, "denoiser"),
+            (MediaCall::VideoDecoding, "video_decoder"),
+            (MediaCall::AudioDecoding, "audio_decoder"),
+        ]);
+        let host = media_info(&[
+            (MediaCall::VideoEncoding, "video_codec"),
+            (MediaCall::AudioEncoding, "muxer"),
+            (MediaCall::Muxing, "muxer"),
+        ]);
         let info = ExecutorInfo {
             workers: vec![
                 (WorkerId("model".to_owned()), model),
                 (WorkerId("host".to_owned()), host),
             ],
-            video_codecs: BTreeMap::new(),
+            ..ExecutorInfo::default()
         };
         let routing = info.media_routing().expect("the union is complete");
         assert_eq!(routing.len(), 8);
@@ -1504,64 +1537,84 @@ mod tests {
     /// out the ranks its worker's text encoder takes.
     #[test]
     fn media_lanes_count_the_units_one_call_covers() {
-        let encoder = |id: &str, ranks: usize, units_per_rank: usize| {
-            let (id, mut info) =
-                media_pool(id, &[(MediaCall::LatentEncoding, "latent_encoder")], 0, 1);
-            let config = &mut info.components[0].config;
-            config.ranks = (0..ranks).collect();
-            config.distribution = Some(uniserve_core::ComponentDistribution::TemporalUnits);
-            config.units_per_rank = units_per_rank;
-            (id, info)
+        let placed = |id: &str, components: &[(&str, Vec<usize>, bool, usize)]| {
+            let routes = [
+                (MediaCall::LatentEncoding, "latent_encoder"),
+                (MediaCall::TextEncoding, "text_encoder"),
+            ];
+            let (id, info) = media_pool(id, &routes, 1);
+            let placement = PoolPlacement {
+                queue_depth: 1,
+                components: components
+                    .iter()
+                    .map(|(name, ranks, distributed, units_per_rank)| {
+                        let mut config =
+                            ComponentConfig::parallel(ranks.clone(), ParallelConfig::default());
+                        if *distributed {
+                            config.distribution =
+                                Some(uniserve_core::ComponentDistribution::TemporalUnits);
+                        }
+                        config.units_per_rank = *units_per_rank;
+                        ((*name).to_owned(), config)
+                    })
+                    .collect(),
+            };
+            (id, info, placement)
         };
-        let lanes = |workers| {
-            ExecutorInfo {
-                workers,
-                video_codecs: BTreeMap::new(),
+        let lanes = |pools: Vec<(WorkerId, WorkerInfo, PoolPlacement)>| {
+            let mut info = ExecutorInfo::default();
+            for (id, worker, placement) in pools {
+                info.placements.insert(id.clone(), placement);
+                info.workers.push((id, worker));
             }
-            .media_lane_units(MediaCall::LatentEncoding)
+            info.media_lane_units(MediaCall::LatentEncoding)
+        };
+        // The text encoder shares no rank with the latent encoder unless a
+        // test says so.
+        let encoder = |id: &str, ranks: usize, units_per_rank: usize| {
+            placed(
+                id,
+                &[
+                    ("latent_encoder", (0..ranks).collect(), true, units_per_rank),
+                    ("text_encoder", Vec::new(), false, 1),
+                ],
+            )
         };
 
         assert_eq!(lanes(vec![encoder("a", 4, 1)]), Some(4));
         assert_eq!(lanes(vec![encoder("a", 4, 2)]), Some(8));
         assert_eq!(lanes(vec![encoder("a", 4, 1), encoder("b", 2, 1)]), Some(2));
-        let (id, mut single) = encoder("a", 4, 1);
-        single.components[0].config.distribution = None;
-        assert_eq!(lanes(vec![(id, single)]), Some(1));
+        assert_eq!(
+            lanes(vec![placed(
+                "a",
+                &[
+                    ("latent_encoder", vec![0, 1, 2, 3], false, 1),
+                    ("text_encoder", Vec::new(), false, 1),
+                ],
+            )]),
+            Some(1)
+        );
 
         // A latent encoding round covers the ranks the prompt's encoding
         // leaves free: those the latent encoder does not share with its
         // worker's text encoder, or all of them when it shares every one.
         let beside = |text: Vec<usize>| {
-            let (id, mut info) = media_pool(
+            lanes(vec![placed(
                 "a",
                 &[
-                    (MediaCall::LatentEncoding, "latent_encoder"),
-                    (MediaCall::TextEncoding, "text_encoder"),
+                    ("latent_encoder", vec![4, 5, 6, 7, 0, 1, 2, 3], true, 1),
+                    ("text_encoder", text, false, 1),
                 ],
-                0,
-                1,
-            );
-            for binding in &mut info.components {
-                if binding.name == "text_encoder" {
-                    binding.config.ranks = text.clone();
-                } else {
-                    binding.config.ranks = vec![4, 5, 6, 7, 0, 1, 2, 3];
-                    binding.config.distribution =
-                        Some(uniserve_core::ComponentDistribution::TemporalUnits);
-                }
-            }
-            lanes(vec![(id, info)])
+            )])
         };
         assert_eq!(beside(vec![0, 1, 2, 3]), Some(4));
         assert_eq!(beside(vec![0]), Some(7));
         assert_eq!(beside((0..8).collect()), Some(8));
         assert_eq!(
-            lanes(vec![media_pool(
-                "a",
-                &[(MediaCall::Denoising, "denoiser")],
-                4,
-                1
-            )]),
+            lanes(vec![{
+                let (id, info) = media_pool("a", &[(MediaCall::Denoising, "denoiser")], 1);
+                (id, info, PoolPlacement::default())
+            }]),
             None
         );
     }
@@ -1582,17 +1635,26 @@ mod tests {
             (MediaCall::Muxing, "muxer"),
         ];
         let serving = |tasks: &[&str], routes: &[(MediaCall, &str)]| {
-            let mut info = media_info(routes, 4);
+            let mut info = media_info(routes);
             info.video_denoiser = Some(VideoDenoiserInfo {
                 tasks: tasks.iter().map(|task| (*task).to_owned()).collect(),
                 schedule_points: 5,
                 video_shift: 12.0,
                 audio_shift: 3.0,
+                frame_rate: 24,
+                audio_sample_rate: 32_000,
+                frames: uniserve_worker_ipc::FrameClips {
+                    min_frames: 22,
+                    clip_frames: 17,
+                    clip_latent_frames: 5,
+                    tail_latent_frames: 2,
+                },
                 canvases: Vec::new(),
+                references: Default::default(),
             });
             ExecutorInfo {
                 workers: vec![(WorkerId("model".to_owned()), info)],
-                video_codecs: BTreeMap::new(),
+                ..ExecutorInfo::default()
             }
         };
 
@@ -1617,14 +1679,14 @@ mod tests {
 
     #[test]
     fn media_routing_refuses_an_incomplete_video_graph_and_a_repeated_call() {
-        let model = media_info(&[(MediaCall::VideoDecoding, "video_decoder")], 4);
-        let host = media_info(&[(MediaCall::Muxing, "muxer")], 0);
+        let model = media_info(&[(MediaCall::VideoDecoding, "video_decoder")]);
+        let host = media_info(&[(MediaCall::Muxing, "muxer")]);
         let info = ExecutorInfo {
             workers: vec![
                 (WorkerId("model".to_owned()), model.clone()),
                 (WorkerId("host".to_owned()), host),
             ],
-            video_codecs: BTreeMap::new(),
+            ..ExecutorInfo::default()
         };
         let message = info
             .media_routing()
@@ -1632,13 +1694,13 @@ mod tests {
             .to_string();
         assert!(message.contains("VideoEncoding"), "{message}");
 
-        let other = media_info(&[(MediaCall::VideoDecoding, "decoder")], 4);
+        let other = media_info(&[(MediaCall::VideoDecoding, "decoder")]);
         let info = ExecutorInfo {
             workers: vec![
                 (WorkerId("model".to_owned()), model),
                 (WorkerId("other".to_owned()), other),
             ],
-            video_codecs: BTreeMap::new(),
+            ..ExecutorInfo::default()
         };
         let message = info
             .media_routing()
@@ -1660,7 +1722,7 @@ mod tests {
                     destination_worker: WorkerId("decode".to_owned()),
                     destination_rank: None,
                     device: Some(TransferBackend::CudaVmm),
-                    host: Some(TransferBackend::Shm),
+                    host: Some(TransferBackend::PosixShm),
                 },
                 TransferEdge {
                     source_worker: WorkerId("encoder".to_owned()),
@@ -1705,18 +1767,18 @@ mod tests {
     fn an_edge_names_a_device_mechanism_and_a_host_mechanism() {
         // A product's location decides which mechanism carries it, so one
         // edge binds both, and each location has at most one.
-        let both = TransferConfig::parse("decoder->muxer=cuda_vmm+shm").unwrap();
+        let both = TransferConfig::parse("decoder->muxer=cuda_vmm+posix_shm").unwrap();
         assert_eq!(both.edges[0].device, Some(TransferBackend::CudaVmm));
-        assert_eq!(both.edges[0].host, Some(TransferBackend::Shm));
-        assert!(both.edges[0].carries(TransferBackend::Shm));
+        assert_eq!(both.edges[0].host, Some(TransferBackend::PosixShm));
+        assert!(both.edges[0].carries(TransferBackend::PosixShm));
         assert!(!both.edges[0].carries(TransferBackend::Channel));
 
         let local = TransferConfig::parse("decoder->decoder=local").unwrap();
         assert_eq!(local.edges[0].device, Some(TransferBackend::Local));
         assert_eq!(local.edges[0].host, Some(TransferBackend::Local));
 
-        assert!(TransferConfig::parse("a->b=shm+channel").is_err());
-        assert!(TransferConfig::parse("a->b=local+shm").is_err());
+        assert!(TransferConfig::parse("a->b=posix_shm+channel").is_err());
+        assert!(TransferConfig::parse("a->b=local+posix_shm").is_err());
         assert!(TransferConfig::parse("a->b=cuda_vmm+cuda_vmm").is_err());
     }
 
@@ -1732,8 +1794,6 @@ mod tests {
         // edge that carries only CUDA VMM takes neither to the decoder.
         let transfer = TransferConfig::parse("denoiser->decoder=cuda_vmm").unwrap();
         let endpoint = |worker: &str| Endpoint {
-            worker_id: worker.to_owned(),
-            rank: 0,
             node: "host".to_owned(),
             address_space: format!("{worker}-process"),
             incarnation: format!("{worker}-incarnation"),
@@ -1780,16 +1840,107 @@ mod tests {
             },
         }];
 
+        let ranks = crate::worker::IncarnationRegistry::default();
+        let decoder = endpoint("decoder");
+        ranks.assign(&WorkerId("denoiser".to_owned()), [&producer]);
+        ranks.assign(&WorkerId("decoder".to_owned()), [&decoder]);
+
         let refusal = transfer
-            .bind_inputs(&mut products, &mut [], &endpoint("decoder"))
+            .bind_inputs(&ranks, &mut products, &mut [], &decoder)
             .unwrap_err();
         assert_eq!(refusal.buffers, vec![product.buffer_id()]);
         assert_eq!(refusal.destination, "decoder:0");
     }
 
     #[test]
+    fn a_replaced_rank_incarnation_no_longer_binds_to_its_edge() {
+        use uniserve_worker_ipc::{
+            CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorPublication, TensorRef,
+            TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
+        };
+
+        // Rank 1 of the denoiser sends to the decoder over shared storage,
+        // and no other rank of the denoiser has an edge.
+        let transfer = TransferConfig::parse("denoiser:1->decoder=posix_shm").unwrap();
+        let endpoint = |incarnation: &str| Endpoint {
+            node: "host".to_owned(),
+            address_space: format!("{incarnation}-process"),
+            incarnation: incarnation.to_owned(),
+        };
+        let denoiser = [endpoint("denoiser-0"), endpoint("denoiser-1")];
+        let decoder = endpoint("decoder-0");
+        let ranks = crate::worker::IncarnationRegistry::default();
+        ranks.assign(&WorkerId("denoiser".to_owned()), &denoiser);
+        ranks.assign(&WorkerId("decoder".to_owned()), [&decoder]);
+
+        let product = TensorRef {
+            request_key: RequestKey::new(1, uniserve_core::RequestId(7), 1),
+            producer_call_id: CallId::new(1, 0),
+            output_index: 0,
+            generation: 1,
+            dtype: DType::F32,
+            shape_bound: ShapeBound {
+                dims: vec![DimBound::Static(1)],
+            },
+        };
+        let published_by = |source: &Endpoint| TensorPublication {
+            product: product.clone(),
+            value: TransferHandle::DeviceProduct {
+                height: 0,
+                width: 0,
+                value_range: String::new(),
+                tensor: TensorTransfer {
+                    shape: vec![1],
+                    locations: vec![Locator {
+                        source: source.clone(),
+                        transport: TransferTransport::PosixShm {
+                            endpoint: source.incarnation.clone(),
+                            name: "segment".to_owned(),
+                        },
+                        nbytes: 4,
+                        dtype: "float32".to_owned(),
+                        shape: vec![1],
+                        offset: vec![0],
+                        device: "cpu".to_owned(),
+                    }],
+                },
+            },
+        };
+
+        let mut live = vec![published_by(&denoiser[1])];
+        transfer
+            .bind_inputs(&ranks, &mut live, &mut [], &decoder)
+            .unwrap();
+
+        // Rank 0 holds no edge to the decoder.
+        let mut unbound = vec![published_by(&denoiser[0])];
+        assert!(
+            transfer
+                .bind_inputs(&ranks, &mut unbound, &mut [], &decoder)
+                .is_err()
+        );
+
+        // The denoiser replaces both of its ranks. The old rank 1 incarnation
+        // is retired, and its replacement takes the same edge.
+        let replacement = [endpoint("denoiser-0b"), endpoint("denoiser-1b")];
+        ranks.assign(&WorkerId("denoiser".to_owned()), &replacement);
+
+        let mut retired = vec![published_by(&denoiser[1])];
+        assert!(
+            transfer
+                .bind_inputs(&ranks, &mut retired, &mut [], &decoder)
+                .is_err()
+        );
+        let mut replaced = vec![published_by(&replacement[1])];
+        transfer
+            .bind_inputs(&ranks, &mut replaced, &mut [], &decoder)
+            .unwrap();
+    }
+
+    #[test]
     fn transport_map_parses_edges() {
-        let t = TransferConfig::parse("encoder->prefill=cuda_vmm,prefill->decode=shm").unwrap();
+        let t =
+            TransferConfig::parse("encoder->prefill=cuda_vmm,prefill->decode=posix_shm").unwrap();
         assert_eq!(
             t.edges[0],
             TransferEdge {
@@ -1801,18 +1952,21 @@ mod tests {
                 host: None,
             }
         );
-        assert_eq!(t.edges[1].host, Some(TransferBackend::Shm));
+        assert_eq!(t.edges[1].host, Some(TransferBackend::PosixShm));
         assert!(TransferConfig::parse("bad-entry").is_err());
         assert!(TransferConfig::parse("prefill->decode=tcp").is_err());
-        assert!(TransferConfig::parse("prefill->decode=shm,prefill->decode=cuda_vmm").is_err());
+        assert!(
+            TransferConfig::parse("prefill->decode=posix_shm,prefill->decode=cuda_vmm").is_err()
+        );
         let split =
-            TransferConfig::parse("encoder:0->denoiser:0=shm,encoder:0->denoiser:1=cuda_vmm")
+            TransferConfig::parse("encoder:0->denoiser:0=posix_shm,encoder:0->denoiser:1=cuda_vmm")
                 .unwrap();
         assert_eq!(split.edges[1].source_rank, Some(0));
         assert_eq!(split.edges[1].destination_rank, Some(1));
-        assert!(TransferConfig::parse("encoder:x->denoiser=shm").is_err());
+        assert!(TransferConfig::parse("encoder:x->denoiser=posix_shm").is_err());
         assert!(
-            TransferConfig::parse("encoder->denoiser=shm,encoder:0->denoiser:1=cuda_vmm").is_err()
+            TransferConfig::parse("encoder->denoiser=posix_shm,encoder:0->denoiser:1=cuda_vmm")
+                .is_err()
         );
     }
 

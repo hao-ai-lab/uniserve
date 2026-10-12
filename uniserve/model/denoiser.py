@@ -1,7 +1,7 @@
 """Numerical denoiser capabilities and shared image latent transforms."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Generic, Protocol, TypeVar, cast
@@ -9,7 +9,15 @@ from typing import Any, Generic, Protocol, TypeVar, cast
 import torch
 from torch import nn
 
-from uniserve.diffusion import FixedGrid, Grid, NoiseScale, Schedule, Solver
+from uniserve.diffusion import (
+    Branch,
+    FixedGrid,
+    Grid,
+    LinearGrid,
+    NoiseScale,
+    Schedule,
+    Solver,
+)
 from uniserve.distributed import DeviceMesh
 from uniserve.media import image, video
 from uniserve.nn.functional import patchify
@@ -67,6 +75,29 @@ class Condition:
             raise ValueError("a keyframe is one encoded frame without audio")
 
 
+@dataclass(frozen=True, slots=True)
+class ReferenceLimits:
+    """Most references of each kind one request may carry.
+
+    A network that takes no references states none. ``total`` bounds the
+    references of every kind together, keyframes not counted; a video's
+    soundtrack counts with the video, and ``audios`` bounds the audio
+    references that are not a video's soundtrack.
+    """
+
+    images: int = 0
+    videos: int = 0
+    audios: int = 0
+    total: int = 0
+
+    def __post_init__(self) -> None:
+        if any(
+            type(limit) is not int or limit < 0
+            for limit in (self.images, self.videos, self.audios, self.total)
+        ):
+            raise ValueError("reference limits must be nonnegative integers")
+
+
 class VideoSize(Protocol):
     """A video request's output timeline, raster and conditioning lengths.
 
@@ -104,7 +135,11 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
     With explicit solver, evaluation grids and mathematical partitioning.
     ``grids`` declares each modality's ``Grid``; every modality's trajectory
     evaluates the network equally often, so the grids either all fix the
-    same step count or all leave it to requests.
+    same step count or all leave it to requests. A denoiser whose grids are
+    fixed builds its schedules from the checkpoint alone
+    (``VideoDenoiser.make_schedules``); one whose requests choose the step
+    count and shift builds them from those choices
+    (``ImageDenoiser.make_schedules``).
     """
 
     def __init__(
@@ -161,28 +196,6 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
     def num_steps(self) -> int | None:
         """Network evaluations of a trajectory, None when requests choose."""
         return next(iter(self.grids.values())).num_steps
-
-    def make_schedules(
-        self,
-        steps: int | None,
-        *,
-        shift: float | None,
-        device: torch.device | str,
-    ) -> Mapping[str, Schedule]:
-        """Build every modality's schedule for a request.
-
-        ``steps`` and ``shift`` are the request's choices, None leaving a
-        parameter to the grids (``Grid.schedule``).
-
-        Raises:
-            ValueError: A grid does not admit the requested parameters.
-        """
-        return {
-            name: self.grids[name].schedule(
-                steps=steps, shift=shift, device=device
-            )
-            for name in self.modalities
-        }
 
     def layout_size(self, size: SizeT) -> SizeT:
         """Return the smallest layout that holds ``size``.
@@ -257,7 +270,7 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
     A request is sized by its output frame count, canvas, prompt length and
     condition rows. The network's fixed grids set its step count
     (``num_steps``) and trained shifts; it rounds a requested duration to its
-    native windows and describes the request state and outputs that the
+    native clips and describes the request state and outputs that the
     caller's storage holds; the caller advances the fixed schedule and
     supplies each step's borrowed tensors to ``bind_inputs``.
     """
@@ -267,18 +280,88 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         if any(not isinstance(grid, FixedGrid) for grid in self.grids.values()):
             raise ValueError("a video denoiser evaluates its fixed grids")
 
+    def make_schedules(
+        self, *, device: torch.device | str
+    ) -> Mapping[str, Schedule]:
+        """Build every modality's schedule from the checkpoint's grids."""
+        # ``__init__`` admits only fixed grids.
+        return {
+            name: cast(FixedGrid, self.grids[name]).schedule(device)
+            for name in self.modalities
+        }
+
     @property
-    def canvases(self) -> tuple[image.Config, ...]:
+    def canvases(self) -> Mapping[tuple[int, str], image.Config]:
         """Canvases a deployment may prepare layouts for before serving.
 
-        A deployment prepares a selection of them, or all of them without
-        one, and admits only the canvases it prepares.
+        Each is keyed by the pair a request selects it with: the resolution
+        class's short edge in pixels and the display aspect ratio as
+        ``W:H``, such as ``(768, "16:9")``. A deployment prepares a selection
+        of them (``select_canvases``) and admits only the canvases it
+        prepares.
         """
         raise NotImplementedError
+
+    def select_canvases(
+        self, resolutions: Sequence[str], aspect_ratios: Sequence[str]
+    ) -> tuple[image.Config, ...]:
+        """Resolve a deployment's named canvases to the rasters it prepares.
+
+        ``resolutions`` are resolution classes such as ``768p`` and
+        ``aspect_ratios`` display ratios such as ``16:9``. Every resolution
+        is crossed with every aspect ratio, resolution-major in the order
+        named. Without resolutions, or without aspect ratios, every one the
+        network offers takes their place; without either, the result is every
+        canvas it offers, in its own order.
+
+        Raises:
+            ValueError: A name that is not a resolution class, a pair the
+                network does not generate, or a repeated name.
+        """
+        offered = self.canvases
+        if not resolutions and not aspect_ratios:
+            return tuple(offered.values())
+
+        edges: list[int] = []
+        for name in resolutions:
+            if not (name.endswith("p") and name[:-1].isdecimal()):
+                raise ValueError(
+                    f"a video resolution is a class such as 768p, got {name!r}"
+                )
+            edges.append(int(name[:-1]))
+        # Without names, every one the network offers, in its own order.
+        edges = edges or list(dict.fromkeys(edge for edge, _ in offered))
+        ratios = list(aspect_ratios) or list(
+            dict.fromkeys(ratio for _, ratio in offered)
+        )
+        if len(set(edges)) != len(edges) or len(set(ratios)) != len(ratios):
+            raise ValueError("a video resolution or aspect ratio repeats")
+
+        selected = []
+        for edge in edges:
+            for ratio in ratios:
+                canvas = offered.get((edge, ratio))
+                if canvas is None:
+                    generated = ", ".join(f"{e}p {r}" for e, r in offered)
+                    raise ValueError(
+                        f"this network generates only {generated}, not "
+                        f"{edge}p {ratio}"
+                    )
+                selected.append(canvas)
+        return tuple(selected)
 
     @property
     def tasks(self) -> tuple[str, ...]:
         """Task names this network serves, in canonical order."""
+        raise NotImplementedError
+
+    @property
+    def text_only(self) -> bool:
+        """Whether the network serves requests that bring no conditions.
+
+        Every other request brings at least one condition and evaluates in a
+        layout of its own.
+        """
         raise NotImplementedError
 
     @property
@@ -291,14 +374,13 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         }
 
     @property
-    def fixed_canvases(self) -> tuple[image.Config, ...] | None:
-        """The only canvases the network generates, or None for any canvas.
+    def max_references(self) -> ReferenceLimits:
+        """Most references of each kind one request may carry.
 
-        ``None`` generates every canvas of the model's canvas rule; a
-        deployment still prepares and admits only its selection of
-        ``canvases``.
+        The serving owner refuses a request above them, and
+        ``max_conditions`` provisions for them.
         """
-        raise NotImplementedError
+        return ReferenceLimits()
 
     def max_conditions(
         self, num_frames: int, canvas: image.Config
@@ -445,12 +527,21 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
 
     ``framing_tokens`` and ``image_unconditional`` describe how this network
     frames a generated image and which prefix its image-unconditional guidance
-    branch reads. Execution owns the buffers and the stepping; the network
-    states these layout facts and assembles its own typed input.
+    branch reads; ``guidance_branches`` is the most branches one denoising
+    step's guidance evaluates (the conditioned prediction and each
+    unconditional one, ``uniserve.diffusion.Branch``), so execution prepares
+    one call shape for every count from one to it. ``rope_advance`` is the
+    language positions a generated image spans once it is part of a
+    continuing conversation: the request's logical position after the image
+    is its position before the image plus this. Execution owns the buffers
+    and the stepping; the network states these layout facts and assembles its
+    own typed input.
     """
 
     framing_tokens: int = 0
     image_unconditional: BranchSource = BranchSource.START
+    guidance_branches: int = len(Branch)
+    rope_advance: int
 
     @property
     def max_sequence_tokens(self) -> int:
@@ -488,7 +579,7 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
         noise_scale: NoiseScale,
         prediction_dtype: torch.dtype,
         solver: Solver,
-        grid: Grid,
+        grid: LinearGrid,
     ):
         super().__init__(
             modalities=("image",),
@@ -510,6 +601,19 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
             downsample,
         )
         self.noise_scale = noise_scale
+
+    def make_schedules(
+        self, steps: int, *, shift: float | None, device: torch.device | str
+    ) -> Mapping[str, Schedule]:
+        """Build the image schedule of a request's ``steps`` and ``shift``.
+
+        None leaves the shift to the grid.
+
+        Raises:
+            ValueError: The grid does not admit the requested parameters.
+        """
+        grid = cast(LinearGrid, self.grids["image"])
+        return {"image": grid.schedule(steps=steps, shift=shift, device=device)}
 
     def latent_shape(
         self, modality: str, size: image.Config

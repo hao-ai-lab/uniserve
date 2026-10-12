@@ -1,10 +1,12 @@
 //! Worker identity, supported calls, and startup capacity handshake.
 //!
-//! A rank answers the engine's `Info` request with a [`WorkerInfo`]. The engine
-//! validates it, checks it against the launch configuration, and requires a
-//! replacement rank to report an identical description apart from its
-//! endpoint. The executor then derives the capacity view the scheduler plans
-//! against from the descriptions of all workers (`ExecutorInfo::runtime_info`).
+//! A rank answers the engine's `Info` request with a [`WorkerInfo`], which the
+//! codec validates, and the engine requires a replacement rank to report an
+//! identical description apart from its endpoint. The executor then derives
+//! the capacity view the scheduler plans against from the descriptions of all
+//! workers (`ExecutorInfo::runtime_info`). A report states what loading the
+//! model decided; the values the engine launched the rank with (placement,
+//! queue depth) are not echoed back.
 
 use super::*;
 
@@ -19,10 +21,6 @@ use super::*;
 pub struct KvCacheInfo {
     /// Allocation units in the pool, including the unit-zero sentinel.
     pub num_units: u32,
-    /// Physical bytes one unit occupies on this rank: every column plane of
-    /// the unit plus its per-unit metadata (initialization flags and, with
-    /// FP8, scales).
-    pub unit_bytes: u64,
     /// Element data type of KV tensors.
     pub dtype: KvCacheDtype,
     /// Cache groups in table order.
@@ -35,14 +33,14 @@ impl KvCacheInfo {
         self.num_units.saturating_sub(1)
     }
 
-    /// Returns the largest page size of any group, in tokens.
+    /// Returns the largest block size of any group, in tokens.
     ///
-    /// Every page size divides it (`validate`), so a length aligned to it is
+    /// Every block size divides it (`validate`), so a length aligned to it is
     /// a whole number of pages in every group.
-    pub fn max_page_tokens(&self) -> u32 {
+    pub fn max_block_size(&self) -> u32 {
         self.groups
             .iter()
-            .map(|group| group.page_tokens)
+            .map(|group| group.block_size)
             .max()
             .unwrap_or(0)
     }
@@ -91,22 +89,21 @@ impl KvCacheInfo {
     /// Validates the pool size, page shapes and each group's layer and head
     /// placement.
     ///
-    /// Every page size must be a power of two that divides the largest one,
+    /// Every block size must be a power of two that divides the largest one,
     /// so page-aligned prefix lengths agree across groups. A layer belongs to
-    /// at most one group. A sliding-window group may not retain sink tokens:
-    /// a table keeps one contiguous run of pages.
+    /// at most one group.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            self.num_units > 1 && self.unit_bytes > 0 && !self.groups.is_empty(),
+            self.num_units > 1 && !self.groups.is_empty(),
             "worker info declare an incomplete KV unit pool"
         );
 
-        let largest = self.max_page_tokens();
+        let largest = self.max_block_size();
         let mut layers = HashSet::new();
         for group in &self.groups {
             ensure_valid!(
-                group.page_tokens.is_power_of_two()
-                    && largest.is_multiple_of(group.page_tokens)
+                group.block_size.is_power_of_two()
+                    && largest.is_multiple_of(group.block_size)
                     && group.units_per_page > 0
                     && group.units_per_page < self.num_units,
                 "worker KV group page shape is invalid"
@@ -123,10 +120,6 @@ impl KvCacheInfo {
                     && group.head_dim > 0,
                 "worker KV group head interval exceeds its logical bounds"
             );
-            ensure_valid!(
-                !matches!(group.kind, KvGroupKind::SlidingWindow { sink, .. } if sink > 0),
-                "worker KV group retains sliding-window sink tokens"
-            );
         }
         Ok(())
     }
@@ -136,8 +129,8 @@ impl KvCacheInfo {
     /// Stages must agree on dtype and on every group's retention policy and
     /// page shape; their rank-local layer ids and head placement may differ.
     /// The combined pool has the smaller unit count, because the scheduler
-    /// assigns one set of unit ids valid in both, the larger unit size, and
-    /// per group the union of both stages' layers, which bounds publications.
+    /// assigns one set of unit ids valid in both, and per group the union of
+    /// both stages' layers, which bounds publications.
     pub fn merge(&self, other: &Self) -> ValidationResult<Self> {
         ensure_valid!(
             self.dtype == other.dtype
@@ -171,7 +164,6 @@ impl KvCacheInfo {
             .collect();
         let merged = Self {
             num_units: self.num_units.min(other.num_units),
-            unit_bytes: self.unit_bytes.max(other.unit_bytes),
             dtype: self.dtype,
             groups,
         };
@@ -180,20 +172,21 @@ impl KvCacheInfo {
     }
 }
 
-/// One component's finalized configuration shared by all worker descriptions.
+/// One loaded component and the tensor results its computation declares.
+///
+/// The engine owns the component's placement (member ranks, parallel degrees,
+/// distribution); the report names only what loading the model decided.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentInfo {
     /// Component name; `WorkerInfo::validate` requires it to be non-empty and
     /// unique within one worker.
     pub name: String,
-    #[serde(flatten)]
-    pub config: uniserve_core::ComponentConfig,
     /// Named tensor results declared by the loaded computation. Their order
     /// defines product output indices independently of Worker grouping.
     pub outputs: Vec<OutputInfo>,
 }
 
-/// A computation's bounded tensor result, before request and storage binding.
+/// A call's bounded tensor result, before request and storage binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputInfo {
     /// Result name; `OutputInfo::validate` requires it to be non-empty and
@@ -249,10 +242,6 @@ impl OutputInfo {
 /// Backend addresses and storage generations are carried by each publication.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerEndpoint {
-    /// Logical instance selected by the engine.
-    pub worker_id: String,
-    /// Member coordinate within that instance.
-    pub rank: u32,
     /// Host identity, independent of process-local device ordinals.
     pub node: String,
     /// Process lifetime identity; multiple Workers may share it.
@@ -265,11 +254,136 @@ impl WorkerEndpoint {
     /// Checks identities before accepting startup metadata or a publication.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            !self.worker_id.is_empty()
-                && !self.node.is_empty()
-                && !self.address_space.is_empty()
-                && !self.incarnation.is_empty(),
+            !self.node.is_empty() && !self.address_space.is_empty() && !self.incarnation.is_empty(),
             "worker endpoint identity is incomplete"
+        );
+        Ok(())
+    }
+}
+
+/// An image shape a worker's flow runtime is prepared for.
+///
+/// The engine runs one image request of `height` by `width` pixels at these
+/// guidance scales before it serves, so every guidance-branch count the
+/// worker captured has run through the serving path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageWarmup {
+    /// Output height in pixels.
+    pub height: u32,
+    /// Output width in pixels.
+    pub width: u32,
+    /// Classifier-free guidance scale of the text condition.
+    pub cfg_text_scale: f32,
+    /// Classifier-free guidance scale of the image condition.
+    pub cfg_img_scale: f32,
+    /// Tokens of the alternative guidance prefix the worker encodes for an
+    /// empty negative prompt, which the request carries as its negative prompt
+    /// so the engine sizes that prefix as the worker reads it. Empty when no
+    /// guidance branch has an alternative prefix.
+    #[serde(default)]
+    pub negative_token_ids: Vec<u32>,
+}
+
+impl ImageWarmup {
+    /// Checks that the shape names a nonempty raster at positive finite
+    /// guidance scales.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.height > 0 && self.width > 0,
+            "an image warmup shape is empty"
+        );
+        ensure_valid!(
+            self.cfg_text_scale.is_finite()
+                && self.cfg_text_scale > 0.0
+                && self.cfg_img_scale.is_finite()
+                && self.cfg_img_scale > 0.0,
+            "an image warmup guidance scale is not positive"
+        );
+        Ok(())
+    }
+}
+
+/// A canvas a deployment serves, with the request fields that select it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedCanvas {
+    /// `target.short_edge`: the resolution class, in pixels.
+    pub short_edge: u32,
+    /// `target.aspect_ratio`: the display ratio as `W:H`.
+    pub aspect_ratio: String,
+    /// The raster this pair selects.
+    pub canvas: uniserve_core::Canvas,
+}
+
+/// Most references of each kind one request may carry.
+///
+/// `total` bounds all kinds together, keyframes not counted; a video's
+/// soundtrack counts with the video, and `audios` bounds the audio references
+/// that are not one. A denoiser that takes no references declares zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceLimits {
+    /// Image references.
+    pub images: u32,
+    /// Video references, with or without soundtrack.
+    pub videos: u32,
+    /// Audio references that are not a video's soundtrack.
+    pub audios: u32,
+    /// References of every kind.
+    pub total: u32,
+}
+
+/// How the video VAE divides a video's frames into clips.
+///
+/// A video has `min_frames + n * clip_frames` frames: one decode unit per
+/// clip, so `n + 1` units. The VAE encodes each such clip of a video to
+/// `clip_latent_frames` latent frames and the tail past the whole clips to
+/// `tail_latent_frames`. The model states the rule; every count a
+/// request derives from it, the generated frames, the decode units and a
+/// reference video's encoded frames, follows from these four values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameClips {
+    /// Fewest frames of a video: one clip and the tail.
+    pub min_frames: u32,
+    /// Frames each further clip adds.
+    pub clip_frames: u32,
+    /// Latent frames one clip encodes to.
+    pub clip_latent_frames: u32,
+    /// Latent frames of the tail past the clips.
+    pub tail_latent_frames: u32,
+}
+
+impl FrameClips {
+    /// Returns the decode units of a video of `frames` legal frames.
+    pub fn units(&self, frames: u32) -> u32 {
+        frames.saturating_sub(self.min_frames) / self.clip_frames + 1
+    }
+
+    /// Returns the fewest legal frame count that is at least `requested`.
+    pub fn align_up(&self, requested: u32) -> u32 {
+        let beyond = requested.saturating_sub(self.min_frames);
+        self.min_frames + beyond.div_ceil(self.clip_frames) * self.clip_frames
+    }
+
+    /// Returns the most legal frames of at most `available`, or `None` below
+    /// the fewest.
+    pub fn align_down(&self, available: u32) -> Option<u32> {
+        let beyond = available.checked_sub(self.min_frames)?;
+        Some(self.min_frames + beyond / self.clip_frames * self.clip_frames)
+    }
+
+    /// Returns the latent frames the VAE encodes `frames` legal frames to.
+    pub fn latent_frames(&self, frames: u32) -> u32 {
+        self.units(frames) * self.clip_latent_frames + self.tail_latent_frames
+    }
+
+    /// Checks that the rule is positive and leaves a tail past the first
+    /// clip.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.clip_frames > 0
+                && self.min_frames > self.clip_frames
+                && self.clip_latent_frames > 0
+                && self.tail_latent_frames > 0,
+            "a video denoiser declares an empty frame rule"
         );
         Ok(())
     }
@@ -277,28 +391,48 @@ impl WorkerEndpoint {
 
 /// What the video denoiser a deployment places serves.
 ///
-/// The denoiser fixes its schedule; the tasks and canvases bound what
-/// admission accepts.
+/// The denoiser fixes its schedule; the tasks, canvases and reference limits
+/// bound what a request may ask for.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoDenoiserInfo {
     /// Task names the denoiser serves, in canonical order.
     pub tasks: Vec<String>,
     /// Sigma points of the fixed schedule, the clean endpoint included: one
-    /// more than the network evaluations (`WorkerInfo::num_inference_steps`).
+    /// more than the network evaluations ([`Self::denoise_steps`]).
     pub schedule_points: u32,
     /// Shift of the video schedule.
     pub video_shift: f64,
     /// Shift of the audio schedule.
     pub audio_shift: f64,
-    /// The only canvases the deployment serves: those it prepares. Empty
-    /// declares every canvas of the model's canvas rule.
+    /// Frame rate, in frames per second, of every video the deployment
+    /// generates: the output clock durations and reference videos are
+    /// counted on.
+    pub frame_rate: u32,
+    /// Sample rate, in Hz, of the audio track generated with each video; zero
+    /// for a deployment that generates none.
+    pub audio_sample_rate: u32,
+    /// How the VAE divides a video's frames into clips, which counts frames
+    /// and decode units.
+    pub frames: FrameClips,
+    /// The only canvases the deployment serves: those it prepares, in the
+    /// order its operator selected them.
     #[serde(default)]
-    pub canvases: Vec<uniserve_core::Canvas>,
+    pub canvases: Vec<ServedCanvas>,
+    /// References one request may carry.
+    #[serde(default)]
+    pub references: ReferenceLimits,
 }
 
 impl VideoDenoiserInfo {
+    /// Network evaluations of every request: one per interval of the fixed
+    /// schedule.
+    pub fn denoise_steps(&self) -> u32 {
+        self.schedule_points - 1
+    }
+
     /// Checks that tasks are named once each, the schedule has an endpoint
-    /// and positive finite shifts, and every canvas is positive.
+    /// and positive finite shifts, and every canvas is a positive raster
+    /// selected by its own `(short_edge, aspect_ratio)` pair.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -314,39 +448,57 @@ impl VideoDenoiserInfo {
             "a video denoiser schedule needs points and positive shifts"
         );
         ensure_valid!(
+            self.frame_rate > 0,
+            "a video denoiser declares no frame rate"
+        );
+        self.frames.validate()?;
+        ensure_valid!(
+            self.canvases.iter().all(|served| {
+                served.short_edge > 0
+                    && !served.aspect_ratio.is_empty()
+                    && served.canvas.width > 0
+                    && served.canvas.height > 0
+            }),
+            "a video denoiser declares an empty canvas"
+        );
+        ensure_valid!(
             self.canvases
                 .iter()
-                .all(|canvas| canvas.width > 0 && canvas.height > 0),
-            "a video denoiser declares an empty canvas"
+                .map(|served| (served.short_edge, served.aspect_ratio.as_str()))
+                .collect::<HashSet<_>>()
+                .len()
+                == self.canvases.len(),
+            "a video denoiser declares a canvas name twice"
         );
         Ok(())
     }
 }
 
-/// Post-load worker geometry, limits, supported work, and model identity.
+/// Post-load worker geometry, limits and supported work.
 ///
-/// [`WorkerInfo::validate`] checks only internal consistency. The engine's
-/// `RankProcess::finish_startup` additionally checks the description against
-/// the launch: `queue_depth`, rank and world size, component configuration,
-/// and non-empty resolved numerical settings.
+/// [`WorkerInfo::validate`] checks internal consistency, and the codec runs it
+/// when it encodes or decodes the report. The engine owns the launch values
+/// (placement, queue depth, transfer mechanisms) and the report does not
+/// carry them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerInfo {
-    /// Loaded model identity.
-    pub model_name: String,
     /// Model-declared finite terminal-media computation, when supported.
     #[serde(default)]
     pub media_components: std::collections::BTreeMap<MediaCall, String>,
-    /// Effective number of diffusion predictions advertised by the loaded model.
-    pub num_inference_steps: u32,
     /// What the deployment's video denoiser serves, when the model has one.
     #[serde(default)]
     pub video_denoiser: Option<VideoDenoiserInfo>,
+    /// Image shapes this rank's flow runtime is prepared for, each of which
+    /// the engine warms with a batch of real requests before serving.
+    #[serde(default)]
+    pub image_warmups: Vec<ImageWarmup>,
+    /// Canvas rows one sampler chunk of this rank's token denoiser covers,
+    /// which the engine warms every row count of; zero when it generates no
+    /// canvases.
+    #[serde(default)]
+    pub canvas_step_rows: u32,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
-    /// Rank-local primary compute device used to bind physical transfer edges.
-    pub device: String,
-    /// Physical transfer mechanisms initialized by this rank.
-    pub transfer_backends: Vec<String>,
     /// Whether this rank's device exports a fabric allocation handle.
     ///
     /// A fabric handle is importable from another host inside the fabric
@@ -354,45 +506,15 @@ pub struct WorkerInfo {
     /// this is what decides whether a transfer edge may cross hosts.
     #[serde(default)]
     pub fabric_handles: bool,
-    /// Number of physical members in this Worker.
-    pub world_size: u32,
-    /// Resolved compute dtype, compared per rank on restart.
-    #[serde(default)]
-    pub model_dtype: String,
-    /// Resolved attention selection, compared per rank on restart.
-    #[serde(default)]
-    pub attention_backend: String,
-    /// Numerical weight storage formats present on this rank.
-    #[serde(default)]
-    pub weight_formats: Vec<String>,
-    /// Resolved activation quantization formats on this physical rank.
-    #[serde(default)]
-    pub activation_formats: Vec<String>,
     /// Finalized component membership and logical degrees.
     #[serde(default)]
     pub components: Vec<ComponentInfo>,
     /// Call families accepted by the worker.
     pub supported_calls: Vec<CallKind>,
-    /// Maximum unresolved physical runs. It must equal the depth the engine
-    /// launched the rank with and connects its channel with.
-    pub queue_depth: u32,
-    /// Maximum calls in one run.
+    /// Maximum calls in one batch.
     pub max_batch_calls: u32,
-    /// Maximum text tokens represented in one run.
+    /// Maximum text tokens represented in one batch.
     pub max_batch_tokens: u32,
-    /// Maximum calls in one prefill run: the rows the rank's captured
-    /// prefill graphs hold. A prefill run no captured graph holds fails, so
-    /// the scheduler never forms one. Zero leaves prefill runs bounded by
-    /// `max_batch_calls` alone, as when they run eagerly.
-    #[serde(default)]
-    pub max_prefill_calls: u32,
-    /// Maximum calls in one decode run: the rows the rank's largest captured
-    /// decode graph holds, fewer when its KV pool cannot hold a page of
-    /// every cache group for more rows. A decode run no captured graph
-    /// holds fails, so the scheduler never forms one. Zero leaves decode
-    /// runs bounded by `max_batch_calls` alone, as when they run eagerly.
-    #[serde(default)]
-    pub max_decode_calls: u32,
     /// Number of resident request slots.
     pub request_slots: u32,
     /// Paged KV geometry when autoregressive work is supported.
@@ -402,7 +524,8 @@ pub struct WorkerInfo {
     /// Physical latent pages including the reserved sentinel page, which
     /// [`WorkerInfo::latent_capacity_units`] excludes.
     pub latent_pages: u32,
-    /// Persistent buffer-pool capacity in bytes.
+    /// Bytes of the persistent buffer pool this rank backs, which the engine
+    /// places this rank's buffers in.
     pub buffer_pool_bytes: u64,
     /// Maximum simultaneously retained encoder feature products.
     pub encoder_cache_entries: u32,
@@ -414,14 +537,13 @@ pub struct WorkerInfo {
     /// The scheduler treats zero as one.
     #[serde(default)]
     pub host_lane_capacity: u32,
+    /// Transfer entries this rank's transport holds in flight at once. The
+    /// scheduler keeps no more transfer calls reserved than the narrowest
+    /// rank holds.
+    pub transfer_tickets: u32,
 }
 
 impl WorkerInfo {
-    /// Returns the fixed prediction count from the model-declared plan.
-    pub fn denoise_steps(&self) -> u32 {
-        self.num_inference_steps
-    }
-
     /// Returns the advertised allocatable KV units, or zero when KV is
     /// unsupported.
     pub fn kv_usable_units(&self) -> u32 {
@@ -439,28 +561,11 @@ impl WorkerInfo {
         self.kv_cache.is_some()
     }
 
-    /// Validates worker identity, capacity, call, and rank invariants.
+    /// Validates worker identity, capacity, call, and component invariants.
     pub fn validate(&self) -> ValidationResult<()> {
-        // Identity and physical transfer capabilities.
         self.endpoint.validate()?;
-        ensure_valid!(
-            !self.device.is_empty()
-                && !self.transfer_backends.is_empty()
-                && self
-                    .transfer_backends
-                    .iter()
-                    .all(|name| matches!(name.as_str(), "local" | "shm" | "cuda_vmm" | "channel"))
-                && self.transfer_backends.iter().collect::<HashSet<_>>().len()
-                    == self.transfer_backends.len(),
-            "worker physical transfer capabilities are incomplete"
-        );
-        ensure_valid!(
-            self.world_size > 0 && self.endpoint.rank < self.world_size,
-            "worker process rank is outside its world"
-        );
 
-        // Components: unique names and outputs, membership within the world,
-        // and parallel degrees consistent with membership.
+        // Components: unique names and outputs.
         let mut names = HashSet::new();
         for component in &self.components {
             ensure_valid!(
@@ -475,42 +580,6 @@ impl WorkerInfo {
                     "component repeats a tensor result name"
                 );
             }
-            let params = &component.config;
-            ensure_valid!(
-                !params.ranks.is_empty()
-                    && params
-                        .ranks
-                        .iter()
-                        .all(|&rank| rank < self.world_size as usize),
-                "component membership is outside the process world"
-            );
-            ensure_valid!(
-                params.ranks.iter().collect::<HashSet<_>>().len() == params.ranks.len(),
-                "component repeats process ranks"
-            );
-            let degree = params
-                .parallel_config
-                .world_size()
-                .map_err(|error| invalid_message!("{error}"))?;
-            ensure_valid!(
-                degree <= u32::MAX as usize,
-                "parallel degrees exceed protocol range"
-            );
-            ensure_valid!(
-                params.units_per_rank > 0 && params.units_per_rank <= u32::MAX as usize,
-                "component unit capacity is outside protocol range"
-            );
-            // A distributed component spreads independent units over its member
-            // ranks without model parallelism, so its degree is one; otherwise
-            // every member rank is one position in the parallel degrees.
-            ensure_valid!(
-                if params.distribution.is_some() {
-                    degree == 1
-                } else {
-                    degree == params.ranks.len()
-                },
-                "component membership disagrees with parallel degrees"
-            );
         }
 
         // A collective-only participant owns no request components or KV.
@@ -521,7 +590,7 @@ impl WorkerInfo {
                     && self.kv_cache.is_none()
                     && self.latent_pages == 0
                     && self.media_components.is_empty()),
-            "a worker without call kinds must own no request computation"
+            "a worker without call kinds must own no request call"
         );
         ensure_valid!(
             self.supported_calls
@@ -536,8 +605,7 @@ impl WorkerInfo {
         // Here every named call must be one it advertises, with a non-empty
         // component name. The video graph may span workers, a model worker
         // decoding and a host worker encoding and muxing, so its completeness
-        // and its diffusion step count are the executor's checks over every
-        // worker.
+        // is the executor's check over every worker.
         ensure_valid!(
             self.media_components.iter().all(|(call, component)| {
                 !component.is_empty() && self.supported_calls.contains(&CallKind::Media(*call))
@@ -546,26 +614,17 @@ impl WorkerInfo {
         );
         if let Some(video) = &self.video_denoiser {
             video.validate()?;
-            ensure_valid!(
-                video.schedule_points == self.num_inference_steps + 1,
-                "a video denoiser's schedule points disagree with its evaluations"
-            );
+        }
+        for warmup in &self.image_warmups {
+            warmup.validate()?;
         }
         ensure_valid!(
             self.max_batch_calls > 0
                 && self.max_batch_tokens > 0
                 && self.request_slots > 0
-                && self.max_unresolved_calls > 0,
+                && self.max_unresolved_calls > 0
+                && self.transfer_tickets > 0,
             "worker info declare a zero scheduling bound"
-        );
-        ensure_valid!(self.queue_depth > 0, "worker queue depth must be positive");
-        ensure_valid!(
-            self.max_prefill_calls <= self.max_batch_calls,
-            "worker prefill call bound exceeds its batch call bound"
-        );
-        ensure_valid!(
-            self.max_decode_calls <= self.max_batch_calls,
-            "worker decode call bound exceeds its batch call bound"
         );
 
         // Advertised call families require their corresponding pools; every
@@ -590,9 +649,6 @@ impl WorkerInfo {
                 "worker info declare incomplete latent pool capacity"
             );
         }
-
-        // Model identity remains mandatory independently of enabled resources.
-        ensure_valid!(!self.model_name.is_empty(), "worker model name is empty");
         Ok(())
     }
 }
@@ -601,46 +657,32 @@ impl Default for WorkerInfo {
     /// Returns a valid single-rank autoregressive worker description.
     fn default() -> Self {
         Self {
-            model_name: "model".to_owned(),
             media_components: Default::default(),
-            num_inference_steps: 0,
             video_denoiser: None,
+            image_warmups: Vec::new(),
+            canvas_step_rows: 0,
             fabric_handles: false,
             endpoint: WorkerEndpoint {
-                worker_id: "worker".into(),
-                rank: 0,
                 node: "simulation".into(),
                 address_space: "simulation".into(),
                 incarnation: "simulation".into(),
             },
-            world_size: 1,
-            device: "cpu".into(),
-            transfer_backends: vec!["local".into()],
-            model_dtype: String::new(),
-            attention_backend: String::new(),
-            weight_formats: Vec::new(),
-            activation_formats: Vec::new(),
             components: Vec::new(),
             supported_calls: vec![
                 CallKind::Forward(ForwardMode::Prefill),
                 CallKind::Forward(ForwardMode::Decode),
             ],
-            queue_depth: 1,
             max_batch_calls: 1,
             max_batch_tokens: 8192,
-            max_prefill_calls: 0,
-            max_decode_calls: 0,
             request_slots: 128,
-            // One full-attention group of 28 layers with 8 BF16 heads of 128:
-            // each 64-token page is one unit of 28 columns of 128 KiB K and V
-            // planes plus one initialization flag per plane.
+            // One full-attention group of 28 layers with 8 BF16 heads of 128,
+            // each 64-token page one unit.
             kv_cache: Some(KvCacheInfo {
                 num_units: 4096,
-                unit_bytes: 28 * 2 * (64 * 8 * 128 * 2 + 1),
                 dtype: KvCacheDtype::BFloat16,
                 groups: vec![KvCacheGroup {
                     kind: Default::default(),
-                    page_tokens: 64,
+                    block_size: 64,
                     units_per_page: 1,
                     layer_ids: (0..28).collect(),
                     num_kv_heads: 8,
@@ -656,6 +698,7 @@ impl Default for WorkerInfo {
             encoder_entry_bytes: 0,
             max_unresolved_calls: 1,
             host_lane_capacity: 1,
+            transfer_tickets: 1,
         }
     }
 }

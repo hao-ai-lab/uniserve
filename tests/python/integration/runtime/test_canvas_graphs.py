@@ -19,9 +19,10 @@ A readout reading more slots than the largest readout tail graph holds
 replays the tails in chunks and returns the eager pass's log-probabilities.
 A model whose final layer exchanges tokens across an expert group keeps its
 readout tail eager.
-After startup, a call of more canvases than every bucket fails instead of
-running eagerly. A worker whose KV unit pool holds fewer requests than its
-call bound starts, and replays calls of as many canvases as the pool holds.
+A call of more canvases than every bucket runs eagerly and returns the
+values a replayed call of the same canvas returns. A worker whose KV unit
+pool holds fewer requests than its call bound starts, and replays calls of
+as many canvases as the pool holds.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ import torch
 import torch.multiprocessing as mp
 
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
+from tests.python.fixtures.worker_config import cpu_worker_config
 from tests.python.integration.runtime.test_prefill_graphs import (
     NATIVE_TEXT,
     NATIVE_VISION,
@@ -44,26 +46,24 @@ from uniserve.distributed import Communicator
 from uniserve.loading import weights
 from uniserve.math import ceil_div
 from uniserve.nn.moe import FusedMoE
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve.runtime.process_groups import (
     Rendezvous,
     initialize_process_groups,
 )
 from uniserve_models import loading as models
-from uniserve_worker.bootstrap.cache import cache_info
+from uniserve_worker.bootstrap.cache import cache_info, plan_cache
 from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
 )
-from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.errors import ResourceError
+from uniserve_worker.config.execution import CanvasSampling
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.input_batch import (
     CanvasRow,
     CanvasStepRow,
     TokenRow,
 )
-from uniserve_worker.protocol.batch import CanvasSampling
 from uniserve_worker.protocol.call import (
     Bounds,
     Call,
@@ -150,14 +150,14 @@ def _worker(
         model = torch.nn.ModuleList(
             module for module in model.modules() if isinstance(module, FusedMoE)
         )
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device=device,
         model_dtype="bfloat16",
         block_size=16,
         max_batch_calls=SLOTS,
         max_request_pool_size=SLOTS,
         max_batch_tokens=512,
-        max_sequence_tokens=SEQUENCE,
+        max_model_len=SEQUENCE,
         prefill_graph_token_sizes=(64, 256),
         decode_graph_batch_sizes=(1,),
         canvas_sampling=SAMPLING,
@@ -188,15 +188,16 @@ def _worker(
         else:
             runner.close()
         return
-    cache = PrefixCache(
+    planes = plan_cache(model.text, config)
+    cache = KVCache(
         model.text.cache_config,
+        planes,
         num_units=units,
-        block_size=16,
         device=device,
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model.text, config, num_units=units),
+        info=cache_info(model.text, planes, num_units=units),
         request_pool_size=SLOTS,
         table_width=64,
     )
@@ -204,7 +205,7 @@ def _worker(
     try:
         runner.configure_inputs(
             input_config=input_buffer_config(
-                model, config, processor=processor
+                model, config, planes=planes, processor=processor
             ),
             kv_cache=manager,
             latent_pool=None,
@@ -244,10 +245,10 @@ def _install(manager, count, tokens=SEQUENCE):
     entries, unit = [], 1
     for slot in range(1, count + 1):
         for group, shape in enumerate(manager.shapes):
-            pages = ceil_div(tokens, shape.page_tokens)
+            pages = ceil_div(tokens, shape.block_size)
             units = tuple(range(unit, unit + pages * shape.units_per_page))
             unit += len(units)
-            entries.append((slot, group, 0, units, pages * shape.page_tokens))
+            entries.append((slot, group, 0, units, pages * shape.block_size))
     manager.block_tables.install(tuple(entries))
 
 
@@ -354,7 +355,6 @@ def _scenario(slots, prompt_tokens=PROMPT):
                 seed=_request(slot),
                 block=0,
                 step=step,
-                sampling=slots.constants,
             )
             for step in range(SAMPLING.max_steps)
         )
@@ -679,15 +679,35 @@ def test_a_readout_answers_every_slot_of_many_canvases(tmp_path):
 
 @SM100
 @torch.inference_mode()
-def test_a_call_exceeding_the_configured_row_capacity_fails(tmp_path):
-    """Calls beyond the deployment's row capacity are rejected."""
+def test_a_call_exceeding_the_largest_bucket_runs_eagerly(tmp_path):
+    """More canvases than the largest bucket run eagerly, with equal values.
+
+    One canvas replays a graph. The same canvas read by ``SLOTS + 1`` rows,
+    more than the largest bucket holds, runs without a graph, and each of
+    its rows returns the replayed canvas's values.
+    """
     _checkpoint(tmp_path)
     with _worker(tmp_path) as (runner, manager, slots):
         _install(manager, 1)
         _, readout, _ = _scenario(slots)
-        rows = (readout[1],) * (SLOTS + 1)
-        with pytest.raises(ResourceError):
-            _run(runner, manager, rows, ForwardMode.TOKEN_DENOISING)
+        replayed = _run(
+            runner, manager, (readout[1],), ForwardMode.TOKEN_DENOISING
+        )
+        assert replayed.stats.cuda_graph_replays == 1
+
+        wide = _run(
+            runner,
+            manager,
+            (readout[1],) * (SLOTS + 1),
+            ForwardMode.TOKEN_DENOISING,
+        )
+        assert wide.stats.cuda_graph_replays == 0
+        assert wide.stats.cuda_graph_runtime_mode_counts == {"eager": 1}
+        (expected,) = _values(replayed)
+        values = _values(wide)
+        assert len(values) == SLOTS + 1
+        for actual in values:
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @SM100
@@ -702,7 +722,7 @@ def test_a_small_pool_replays_calls_of_every_canvas_it_holds(tmp_path):
     """
     _checkpoint(tmp_path)
     with _worker(tmp_path, units=SMALL_UNITS) as (runner, manager, slots):
-        rows = (manager.info.num_units - 1) // manager.row_units
+        rows = (manager.num_units - 1) // manager.row_units
         # The pool, not the call or request slot bound, bounds the rows.
         assert rows < SLOTS
         _install(manager, rows, tokens=PAGE)

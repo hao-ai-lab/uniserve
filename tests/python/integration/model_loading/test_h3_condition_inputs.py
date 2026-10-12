@@ -39,10 +39,10 @@ from tests.python.fixtures.h3_conditions import (
     recorded_request,
     vision_encoder,
 )
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve_models import loading as models
 from uniserve_worker.config.deployment import ComponentConfig, ParallelConfig
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.conditions import (
     condition_units,
     encode_tracks,
@@ -52,7 +52,7 @@ from uniserve_worker.execution.conditions import (
 )
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.component_binding import ComponentBinding
-from uniserve_worker.protocol.video import VideoAdmission, VideoTask
+from uniserve_worker.protocol.video import VideoAdmission
 
 pytestmark = [
     pytest.mark.integration,
@@ -102,9 +102,9 @@ def _runner(checkpoint: Path, modules, placed) -> ModelExecutor:
     """
     source = models.read_config(checkpoint, modules=frozenset(modules))
     model = models.load_model(source, device=DEVICE).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device=DEVICE,
-        max_sequence_tokens=8192,
+        max_model_len=8192,
         max_video_seconds=15.0,
         deployment_components=(*(name for name, _ in placed), "transformer"),
     )
@@ -143,13 +143,13 @@ def _request(root: Path, case: str, ffmpeg: str, image_bands: int = 1):
     admitted in ``image_bands`` bands.
     """
     with published() as publish:
-        run, plan, _, conditions = recorded_request(
-            root, case, ffmpeg, publish, image_bands
+        run, request, _, conditions = recorded_request(
+            root, case, publish, image_bands
         )
         products = read(conditions, vision_encoder(), ffmpeg)
     presentation = json.loads((run / "presentation.json").read_text())
     video = VideoAdmission(
-        VideoTask(plan.task.value),
+        request.task,
         text_tags=tuple(presentation["tags"]),
         conditions=conditions,
     )

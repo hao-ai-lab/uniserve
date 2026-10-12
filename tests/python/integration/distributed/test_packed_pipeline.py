@@ -28,9 +28,10 @@ from uniserve.nn.attention import (
 )
 from uniserve.runtime import (
     ExecutionContext,
-    PrefixCache,
+    KVCache,
     initialize_process_groups,
 )
+from uniserve.runtime.kv_cache import plan_units
 from uniserve_models import bagel, sensenova_u1
 from uniserve_worker.bootstrap.inputs import image_builder
 
@@ -83,10 +84,10 @@ def _run(rank, rendezvous, root, architecture, config, shape, axes):
         with ExitStack() as scope:
             caches = [
                 scope.enter_context(
-                    PrefixCache(
+                    KVCache(
                         item.text.cache_config,
+                        plan_units(item.text.cache_config, block_size=4),
                         num_units=2,
-                        block_size=4,
                         device="cpu",
                     )
                 )

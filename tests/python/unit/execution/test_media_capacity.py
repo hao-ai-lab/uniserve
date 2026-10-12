@@ -17,10 +17,8 @@ from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
 from uniserve_models.minimax_h3 import Model
 from uniserve_models.minimax_h3 import config as h3_config
-from uniserve_models.minimax_h3.processing import (
-    ReferenceConfig,
-    reference_image_size,
-)
+from uniserve_models.minimax_h3.config import DMD_CANVASES, NAMED_CANVASES
+from uniserve_models.minimax_h3.processing import REFERENCE_IMAGE_SHORT_EDGE
 from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
 pytestmark = pytest.mark.unit
@@ -30,28 +28,24 @@ pytestmark = pytest.mark.unit
 ADMITTED_FRAMES = tuple(107 + 17 * index for index in range(16))
 
 # The default FastH3 deployment's canvases: 768p 16:9 and 9:16.
-TALL = image.Config(1344, 768)
+TALL = DMD_CANVASES[(768, "9:16")]
 SERVED = (WIDE, TALL)
 
-# FastH3's (height, width) training buckets: 21:9, 16:9, 4:3, 1:1, 3:4 and
-# 9:16 at 768p, then at 480p.
-BUCKETS = tuple(
-    image.Config(height, width)
-    for height, width in (
-        (672, 1536),
-        (768, 1344),
-        (768, 1024),
-        (768, 768),
-        (1024, 768),
-        (1344, 768),
-        (416, 992),
-        (480, 832),
-        (480, 640),
-        (480, 480),
-        (640, 480),
-        (832, 480),
+# FastH3's training buckets: every named aspect ratio at 768p, then at 480p.
+BUCKETS = tuple(DMD_CANVASES.values())
+
+
+def _enlarged_image(width: int, height: int) -> image.Config:
+    """The size an image reference is encoded at when enlarged.
+
+    The short edge scales to the checkpoint's encoding edge and each side
+    rounds to the nearest multiple of 32.
+    """
+    scale = REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    return image.Config(
+        height=max(32, round(height * scale / 32) * 32),
+        width=max(32, round(width * scale / 32) * 32),
     )
-)
 
 
 @pytest.fixture(scope="module")
@@ -209,18 +203,10 @@ def test_every_named_canvas_has_layouts_that_fit_the_slot_storage():
         min_frames=96,
         text_capacities=(1024, 4096),
     )
-    canvases = {(canvas.width, canvas.height) for canvas in builder.canvases}
-    assert canvases == {
-        (1536, 672),
-        (1344, 768),
-        (1024, 768),
-        (768, 768),
-        (768, 1024),
-        (768, 1344),
-    }
+    assert set(builder.canvases) == set(NAMED_CANVASES.values())
     layouts = builder.layouts()
     assert layouts[0] == builder.maximum
-    assert len(layouts) == len(canvases) * len(ADMITTED_FRAMES) * 2
+    assert len(layouts) == len(builder.canvases) * len(ADMITTED_FRAMES) * 2
     capacity = builder.capacity_buffers()
     maximum = denoiser.workspace_buffers(builder.maximum)
     for layout in layouts:
@@ -250,7 +236,7 @@ def test_a_condition_capacity_bounds_each_conditioned_layout():
     A worker serving conditions sizes the slot storage and the layout its
     runner prepares first by its condition capacity; each conditioned
     request takes the smallest text capacity with its own condition tiles,
-    and text-only requests keep the prepared ladder.
+    and text-only requests keep the prepared layout.
     """
     with torch.device("meta"):
         denoiser = Model(base_config()).transformer
@@ -399,11 +385,10 @@ def test_the_largest_condition_set_follows_the_served_tasks():
         # No reference a request may bring packs more rows than the
         # declared one of its kind, at any aspect from 1:4 to 4:1, however
         # the deployment sizes it: enlarged references are the largest.
-        enlarged = ReferenceConfig(enlarge=True)
         for width in range(250, 4001, 7):
             still = Condition(
                 ConditionRole.REFERENCE,
-                video.Config(1, reference_image_size(width, 1000, enlarged)),
+                video.Config(1, _enlarged_image(width, 1000)),
             )
             clip = Condition(
                 ConditionRole.REFERENCE,

@@ -12,7 +12,6 @@ import torch
 
 from uniserve.diffusion import BlockGrid, RungGrid, UniformGrid
 from uniserve.loading import Config as IOConfig
-from uniserve.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     DenseAttention,
     Model,
@@ -21,6 +20,7 @@ from uniserve_models.minimax_h3 import (
 )
 from uniserve_models.minimax_h3.checkpoint import base_checkpoint, detect
 from uniserve_models.minimax_h3.config import Config, read_config
+from uniserve_models.minimax_h3.precision import weight_config
 
 pytestmark = pytest.mark.unit
 
@@ -56,29 +56,35 @@ def test_t2va_fasth3_resolves_its_trained_rungs(checkpoint):
     assert set(config.denoisers) == {"transformer"}
     denoiser = config.denoisers["transformer"]
     assert denoiser.grids == {
-        "video": RungGrid((999, 749, 500, 250), shift=12.0, clock=1000.0),
-        "audio": RungGrid((999, 749, 500, 250), shift=3.0, clock=1000.0),
+        "video": RungGrid(
+            (999, 749, 500, 250), shift=12.0, num_train_timesteps=1000.0
+        ),
+        "audio": RungGrid(
+            (999, 749, 500, 250), shift=3.0, num_train_timesteps=1000.0
+        ),
     }
     assert denoiser.attention == SparseAttention(tile=64, sparsity=0.9)
     assert denoiser.tasks == ("t2va",)
-    # The student generates its 12 (width, height) training buckets: 21:9,
-    # 16:9, 4:3, 1:1, 3:4 and 9:16 at 768p, then at 480p.
-    assert [(canvas.width, canvas.height) for canvas in denoiser.canvases] == [
-        (1536, 672),
-        (1344, 768),
-        (1024, 768),
-        (768, 768),
-        (768, 1024),
-        (768, 1344),
-        (992, 416),
-        (832, 480),
-        (640, 480),
-        (480, 480),
-        (480, 640),
-        (480, 832),
-    ]
-    # Single-segment sparse attention keeps the single-rounding epilogues.
-    assert denoiser.transformer.rounding is Rounding.ONCE
+    # The student generates its 12 training buckets: 21:9, 16:9, 4:3, 1:1,
+    # 3:4 and 9:16 at 768p, then at 480p, by the (short edge, aspect ratio)
+    # a request names them with.
+    assert {
+        name: (canvas.width, canvas.height)
+        for name, canvas in denoiser.canvases.items()
+    } == {
+        (768, "21:9"): (1536, 672),
+        (768, "16:9"): (1344, 768),
+        (768, "4:3"): (1024, 768),
+        (768, "1:1"): (768, 768),
+        (768, "3:4"): (768, 1024),
+        (768, "9:16"): (768, 1344),
+        (480, "21:9"): (992, 416),
+        (480, "16:9"): (832, 480),
+        (480, "4:3"): (640, 480),
+        (480, "1:1"): (480, 480),
+        (480, "3:4"): (480, 640),
+        (480, "9:16"): (480, 832),
+    }
 
 
 def test_base_release_serves_both_task_families(base):
@@ -97,8 +103,7 @@ def test_base_release_serves_both_task_families(base):
         }
         assert denoiser.canvases is None
         # The released DiTs follow the diffusers eager BF16 arithmetic.
-        assert denoiser.transformer.rounding is Rounding.STEPWISE
-    points = entry_points(config)
+        points = entry_points(config)
     assert {"transformer", "transformer_ref"} <= set(points)
     with torch.device("meta"):
         model = Model(config)
@@ -144,9 +149,6 @@ def test_ref2va_fasth3_branches_from_the_reference_partition(checkpoint):
     )
     assert denoiser.tasks == ("ref2va",)
     assert denoiser.canvases is None
-    # Reference-segment sparse attention follows the reference's eager BF16
-    # arithmetic.
-    assert denoiser.transformer.rounding is Rounding.STEPWISE
 
 
 def test_parallel_decoding_blocks_must_cover_the_heads(checkpoint):
@@ -155,7 +157,7 @@ def test_parallel_decoding_blocks_must_cover_the_heads(checkpoint):
         read_config(export, IOConfig(), sources={})
 
 
-def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
+def test_eight_step_checkpoint_owns_its_rungs_and_shifts(checkpoint):
     inference_path = checkpoint / "fastvideo_inference.json"
     inference = json.loads(inference_path.read_text())
     inference.update(
@@ -175,8 +177,8 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
     denoiser = config.denoisers["transformer"]
     rungs = (999, 874, 749, 624, 500, 375, 250, 125)
     assert denoiser.grids == {
-        "video": RungGrid(rungs, shift=10, clock=1000.0),
-        "audio": RungGrid(rungs, shift=3, clock=1000.0),
+        "video": RungGrid(rungs, shift=10, num_train_timesteps=1000.0),
+        "audio": RungGrid(rungs, shift=3, num_train_timesteps=1000.0),
     }
     assert denoiser.attention.sparsity == 0.8
     with torch.device("meta"):
@@ -185,7 +187,7 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
     # The first and last evaluations follow the shifted timestep equation
     # sigma = s t / (1 + (s - 1) t) with t = step / 1000 and each modality's
     # trained shift; the clean endpoint follows the last evaluation.
-    schedules = model.transformer.make_schedules(8, shift=None, device="cpu")
+    schedules = model.transformer.make_schedules(device="cpu")
     for name, shift in (("video", 10.0), ("audio", 3.0)):
         sigmas = schedules[name].sigmas
         assert sigmas.shape == (9,)
@@ -196,8 +198,6 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
                 sigmas[index], torch.tensor(expected), rtol=0, atol=1e-7
             )
         assert sigmas[8] == 0
-    with pytest.raises(ValueError, match="evaluates the network 8 times"):
-        model.transformer.make_schedules(4, shift=None, device="cpu")
 
 
 @pytest.mark.parametrize(
@@ -238,12 +238,9 @@ def test_architecture_without_variant_metadata_is_rejected(tmp_path):
 @pytest.mark.parametrize(
     "sidecar, field, value, error",
     [
-        (
-            "vae/config.json",
-            "decoder_num_layers",
-            35,
-            "video_vae.decoder_num_layers",
-        ),
+        ("vae/config.json", "clip_length", 33, "17-frame clips"),
+        ("vae/config.json", "token_drop", 2, "17-frame clips"),
+        ("audio_vae/config.json", "encoder_rates", [2, 4, 4, 5, 6], "hop 800"),
         (
             "audio_vae/config.json",
             "latents_std",
@@ -269,6 +266,41 @@ def test_h3_reader_rejects_unsupported_decoder_math(
         read_config(checkpoint, IOConfig(), sources={})
 
 
+def test_a_checkpoint_defines_its_own_network_dimensions(checkpoint):
+    """Layer counts come from the checkpoint, not from released defaults."""
+    transformer = checkpoint / "transformer/config.json"
+    values = json.loads(transformer.read_text())
+    transformer.write_text(json.dumps({**values, "num_layers": 7}))
+    vae = checkpoint / "vae/config.json"
+    values = json.loads(vae.read_text())
+    vae.write_text(json.dumps({**values, "decoder_num_layers": 35}))
+
+    config = read_config(checkpoint, IOConfig(), sources={})
+    assert config.denoisers["transformer"].transformer.num_hidden_layers == 7
+    assert config.video_vae.decoder_num_layers == 35
+
+    precision = weight_config(config)
+    layers = "transformer.transformer.layers"
+    assert f"{layers}.6.mlp" in precision.quantization
+    assert f"{layers}.7.mlp" not in precision.quantization
+    decoder = "video_decoder.decoder.decoder.decoder.layers"
+    assert f"{decoder}.34.qkv" in precision.dtypes
+    assert f"{decoder}.35.qkv" not in precision.dtypes
+
+
+def test_pixel_normalization_comes_from_the_checkpoint_processor(checkpoint):
+    path = checkpoint / "processor/preprocessor_config.json"
+    values = json.loads(path.read_text())
+    path.write_text(
+        json.dumps(
+            {**values, "image_mean": [0.1, 0.2, 0.3], "image_std": [1, 2, 3]}
+        )
+    )
+
+    pixels = read_config(checkpoint, IOConfig(), sources={}).text_encoder.pixels
+    assert (pixels.mean, pixels.std) == ((0.1, 0.2, 0.3), (1, 2, 3))
+
+
 def test_h3_reader_reports_missing_decoder_field(checkpoint):
     path = checkpoint / "vae/config.json"
     values = json.loads(path.read_text())
@@ -281,16 +313,17 @@ def test_h3_reader_reports_missing_decoder_field(checkpoint):
 
 
 def test_h3_direct_configuration_preserves_cross_component_dimensions():
-    from dataclasses import replace
-
-    from tests.python.fixtures.h3 import dmd_denoiser
-    from uniserve_models.minimax_h3 import audio_vae, video_vae
-    from uniserve_models.minimax_h3.encoder import TextEncoderConfig
+    from tests.python.fixtures.h3 import (
+        audio_vae_config,
+        dmd_denoiser,
+        text_encoder_config,
+        video_vae_config,
+    )
 
     with pytest.raises(ValueError, match="conditioning width"):
         Config(
-            text_encoder=replace(TextEncoderConfig(), hidden_size=4096),
+            text_encoder=text_encoder_config(hidden_size=4096),
             denoisers={"transformer": dmd_denoiser()},
-            video_vae=video_vae.Config(),
-            audio_vae=audio_vae.Config(),
+            video_vae=video_vae_config(),
+            audio_vae=audio_vae_config(),
         )

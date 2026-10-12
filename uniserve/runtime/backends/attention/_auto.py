@@ -20,7 +20,7 @@ A call no native kernel serves raises when its layer is prepared or bound,
 naming the call's path, shape, dtype and mask semantics. FlashInfer's own
 attention kernels, the FlashAttention-2 library and the portable torch
 provider remain selectable by name but never stand in for a native kernel.
-FP32 dense attention without a prefix cache or history window uses PyTorch
+FP32 dense attention without a K/V cache or history window uses PyTorch
 SDPA, preserving the precision of image and audio autoencoders. Both causal
 and non-causal calls are supported. Off CUDA the portable provider serves
 every call.
@@ -66,7 +66,7 @@ def _available(module, names):
 def _layer(*, num_heads, num_kv_heads, head_dim, dtype, cache, window):
     """Describe a layer's attention shape, dtypes and history bound."""
     if cache is None:
-        storage = "without a prefix cache"
+        storage = "without a K/V cache"
     elif isinstance(cache.key, QuantizedTensor):
         storage = (
             f"over a per-block FP8 cache of {cache.block_size}-token pages"
@@ -134,15 +134,15 @@ def _input_class(batch):
     return path, mask
 
 
-def _paged_calls(page_tokens):
+def _paged_calls(block_size):
     """Return one-row samples of every paged call a cache layer receives.
 
     They are a causal and a non-causal paged row and a segmented prefix read
-    whose queries see every current key, over ``page_tokens``-token pages.
-    Routing depends only on their kind, causality and page size.
+    whose queries see every current key, over ``block_size``-token pages.
+    Routing depends only on their kind, causality and block size.
     """
     lengths = SequenceLengths.from_lengths((1,), device="cpu")
-    table = BlockTable(torch.ones((1, 1), dtype=torch.int32), page_tokens)
+    table = BlockTable(torch.ones((1, 1), dtype=torch.int32), block_size)
     return (
         PagedInput(lengths, lengths, table, None, (True,)),
         PagedInput(lengths, lengths, table, None, (False,)),
@@ -389,9 +389,9 @@ class _Automatic(_Operator):
             )
         # A later run may read rows an earlier run of the same sequence
         # writes, so the batch's complete write commits before any run; the
-        # runs carry no write addresses.
-        if batch.write_indices is not None:
-            self.update_cache(k, v, indices=batch.write_indices)
+        # runs carry no slot mapping.
+        if batch.slot_mapping is not None:
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
         for rows, _, run in causal_runs(batch):
             if rows.start == rows.stop:
                 continue
@@ -483,7 +483,7 @@ class Backend(_Backend):
     ):
         """Return the available providers that serve a layer's shape.
 
-        ``pages`` describes the layer's paged prefix cache, or is None for
+        ``pages`` describes the layer's paged K/V cache, or is None for
         a layer without one.
         """
         if self.device.type != "cuda" or (
@@ -491,64 +491,50 @@ class Backend(_Backend):
         ):
             return {"torch": self._portable}
 
-        # Native kernels require half precision and unquantized cache state.
-        if dtype not in {torch.float16, torch.bfloat16} or (
-            pages is not None and pages.quantized
-        ):
-            return {}
-
-        from .prefix_block import unsupported
-
-        # Restrict candidates to each kernel's head-dimension, cache-block and
-        # history-window constraints. The pinned SM100 TensorRT-LLM cubins
-        # specialize head dimension 512 context kernels only for causal and
-        # dense masks over 16-, 32- and 64-token pages; FlashAttention
-        # kernels do not take UniServe's history windows.
+        # Each provider states what it serves; a layer a provider refuses
+        # never reaches it as a candidate.
         return {
             name: backend
             for name, backend in self._native.items()
-            if (
-                name != "trtllm"
-                or head_dim in {64, 128, 256}
-                or (
-                    head_dim == 512
-                    and window is None
-                    and pages is not None
-                    and pages.page_tokens in {16, 32, 64}
-                )
+            if self._refusal(
+                name,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                pages=pages,
+                window=window,
             )
-            and (
-                name != "prefix_block"
-                or unsupported(
-                    num_heads=num_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_dim=head_dim,
-                    dtype=dtype,
-                    pages=pages,
-                )
-                is None
-            )
-            and (window is None or name not in {"sgl_kernel", "flash_attn_4"})
-            and (
-                name != "sgl_kernel"
-                or (
-                    head_dim <= 256
-                    and head_dim % 8 == 0
-                    and (pages is None or pages.page_tokens % 256 == 0)
-                )
-            )
-            and (
-                name != "flash_attn_4"
-                or (
-                    head_dim % 8 == 0
-                    and (
-                        head_dim <= 128
-                        or head_dim == 256
-                        or (self._architecture == 9 and head_dim <= 256)
-                    )
-                )
-            )
+            is None
         }
+
+    def _refusal(
+        self, name, *, num_heads, num_kv_heads, head_dim, dtype, pages, window
+    ):
+        """Return why provider ``name`` cannot serve a layer, or None."""
+        from . import flash_attn, flash_attn_4, prefix_block, trtllm
+
+        layer = {
+            "head_dim": head_dim,
+            "dtype": dtype,
+            "pages": pages,
+            "window": window,
+        }
+        if name == "sgl_kernel":
+            return flash_attn.unsupported(**layer)
+        if name == "flash_attn_4":
+            return flash_attn_4.unsupported(
+                **layer, architecture=self._architecture
+            )
+        if name == "trtllm":
+            return trtllm.unsupported(**layer)
+        return prefix_block.unsupported(
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            pages=pages,
+        )
 
     def reads_pages(
         self, *, num_heads, num_kv_heads, head_dim, dtype, window, pages
@@ -573,7 +559,7 @@ class Backend(_Backend):
                     architecture=self._architecture,
                 )
             )
-            for call in _paged_calls(pages.page_tokens)
+            for call in _paged_calls(pages.block_size)
         )
 
     def _requirements(self, arguments):

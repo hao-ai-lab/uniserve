@@ -23,14 +23,14 @@ from uniserve.tensors import BufferConfig
 
 @dataclass(frozen=True, slots=True)
 class CachePages:
-    """How a layer's paged prefix cache stores its pages.
+    """How a layer's paged K/V cache stores its pages.
 
-    ``page_tokens`` is the tokens of one page, ``dtype`` the element type
+    ``block_size`` is the tokens of one page, ``dtype`` the element type
     the pages store and ``quantized`` whether they hold per-block FP8
     values with scales.
     """
 
-    page_tokens: int
+    block_size: int
     dtype: torch_lib.dtype
     quantized: bool = False
 
@@ -201,9 +201,9 @@ class Operator:
         k: torch_lib.Tensor,
         v: torch_lib.Tensor,
         *,
-        indices: torch_lib.Tensor,
+        slot_mapping: torch_lib.Tensor,
     ) -> None:
-        """Write current K/V rows into the bound prefix cache."""
+        """Write current K/V rows into the bound K/V cache."""
         if self._closed:
             raise RuntimeError("attention operator is closed")
         if self.cache is None:
@@ -211,7 +211,7 @@ class Operator:
                 "attention cache update requires bound prefix state"
             )
 
-        self.cache.update(k, v, indices=indices)
+        self.cache.update(k, v, slot_mapping=slot_mapping)
 
     def _validate(self, q, k, v, batch, out):
         # Host-driven provider preparation belongs to bind(), before capture.
@@ -321,7 +321,7 @@ class Backend:
     ) -> bool:
         """Report whether the backend serves a cache layer on ``pages``.
 
-        A layer with a paged prefix cache receives causal and non-causal
+        A layer with a paged K/V cache receives causal and non-causal
         paged calls and segmented reads of its prefix. A backend serving
         one provider reports True and validates its own page constraints
         when a layer is prepared.

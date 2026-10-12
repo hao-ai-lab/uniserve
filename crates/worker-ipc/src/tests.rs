@@ -36,7 +36,6 @@ fn ar_decode_call() -> Call {
             logical_position: 7,
             kv_visible_len: 5,
             kv_computed_len: 6,
-            flow_step: 0,
         },
 
         token_output: Some(output_product(CallId::new(11, 0))),
@@ -60,20 +59,15 @@ fn ar_decode_call() -> Call {
         request_key: request_key(),
         call_id: CallId::new(11, 0),
         component: "model".into(),
-        code: kind,
+        kind,
         bounds: Bounds {
             max_tokens: 1,
-            max_kv_units: 1,
             ..Bounds::default()
         },
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: Some(Rng {
-            seed: 99,
-            semantic_index_base: 4,
-            draw_layout: DrawLayout::TargetSampling,
-        }),
+        image_index: Some(4),
     }
 }
 
@@ -134,7 +128,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         request_key: request_key(),
         call_id,
         component: "model".into(),
-        code: kind,
+        kind,
         bounds: Bounds {
             max_tokens: if denoises { 4 } else { 0 },
             ..Bounds::default()
@@ -142,12 +136,12 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     }
 }
 
-fn completion_record() -> RequestOutput {
-    RequestOutput {
+fn completion_record() -> CallOutput {
+    CallOutput {
         sampled_logprob: Some(-0.25),
         top_logprobs: vec![
             TokenLogprob {
@@ -170,16 +164,12 @@ fn completion_record() -> RequestOutput {
         call_id: CallId::new(11, 0),
 
         status: CallStatus::Ok,
-
-        product_generations: vec![3, 4],
         error_code: None,
         error_message: None,
         timing_counters: TimingCounters::default(),
-        code: CallKind::Forward(ForwardMode::Decode),
-        position: 5,
         kv_visible_len: 5,
         kv_computed_len: 5,
-        num_completed_steps: 0,
+        step_index: 0,
 
         committed_tokens: vec![271],
         candidate_logprobs: Vec::new(),
@@ -194,12 +184,11 @@ fn admission() -> NewRequest {
     NewRequest::new(
         request_key(),
         u32::try_from(request_key().request_id.0).unwrap(),
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: SamplingParams::default(),
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![2, 7],
             initial_position: 0,
-            canvas: None,
         }),
         None,
         3,
@@ -211,7 +200,6 @@ fn media_sampling() -> DiffusionSamplingParams {
     DiffusionSamplingParams {
         num_frames: 22,
         video_units: 3,
-        num_inference_steps: 4,
         seed: 17,
         width: 1024,
         height: 768,
@@ -333,6 +321,12 @@ fn reference_conditions() -> Vec<uniserve_core::VideoCondition> {
 }
 
 /// Encodes `batch` as a submit request, decodes it, and returns the decoded batch.
+/// Reports whether the receiving end of the wire refuses `request`: the
+/// decoder validates every frame, and encoding checks nothing.
+fn is_refused_on_decode(request: &WorkerRequest) -> bool {
+    decode_request(&encode_request(request).unwrap()).is_err()
+}
+
 fn execute_round_trip(batch: Batch) -> Batch {
     let request = WorkerRequest::submit(batch);
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
@@ -358,18 +352,18 @@ fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
     // row naming a call outside the batch are each rejected on encode.
     let mut missing_length = run.clone();
     missing_length.forward.seq_lens.pop();
-    assert!(encode_request(&WorkerRequest::submit(missing_length)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(missing_length)));
 
     let mut short_sequence = run.clone();
     short_sequence.forward.seq_lens[2] = 3;
-    assert!(encode_request(&WorkerRequest::submit(short_sequence)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(short_sequence)));
 
     run.forward.call_indices[2] = 1;
-    assert!(encode_request(&WorkerRequest::submit(run)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(run)));
 }
 
 #[test]
-fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
+fn call_coordinates_survive_physical_dispatch_and_reject_collisions() {
     let batch_id = u64::MAX - 7;
     let first = call_for(
         CallKind::Media(MediaCall::TextEncoding),
@@ -393,7 +387,7 @@ fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
 
     let mut collision = run;
     collision.calls[1].call_id = first.call_id;
-    assert!(encode_request(&WorkerRequest::submit(collision)).is_err());
+    assert!(is_refused_on_decode(&WorkerRequest::submit(collision)));
 }
 
 /// Builds a batch around `calls` with the planner columns `Batch::validate`
@@ -419,7 +413,8 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
             });
             next_buffer_offset += bytes;
         }
-        let capacity_units = call.bounds.max_kv_units;
+        // Each forward call holds one fresh KV unit.
+        let capacity_units = u32::from(matches!(call.kind, CallKind::Forward(_)));
         if capacity_units > 0 {
             // The request id doubles as the request pool slot, which forward
             // rows, block tables, and unit allocations require to be positive.
@@ -445,11 +440,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 true,
             );
         }
-        if matches!(
-            call.code,
-            CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
-        ) || call.latent_input.is_some()
-        {
+        if call.addresses_latent_pages() {
             run.latent_params.push(LatentParams {
                 request_key: call.request_key,
                 call_id: call.call_id,
@@ -457,12 +448,10 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 latent_units: 1,
                 height: 1,
                 width: 1,
-                start_step: 0,
-                step_count: u32::from(call.code == CallKind::Media(MediaCall::Denoising)),
             });
         }
         if matches!(
-            call.code,
+            call.kind,
             CallKind::Media(
                 MediaCall::VideoDecoding
                     | MediaCall::VideoEncoding
@@ -486,7 +475,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
 /// overrides `batch_id`.
 fn lane_report(
     batch_id: u64,
-    completions: Vec<RequestOutput>,
+    completions: Vec<CallOutput>,
     products: Vec<TensorPublication>,
     worker_exec_us: Option<u64>,
     forward_stats: Option<ForwardStats>,
@@ -525,18 +514,16 @@ fn a_readout_and_its_candidate_logprobs_round_trip() {
 
     let mut record = completion_record();
     record.call_id = call_id;
-    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
     record.sampled_logprob = None;
     record.top_logprobs.clear();
     record.prompt_logprobs.clear();
     record.committed_tokens.clear();
-    record.product_generations.clear();
     record.candidate_logprobs = vec![-0.25, -3.5, -17.75];
     let report = lane_report(5, vec![record], Vec::new(), None, None);
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
             .unwrap();
-    assert_eq!(decoded.report().unwrap(), &report);
+    assert_eq!(decoded.output().unwrap(), &report);
 }
 
 /// A readout belongs to a token-denoising call and must address the canvas
@@ -576,8 +563,7 @@ fn a_readout_must_address_the_canvas_of_a_token_denoising_call() {
     }
 }
 
-/// A canvas step of a block-diffusion request whose admission names its
-/// canvas sampling.
+/// A canvas step of a block-diffusion request.
 fn canvas_step_batch() -> Batch {
     let call_id = CallId::new(6, 0);
     let mut call = call_for(CallKind::Forward(ForwardMode::TokenDenoising), call_id);
@@ -588,7 +574,7 @@ fn canvas_step_batch() -> Batch {
     let admission = NewRequest::new(
         request_key(),
         u32::try_from(request_key().request_id.0).unwrap(),
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: SamplingParams {
                 seed: Some(11),
                 ..SamplingParams::default()
@@ -596,15 +582,6 @@ fn canvas_step_batch() -> Batch {
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![1, 50, 106],
             initial_position: 0,
-            canvas: Some(CanvasSampling {
-                canvas_length: 256,
-                max_steps: 48,
-                entropy_bound: 0.1,
-                t_min: 0.4,
-                t_max: 0.8,
-                confidence_threshold: 0.005,
-                stability_threshold: 1,
-            }),
         }),
         None,
         0,
@@ -613,26 +590,24 @@ fn canvas_step_batch() -> Batch {
     batch_with_calls(6, vec![admission], vec![call])
 }
 
-/// A canvas step reaches the rank with its block and step and its request's
-/// admitted sampling, and its completion returns the stopped block's tokens.
+/// A canvas step reaches the rank with its block and step, and its
+/// completion returns the stopped block's tokens.
 #[test]
-fn a_canvas_step_its_sampling_and_its_block_round_trip() {
+fn a_canvas_step_and_its_block_round_trip() {
     let batch = canvas_step_batch();
     assert_eq!(execute_round_trip(batch.clone()), batch);
 
     let mut record = completion_record();
     record.call_id = CallId::new(6, 0);
-    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
     record.sampled_logprob = None;
     record.top_logprobs.clear();
     record.prompt_logprobs.clear();
-    record.product_generations.clear();
     record.committed_tokens = (0..256).collect();
     let report = lane_report(6, vec![record], Vec::new(), None, None);
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
             .unwrap();
-    assert_eq!(decoded.report().unwrap(), &report);
+    assert_eq!(decoded.output().unwrap(), &report);
 }
 
 /// A canvas step belongs to a token-denoising call, which carries either a
@@ -657,19 +632,34 @@ fn a_canvas_step_is_a_token_denoising_call_without_input_tokens() {
     }
 }
 
-/// Only a successful token-denoising completion reports candidate
-/// log-probabilities.
+/// Only a successful completion reports candidate log-probabilities.
 #[test]
-fn candidate_logprobs_belong_to_a_successful_token_denoising_completion() {
+fn candidate_logprobs_belong_to_a_successful_completion() {
     let mut record = completion_record();
     record.candidate_logprobs = vec![-1.0];
-    assert!(record.validate().is_err());
-
-    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
     assert!(record.validate().is_ok());
     record.status = CallStatus::Error;
     record.error_code = Some(ErrorCode::ComputeError);
     assert!(record.validate().is_err());
+}
+
+/// A completion states why exactly when it refuses its request, so the engine
+/// has a reason to return to the client.
+#[test]
+fn a_refusal_and_only_a_refusal_states_its_reason() {
+    let mut refusal = completion_record();
+    refusal.status = CallStatus::Error;
+    refusal.error_code = Some(ErrorCode::InvalidRequest);
+    assert!(refusal.validate().is_err());
+    refusal.error_message = Some("conditions exceed the worker's capacity".into());
+    assert!(refusal.validate().is_ok());
+
+    let mut failure = completion_record();
+    failure.status = CallStatus::Error;
+    failure.error_code = Some(ErrorCode::ComputeError);
+    assert!(failure.validate().is_ok());
+    failure.error_message = Some("unrequested reason".into());
+    assert!(failure.validate().is_err());
 }
 
 /// Constructs malformed wire input independently of the validated encoder.
@@ -710,7 +700,7 @@ fn malformed_call(
             request_key: Some(key),
             call_id: Some(&fbs::CallId::new(1, 0)),
             component: Some(component),
-            code: Some(&code),
+            kind: Some(&code),
             coordinates,
             ..Default::default()
         },
@@ -720,6 +710,7 @@ fn malformed_call(
         &mut builder,
         &fbs::BatchArgs {
             batch_id: 1,
+            collective_seq: 1,
             calls: Some(calls),
             ..Default::default()
         },
@@ -737,7 +728,7 @@ fn malformed_call(
 }
 
 #[test]
-fn decoder_requires_one_concrete_computation() {
+fn decoder_requires_one_concrete_call() {
     use crate::schema::uniserve::ipc as fbs;
     for (forward, media) in [
         (fbs::ForwardMode::None, fbs::MediaCall::None),
@@ -750,7 +741,7 @@ fn decoder_requires_one_concrete_computation() {
 }
 
 #[test]
-fn every_computation_variant_round_trips_in_its_own_batch() {
+fn every_call_kind_round_trips_in_its_own_batch() {
     let batches = comprehensive_batches();
     assert_eq!(batches.len(), CallKind::ALL.len());
     for batch in batches {
@@ -759,7 +750,7 @@ fn every_computation_variant_round_trips_in_its_own_batch() {
 }
 
 #[test]
-fn a_batch_carries_one_computation_through_one_entry() {
+fn a_batch_carries_one_call_through_one_entry() {
     let decode = call_for(CallKind::Forward(ForwardMode::Decode), CallId::new(1, 0));
     let prefill = call_for(CallKind::Forward(ForwardMode::Prefill), CallId::new(1, 1));
     let mixed = batch_with_calls(1, Vec::new(), vec![decode.clone(), prefill]);
@@ -787,8 +778,9 @@ fn decoder_requires_every_call_to_state_its_coordinates() {
 }
 
 #[test]
-fn solver_parameters_round_trip_with_request_or_paged_storage() {
-    let call = call_for(CallKind::Media(MediaCall::Denoising), CallId::new(101, 0));
+fn latent_parameters_round_trip_with_request_or_paged_storage() {
+    let mut call = call_for(CallKind::Media(MediaCall::Denoising), CallId::new(101, 0));
+    call.latent_output = Some(output_product(call.call_id));
     let mut run = batch_with_calls(1, Vec::new(), vec![call]);
     assert_eq!(execute_round_trip(run.clone()), run);
 
@@ -844,12 +836,12 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             request_key: request_key(),
             call_id: CallId::new(56 + index as u64, 0),
             component: (*entry).into(),
-            code: CallKind::Media(*stage),
+            kind: CallKind::Media(*stage),
             bounds: Bounds::default(),
             inputs: vec![latent.clone()],
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         // A video decode range may start past the first unit, while an audio
         // decode range must start at it. Neither call may omit its range.
@@ -957,13 +949,13 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
             None,
         );
 
-        // A replica differs only in its source rank. A report for another
+        // A replica differs only in its source incarnation. A report for another
         // generation names a different identity: merging it fails and leaves
         // the publication unchanged.
         let original = &mut report.products[0];
         let mut replica = original.clone();
         if let TransferHandle::DeviceProduct { tensor, .. } = &mut replica.value {
-            tensor.locations[0].source.rank = 1;
+            tensor.locations[0].source.incarnation = "replica".into();
         }
         let mut stale = replica.clone();
         stale.product.generation += 1;
@@ -974,7 +966,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
         let decoded =
             decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
                 .unwrap();
-        assert_eq!(decoded.report().unwrap(), &report);
+        assert_eq!(decoded.output().unwrap(), &report);
 
         // Other product dtypes round-trip with locator byte sizes that follow
         // their element widths.
@@ -994,7 +986,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
                 &encode_response(&WorkerResponse::result(typed_report.clone())).unwrap(),
             )
             .unwrap();
-            assert_eq!(decoded.report().unwrap(), &typed_report);
+            assert_eq!(decoded.output().unwrap(), &typed_report);
         }
     }
 }
@@ -1057,8 +1049,7 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     };
     let mut report = lane_report(
         5,
-        vec![RequestOutput {
-            code: CallKind::Transfer(TransferMode::KvPublish),
+        vec![CallOutput {
             kv_output: Some(KvTransfer {
                 groups: Vec::new(),
                 source,
@@ -1077,7 +1068,7 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
             .unwrap();
-    assert_eq!(decoded.report().unwrap(), &report);
+    assert_eq!(decoded.output().unwrap(), &report);
 
     // A grown extent must carry the tensors of its suffix.
     let KvTransfer {
@@ -1170,18 +1161,17 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
         }
         let report = lane_report(
             5,
-            vec![RequestOutput {
-                code: CallKind::Transfer(TransferMode::KvPublish),
+            vec![CallOutput {
                 kv_output: Some(KvTransfer {
                     groups: vec![
                         KvGroupTransfer {
                             start: 3,
-                            page_tokens: 4,
+                            block_size: 4,
                             tensors,
                         },
                         KvGroupTransfer {
                             start: 6,
-                            page_tokens: 8,
+                            block_size: 8,
                             tensors: window,
                         },
                     ],
@@ -1201,12 +1191,12 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
         let decoded =
             decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
                 .unwrap();
-        assert_eq!(decoded.report().unwrap(), &report);
+        assert_eq!(decoded.output().unwrap(), &report);
 
-        // Zero generations, a zero page size, a group starting before the
+        // Zero generations, a zero block size, a group starting before the
         // base, an unchanged extent with groups, and malformed or unexpected
         // scales are each rejected on encode.
-        for invalid_field in ["source", "base", "page_tokens", "start", "extent", "scales"] {
+        for invalid_field in ["source", "base", "block_size", "start", "extent", "scales"] {
             let mut invalid = report.clone();
             let KvTransfer {
                 source,
@@ -1219,7 +1209,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
             match invalid_field {
                 "source" => source.generation = 0,
                 "base" => base.as_mut().unwrap().generation = 0,
-                "page_tokens" => groups[0].page_tokens = 0,
+                "block_size" => groups[0].block_size = 0,
                 "start" => groups[1].start = 2,
                 "extent" => *base_extent = *published_extent,
                 "scales" if dtype == "float8_e4m3fn" => {
@@ -1244,7 +1234,7 @@ fn error_completion_round_trips_with_its_error_code() {
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report)).unwrap()).unwrap();
     assert_eq!(
-        decoded.report().unwrap().completions().next().unwrap(),
+        decoded.output().unwrap().completions().next().unwrap(),
         &record
     );
 }
@@ -1274,13 +1264,10 @@ fn request_retirement_requires_unique_buffers_from_its_request() {
             request_key: request_key(),
             retained_buffers,
         };
-        assert!(
-            encode_request(&WorkerRequest::submit(
-                batch_with_calls(3, vec![admission()], vec![ar_decode_call()])
-                    .with_commands(vec![command]),
-            ))
-            .is_err()
-        );
+        assert!(is_refused_on_decode(&WorkerRequest::submit(
+            batch_with_calls(3, vec![admission()], vec![ar_decode_call()])
+                .with_commands(vec![command]),
+        )));
     }
 }
 
@@ -1460,6 +1447,29 @@ fn product_validation_enforces_generation_and_shape_bounds() {
 }
 
 #[test]
+fn a_group_batch_is_unplaced_and_each_rank_projection_is_placed() {
+    let mut call = call_for(CallKind::Transfer(TransferMode::Tensor), CallId::new(1, 0));
+    let input = output_product(CallId::new(9, 0));
+    let output = output_product(CallId::new(1, 0));
+    call.bounds.max_transfer_bytes = input.max_bytes();
+    call.inputs = vec![input];
+    call.outputs = vec![output.clone()];
+
+    // A rank's batch names the span of every persistent output in that
+    // rank's own pool.
+    let placed = batch_with_calls(1, Vec::new(), vec![call]);
+    assert_eq!(placed.buffer_allocations.len(), 1);
+    placed.validate().unwrap();
+
+    // A group's batch is validated before any rank's spans are chosen.
+    let mut unplaced = placed.clone();
+    unplaced.buffer_allocations.clear();
+    assert!(unplaced.validate().is_err());
+    unplaced.validate_unplaced().unwrap();
+    assert!(placed.validate_unplaced().is_err());
+}
+
+#[test]
 fn batch_rejects_two_calls_for_one_request() {
     let batch = Batch {
         batch_id: 1,
@@ -1513,9 +1523,9 @@ fn call_sampling_state_preserves_whitelist_presence() {
 }
 
 #[test]
-fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
+fn image_encoder_input_round_trips_and_rejects_an_incompatible_call() {
     let mut call = ar_decode_call();
-    call.code = CallKind::Media(MediaCall::VisionEncoding);
+    call.kind = CallKind::Media(MediaCall::VisionEncoding);
     call.input_image = Some("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGN0SGhgIAUwkaR6VMOohiGlAQCjvQFA6eri4wAAAABJRU5ErkJggg==".into());
     call.token_output = None;
     let batch = batch_with_calls(1, vec![admission()], vec![call.clone()]);
@@ -1536,10 +1546,10 @@ fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
         ),
     ] {
         let mut invalid = call.clone();
-        invalid.code = code;
+        invalid.kind = code;
         invalid.input_image = image;
         let request = WorkerRequest::submit(batch_with_calls(1, vec![admission()], vec![invalid]));
-        assert!(encode_request(&request).is_err());
+        assert!(is_refused_on_decode(&request));
     }
 }
 
@@ -1577,92 +1587,122 @@ fn batch_allows_a_duplicate_identical_command() {
 
 #[test]
 fn worker_info_round_trips() {
-    use uniserve_core::{ComponentConfig, ParallelConfig, SequenceParallel};
-    let strategies = [
-        SequenceParallel::Local,
-        SequenceParallel::Ulysses { ulysses_degree: 2 },
-        SequenceParallel::Allgather {
-            allgather_degree: 2,
-        },
-        SequenceParallel::Hybrid {
-            ulysses_degree: 2,
-            allgather_degree: 2,
-        },
-    ];
-    for sequence_parallel in strategies {
-        let config = ParallelConfig {
-            sequence_parallel,
-            ..Default::default()
-        };
-        let count = config.world_size().unwrap();
-        let info = WorkerInfo {
-            world_size: count as u32,
-            model_dtype: "bfloat16".into(),
-            attention_backend: "torch".into(),
-            weight_formats: vec!["dense".into()],
-            kv_cache: Some(KvCacheInfo {
-                groups: vec![KvCacheGroup {
-                    layer_ids: (11..20).collect(),
-                    ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
-                }],
-                ..WorkerInfo::default().kv_cache.unwrap()
-            }),
-            components: vec![ComponentInfo {
-                name: "denoiser".into(),
-                config: ComponentConfig::parallel((0..count).rev().collect(), config),
-                outputs: vec![
-                    OutputInfo {
-                        name: "conditioning".into(),
-                        dtype: DType::BF16,
-                        shape_bound: ShapeBound {
-                            dims: vec![
-                                DimBound::Static(1),
-                                DimBound::Device { max: 16384 },
-                                DimBound::Static(2560),
-                            ],
-                        },
-                        raster_axes: None,
-                    },
-                    // A product laid out at the request's raster names it.
-                    OutputInfo {
-                        name: "video_units".into(),
-                        dtype: DType::U8,
-                        shape_bound: ShapeBound {
-                            dims: vec![
-                                DimBound::Device { max: 8 },
-                                DimBound::Static(22),
-                                DimBound::Static(1344),
-                                DimBound::Static(1536),
-                                DimBound::Static(3),
-                            ],
-                        },
-                        raster_axes: Some(RasterAxes {
-                            height: 2,
-                            width: 3,
-                        }),
-                    },
-                ],
+    let info = WorkerInfo {
+        kv_cache: Some(KvCacheInfo {
+            groups: vec![KvCacheGroup {
+                layer_ids: (11..20).collect(),
+                ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
             }],
-            ..Default::default()
-        };
-        // Python startup metadata crosses the serde mapping boundary before
-        // the binary response is delivered to the native host.
-        let mapped = serde_json::to_value(&info).unwrap();
-        assert_eq!(serde_json::from_value::<WorkerInfo>(mapped).unwrap(), info);
-        let response = WorkerResponse::info(info.clone());
-        let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
-        let WorkerResponse::Info { info: decoded, .. } = decoded else {
-            panic!("decoded response must preserve its info variant");
-        };
-        assert_eq!(decoded, info);
-    }
+            ..WorkerInfo::default().kv_cache.unwrap()
+        }),
+        components: vec![ComponentInfo {
+            name: "denoiser".into(),
+            outputs: vec![
+                OutputInfo {
+                    name: "conditioning".into(),
+                    dtype: DType::BF16,
+                    shape_bound: ShapeBound {
+                        dims: vec![
+                            DimBound::Static(1),
+                            DimBound::Device { max: 16384 },
+                            DimBound::Static(2560),
+                        ],
+                    },
+                    raster_axes: None,
+                },
+                // A product laid out at the request's raster names it.
+                OutputInfo {
+                    name: "video_units".into(),
+                    dtype: DType::U8,
+                    shape_bound: ShapeBound {
+                        dims: vec![
+                            DimBound::Device { max: 8 },
+                            DimBound::Static(22),
+                            DimBound::Static(1344),
+                            DimBound::Static(1536),
+                            DimBound::Static(3),
+                        ],
+                    },
+                    raster_axes: Some(RasterAxes {
+                        height: 2,
+                        width: 3,
+                    }),
+                },
+            ],
+        }],
+        image_warmups: vec![
+            ImageWarmup {
+                height: 512,
+                width: 768,
+                cfg_text_scale: 4.0,
+                cfg_img_scale: 1.0,
+                negative_token_ids: Vec::new(),
+            },
+            ImageWarmup {
+                height: 1024,
+                width: 1024,
+                cfg_text_scale: 4.0,
+                cfg_img_scale: 2.0,
+                negative_token_ids: vec![151644, 872, 198, 151645],
+            },
+        ],
+        canvas_step_rows: 6,
+        ..Default::default()
+    };
+    // Python startup metadata crosses the serde mapping boundary before
+    // the binary response is delivered to the native host.
+    let mapped = serde_json::to_value(&info).unwrap();
+    assert_eq!(serde_json::from_value::<WorkerInfo>(mapped).unwrap(), info);
+    let response = WorkerResponse::info(info.clone());
+    let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
+    let WorkerResponse::Info { info: decoded, .. } = decoded else {
+        panic!("decoded response must preserve its info variant");
+    };
+    assert_eq!(decoded, info);
 }
 
 #[test]
 fn kv_free_worker_info_round_trips() {
     let info = WorkerInfo {
         media_components: video_components(),
-        num_inference_steps: 4,
+        video_denoiser: Some(VideoDenoiserInfo {
+            tasks: vec!["t2va".into()],
+            schedule_points: 5,
+            video_shift: 12.0,
+            audio_shift: 3.0,
+            frame_rate: 24,
+            audio_sample_rate: 32_000,
+            frames: crate::FrameClips {
+                min_frames: 22,
+                clip_frames: 17,
+                clip_latent_frames: 5,
+                tail_latent_frames: 2,
+            },
+            canvases: vec![
+                ServedCanvas {
+                    short_edge: 768,
+                    aspect_ratio: "16:9".into(),
+                    canvas: uniserve_core::Canvas {
+                        width: 1344,
+                        height: 768,
+                    },
+                },
+                ServedCanvas {
+                    short_edge: 480,
+                    aspect_ratio: "21:9".into(),
+                    canvas: uniserve_core::Canvas {
+                        width: 992,
+                        height: 416,
+                    },
+                },
+            ],
+            references: ReferenceLimits {
+                images: 9,
+                videos: 3,
+                audios: 3,
+                total: 12,
+            },
+        }),
         supported_calls: video_components()
             .into_keys()
             .map(CallKind::Media)
@@ -1678,7 +1718,6 @@ fn kv_free_worker_info_round_trips() {
         panic!("decoded response must preserve its info variant");
     };
     assert_eq!(decoded, info);
-    assert_eq!(decoded.denoise_steps(), 4);
 }
 
 #[test]
@@ -1694,25 +1733,19 @@ fn worker_info_rejects_duplicate_set_members() {
     assert!(encode_response(&WorkerResponse::info(info)).is_err());
 }
 
-/// A KV pool needs an allocatable unit; every page size must be a power of
-/// two dividing the largest one; a layer belongs to one group; heads stay
-/// within their logical bounds; and a sliding window retains no sink.
+/// A KV pool needs an allocatable unit; every block size must be a power of
+/// two dividing the largest one; a layer belongs to one group; and heads stay
+/// within their logical bounds.
 #[test]
 fn worker_info_rejects_inconsistent_kv_groups() {
     let valid = full_caps();
     assert!(encode_response(&WorkerResponse::info(valid.clone())).is_ok());
-    let cases: [fn(&mut KvCacheInfo); 6] = [
+    let cases: [fn(&mut KvCacheInfo); 5] = [
         |cache| cache.num_units = 1,
-        |cache| cache.groups[1].page_tokens = 48,
+        |cache| cache.groups[1].block_size = 48,
         |cache| cache.groups[1].layer_ids.push(0),
         |cache| cache.groups[0].layer_ids.clear(),
         |cache| cache.groups[0].kv_head_offset = 1,
-        |cache| {
-            cache.groups[1].kind = KvGroupKind::SlidingWindow {
-                window: 4096,
-                sink: 64,
-            }
-        },
     ];
     for invalidate in cases {
         let mut info = valid.clone();
@@ -1721,18 +1754,16 @@ fn worker_info_rejects_inconsistent_kv_groups() {
     }
 }
 
-/// Stages combine into the narrowest pool with the largest unit and the
-/// union of their layers, and must agree on every group's page shape.
+/// Stages combine into the narrowest pool with the union of their layers,
+/// and must agree on every group's page shape.
 #[test]
 fn kv_stages_merge_into_the_narrowest_pool() {
     let first = full_caps().kv_cache.unwrap();
     let mut second = first.clone();
     second.num_units = 1024;
-    second.unit_bytes = first.unit_bytes * 2;
     second.groups[0].layer_ids = vec![28, 29];
     let merged = first.merge(&second).unwrap();
     assert_eq!(merged.num_units, 1024);
-    assert_eq!(merged.unit_bytes, first.unit_bytes * 2);
     assert_eq!(merged.groups[0].layer_ids.len(), 16);
     assert_eq!(merged.groups[1].layer_ids, first.groups[1].layer_ids);
 
@@ -1778,7 +1809,6 @@ fn full_sampling() -> SamplingParams {
         return_logprobs: true,
         return_prompt_logprobs: true,
         n_prompt_logprobs: 2,
-        logprob_token_ids: vec![7, 8, 9],
         bad_words_ids: vec![vec![1, 2, 3], vec![42]],
         allowed_token_ids: Some(vec![10, 11, 12]),
         typical_p: 0.8,
@@ -1799,9 +1829,6 @@ fn full_image() -> ImageParams {
         width: 768,
         seed: Some(77),
         negative_prompt: "blurry".into(),
-        max_images: 2,
-        image_prompts: vec!["p0".into(), "p1".into()],
-        retain_images: false,
     }
 }
 
@@ -1813,12 +1840,11 @@ fn comprehensive_batches() -> Vec<Batch> {
     let ar_params = NewRequest::new(
         key_for_request(100),
         100,
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: full_sampling(),
             negative_token_ids: vec![100, 101],
             finish_token_ids: vec![2, 7],
             initial_position: 128,
-            canvas: None,
         }),
         None,
         0,
@@ -1876,13 +1902,12 @@ fn comprehensive_batches() -> Vec<Batch> {
             request_key: key,
             call_id,
             component: "model".into(),
-            code: kind,
+            kind,
             bounds: Bounds {
                 max_tokens: 7 + index as u32,
-                max_kv_units: 3,
-                max_latent_bytes: 1 << 20,
                 max_completion_bytes: 4096,
                 max_transfer_bytes: 1 << 16,
+                ..Bounds::default()
             },
             inputs: vec![tensor_for(
                 key,
@@ -1901,15 +1926,7 @@ fn comprehensive_batches() -> Vec<Batch> {
                 DType::U8,
                 ShapeBound::default(),
             )),
-            rng: Some(Rng {
-                seed: 99 + index as u64,
-                semantic_index_base: 4,
-                draw_layout: match index % 3 {
-                    0 => DrawLayout::TargetSampling,
-                    1 => DrawLayout::SpeculativeProposal,
-                    _ => DrawLayout::FlowNoise,
-                },
-            }),
+            image_index: Some(4 + index as u32),
         });
         // The admissions ride on the first batch of the pass, as a scheduler
         // places them ahead of the calls that use them.
@@ -1922,7 +1939,7 @@ fn comprehensive_batches() -> Vec<Batch> {
         batches.push(batch_with_calls(42 + index as u64, admissions, calls));
     }
     // The pass's retirement rides on its last batch.
-    let last = batches.pop().expect("one batch per computation variant");
+    let last = batches.pop().expect("one batch per call variant");
     batches.push(last.with_commands(vec![BatchCommand::Finish {
         request_key: key_for_request(201),
         retained_buffers: Vec::new(),
@@ -1936,9 +1953,9 @@ fn request_fixtures() -> Vec<WorkerRequest> {
         comprehensive_batches()
             .into_iter()
             .next()
-            .expect("one batch per computation variant"),
+            .expect("one batch per call variant"),
     );
-    submit.set_call_id(Some(91));
+    submit.set_message_id(Some(91));
     vec![WorkerRequest::info(), submit, WorkerRequest::close()]
 }
 
@@ -1947,7 +1964,6 @@ fn full_caps() -> WorkerInfo {
         encoder_cache_entries: 64,
         encoder_entry_bytes: 128 << 20,
         media_components: video_components(),
-        num_inference_steps: 4,
         supported_calls: CallKind::ALL.to_vec(),
         // A full-attention group with 64-token pages of one unit and a
         // sliding-window group with 32-token pages of two units share one
@@ -1959,11 +1975,8 @@ fn full_caps() -> WorkerInfo {
                     ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
                 },
                 KvCacheGroup {
-                    kind: KvGroupKind::SlidingWindow {
-                        window: 4096,
-                        sink: 0,
-                    },
-                    page_tokens: 32,
+                    kind: KvGroupKind::SlidingWindow { window: 4096 },
+                    block_size: 32,
                     units_per_page: 2,
                     layer_ids: (14..28).collect(),
                     ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
@@ -1972,20 +1985,16 @@ fn full_caps() -> WorkerInfo {
             ..WorkerInfo::default().kv_cache.unwrap()
         }),
         endpoint: WorkerEndpoint {
-            rank: 1,
+            incarnation: "rank-1".into(),
             ..WorkerInfo::default().endpoint
         },
-        world_size: 2,
-        queue_depth: 2,
         max_batch_calls: 64,
         max_batch_tokens: 4096,
-        max_prefill_calls: 31,
-        max_decode_calls: 48,
         request_slots: 96,
         max_unresolved_calls: 3,
+        transfer_tickets: 192,
         latent_page_units: 64,
         latent_pages: 17,
-        model_name: "test-model".into(),
         ..WorkerInfo::default()
     }
 }
@@ -2048,7 +2057,7 @@ fn full_forward_stats() -> ForwardStats {
 }
 
 fn full_run_result() -> BatchOutput {
-    let mut ok_record = RequestOutput {
+    let mut ok_record = CallOutput {
         sampled_logprob: None,
         top_logprobs: Vec::new(),
         prompt_logprobs: Vec::new(),
@@ -2056,8 +2065,6 @@ fn full_run_result() -> BatchOutput {
         call_id: CallId::new(11, 0),
 
         status: CallStatus::Ok,
-
-        product_generations: vec![3, 5],
         error_code: None,
         error_message: None,
         timing_counters: TimingCounters {
@@ -2066,10 +2073,8 @@ fn full_run_result() -> BatchOutput {
             copy_us: 43,
             host_us: 44,
         },
-        code: CallKind::Forward(ForwardMode::Decode),
-        position: 5,
         kv_visible_len: 6,
-        num_completed_steps: 7,
+        step_index: 7,
         kv_computed_len: 8,
 
         committed_tokens: vec![271, 272],
@@ -2088,12 +2093,11 @@ fn full_run_result() -> BatchOutput {
     predicated_record.status = CallStatus::Predicated;
     predicated_record.committed_tokens.clear();
     predicated_record.finish_flags = FinishFlags::default();
-    predicated_record.product_generations = Vec::new();
     let mut error_record = ok_record.clone();
     error_record.request_key = key_for_request(102);
     error_record.call_id = CallId::new(11, 2);
     error_record.status = CallStatus::Error;
-    error_record.error_code = Some(ErrorCode::ResourceExhausted);
+    error_record.error_code = Some(ErrorCode::ResourceError);
     error_record.finish_flags = FinishFlags {
         eos: false,
         length: false,
@@ -2138,7 +2142,7 @@ fn response_fixtures() -> Vec<WorkerResponse> {
             message_id: Some(17),
             error: WorkerResponseError {
                 message: "device fault on decode".into(),
-                code: Some("compute_error".into()),
+                code: ErrorCode::ComputeError,
                 fatal: false,
                 phase: Some("execute".into()),
                 route: Some("und.decode".into()),
@@ -2218,60 +2222,42 @@ fn ipc_decode_rejects_malformed_frames() {
 }
 
 #[test]
-fn a_rank_may_transfer_over_every_mechanism_its_edges_name() {
-    let mut info = WorkerInfo {
-        transfer_backends: vec![
-            "cuda_vmm".to_owned(),
-            "shm".to_owned(),
-            "channel".to_owned(),
-        ],
-        ..WorkerInfo::default()
+fn frame_clips_count_decode_units_and_align_requested_frames() {
+    // 17-frame clips past a final 5-frame tail: `17n + 5` frames in `n`
+    // units, five latent frames per clip and two in the tail.
+    let frames = FrameClips {
+        min_frames: 22,
+        clip_frames: 17,
+        clip_latent_frames: 5,
+        tail_latent_frames: 2,
     };
-    assert!(info.validate().is_ok());
+    frames.validate().unwrap();
 
-    // `socket` is not a transfer mechanism name (`local`, `shm`, `cuda_vmm`,
-    // or `channel`).
-    info.transfer_backends = vec!["cuda_vmm".to_owned(), "socket".to_owned()];
-    let error = info.validate().unwrap_err().to_string();
-    assert!(error.contains("transfer capabilities"), "{error}");
-}
+    assert_eq!([22, 39, 124].map(|count| frames.units(count)), [1, 2, 7]);
+    assert_eq!(
+        [22, 39, 124].map(|count| frames.latent_frames(count)),
+        [7, 12, 37]
+    );
 
-#[test]
-fn a_channel_product_of_media_size_fits_the_transfer_handle_bound() {
-    // A five-second stereo PCM track: the bytes are the product and travel on
-    // the rank channel, so they do not count against the handle bound.
-    let samples = 5 * 32_000u64;
-    let mut reference = output_product(CallId::new(12, 0));
-    reference.dtype = DType::I16;
-    reference.shape_bound.dims = vec![
-        DimBound::Device {
-            max: samples as u32,
-        },
-        DimBound::Static(2),
-    ];
-    let publication = TensorPublication {
-        product: reference,
-        value: TransferHandle::DeviceProduct {
-            height: 0,
-            width: 0,
-            value_range: String::new(),
-            tensor: TensorTransfer {
-                shape: vec![samples, 2],
-                locations: vec![Locator {
-                    source: WorkerInfo::default().endpoint,
-                    transport: TransferTransport::Channel {
-                        endpoint: "tensor-publisher".into(),
-                        payload: vec![0u8; (samples * 4) as usize],
-                    },
-                    nbytes: samples * 4,
-                    dtype: "int16".into(),
-                    offset: vec![0, 0],
-                    shape: vec![samples, 2],
-                    device: "cpu".into(),
-                }],
-            },
-        },
-    };
-    assert!(publication.validate().is_ok());
-    assert!(publication.value.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES);
+    // A request rounds up to the next legal count and never below the fewest.
+    assert_eq!(
+        [1, 22, 23, 96, 360].map(|count| frames.align_up(count)),
+        [22, 22, 39, 107, 362]
+    );
+
+    // Available frames round down to a whole number of clips.
+    assert_eq!(frames.align_down(21), None);
+    assert_eq!(
+        [22, 38, 39, 130].map(|count| frames.align_down(count)),
+        [Some(22), Some(22), Some(39), Some(124)]
+    );
+
+    assert!(
+        FrameClips {
+            clip_frames: 0,
+            ..frames
+        }
+        .validate()
+        .is_err()
+    );
 }

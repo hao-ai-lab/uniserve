@@ -5,7 +5,7 @@ serves a token-denoising call: each canvas row attends to the cached prompt
 and to its own tokens without writing the cache, and the call reports each
 answer slot's candidate log-probabilities under the full-vocabulary
 softmax. The reported values must equal the public model evaluated
-directly, a prompt pass that writes a prefix cache followed by a canvas pass
+directly, a prompt pass that writes a K/V cache followed by a canvas pass
 that reads it, in FP32 on the CPU with the torch attention backend. Image
 soft tokens enter the prompt between its image markers.
 """
@@ -48,10 +48,11 @@ from uniserve.nn.attention import (
 from uniserve.nn.attention import (
     BlockTable as Table,
 )
-from uniserve.runtime import ExecutionContext, PrefixCache
-from uniserve.runtime.prefix_cache import plan_units
+from uniserve.runtime import ExecutionContext, KVCache
+from uniserve.runtime.kv_cache import plan_units
 from uniserve.sampling import SamplingParams
 from uniserve_models import loading as models
+from uniserve_worker.errors import ErrorCode
 from uniserve_worker.model_executor.image_inputs import prepare_image
 from uniserve_worker.protocol.batch import (
     Batch,
@@ -68,7 +69,6 @@ from uniserve_worker.protocol.call import (
     Call,
     CallCoordinates,
     CallStatus,
-    ErrorCode,
     ForwardMode,
     MediaCall,
     Readout,
@@ -103,7 +103,7 @@ def _worker(root, queue_depth=1, **settings):
     config = replace(
         stub_worker_config(PAGE, max_batch_tokens=256),
         model_dtype="float32",
-        max_sequence_tokens=128,
+        max_model_len=128,
         **settings,
     )
     return Worker(
@@ -112,9 +112,7 @@ def _worker(root, queue_depth=1, **settings):
         image_processor=loaded.image_processor,
         sampling_group=Communicator(device=torch.device("cpu")),
         tokenizer=None,
-        allowed_calls=None,
         queue_depth=queue_depth,
-        completion_payload_bytes=1 << 16,
         attention="torch",
         host_slots=(0, 1),
     )
@@ -247,7 +245,7 @@ def _attention(cache, *, build):
     entries = {}
     for table in range(len(cache.tables)):
         units = tuple(range(table * PAGES, (table + 1) * PAGES))
-        page = cache.groups[cache.tables[table].group].page_tokens
+        page = cache.groups[cache.tables[table].group].block_size
         entry = build(units, page)
         if entries:
             entry = replace(
@@ -279,9 +277,13 @@ def _reference(root, prompt, segments, canvases, slots, features=None):
     """
     model = load_diffusion_gemma(root)
     config = model.text.cache_config
-    tables = len(plan_units(config, block_size=PAGE).tables)
-    cache = PrefixCache(
-        config, num_units=tables * PAGES, block_size=PAGE, device="cpu"
+    planes = plan_units(config, block_size=PAGE)
+    tables = len(planes.tables)
+    cache = KVCache(
+        config,
+        planes,
+        num_units=tables * PAGES,
+        device="cpu",
     )
     context = ExecutionContext(model, cache=cache, attention="torch")
     values, prompt_values = [], []
@@ -399,7 +401,7 @@ def test_canvas_rows_read_candidates_over_the_cached_prompt(tmp_path):
     torch.testing.assert_close(
         torch.logsumexp(whole, dim=0), torch.tensor(0.0), atol=1e-5, rtol=0
     )
-    assert (record.position, record.kv_visible_len) == (13, 13)
+    assert record.kv_visible_len == 13
     assert record.kv_computed_len == 13
 
 
@@ -486,9 +488,7 @@ def test_image_context_preserves_readout_and_next_token(
                     call_id=CallId(1, 0),
                     coordinates=CallCoordinates(0, 0, 0),
                     kind=MediaCall.VISION_ENCODING,
-                    bounds=Bounds(
-                        max_tokens=soft, max_latent_bytes=feature.max_bytes
-                    ),
+                    bounds=Bounds(max_tokens=soft),
                     input_image=image,
                     encoder_output=feature,
                 ),
@@ -538,7 +538,6 @@ def test_image_context_preserves_readout_and_next_token(
         )
         written = _completion(_run(worker, context))
         assert written.kv_visible_len == length
-        assert written.position == length
         record = _completion(_run(worker, _readout(3, length, canvases, slots)))
         _run(worker, Batch(batch_id=4, commands=(Finish(REQUEST),)))
 
@@ -602,7 +601,7 @@ def _encode(batch, image, soft):
         batch,
         MediaCall.VISION_ENCODING,
         4,
-        bounds=Bounds(max_tokens=soft, max_latent_bytes=feature.max_bytes),
+        bounds=Bounds(max_tokens=soft),
         input_image=image,
         encoder_output=feature,
     )
@@ -717,5 +716,5 @@ def test_an_undecodable_image_fails_its_encode_with_the_reason(
         (record,) = _run(worker, _encode(2, payload, soft=70)).completions
 
     assert record.status is CallStatus.ERROR
-    assert record.error_code is ErrorCode.INVALID_CALL
+    assert record.error_code is ErrorCode.INVALID_DESCRIPTOR
     assert "inline image payload is not a valid encoded image" in caplog.text

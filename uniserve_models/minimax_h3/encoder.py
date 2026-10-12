@@ -10,21 +10,10 @@ from torch import nn
 
 from uniserve_models import qwen3, qwen3_vl
 
-# The Qwen3-VL-32B vision tower of the H3 text encoder checkpoint.
-_VISION = qwen3_vl.VisionConfig(
-    depth=27,
-    hidden_size=1_152,
-    intermediate_size=4_304,
-    num_heads=16,
-    hidden_act="gelu_pytorch_tanh",
-    in_channels=3,
-    patch_size=16,
-    temporal_patch_size=2,
-    spatial_merge_size=2,
-    out_hidden_size=5_120,
-    num_position_embeddings=2_304,
-    deepstack_visual_indexes=(8, 16, 24),
-)
+# H3 conditions on the hidden state after the first 50 of the text encoder
+# checkpoint's 64 decoder layers; the checkpoint's configuration does not
+# state it.
+RETAINED_LAYERS = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,31 +21,28 @@ class TextEncoderConfig:
     """Define the H3 text encoder's vocabulary and tensor dimensions.
 
     ``num_checkpoint_layers`` is the checkpoint's decoder depth; the encoder
-    runs only the first ``num_retained_layers`` of them. ``read_config``
-    fills the language fields, ``mrope_sections`` (the interleaved M-RoPE
-    widths of the temporal, height and width axes), the image and video
-    placeholder tokens and ``vision`` (the vision tower) from the
-    checkpoint's text encoder config, while ``num_retained_layers`` and
-    ``pixels`` (its processor's pixel normalization) keep their defaults.
-    The defaults are the H3 checkpoint's Qwen3-VL-32B values.
+    runs only the first ``num_retained_layers`` of them. ``mrope_sections``
+    are the interleaved M-RoPE widths of the temporal, height and width
+    axes, ``vision`` is the vision tower and ``pixels`` the pixel
+    normalization of the checkpoint's processor.
     """
 
-    vocab_size: int = 151_936
-    hidden_size: int = 5_120
-    intermediate_size: int = 25_600
-    num_checkpoint_layers: int = 64
-    num_retained_layers: int = 50
-    num_attention_heads: int = 64
-    num_key_value_heads: int = 8
-    head_dim: int = 128
-    rope_theta: float = 5_000_000.0
-    rms_norm_eps: float = 1e-6
-    max_position_embeddings: int = 262_144
-    mrope_sections: tuple[int, ...] = (24, 20, 20)
-    image_token_id: int = 151_655
-    video_token_id: int = 151_656
-    vision: qwen3_vl.VisionConfig = _VISION
-    pixels: qwen3_vl.PixelConfig = qwen3_vl.PixelConfig()
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_checkpoint_layers: int
+    num_retained_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    rope_theta: float
+    rms_norm_eps: float
+    max_position_embeddings: int
+    mrope_sections: tuple[int, ...]
+    image_token_id: int
+    video_token_id: int
+    vision: qwen3_vl.VisionConfig
+    pixels: qwen3_vl.PixelConfig
 
     def __post_init__(self) -> None:
         for name in (

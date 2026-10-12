@@ -35,9 +35,7 @@ def test_segment_attention_matches_its_dense_equations():
         dtype=torch.bfloat16,
     )
     q, k, v, gate = projected.unbind(2)
-    module = vsa.SegmentAttention(
-        vsa.BlockAttention(128**-0.5, tile_size=SEGMENT_TILE)
-    )
+    module = vsa.SegmentAttention(vsa.BlockAttention(128**-0.5))
     segments = vsa.Segments(SEGMENT_TILE, q.shape[0], *segment_tables(q.device))
 
     with ExecutionContext(module) as context:

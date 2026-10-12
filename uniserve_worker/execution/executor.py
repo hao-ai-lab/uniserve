@@ -42,8 +42,8 @@ import torch
 
 from uniserve.runtime.resources import close_resources
 from uniserve_worker.errors import (
+    ErrorCode,
     WorkerError,
-    WorkerErrorCode,
     classify,
     invalid_descriptor,
     resource_error,
@@ -113,7 +113,7 @@ class Executor:
 
     def __init__(self, worker: Worker) -> None:
         self.worker = worker
-        self.queue_depth = int(worker.info.queue_depth)
+        self.queue_depth = worker.queue_depth
         self._last_batch_id = -1
         self._last_collective_seq = -1
         # Accepted batches by id. Insertion order is submission order, which
@@ -436,7 +436,7 @@ class Executor:
             self.release_buffers(freed)
 
     def advance(self) -> bool:
-        """Progress dependencies, computation and physical retirement.
+        """Progress dependencies, call and physical retirement.
 
         Returns whether any batch made progress.
         """
@@ -455,7 +455,7 @@ class Executor:
         return advanced
 
     def poll(self, submission: Submission) -> BatchOutput | None:
-        """Consume the batch's result without launching computation.
+        """Consume the batch's result without launching call.
 
         Returns None while the batch is not ready. Otherwise the batch is
         released and its output returned, or its recorded error raised. A
@@ -493,7 +493,7 @@ class Executor:
         begins (``_retire_commands``).
         """
         batch = state.batch
-        # Cooperative ranks launch computation in increasing
+        # Cooperative ranks launch call in increasing
         # ``collective_seq``; preparation and host completion may overlap.
         if self.worker.worker_config.world_size > 1 and batch.calls:
             if batch.collective_seq <= self._last_collective_seq:
@@ -502,7 +502,7 @@ class Executor:
                 # batch would leave them waiting for a participant that never
                 # arrives. The rank cannot serve further collective work.
                 raise WorkerError(
-                    code=WorkerErrorCode.INVARIANT_VIOLATION,
+                    code=ErrorCode.INVARIANT_VIOLATION,
                     message=(
                         f"collective sequence does not advance: batch "
                         f"{batch.batch_id} carries {batch.collective_seq} "
@@ -515,7 +515,7 @@ class Executor:
         # A batch with calls is one numerical step of the worker: the profiler's
         # capture window counts these steps, and the step name becomes the NVTX
         # range that Nsight shows for the batch. Lifecycle-only batches carry no
-        # computation and are not counted.
+        # call and are not counted.
         step: AbstractContextManager[None]
         if self.worker.profiler is not None and batch.calls:
             first = batch.calls[0]
@@ -532,14 +532,13 @@ class Executor:
                 kv_cache=self.worker.kv_cache,
                 host_tasks=self.worker.host_tasks,
                 tensor_store=self.worker.tensor_store,
-                worker_info=self.worker.info,
                 latent_pool=self.worker.latent_pool,
                 media_mux=self.worker.media_mux,
                 output_pool=self.worker.output_pool,
                 publication_transports=self.worker.publication_transports,
                 request_tables=self.worker.block_tables,
                 request_pool=self.worker.requests,
-                model_runner=self.worker.runner,
+                model_executor=self.worker.runner,
                 decode_state=self.worker.decode_state,
                 sampling_group=self.worker.sampling_group,
                 tokenizer=self.worker.tokenizer,
@@ -583,7 +582,7 @@ class Executor:
         unsupported = {
             call.kind.value
             for call in batch.calls
-            if not self.worker.supports_computation(call.kind)
+            if not self.worker.supports_call(call.kind)
         }
         if unsupported:
             raise invalid_descriptor(
@@ -625,8 +624,7 @@ class Executor:
         state.predecessors = self.worker.requests.predecessors(batch.calls)
         validate_batch(
             batch,
-            worker_info=self.worker.info,
-            model_runner=self.worker.runner,
+            model_executor=self.worker.runner,
             config=self.worker.worker_config,
             predecessors=state.predecessors,
         )
@@ -674,7 +672,7 @@ class Executor:
             state,
             host_tasks=self.worker.host_tasks,
             request_pool=self.worker.requests,
-            model_runner=self.worker.runner,
+            model_executor=self.worker.runner,
         )
         self.advance_inputs(state)
 
@@ -712,7 +710,7 @@ class Executor:
                 output_pool=self.worker.output_pool,
                 request_tables=self.worker.block_tables,
                 request_pool=self.worker.requests,
-                model_runner=self.worker.runner,
+                model_executor=self.worker.runner,
                 transfer_backends=self.worker.transports,
                 config=self.worker.worker_config,
             )

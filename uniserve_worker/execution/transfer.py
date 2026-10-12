@@ -67,7 +67,7 @@ def execute(
     latent_pool: LatentPool | None,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> PendingOutput:
     """Execute one transfer call and stage its outcome.
 
@@ -180,7 +180,7 @@ def execute(
             value, metadata = fetch_product(
                 call,
                 tensor_store=tensor_store,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
             tensor_publication = publish_product(
@@ -210,9 +210,9 @@ def _publish_current_latent(
 ) -> TensorPublication:
     """Publish the committed trajectory's current latent pages as a product.
 
-    ``LatentPool.reserve_current_publication`` requires the staged start
-    step, the input's generation, units, raster and pages to match the
-    slot's committed trajectory. The product must be the call's declared
+    ``LatentPool.reserve_current_publication`` requires the input's
+    generation, units, raster and pages to match the slot's committed
+    trajectory. The product must be the call's declared
     latent output, and publication leaves the request's generation and step
     unchanged.
     """
@@ -227,12 +227,13 @@ def _publish_current_latent(
     if params is None or staging is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
+    step = latent_pool.committed_step_index(row.request.request_pool_idx)
     source = latent_pool.reserve_current_publication(
         product,
         request_pool_idx=row.request.request_pool_idx,
         page_table=params.page_table,
         generation=reference.generation,
-        step=params.start_step,
+        step_index=step,
         latent_units=params.latent_units,
         height=params.height,
         width=params.width,
@@ -242,7 +243,7 @@ def _publish_current_latent(
         product,
         source,
         row,
-        step=params.start_step,
+        step_index=step,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
         state=state,
@@ -255,7 +256,7 @@ def publish_latent_source(
     row: PendingOutput,
     *,
     state: BatchState,
-    step: int,
+    step_index: int,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
@@ -306,7 +307,7 @@ def publish_latent_source(
         height=params.height,
         width=params.width,
         latent_units=params.latent_units,
-        step=step,
+        step_index=step_index,
         tensor=TensorTransfer(shape=shape, locations=locations),
     )
     return TensorPublication(product=product, value=descriptor)
@@ -614,7 +615,7 @@ def fetch_product(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> tuple[torch.Tensor, ImageMetadata | FeatureMetadata | None]:
     """Consume the call's single resident source with its metadata.
 
@@ -635,7 +636,7 @@ def fetch_product(
         read = tensor_store.consume(
             features[0],
             consumer_call_id=call.call_id,
-            device=model_runner.call_devices(call)[0],
+            device=model_executor.call_devices(call)[0],
         )
         request.feature_reads.append(read)
         metadata = read.metadata
@@ -657,7 +658,7 @@ def fetch_product(
     device_read = tensor_store.consume(
         references[0],
         consumer_call_id=call.call_id,
-        device=model_runner.call_devices(call)[0],
+        device=model_executor.call_devices(call)[0],
     )
     request.device_reads.append(device_read)
     return device_read.tensor, device_read.metadata

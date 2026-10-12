@@ -2,9 +2,9 @@
 
 Each case reads the media of a recorded diffusers reference run through the
 media reader's ``read_conditions``, from shared memory, with the descriptors
-the planner derives from the media's probed facts
-(``processing.plan_request``). The reader's operations are the reference
-conditioning's own, in its order, so every product is compared bit for bit:
+the reference's sizes give (``tests/python/fixtures/h3_conditions.py``). The
+reader's operations are the reference conditioning's own, in its order, so
+every product is compared bit for bit:
 
 - the conditioner's patch rows with the recorded processor output
   (``qwen_pixel_values`` and ``qwen_pixel_values_videos``): the same decode,
@@ -44,14 +44,14 @@ import torch
 from safetensors.torch import load_file
 
 from tests.python.fixtures.h3_conditions import (
-    FPS,
     SAMPLE_RATE,
     published,
     read,
     recorded_request,
     vision_encoder,
 )
-from uniserve_models.minimax_h3 import processing
+from uniserve.media import image
+from uniserve_models.minimax_h3.packing import FPS
 from uniserve_worker.media.reader import read_image
 from uniserve_worker.protocol.video import ImageFit
 
@@ -60,6 +60,11 @@ pytestmark = [
     pytest.mark.model("minimax_h3"),
     pytest.mark.slow,
 ]
+
+
+def _nearest_multiple(value: float) -> int:
+    """Round a side to the nearest multiple of 32, half to even."""
+    return max(32, round(value / 32) * 32)
 
 
 @pytest.fixture(scope="module")
@@ -103,9 +108,7 @@ def test_conditions_read_as_the_reference_conditioning(case, root, ffmpeg):
     from diffusers.utils import load_image
 
     with published() as publish:
-        run, plan, paths, conditions = recorded_request(
-            root, case, ffmpeg, publish
-        )
+        run, request, paths, conditions = recorded_request(root, case, publish)
         pixels, samples, patches = read(conditions, vision_encoder(), ffmpeg)
 
     # The conditioner's rows, split by modality as the processor batches
@@ -152,7 +155,7 @@ def test_conditions_read_as_the_reference_conditioning(case, root, ffmpeg):
             continue
         waveform, rate = references._decode_audio_file(path)
         expected = MiniMaxH3Ref2VASetupStep._normalize_audio_condition(
-            waveform, rate, SAMPLE_RATE, max_duration=plan.num_frames / FPS
+            waveform, rate, SAMPLE_RATE, max_duration=request.num_frames / FPS
         )
         count = condition.audio.samples
         assert torch.equal(samples[offset : offset + count], expected.T)
@@ -184,10 +187,13 @@ def test_image_references_resize_as_pillow(name, enlarge, root):
     decoded = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
     decoded = decoded.convert("RGB")
     # Every image here is smaller than its 2048 short edge: it keeps its
-    # own size on the 32-pixel grid, or is enlarged as the reference
-    # pipeline enlarges it.
-    raster = processing.reference_image_size(
-        *decoded.size, processing.ReferenceConfig(enlarge=enlarge)
+    # own size on the 32-pixel grid, or is enlarged to that edge as the
+    # reference pipeline enlarges it.
+    width, height = decoded.size
+    scale = 2048 / min(width, height) if enlarge else 1.0
+    raster = image.Config(
+        height=_nearest_multiple(height * scale),
+        width=_nearest_multiple(width * scale),
     )
     fit = ImageFit(resized=raster, left=0, top=0, size=raster)
 

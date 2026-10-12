@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use tower::ServiceExt as _;
-use uniserve_core::{ModelDtype, RuntimeFamily};
+use uniserve_core::ModelDtype;
 use uniserve_engine::{EngineConfig, SimEngine, SimExecutor};
 
 use crate::AppState;
@@ -24,8 +24,8 @@ use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
-use crate::serving::video::plan::VisionConfig;
-use crate::serving::{InputProcessor, ServedSamplingControl, ServingRuntime, WorkerCapabilities};
+use crate::serving::video::plan::ProcessorConfig;
+use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime, WorkerCapabilities};
 
 /// Served model name the simulated state answers to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
@@ -42,7 +42,8 @@ pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
 /// The tokenizer is `serving::test_support::configured_tokenizer`, whose
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
 /// renders only the first message's content. A MiniMax H3 model runs four
-/// denoising steps on a diffusion runtime, as a video deployment does, and a
+/// denoising steps on a diffusion runtime with a 15-second duration capacity,
+/// as a default video deployment does, and a
 /// DiffusionGemma model runs readouts on its own runtime family and generation
 /// limits, as `build_state` starts it.
 pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
@@ -50,45 +51,36 @@ pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
         served_name: SERVED_MODEL.to_string(),
         parameters,
         sampling_defaults: SamplingDefaults::default(),
-        max_model_tokens: Some(4096),
+        max_model_len: 4096,
         primary_eos_token_id: Some(2),
         eos_token_ids: BTreeSet::from([2]),
     };
     let mut config = EngineConfig::sim(SERVED_MODEL);
-    match model.parameters {
-        ModelParameters::MiniMaxH3 { .. } => config.runtime_family = RuntimeFamily::Diffusion,
-        ModelParameters::DiffusionGemma(_) => {
-            config.runtime_family = model.runtime_family();
-            config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
-        }
-        _ => {}
+    if let ModelParameters::DiffusionGemma(_) = model.parameters {
+        config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
     }
     let client = Arc::new(
         EngineClient::connect_with_executor(config, Box::new(SimExecutor::new(SimEngine::new())))
             .unwrap(),
     );
-    let renderer = HfChatRenderer::new(
-        Some("{{ messages[0].content }}".to_string()),
-        HashMap::new(),
-        ChatTemplateContentFormatOption::String,
-    )
-    .unwrap();
-    let video = match &model.parameters {
-        ModelParameters::MiniMaxH3 { max_video_seconds } => {
-            Some(sim_video_service(*max_video_seconds))
-        }
-        _ => None,
+    let renderer = match &model.parameters {
+        ModelParameters::MiniMaxH3 => RequestRenderer::Video(sim_video_service(15.0)),
+        _ => RequestRenderer::Chat(
+            HfChatRenderer::new(
+                Some("{{ messages[0].content }}".to_string()),
+                HashMap::new(),
+                ChatTemplateContentFormatOption::String,
+            )
+            .unwrap(),
+        ),
     };
     let processor = InputProcessor::new(
         model,
         configured_tokenizer(),
-        Some(renderer),
+        renderer,
         WorkerCapabilities {
             limits: client.generation_limits(),
-            sampling_controls: ServedSamplingControl::ALL.to_vec(),
-            max_model_tokens: 4096,
         },
-        video,
         false,
     )
     .unwrap();
@@ -97,9 +89,9 @@ pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
     ServingRuntime::new(processor, client, images, false)
 }
 
-/// The video service of a four-step text-to-video denoiser that generates
-/// every canvas of the canvas rule, with the released checkpoint's vision
-/// processor geometry and the default media policy.
+/// The video service of a four-step text-to-video denoiser that prepared the
+/// named aspect ratios' canvases of the canvas rule, with the released
+/// checkpoint's vision processor geometry and the default media policy.
 pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
     VideoService::new(
         uniserve_engine::VideoDenoiserInfo {
@@ -107,9 +99,35 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             schedule_points: 5,
             video_shift: 12.0,
             audio_shift: 3.0,
-            canvases: Vec::new(),
+            frame_rate: 24,
+            audio_sample_rate: 32_000,
+            frames: uniserve_engine::FrameClips {
+                min_frames: 22,
+                clip_frames: 17,
+                clip_latent_frames: 5,
+                tail_latent_frames: 2,
+            },
+            canvases: [
+                ("21:9", 1536, 672),
+                ("16:9", 1344, 768),
+                ("4:3", 1024, 768),
+                ("1:1", 768, 768),
+                ("3:4", 768, 1024),
+                ("9:16", 768, 1344),
+            ]
+            .into_iter()
+            .map(
+                |(aspect_ratio, width, height)| uniserve_engine::ServedCanvas {
+                    short_edge: 768,
+                    aspect_ratio: aspect_ratio.to_owned(),
+                    canvas: uniserve_core::Canvas { width, height },
+                },
+            )
+            .collect(),
+            // A text-to-video denoiser takes no references.
+            references: Default::default(),
         },
-        VisionConfig {
+        ProcessorConfig {
             patch_size: 16,
             temporal_patch_size: 2,
             merge_size: 2,

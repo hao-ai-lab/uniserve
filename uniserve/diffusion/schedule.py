@@ -3,10 +3,10 @@
 A ``Grid`` declares where one modality's trajectory evaluates the network:
 the points of a checkpoint's trained or released grid, or the step count a
 request chooses, and the shift that maps them to noise levels.
-``Grid.schedule`` materializes the declaration, with the request parameters
-it admits, as the ``Schedule`` endpoints a trajectory steps through. Each
-grid is evaluated on the host by fixed precision rules, so a schedule does
-not depend on the device that holds it.
+``schedule`` materializes the declaration, with the request parameters a
+``LinearGrid`` admits, as the ``Schedule`` endpoints a trajectory steps
+through. Each grid is evaluated on the host by fixed precision rules, so a
+schedule does not depend on the device that holds it.
 """
 
 import math
@@ -81,31 +81,15 @@ class Schedule:
 class Grid(ABC):
     """Where one modality's trajectory evaluates the network.
 
-    A denoiser declares one grid per modality. A request may choose the
-    step count, the shift, both or neither, as the grid admits;
-    ``schedule`` validates those choices and builds the endpoints.
+    A denoiser declares one grid per modality. A ``FixedGrid`` is the
+    checkpoint's own; a ``LinearGrid`` leaves the step count and the shift
+    to each request.
     """
 
     @property
     @abstractmethod
     def num_steps(self) -> int | None:
         """Network evaluations of the grid, None when requests choose them."""
-
-    @abstractmethod
-    def schedule(
-        self,
-        *,
-        steps: int | None = None,
-        shift: float | None = None,
-        device: torch.device | str,
-    ) -> Schedule:
-        """Build the schedule of a request's ``steps`` and ``shift``.
-
-        None leaves a parameter to the grid.
-
-        Raises:
-            ValueError: The grid does not admit the requested parameters.
-        """
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +121,21 @@ class LinearGrid(Grid):
     def num_steps(self) -> None:
         return None
 
-    def schedule(self, *, steps=None, shift=None, device) -> Schedule:
+    def schedule(
+        self,
+        *,
+        steps: int,
+        shift: float | None = None,
+        device: torch.device | str,
+    ) -> Schedule:
+        """Build the schedule of a request's ``steps`` and ``shift``.
+
+        None leaves the shift to the grid.
+
+        Raises:
+            ValueError: ``steps`` is not positive or the shift is not finite
+                and positive.
+        """
         if type(steps) is not int or steps < 1:
             raise ValueError("a linear grid needs a positive step count")
         shift = self.shift if shift is None else shift
@@ -174,8 +172,7 @@ class LinearGrid(Grid):
 class FixedGrid(Grid):
     """A checkpoint's own grid, which requests cannot change.
 
-    A request may restate the step count but not choose another, and may
-    not choose a shift; ``shift`` is the trained one.
+    The grid fixes the step count and ``shift`` is the trained one.
     """
 
     shift: float
@@ -184,16 +181,8 @@ class FixedGrid(Grid):
     @abstractmethod
     def num_steps(self) -> int: ...
 
-    def schedule(self, *, steps=None, shift=None, device) -> Schedule:
-        if shift is not None or steps not in (None, self.num_steps):
-            raise ValueError(
-                f"the checkpoint's grid evaluates the network {self.num_steps} "
-                "times at its trained shift"
-            )
-        return self.endpoints(device)
-
     @abstractmethod
-    def endpoints(self, device: torch.device | str) -> Schedule:
+    def schedule(self, device: torch.device | str) -> Schedule:
         """Build the grid's schedule on ``device``."""
 
 
@@ -221,7 +210,7 @@ class UniformGrid(FixedGrid):
     def num_steps(self) -> int:
         return self._sigmas().numel() - 1
 
-    def endpoints(self, device) -> Schedule:
+    def schedule(self, device) -> Schedule:
         sigmas = self._sigmas()
         timesteps = 1.0 - sigmas
         return Schedule(
@@ -239,28 +228,30 @@ class UniformGrid(FixedGrid):
 
 @dataclass(frozen=True, slots=True)
 class RungGrid(FixedGrid):
-    """A distilled student's trained rungs (a DMD ladder).
+    """A distilled student's trained rungs.
 
-    Each rung is an unshifted noise level on a ``clock``-step training
-    clock, strictly decreasing; divided by ``clock`` it gives ``u`` in
-    (0, 1], which ``shift`` warps once in double precision. The clean
-    endpoint follows the last rung, and sigma is then materialized in FP32;
-    network times are ``1 - sigma`` formed in FP32, while the analytical
-    coordinates keep the unrounded ``1 - sigma``.
+    Each rung is an unshifted noise level on a ``num_train_timesteps``-step
+    training schedule, strictly decreasing; divided by
+    ``num_train_timesteps`` it gives ``u`` in (0, 1], which ``shift`` warps
+    once in double precision. The clean endpoint follows the last rung, and
+    sigma is then materialized in FP32; network times are ``1 - sigma``
+    formed in FP32, while the analytical coordinates keep the unrounded
+    ``1 - sigma``.
     """
 
     rungs: tuple[int, ...]
     shift: float
-    clock: float
+    num_train_timesteps: float
 
     def __post_init__(self):
-        if not _is_positive(self.clock):
-            raise ValueError("a training clock must be finite and positive")
+        if not _is_positive(self.num_train_timesteps):
+            raise ValueError("num_train_timesteps must be finite and positive")
         if (
             not isinstance(self.rungs, tuple)
             or not self.rungs
             or any(
-                type(rung) is not int or not 0 < rung <= self.clock
+                type(rung) is not int
+                or not 0 < rung <= self.num_train_timesteps
                 for rung in self.rungs
             )
             or any(
@@ -268,8 +259,8 @@ class RungGrid(FixedGrid):
             )
         ):
             raise ValueError(
-                "rungs must be strictly decreasing integers within the "
-                "training clock"
+                "rungs must be strictly decreasing integers within "
+                "num_train_timesteps"
             )
         _require_shift(self.shift)
 
@@ -277,9 +268,10 @@ class RungGrid(FixedGrid):
     def num_steps(self) -> int:
         return len(self.rungs)
 
-    def endpoints(self, device) -> Schedule:
+    def schedule(self, device) -> Schedule:
         sigmas = tuple(
-            _shifted(rung / self.clock, self.shift) for rung in (*self.rungs, 0)
+            _shifted(rung / self.num_train_timesteps, self.shift)
+            for rung in (*self.rungs, 0)
         )
         sigma = torch.tensor(sigmas, dtype=torch.float32, device=device)
         return Schedule(
@@ -289,7 +281,7 @@ class RungGrid(FixedGrid):
 
 @dataclass(frozen=True, slots=True)
 class BlockGrid(FixedGrid):
-    """A fine base-clock grid partitioned into evaluation blocks.
+    """A fine grid over ``[0, max_t]`` partitioned into evaluation blocks.
 
     A parallel-decoding (PDD) student predicts one head per fine interval of
     ``linspace(max_t, 0, intervals + 1)``, an FP64 grid clamped to
@@ -366,7 +358,7 @@ class BlockGrid(FixedGrid):
         weights = self.weights[self.nodes[block] : self.nodes[block + 1]]
         return weights / weights.sum()
 
-    def endpoints(self, device) -> Schedule:
+    def schedule(self, device) -> Schedule:
         nodes = self._fine()[
             torch.tensor(self.nodes, dtype=torch.long, device="cpu")
         ]

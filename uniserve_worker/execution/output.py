@@ -10,7 +10,7 @@ speculative verification coordinates (`TokenResult`), latent trajectory updates
 
 After the batch commits, `uniserve_worker.execution.commit` drops the
 borrowed device references with `release_execution_references`. The executor
-polls `ready`, calls `materialize` once to resolve the wire `RequestOutput`,
+polls `ready`, calls `materialize` once to resolve the wire `CallOutput`,
 and passes `request_result` to `RequestPool.apply_result`. A discarded batch
 calls `abandon` instead. No method here installs request progress itself.
 """
@@ -27,6 +27,7 @@ from typing import Final
 import torch
 
 from uniserve.runtime.resources import close_resources
+from uniserve_worker.errors import ErrorCode
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.request import (
     RequestPool,
@@ -36,13 +37,18 @@ from uniserve_worker.execution.request import (
 )
 from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.protocol.batch import LatentParams, TensorPublication
-from uniserve_worker.protocol.call import Call, CallKind, CallStatus, ErrorCode
+from uniserve_worker.protocol.call import (
+    Call,
+    CallKind,
+    CallStatus,
+    MediaCall,
+)
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.output import (
+    CallOutput,
     FinishFlags,
     MediaOutput,
     PosixShmArtifact,
-    RequestOutput,
     TimingCounters,
 )
 from uniserve_worker.protocol.transfer import KvTransfer, Locator
@@ -70,9 +76,9 @@ _SAMPLING_FIELDS_PER_CALL: Final[int] = 4
 
 
 # Control-flow signals raised by `sampled_tokens`; `PendingOutput.materialize`
-# maps an invalid distribution to `ErrorCode.INVALID_CALL` and a predicated
-# call to `CallStatus.PREDICATED`. Their names describe the condition instead
-# of ending in "Error".
+# maps an invalid distribution to `ErrorCode.INVALID_DESCRIPTOR` and a
+# predicated call to `CallStatus.PREDICATED`. Their names describe the
+# condition instead of ending in "Error".
 class _InvalidSamplingDistribution(RuntimeError):  # noqa: N818
     """Marks a sampling row whose filtered probability mass is unusable."""
 
@@ -101,16 +107,10 @@ def capture_logprobs(
     """
     if details is None:
         return {}
-    packed, rows, counts, requested_ids, max_count, max_requested = details
+    packed, rows, counts, max_count = details
     capture = output.capture(packed)
     key = capture
-    output.logprob_layouts[key] = (
-        rows,
-        counts,
-        requested_ids,
-        max_count,
-        max_requested,
-    )
+    output.logprob_layouts[key] = (rows, counts, max_count)
     return {index: (*key, index) for index in rows}
 
 
@@ -216,35 +216,17 @@ def sampled_tokens(record: PendingOutput) -> tuple[int, ...]:
     return (*draft[:accepted], token)
 
 
-def logprob_entries(record: PendingOutput, span: tuple[int, int, int]) -> int:
-    """Return the number of score entries one logprob row can report.
-
-    The count is the sampled entry plus the row's top-k count plus its
-    explicitly requested token ids. `uniserve_worker.execution.commit` uses it
-    to bound the logprob payload against `max_completion_bytes`.
-    """
-    if record._buffer is None:
-        raise RuntimeError("logprob output lost its pinned range")
-    offset, count, index = span
-    rows, counts, requested_ids, _max_count, _max_requested = (
-        record._buffer.logprob_layouts[(offset, count)]
-    )
-    local = rows.index(index)
-    return 1 + counts[local] + len(requested_ids[local])
-
-
 def create_outputs(
     requests: RequestPool,
     calls: Sequence[Call],
-    request_pool_indices: Sequence[int],
     buffer: OutputBuffer,
 ) -> tuple[PendingOutput, ...]:
     """Bind output rows to validated, admitted requests for one batch.
 
-    Row `i` of `buffer` belongs to `calls[i]`. Slot and identity validation is
+    Row `i` of `buffer` belongs to `calls[i]`. Request identity validation is
     done by `RequestPool.bind_calls`, whose errors propagate.
     """
-    bindings = requests.bind_calls(calls, request_pool_indices)
+    bindings = requests.bind_calls(calls)
     return tuple(
         PendingOutput(call, request, buffer, index)
         for index, (call, request) in enumerate(
@@ -356,7 +338,6 @@ class PendingOutput:
         self.progress: RequestProgress = RequestProgress(
             logical_position=call.coordinates.logical_position,
             rng_counter=request.rng_counter,
-            flow_step=call.coordinates.flow_step,
             kv_visible_len=call.coordinates.kv_visible_len,
             kv_computed_len=call.coordinates.kv_computed_len,
             prompt_logits_ready=request.prompt_logits_ready,
@@ -365,7 +346,6 @@ class PendingOutput:
 
         self.status = CallStatus.OK
         self.finish_flags = FinishFlags()
-        self.product_generations: tuple[int, ...] = ()
         self.error_code: ErrorCode | None = None
         # Why the worker refuses the request, with ErrorCode.INVALID_REQUEST.
         self.error_message: str | None = None
@@ -410,7 +390,7 @@ class PendingOutput:
         self._observed = False
 
         self._reports_output = True
-        self.value: RequestOutput | None = None
+        self.value: CallOutput | None = None
 
     def release_execution_references(self) -> None:
         """Drop borrowed device views once their stores own the lifetimes.
@@ -459,6 +439,18 @@ class PendingOutput:
     def kind(self) -> CallKind:
         return self.call.kind
 
+    def completed_steps(self, status: CallStatus) -> int:
+        """Return the denoising steps the trajectory completed with this call.
+
+        A successful denoising call reports the step its latent update
+        publishes; every other call reports zero, since only a denoising
+        result advances the engine's step progress.
+        """
+        denoising = self.call.kind is MediaCall.DENOISING
+        if status is not CallStatus.OK or not denoising:
+            return 0
+        return int(self.latent.update.step_index)
+
     def ready(self) -> bool:
         """Query host output readiness without changing request acceptance."""
         if self.value is not None:
@@ -470,7 +462,7 @@ class PendingOutput:
                 return False
         return True
 
-    def materialize(self) -> RequestOutput:
+    def materialize(self) -> CallOutput:
         """Resolve output fields once.
 
         A call that did not run keeps the request's committed coordinates, so
@@ -485,7 +477,7 @@ class PendingOutput:
         - An inactive sampled predicate (or a call already marked predicated)
           reports `CallStatus.PREDICATED` at the request's accepted progress.
         - An invalid sampling distribution reports `CallStatus.ERROR` with
-          `ErrorCode.INVALID_CALL`.
+          `ErrorCode.INVALID_DESCRIPTOR`.
 
         These suppressed outcomes report no tokens, scores, product
         generations, finish flags, or KV output; `media_output` is reported
@@ -501,8 +493,8 @@ class PendingOutput:
             RuntimeError: The output is not ready (which includes an
                 abandoned output), or a speculative sampling row disagrees
                 with its draft span or initialized KV extent. Errors from
-                `OutputBuffer.read_tokens`, `OutputBuffer.observe`, and
-                `RequestOutput.validate` also propagate.
+                `OutputBuffer.read_tokens` and `OutputBuffer.observe` also
+                propagate.
         """
         if self.value is not None:
             return self.value
@@ -574,7 +566,7 @@ class PendingOutput:
             except Exception:
                 logger.exception(
                     "completion materialization failed: request=%s "
-                    "call=%s computation=%s",
+                    "call=%s call=%s",
                     self.request_key,
                     self.call_id,
                     self.kind,
@@ -590,7 +582,7 @@ class PendingOutput:
                     suppressed = True
                 except _InvalidSamplingDistribution:
                     status = CallStatus.ERROR
-                    error_code = ErrorCode.INVALID_CALL
+                    error_code = ErrorCode.INVALID_DESCRIPTOR
                     suppressed = True
                 else:
                     if self.token.sampling_range is not None:
@@ -656,11 +648,10 @@ class PendingOutput:
             copy_us=self._completion_timing[2],
             host_us=self._completion_timing[3],
         )
-        concrete = RequestOutput(
+        concrete = CallOutput(
             request_key=self.request_key,
             call_id=self.call_id,
             status=status,
-            product_generations=() if suppressed else self.product_generations,
             error_code=error_code,
             # A materialization failure replaces a refusal's code, and with it
             # the refusal's reason.
@@ -668,17 +659,13 @@ class PendingOutput:
             if error_code is ErrorCode.INVALID_REQUEST
             else None,
             timing_counters=timing,
-            kind=self.kind,
-            position=0 if runtime is None else int(runtime.logical_position),
             kv_visible_len=0
             if runtime is None
             else int(runtime.kv_visible_len),
             kv_computed_len=0
             if runtime is None
             else int(runtime.kv_computed_len),
-            num_completed_steps=0
-            if runtime is None
-            else int(runtime.flow_step),
+            step_index=self.completed_steps(status),
             committed_tokens=tokens,
             sampled_logprob=None if scores is None else scores[0],
             top_logprobs=() if scores is None else scores[1],
@@ -705,7 +692,6 @@ class PendingOutput:
             else runtime
         )
 
-        concrete.validate()
         self.value = concrete
         self.host.tasks = ()
         return concrete

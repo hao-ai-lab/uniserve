@@ -15,29 +15,16 @@
 use super::*;
 use uniserve_worker_ipc::MediaCall;
 
-/// Algorithm inputs retained until their computation completes.
+/// Algorithm inputs retained until their call completes.
 pub(super) enum InflightInput {
     Generation {
         /// Physical KV start and exact token contribution, when known, from the
         /// submitted image-extension input. The call carries its capacity.
         image_kv: Option<(u32, Option<u32>)>,
-        /// The submitted latent interval; cancellation can stop accepted
-        /// progress while later submitted intervals still need validation.
-        latent: Option<LatentParams>,
     },
     Media {
-        latent: Option<LatentParams>,
         decode: Option<DecodeRange>,
     },
-}
-
-impl InflightInput {
-    /// Returns the latent interval a submitted call covers.
-    pub(super) const fn latent(&self) -> Option<&LatentParams> {
-        match self {
-            Self::Generation { latent, .. } | Self::Media { latent, .. } => latent.as_ref(),
-        }
-    }
 }
 
 /// Submitted call awaiting completion, queued per request in submission
@@ -49,7 +36,7 @@ pub(super) struct InflightCall {
 
 /// Completion held until earlier request calls are applied.
 pub(super) struct PendingCompletion {
-    pub(super) record: uniserve_worker_ipc::RequestOutput,
+    pub(super) record: uniserve_worker_ipc::CallOutput,
     /// Claimed media storage stays alive while its result waits or is discarded.
     pub(super) media: Option<Arc<SharedMedia>>,
     /// Engine-wide staging order (`Inflight::next_arrival`), used to order
@@ -157,7 +144,7 @@ impl Inflight {
                 prefill: batch
                     .requests
                     .iter()
-                    .any(|(call, _)| batch_kind(call.code) == BatchKind::Prefill),
+                    .any(|(call, _)| batch_kind(call.kind) == BatchKind::Prefill),
             },
         );
     }
@@ -194,7 +181,7 @@ impl Inflight {
             .iter()
             .filter(|(holder, _)| **holder != id)
             .flat_map(|(_, calls)| calls)
-            .any(|call| call.call.code == CallKind::Media(MediaCall::Denoising))
+            .any(|call| call.call.kind == CallKind::Media(MediaCall::Denoising))
     }
 
     /// Stateful calls retain request order. Pure media branches complete
@@ -232,7 +219,7 @@ impl Inflight {
                 }
                 if let Some(completion) = pending.get(&call.call_id) {
                     ready.push((
-                        completion_priority(call.code),
+                        completion_priority(call.kind),
                         completion.arrival_seq,
                         *id,
                         call.call_id,

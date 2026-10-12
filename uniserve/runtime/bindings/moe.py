@@ -152,8 +152,9 @@ class MoEBinding:
         projection's weight representation and resident row order (the
         physical order the provider placed; ``linear`` is logical order).
         An expert-parallel call site also names its expert group size, its
-        all-to-all exchange and the representation its hidden states travel
-        in. Empty until the call site is prepared.
+        exchange transport (``ExpertExchange.transport``) and the
+        representation its hidden states travel in. Empty until the call site
+        is prepared.
         """
         if self.provider is None:
             return []
@@ -174,11 +175,7 @@ class MoEBinding:
             if self.exchange is None
             else {
                 "expert_parallel": self.exchange.group.size,
-                "exchange": (
-                    "flashinfer_mnnvl_alltoall"
-                    if self.exchange.transport == "alltoall"
-                    else self.exchange.transport
-                ),
+                "exchange": self.exchange.transport,
                 # The representation hidden states travel in.
                 "payload": "nvfp4"
                 if isinstance(self.operator, moe_backend.NVFP4Operator)

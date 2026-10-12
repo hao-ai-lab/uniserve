@@ -8,10 +8,11 @@ use super::common::Normalizable;
 /// Configured OpenAI-compatible image-generation request for
 /// `/v1/images/generations`.
 ///
-/// Serde enforces the field set and types. The value checks (non-blank
-/// prompt, `n == 1`, served model name, positive `steps`, well-formed `size`)
-/// run in `InputProcessor::preprocess_image_request` when the request is
-/// lowered.
+/// Serde enforces the field set and types. The route generates exactly one
+/// image, so the request carries no image count. The value checks (non-blank
+/// prompt, served model name, well-formed `size`) run in
+/// `InputProcessor::preprocess_image_request` when the request is lowered,
+/// and the resolved image controls are checked by `ImageParams::validate`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct ImageGenerationRequest {
@@ -20,9 +21,6 @@ pub struct ImageGenerationRequest {
     /// Served model name; the served-model check is skipped when omitted.
     #[serde(default)]
     pub model: Option<String>,
-    /// Number of images to generate; lowering accepts only `1`.
-    #[serde(default = "default_image_count")]
-    pub n: u16,
     /// Output size as `WIDTHxHEIGHT` in pixels. When omitted, the profile's
     /// resolution policy chooses both dimensions.
     #[serde(default)]
@@ -54,11 +52,6 @@ pub struct ImageGenerationRequest {
 }
 
 impl Normalizable for ImageGenerationRequest {}
-
-/// Returns the default number of requested images.
-const fn default_image_count() -> u16 {
-    1
-}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 /// Completed OpenAI-compatible image-generation response.

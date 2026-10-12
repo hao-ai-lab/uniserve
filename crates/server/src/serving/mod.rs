@@ -1,7 +1,7 @@
 //! Model-aware admission, engine submission, and output streaming.
 //!
 //! Requests follow one ownership chain:
-//! `HTTP schema / text prompt -> InputProcessor -> GenerationRequest ->
+//! `HTTP schema -> InputProcessor -> GenerationRequest ->
 //! EngineClient::submit_generation -> RequestOutput stream`.
 //! Video requests follow the same chain with a `DiffusionRequest`,
 //! `EngineClient::submit_media`, and `assembly::assemble_media_event_stream`.
@@ -62,17 +62,15 @@ use thiserror::Error;
 use uniserve_core::EngineCoreOutput;
 
 pub use input::{
-    DecodeControls, ImageGenControls, ModalitySelection, ModelEventIdentity, OutputDetail,
-    OutputProcessorPolicy, PromptInput, ResponseOptions, SamplingConfig, StopConfig,
-    TextPromptRequest,
+    DecodeControls, ImageGenControls, ModalitySelection, OutputDetail, OutputProcessorPolicy,
+    PromptInput, ResponseOptions, SamplingConfig, StopConfig,
 };
 pub use media::ImageInput;
-pub(crate) use model::LoadedModel;
 pub use model::{
-    InputProcessor, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ModelSupport, ServedEndpoint,
-    ServedFeature, ServedModality, ServedSamplingControl, VIDEO_FPS, WorkerCapabilities,
-    validate_video_capacity, video_frame_count,
+    InputProcessor, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, RequestRenderer, WorkerCapabilities,
+    video_frame_count,
 };
+pub(crate) use model::{LoadedModel, LoadedRenderer};
 pub use preprocessing::chat_image_urls;
 
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock};
@@ -179,20 +177,9 @@ pub enum TokenizeError {
     /// The lowered request violates the canonical generation contract.
     #[error(transparent)]
     Generation(#[from] uniserve_core::GenerationRequestError),
-    /// Requested computation exceeds loaded model capacity.
-    #[error(transparent)]
-    Capacity(#[from] uniserve_core::GenerationResourceError),
     /// Multimodal request controls or geometry are invalid.
     #[error(transparent)]
     Omni(#[from] crate::serving::omni::OmniError),
-    /// A requested log-probability count falls outside the accepted range.
-    #[error("{field} must be non-negative or -1, got {value}")]
-    InvalidLogprobCount {
-        /// Invalid request field.
-        field: &'static str,
-        /// Rejected field value.
-        value: i32,
-    },
     /// The minimum generation length exceeds the maximum generation length.
     #[error("min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})")]
     MinTokensExceedsMaximum {
@@ -201,9 +188,6 @@ pub enum TokenizeError {
         /// Effective maximum generated-token count.
         max_tokens: u32,
     },
-    /// The selected model path cannot report token log probabilities.
-    #[error("this model does not support logprobs")]
-    UnsupportedLogprobs,
     /// The request contains an invalid combination of serving controls.
     #[error("{0}")]
     Invalid(String),
@@ -235,14 +219,6 @@ pub enum OutputProcessingError {
 /// Runtime-local serving errors.
 #[derive(Debug, Error)]
 pub enum ServeError {
-    /// A request asks for more output candidates than the runtime supports.
-    #[error("request `{request_id}` asks for {requested} outputs; only one output is supported")]
-    UnsupportedOutputCount {
-        /// Identifier of the rejected request.
-        request_id: ServeRequestId,
-        /// Requested number of candidates.
-        requested: u32,
-    },
     /// A request requires a feature unavailable on the selected model path.
     #[error("request `{request_id}` requires unsupported feature `{feature}`")]
     UnsupportedFeature {
@@ -272,18 +248,6 @@ pub enum ServeError {
         /// Tokenized prompt length.
         prompt_tokens: usize,
         /// Maximum token count declared by the profile.
-        max_tokens: u32,
-    },
-    /// The request's full KV requirement exceeds runtime capacity.
-    #[error(
-        "request `{request_id}` requires {required_tokens} KV tokens, exceeding the {max_tokens}-token runtime limit"
-    )]
-    ContextCapacityExceeded {
-        /// Identifier of the rejected request.
-        request_id: ServeRequestId,
-        /// Total KV tokens required by the request.
-        required_tokens: u64,
-        /// Maximum KV tokens available to one request.
         max_tokens: u32,
     },
     /// Another live request already owns the same identifier.
@@ -338,19 +302,14 @@ fn malformed_output(
     }
 }
 
-/// Folds cache namespace/salt into a stable isolation key.
+/// Folds a request's cache salt into a stable isolation key.
 ///
-/// Returns `None` when both are absent, which leaves the request in the shared cache
-/// partition. Otherwise the key is a 64-bit FNV-1a hash (the same function as
-/// `model::stable_hash`) over length-prefixed material, so `("ab", "c")` and `("a", "bc")`
-/// hash different bytes. The hash is deterministic across processes.
-pub(crate) fn cache_isolation_key(namespace: Option<&str>, salt: Option<&str>) -> Option<u64> {
-    (namespace.is_some() || salt.is_some()).then(|| {
-        let namespace = namespace.unwrap_or_default();
-        let salt = salt.unwrap_or_default();
-        let material = format!("{}:{namespace}{}:{salt}", namespace.len(), salt.len());
-        material
-            .as_bytes()
+/// Returns `None` when the salt is absent, which leaves the request in the shared cache
+/// partition. Otherwise the key is the 64-bit FNV-1a hash of the salt, which is
+/// deterministic across processes.
+pub(crate) fn cache_isolation_key(salt: Option<&str>) -> Option<u64> {
+    salt.map(|salt| {
+        salt.as_bytes()
             .iter()
             .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -361,7 +320,7 @@ pub(crate) fn cache_isolation_key(namespace: Option<&str>, salt: Option<&str>) -
 /// Tokenized input retains only the response processing its computation needs.
 ///
 /// Media requests carry no `ResponseOptions`: their stream is assembled from the prompt
-/// length and the runtime's model identity.
+/// length alone.
 enum Prepared {
     Generation(Box<(uniserve_core::GenerationRequest, ResponseOptions)>),
     Diffusion(uniserve_core::DiffusionRequest),
@@ -451,16 +410,6 @@ impl ServingRuntime {
         snapshot
     }
 
-    /// Returns current lifecycle statistics for one request.
-    pub fn request_stats(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        self.engine.requests.stats(request_id)
-    }
-
-    /// Waits for one request to leave the active registry and returns its final snapshot.
-    pub async fn drain_request(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        self.engine.requests.drain_request(request_id).await
-    }
-
     /// Waits until every active request leaves the runtime.
     pub async fn drain(&self) {
         self.engine.requests.drain().await;
@@ -520,24 +469,6 @@ impl ServingRuntime {
         .await
     }
 
-    /// Runs a programmatic text prompt, including model-specific context images.
-    pub async fn generate_text(
-        &self,
-        request: TextPromptRequest,
-    ) -> crate::openai::Result<RequestOutputStream> {
-        let request_id = request.request_id.clone();
-        self.generate_with(
-            request_id.clone(),
-            blocking(request_id, move |model| {
-                model
-                    .preprocess_text_request(request)
-                    .map(Prepared::from)
-                    .map_err(crate::openai::serve_error_to_api)
-            }),
-        )
-        .await
-    }
-
     /// Prepares a video request (media processing included) within its request lifecycle and
     /// streams its output.
     ///
@@ -588,11 +519,9 @@ impl ServingRuntime {
         // image fetching and time spent queued for the blocking pool count toward
         // compilation.
         let compile_started = Instant::now();
-        let identity = self.model.event_identity();
 
-        let engine_request_id = self
-            .engine
-            .register_request(request_id.to_string(), Some(identity))
+        self.engine
+            .register_request(request_id.to_string(), true)
             .map_err(|error| {
                 self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
                 match error {
@@ -624,7 +553,7 @@ impl ServingRuntime {
             }
             tokenized = preprocess(Arc::clone(&self.model)) => tokenized,
         };
-        let mut tokenized = match tokenize_result {
+        let tokenized = match tokenize_result {
             Ok(tokenized) => tokenized,
             Err(error) => {
                 lifecycle.terminal(
@@ -639,12 +568,6 @@ impl ServingRuntime {
             .requests
             .mark_submitting(&request_id, compile_duration_us);
 
-        // Preprocessing fills a placeholder engine identifier. `EngineClient::submit_generation`
-        // and `submit_media` accept only the identifier reserved at registration.
-        match &mut tokenized {
-            Prepared::Generation(prepared) => prepared.0.request_id = engine_request_id,
-            Prepared::Diffusion(request) => request.request_id = engine_request_id,
-        }
         self.submit_and_stream(tokenized, compile_duration_us, lifecycle)
             .await
             .map_err(crate::openai::serve_error_to_api)
@@ -658,9 +581,9 @@ impl ServingRuntime {
     /// A submission failure with no pending control records `Failed` and returns the error.
     ///
     /// A control found after a successful submission reaches the engine by dropping the
-    /// unpolled output stream: its `EventRx` sends the engine a cancel at the acknowledged
-    /// prefix, which releases the engine request for a cancel and an abort alike, and then
-    /// releases the registry's engine side. The client's `Cancelled` or `Aborted` event comes
+    /// unpolled output stream: its `EventRx` sends the engine a cancel, which releases the
+    /// engine request for a cancel and an abort alike, and then releases the registry's
+    /// engine side. The client's `Cancelled` or `Aborted` event comes
     /// from the registry's recorded control, not from the engine.
     async fn submit_and_stream(
         &self,
@@ -677,7 +600,6 @@ impl ServingRuntime {
             Prepared::Generation(prepared) => {
                 let (request, response) = *prepared;
                 let ResponseOptions {
-                    request_id: _,
                     tokenizer,
                     prompt_token_ids,
                     decode,
@@ -685,9 +607,6 @@ impl ServingRuntime {
                     prompt_logprobs_requested,
                     generated_logprobs_requested,
                     output_processor,
-                    identity,
-                    cache,
-                    resources,
                 } = response;
                 let engine_stream = self
                     .engine
@@ -695,12 +614,8 @@ impl ServingRuntime {
                     .await;
 
                 let event_context = EventContext {
-                    served_name: identity.served_name.clone(),
-                    description: identity.description.clone(),
                     compile_duration_us,
                     started: lifecycle.started,
-                    cache,
-                    resources,
                     metrics: Arc::clone(&self.metrics),
                 };
 
@@ -735,12 +650,8 @@ impl ServingRuntime {
             Prepared::Diffusion(request) => {
                 let prompt_tokens = request.prompt_token_ids.len();
                 let context = EventContext {
-                    served_name: self.model.served_model_name().to_owned(),
-                    description: self.model.event_identity().description,
                     compile_duration_us,
                     started: lifecycle.started,
-                    cache: CacheAccounting::default(),
-                    resources: ResourceAccounting::default(),
                     metrics: Arc::clone(&self.metrics),
                 };
                 self.engine
@@ -760,8 +671,8 @@ impl ServingRuntime {
 
         // A control recorded before `claim_submission` was not forwarded to the engine (one
         // recorded after it was). Dropping the unpolled stream drops its `EventRx`, which
-        // delivers it as a cancel at the acknowledged prefix and releases the registry's
-        // engine side. A failed submission has no engine request to control.
+        // delivers it as a cancel and releases the registry's engine side. A failed
+        // submission has no engine request to control.
         if let Some(terminal) = self.engine.requests.control_terminal(&request_id) {
             if let Ok(stream) = stream_result {
                 drop(stream);
@@ -830,7 +741,7 @@ impl ServingRuntime {
         Box::pin(LifecycleTrackedStream::new(inner, lifecycle))
     }
 
-    /// Cancels a live request at its acknowledged output prefix.
+    /// Cancels a live request.
     pub async fn cancel(
         &self,
         request_id: impl Into<ServeRequestId>,
@@ -865,9 +776,9 @@ pub enum ServeControlError {
     Engine(#[from] crate::engine_client::Error),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-/// Observable lifecycle phase of one serving request.
-pub enum RequestLifecycleState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Lifecycle phase of one serving request, as `RequestRegistry` tracks it.
+pub(crate) enum RequestLifecycleState {
     /// The public request is being validated and tokenized.
     Compiling,
     /// The tokenized request is being submitted to the engine.
@@ -894,75 +805,11 @@ pub enum RequestLifecycleState {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Point-in-time lifecycle state, usage, and timing statistics for one request.
-///
-/// `RequestRegistry` maintains it from the public events it observes and retains it for a
-/// bounded number of completed requests.
-pub struct RequestStatsSnapshot {
-    /// Caller-visible request identifier.
-    pub request_id: ServeRequestId,
-    /// Model name used for the request.
-    pub served_name: String,
-    /// Stable model profile description.
-    pub description: String,
-    /// Latest observed lifecycle phase.
-    pub state: RequestLifecycleState,
-    /// Number of prompt tokens submitted to the engine.
-    pub prompt_tokens: u32,
-    /// Number of generated tokens included in user-visible output.
-    pub visible_output_tokens: u32,
-    /// Number of generated tokens consumed by internal protocol sections.
-    pub internal_tokens: u32,
-    /// Number of generated images.
-    pub image_count: u32,
-    /// Total image-generation steps completed.
-    pub image_steps: u32,
-    /// Cache policy and pin counts.
-    pub cache: CacheAccounting,
-    /// KV and media resources reserved for the request.
-    pub resources: ResourceAccounting,
-    /// Request phase durations.
-    pub timings: RuntimeTimings,
-}
-
-impl RequestStatsSnapshot {
-    /// Creates a zeroed snapshot for a request entering engine submission.
-    pub(crate) fn submitting(
-        request_id: ServeRequestId,
-        served_name: String,
-        description: String,
-        compile_us: u64,
-    ) -> Self {
-        Self {
-            request_id,
-            served_name,
-            description,
-            state: RequestLifecycleState::Submitting,
-            prompt_tokens: 0,
-            visible_output_tokens: 0,
-            internal_tokens: 0,
-            image_count: 0,
-            image_steps: 0,
-            cache: CacheAccounting::default(),
-            resources: ResourceAccounting::default(),
-            timings: RuntimeTimings {
-                compile_us,
-                ..RuntimeTimings::default()
-            },
-        }
-    }
-}
-
 /// Request-scoped metadata the assemblers stamp onto public events and usage.
 #[derive(Debug, Clone)]
 struct EventContext {
     started: Instant,
-    served_name: String,
-    description: String,
     compile_duration_us: u64,
-    cache: CacheAccounting,
-    resources: ResourceAccounting,
     // The assemblers increment `scheduled` when the engine reports scheduling.
     metrics: Arc<RuntimeLifecycleMetrics>,
 }
@@ -1301,32 +1148,6 @@ impl Drop for LifecycleGuard {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// Cache policy and encoder-cache pin count resolved for one request during preprocessing.
-pub struct CacheAccounting {
-    /// Whether the request may reuse existing cache entries.
-    pub read_enabled: bool,
-    /// Whether the request may publish reusable cache entries.
-    pub write_enabled: bool,
-    /// Number of encoder-cache entries pinned for the request lifetime.
-    pub encoder_pin_count: usize,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// KV, latent, and encoder-cache requirements computed for one request during preprocessing.
-/// Media requests report `ResourceAccounting::default()`.
-pub struct ResourceAccounting {
-    /// KV-token capacity required for the request.
-    pub expected_kv_tokens: u64,
-    /// Latent image units reserved for generation.
-    pub image_latent_units: u64,
-    /// Number of encoder-cache entries retained by the request.
-    pub encoder_cache_pins: usize,
-    /// For a generation request, false when generated images feed back into the request's
-    /// context (`GenerationRequest::feeds_back_images`).
-    pub replayable: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 /// Queue, execution, and end-to-end duration totals.
 pub struct RuntimeTimings {
     /// Request validation and tokenization duration in microseconds, including time queued
@@ -1355,10 +1176,6 @@ pub enum RequestOutput {
     Accepted {
         /// Caller-visible request identifier.
         request_id: ServeRequestId,
-        /// Model name used for the request.
-        served_name: String,
-        /// Stable model profile description.
-        description: String,
         /// Validation and tokenization duration in microseconds.
         compile_duration_us: u64,
         /// Number of prompt tokens submitted to the engine.
@@ -1378,10 +1195,6 @@ pub enum RequestOutput {
         /// Engine wall-clock time, in UNIX seconds, at which the scheduler admitted the
         /// request for execution.
         scheduled_at: Option<f64>,
-        /// Cache policy and pin counts.
-        cache: CacheAccounting,
-        /// KV and media resources reserved for the request.
-        resources: ResourceAccounting,
     },
     /// Newly decoded user-visible text.
     TextDelta {
@@ -1499,10 +1312,6 @@ pub enum RequestOutput {
         image_count: u32,
         /// Total image-generation steps completed.
         image_steps: u32,
-        /// Cache policy and pin counts.
-        cache: CacheAccounting,
-        /// KV and media resources reserved for the request.
-        resources: ResourceAccounting,
         /// Request phase durations.
         timings: RuntimeTimings,
     },
@@ -1653,19 +1462,7 @@ mod tests {
     fn event_context() -> EventContext {
         EventContext {
             started: Instant::now(),
-            served_name: "profile".to_string(),
-            description: "bagel".to_string(),
             compile_duration_us: 7,
-            cache: CacheAccounting {
-                read_enabled: true,
-                write_enabled: true,
-                encoder_pin_count: 0,
-            },
-            resources: ResourceAccounting {
-                expected_kv_tokens: 2,
-                replayable: true,
-                ..ResourceAccounting::default()
-            },
             metrics: Arc::new(RuntimeLifecycleMetrics::default()),
         }
     }

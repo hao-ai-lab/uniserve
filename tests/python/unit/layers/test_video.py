@@ -1,4 +1,4 @@
-"""Numerical video reconstruction preserves window order.
+"""Numerical video reconstruction preserves clip order.
 
 It also preserves decoded precision.
 """
@@ -9,15 +9,15 @@ from torch import nn
 
 from uniserve.media import image, video
 from uniserve.model import VideoPostprocessor
-from uniserve.nn.vae.spatial import SpatialDecoder
+from uniserve.nn.vae.tiled import TiledDecoder
 from uniserve.tensors import OutputLayout, TensorOutput
 
 pytestmark = pytest.mark.unit
 
 
-def test_video_windows_preserve_pixels_across_separate_calls():
+def test_video_clips_preserve_pixels_across_separate_calls():
     class ThreeFrameVideo(VideoPostprocessor):
-        def reconstruction_slices(self, frames, num_frames):
+        def reconstruction_slices(self, clip, num_frames):
             return slice(0, 3), slice(4, 6)
 
     model = ThreeFrameVideo(
@@ -29,15 +29,15 @@ def test_video_windows_preserve_pixels_across_separate_calls():
         (1, 1, 0.5, 0, 1, 0),
         (0, 0, 0, 0, 0.5, 1),
     )
-    segments = tuple(
+    decoded_clips = tuple(
         torch.tensor(values, dtype=torch.float16)
         .reshape(1, 1, 6, 1, 1)
         .expand(1, 3, 6, 2, 3)
         .contiguous()
         for values in frames
     )
-    originals = tuple(segment.clone() for segment in segments)
-    windows = tuple(
+    originals = tuple(decoded.clone() for decoded in decoded_clips)
+    clips = tuple(
         slice(index * 3, index * 3 + (5 if index == 2 else 3))
         for index in range(3)
     )
@@ -50,7 +50,7 @@ def test_video_windows_preserve_pixels_across_separate_calls():
                 tuple(slice(0, n) for n in value.shape),
             ),
         )
-        for value in segments
+        for value in decoded_clips
     )
     constants = {
         "pixel_mean": torch.zeros((1, 3, 1, 1, 1)),
@@ -62,16 +62,16 @@ def test_video_windows_preserve_pixels_across_separate_calls():
     scratch = {
         "rgb_frames": torch.empty((11, 2, 3, 3), dtype=torch.uint8),
         # One rank reconstructs every unit here, so the ring delivers each
-        # window's own overlap to the call that follows it.
+        # clip's own overlap to the call that follows it.
         "overlap_exchange": torch.empty((1, 3, 2, 2, 3), dtype=torch.float16),
     }
     # The first interval resets overlap numerically; later intervals consume
     # the exact successor state left by the previous independent call.
     parts = []
-    for segment, window in zip(outputs, windows, strict=True):
+    for decoded, clip in zip(outputs, clips, strict=True):
         result = model(
-            (segment,),
-            frames=(window,),
+            (decoded,),
+            clips=(clip,),
             sizes=(size,),
             state=state,
             constants=constants,
@@ -79,7 +79,7 @@ def test_video_windows_preserve_pixels_across_separate_calls():
         )[0]
         value = result.tensor
         assert result.layout.shape == (11, 2, 3, 3)
-        assert result.layout.local_slice[0] == window
+        assert result.layout.local_slice[0] == clip
         parts.append(value.clone())
     expected = (
         torch.tensor(
@@ -91,7 +91,7 @@ def test_video_windows_preserve_pixels_across_separate_calls():
     torch.testing.assert_close(torch.cat(parts), expected, rtol=0, atol=0)
     together = model(
         outputs,
-        frames=windows,
+        clips=clips,
         sizes=(size, size, size),
         state=state,
         constants=constants,
@@ -104,17 +104,17 @@ def test_video_windows_preserve_pixels_across_separate_calls():
         atol=0,
     )
     torch.testing.assert_close(
-        state["video_overlap"], segments[-1][:, :, -2:], rtol=0, atol=0
+        state["video_overlap"], decoded_clips[-1][:, :, -2:], rtol=0, atol=0
     )
-    for segment, original in zip(segments, originals, strict=True):
-        torch.testing.assert_close(segment, original, rtol=0, atol=0)
+    for decoded, original in zip(decoded_clips, originals, strict=True):
+        torch.testing.assert_close(decoded, original, rtol=0, atol=0)
 
     previous_state = state["video_overlap"].clone()
     previous_output = scratch["rgb_frames"].clone()
     with pytest.raises(ValueError, match="contiguous"):
         model(
             outputs[:2],
-            frames=(windows[0], slice(4, 7)),
+            clips=(clips[0], slice(4, 7)),
             sizes=(size, size),
             state=state,
             constants=constants,
@@ -133,7 +133,7 @@ def test_video_windows_preserve_pixels_across_separate_calls():
 
 @pytest.mark.parametrize("height,width", [(3, 4), (5, 7), (9, 13)])
 def test_spatial_decoder_preserves_batches_and_raster_alignment(height, width):
-    decoder = SpatialDecoder(
+    decoder = TiledDecoder(
         nn.Upsample(scale_factor=(1, 2, 2), mode="nearest"),
         spatial_compression=2,
         tile_height=8,

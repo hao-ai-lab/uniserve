@@ -1,15 +1,15 @@
-"""Worker image batches preserve the codec's spatial numerical domain."""
+"""Worker image batches preserve the VAE's spatial numerical domain."""
 
 import pytest
 import torch
 
 from tests.python.fixtures.checkpoints import bagel_checkpoint
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.media import image
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve_models import bagel
-from uniserve_worker.bootstrap.cache import cache_info
+from uniserve_worker.bootstrap.cache import cache_info, plan_cache
 from uniserve_worker.bootstrap.capacity import input_buffer_config
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
 from uniserve_worker.protocol.call import (
@@ -26,15 +26,15 @@ pytestmark = pytest.mark.integration
 
 
 @torch.inference_mode()
-def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
+def test_batched_vae_queries_are_independent_of_text_token_capacity(tmp_path):
     _, _, architecture = bagel_checkpoint(tmp_path)
     model = bagel.Model(architecture).eval()
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
         attention_backend="torch",
         model_dtype="float32",
         block_size=16,
-        max_sequence_tokens=32,
+        max_model_len=32,
         max_batch_calls=3,
         max_request_pool_size=3,
         max_batch_tokens=64,
@@ -43,12 +43,16 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
         flow_graph_batch_sizes=(1,),
     )
     runner = ModelExecutor(model, config)
-    cache = PrefixCache(
-        model.text.cache_config, num_units=8, block_size=16, device="cpu"
+    planes = plan_cache(model.text, config)
+    cache = KVCache(
+        model.text.cache_config,
+        planes,
+        num_units=8,
+        device="cpu",
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model.text, config, num_units=8),
+        info=cache_info(model.text, planes, num_units=8),
         request_pool_size=3,
         table_width=2,
     )
@@ -62,7 +66,7 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
     )
     try:
         runner.configure_inputs(
-            input_config=input_buffer_config(model, config),
+            input_config=input_buffer_config(model, config, planes=planes),
             kv_cache=manager,
             latent_pool=latents,
             decode_predicates=torch.tensor([False, True, True, True]),

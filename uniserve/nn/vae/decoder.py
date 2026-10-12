@@ -1,4 +1,4 @@
-"""Latent decoding through a codec's normalization and decoder."""
+"""Latent decoding through a VAE's normalization and decoder."""
 
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ from .normalization import LatentNormalization
 class LatentDecoder(nn.Module):
     """Denormalize latents and call the composed numerical decoder.
 
-    ``normalization`` maps the normalized latent back to the codec's native
+    ``normalization`` maps the normalized latent back to the VAE's native
     latent; ``decoder`` maps that to its output, through overlapping tiles
-    when it is a ``SpatialDecoder``. Latents must have ``latent_shape``; a
+    when it is a ``TiledDecoder``. Latents must have ``latent_shape``; a
     None extent permits that axis to vary.
     """
 

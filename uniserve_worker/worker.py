@@ -1,7 +1,7 @@
 """Resource scope and public entry point for one model-backed worker.
 
 `Worker` owns the execution resources of one worker rank, including the
-model runner (`ModelExecutor`), the paged KV cache and block tables of a
+model executor (`ModelExecutor`), the paged KV cache and block tables of a
 worker with a ``CausalLM``, the latent pool of a denoising worker, the
 request slots (`RequestPool`), the product, buffer and output stores, the
 transports, the host lane, the muxer rank's `MediaMux`, and the process
@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
+from dataclasses import replace
 from functools import partial
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Self
@@ -34,9 +35,10 @@ from torch import nn
 
 from uniserve.distributed.mesh import Communicator
 from uniserve.model import CausalLM, VideoPostprocessor
+from uniserve.nn import Linear
 from uniserve.processing import FlowPrompt, ImageProcessor
-from uniserve.quantization import Quantizer
-from uniserve.runtime import EventPool, PrefixCache
+from uniserve.quantization import QuantizedTensor
+from uniserve.runtime import EventPool, KVCache
 from uniserve.runtime.device import canonical_device, device_storage_budget
 from uniserve.runtime.process_groups import (
     ProcessGroups,
@@ -45,17 +47,13 @@ from uniserve.runtime.process_groups import (
 from uniserve.runtime.resources import close_resources
 from uniserve_worker.bootstrap.cache import (
     group_layers,
-    page_size,
-    plan_cache,
     resident_width,
-    resolve_page_size,
-    storage,
+    resolve_block_size,
 )
 from uniserve_worker.bootstrap.capacity import (
     check_startup_storage,
     device_total_bytes,
     graph_table_widths,
-    latent_pool_plan,
     resolve_request_capacity,
 )
 from uniserve_worker.bootstrap.components import (
@@ -69,7 +67,7 @@ from uniserve_worker.bootstrap.model_loader import (
     prepare_worker_model,
 )
 from uniserve_worker.bootstrap.report import build_worker_layout
-from uniserve_worker.bootstrap.warmup import warmup_requests
+from uniserve_worker.bootstrap.warmup import canvas_step_rows, image_warmups
 from uniserve_worker.config.execution import (
     WorkerConfig,
     graph_storage_budget_bytes,
@@ -120,6 +118,39 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _log_numerics(
+    model: nn.Module, config: WorkerConfig, attention: str
+) -> None:
+    """Log the compute dtype, attention provider and storage formats in use.
+
+    Loading chooses the weight and activation formats; they are read from the
+    loaded parameters and from each ``Linear``'s input quantizer, ``dense``
+    where none quantizes, independently of parameter names and module
+    structure.
+    """
+    weights = {
+        value.quantizer.format
+        if isinstance(value, QuantizedTensor)
+        else "dense"
+        for value in model.parameters()
+    }
+    activations = {
+        child.input_quantizer.format
+        if child.input_quantizer is not None
+        else "dense"
+        for child in model.modules()
+        if isinstance(child, Linear)
+    }
+    logger.info(
+        "resolved numerics: %s compute, %s attention, weights %s, "
+        "activations %s",
+        config.model_dtype,
+        attention,
+        ", ".join(sorted(weights)) or "none",
+        ", ".join(sorted(activations)) or "none",
+    )
 
 
 class Worker:
@@ -268,16 +299,12 @@ class Worker:
                 tokenizer=loaded.tokenizer,
                 image_processor=loaded.image_processor,
                 flow_prompt=loaded.flow_prompt,
-                allowed_calls=config.supported_calls,
                 transfer_backends=config.data_plane.backends,
                 publication_backends=config.data_plane.publication_backends,
-                worker_id=config.worker_id,
-                model_name=loaded.model_name,
                 attention_ranks=0
                 if config.expert_parallel is None
                 else config.expert_parallel.attention_ranks,
                 queue_depth=config.ipc.queue_depth,
-                completion_payload_bytes=config.ipc.max_payload_bytes,
                 acknowledgment_slot=config.ipc.acknowledgment_slot,
                 host_slots=config.ipc.host_slots,
                 products_cross_hosts=config.ipc.products_cross_hosts,
@@ -301,22 +328,18 @@ class Worker:
         worker_config: WorkerConfig,
         sampling_group: Communicator | None,
         tokenizer: Any | None,
-        allowed_calls: frozenset[CallKind],
         queue_depth: int,
-        completion_payload_bytes: int,
         acknowledgment_slot: int = 0,
         host_slots: Sequence[int] = (),
         products_cross_hosts: bool = False,
         attention: str | None = None,
         transfer_backends: tuple[str, ...] = ("local",),
         publication_backends: tuple[str, ...] = ("local",),
-        worker_id: str = "worker",
         image_processor: ImageProcessor | None = None,
         flow_prompt: FlowPrompt | None = None,
         components: tuple[tuple[str, ComponentConfig], ...] = (),
         process_groups: ProcessGroups | None = None,
         bindings: Mapping[str, ComponentBinding] | None = None,
-        model_name: str | None = None,
         attention_ranks: int = 0,
         entry_points=None,
     ) -> None:
@@ -377,6 +400,9 @@ class Worker:
                 )
 
             self.model = model
+            # Unresolved batches this rank holds; the engine connects the
+            # rank's channel with the same depth.
+            self.queue_depth = int(queue_depth)
             self.process_groups = process_groups
             self.sampling_group = sampling_group
             self.tokenizer = tokenizer
@@ -405,10 +431,10 @@ class Worker:
 
             self.attention = runner.attention
 
-            # The KV page size follows from the cache layers and the
+            # The KV block size follows from the cache layers and the
             # attention kernels that read them when the operator set none;
             # everything planned from here on uses the resolved size.
-            worker_config = resolve_page_size(
+            worker_config = resolve_block_size(
                 model,
                 worker_config,
                 runner.attention,
@@ -418,7 +444,7 @@ class Worker:
             )
             runner.worker_config = worker_config
 
-            endpoint = WorkerEndpoint.local(worker_id, int(worker_config.rank))
+            endpoint = WorkerEndpoint.local()
 
             # Measure the remaining grant after the runner binds persistent
             # model inputs and workspaces. Sizing earlier would treat
@@ -448,12 +474,7 @@ class Worker:
                 endpoint=endpoint,
                 bindings=bindings,
                 queue_depth=int(queue_depth),
-                completion_payload_bytes=int(completion_payload_bytes),
-                allowed_calls=allowed_calls,
-                transfer_backends=transfer_backends,
                 components=components,
-                model_name=model_name,
-                attention_backend=runner.attention.name,
                 # The scheduler's page indices address every rank's resident
                 # layer and head regions, including stages with different
                 # storage grants, so a multi-rank token worker's ranks agree
@@ -464,6 +485,7 @@ class Worker:
                     else sampling_group
                 ),
             )
+            _log_numerics(model, worker_config, runner.attention.name)
 
             # Only the token-worker layout reports fixed device bytes; with a
             # KV cache, its primary-device bytes were charged against the KV
@@ -478,7 +500,7 @@ class Worker:
                     continue
 
                 available, _free = device_storage_budget(
-                    device, worker_config.kv_storage_fraction
+                    device, worker_config.mem_fraction_static
                 )
                 reserved = fixed_bytes + graph_storage_budget_bytes(
                     device_total_bytes(device)
@@ -513,24 +535,16 @@ class Worker:
                         "KV model worker has no KV-cache configuration"
                     )
 
-                # The pool's planes follow the same plan that sized the
-                # advertised unit bytes; an FP8 cache passes each layer an
-                # FP8 `Quantizer` in place of a storage dtype.
-                planes = plan_cache(text, worker_config)
-                dtype, fp8 = storage(worker_config)
+                # The pool is allocated from the plan that sized the
+                # advertised units, with the granted unit count.
+                planes = layout.planes
+                assert planes is not None
                 self.kv_cache = KVCacheManager(
-                    PrefixCache(
+                    KVCache(
                         cache,
+                        planes,
                         num_units=kv_cache.num_units,
-                        block_size=page_size(worker_config),
                         device=worker_config.device,
-                        dtype=dtype,
-                        quantization={
-                            name: Quantizer("fp8", axis=0)
-                            for name in cache.layers
-                        }
-                        if fp8
-                        else None,
                     ),
                     info=kv_cache,
                     group_layers=group_layers(text, planes),
@@ -538,7 +552,7 @@ class Worker:
                     request_pool_size=int(info.request_slots),
                     table_width=resident_width(
                         planes,
-                        max_sequence_tokens=worker_config.max_sequence_tokens,
+                        max_sequence_tokens=worker_config.max_model_len,
                     ),
                     staging_depth=int(queue_depth),
                 )
@@ -579,16 +593,16 @@ class Worker:
             # Denoised samples have their own page pool, which may live on
             # another device. An image worker always holds it; a standalone
             # denoiser's pool lives on the ranks that advance its samples.
-            plan = latent_pool_plan(model, worker_config)
+            plan = layout.latent_pool
             if plan is None or (
                 image_builder(model) is None and not runner.denoises
             ):
                 self.latent_pool = None
             else:
                 self.latent_pool = LatentPool(
-                    request_pool_size=int(info.request_slots),
-                    num_pages=int(info.latent_pages),
-                    page_units=int(info.latent_page_units),
+                    request_pool_size=plan.request_pool_size,
+                    num_pages=plan.num_pages,
+                    page_units=plan.page_units,
                     latent_width=plan.latent_width,
                     dtype=plan.dtype,
                     device=worker_config.generation_device
@@ -597,23 +611,11 @@ class Worker:
                 )
                 startup.callback(self.latent_pool.close)
             if runner.denoises:
-                # Ladders gather a request's tables from its slot and its
+                # Bound steps gather a request's tables from its slot and its
                 # samples from its pages, so runners borrow both owners.
                 assert self.latent_pool is not None
                 runner.bind_diffusion_storage(
                     self.requests.storage.bank, self.latent_pool
-                )
-
-            # Storage sizing charged the latent pool's planned bytes
-            # (`LatentPoolPlan.capacity_bytes`), so the allocation must
-            # match that plan exactly.
-            if (
-                self.latent_pool is not None
-                and self.latent_pool.persistent_bytes != arena.latent_pool_bytes
-            ):
-                raise RuntimeError(
-                    "latent pool allocation disagrees with its exact "
-                    "capacity plan"
                 )
 
             # These bounded stores own all asynchronous products, copies,
@@ -631,33 +633,21 @@ class Worker:
             self.device_events = EventPool()
             startup.callback(self.device_events.close)
 
-            # `max_words` bounds a batch's completion lease. Each call takes
-            # `SAMPLING_COMPLETION_FIELDS` (4) int64 words plus its payload
-            # bytes counted at 4 bytes per word; `_completion_words` in
-            # `uniserve_worker.execution.prepare` sizes each lease by the
-            # same rule, so the two change together.
             self.output_pool = OutputPool(
                 capacity=int(queue_depth) * int(info.max_batch_calls),
-                max_words=int(info.max_batch_calls)
-                * (4 + (int(completion_payload_bytes) + 3) // 4),
                 event_pool=self.device_events,
             )
             startup.callback(self.output_pool.close)
 
-            # A rank that backs only the products it produces or consumes has
-            # a physical arena smaller than the engine's logical pool;
-            # `compact` then places bindings first-fit instead of at the
-            # scheduler's offsets.
+            # The engine places buffers in this rank's own pool, whose bytes
+            # the rank reports in `info.buffer_pool_bytes`.
             self.buffer_pool = BufferPool(
-                byte_capacity=int(layout.physical_buffer_pool_bytes),
+                byte_capacity=int(info.buffer_pool_bytes),
                 devices=owner_devices,
-                compact=layout.physical_buffer_pool_bytes
-                < info.buffer_pool_bytes,
             )
             startup.callback(self.buffer_pool.close)
 
             self.tensor_store = TensorStore(
-                capacity=arena.tensor_store,
                 byte_capacity=arena.device_product_bytes,
                 max_entry_bytes=max(1, int(info.encoder_entry_bytes)),
                 devices=owner_devices,
@@ -764,18 +754,31 @@ class Worker:
                 runner.bind_canvas_slots(self.canvas_slots)
 
             # Only the muxer member that publishes the component's host
-            # products (`WorkerInfo.output_rank`) holds a `MediaMux`; it
+            # products (`ModelExecutor.output_rank`) holds a `MediaMux`; it
             # assembles each request's container on its host lane.
             muxer = self.runner.bindings.get(MUXER_COMPONENT)
             self.media_mux = (
                 MediaMux(rank=worker_config.rank)
                 if muxer is not None
                 and muxer.owns
-                and worker_config.rank == info.output_rank(MUXER_COMPONENT)
+                and worker_config.rank == runner.output_rank(MUXER_COMPONENT)
                 else None
             )
             if self.media_mux is not None:
                 startup.callback(self.media_mux.close)
+
+            # The shapes the flow and canvas runtimes were prepared for, which
+            # the engine warms with real requests once the workers report.
+            self._layout = replace(
+                layout,
+                info=replace(
+                    info,
+                    image_warmups=image_warmups(runner, info, tokenizer),
+                    canvas_step_rows=canvas_step_rows(
+                        runner, self.canvas_slots is not None
+                    ),
+                ),
+            )
 
         except BaseException as error:
             # Releasing partially started owners could wait on device work
@@ -819,18 +822,19 @@ class Worker:
         if self._closed:
             raise RuntimeError("worker is closed and cannot be reused")
 
-    def supports_computation(self, kind: CallKind) -> bool:
-        """Return whether this worker can execute this computation."""
+    def supports_call(self, kind: CallKind) -> bool:
+        """Return whether this worker can execute this call."""
         return kind in self.info.supported_calls
 
     def warmup(self) -> None:
         """Prepare numerical execution once without serving requests.
 
-        A numerical worker binds its graph storage budgets, warms and
-        captures its runners, and drives synthetic requests through
-        `warmup_requests`; a codec-slot rank checks that its media codecs
+        A numerical worker binds its graph storage budgets and warms and
+        captures its runners; a codec-slot rank checks that its media codecs
         load. Startup is then sealed and resident storage is checked
-        against the device grants. Successful warmup is retained, so a later
+        against the device grants. The engine then warms the serving path
+        with real requests of the shapes `WorkerInfo.image_warmups` and
+        `canvas_step_rows` state. Successful warmup is retained, so a later
         call (including the one in `run`) returns immediately.
 
         Errors from warmup, capture and the storage checks propagate. The
@@ -838,8 +842,8 @@ class Worker:
         binding or service failure.
 
         Raises:
-            RuntimeError: The worker is closed, a batch was already
-                submitted, or startup left a request resident.
+            RuntimeError: The worker is closed or a batch was already
+                submitted.
         """
         self._require_open()
         if self._warmed_up:
@@ -879,7 +883,7 @@ class Worker:
                 if target.type != "cuda":
                     continue
                 available, _free = device_storage_budget(
-                    target, self.worker_config.kv_storage_fraction
+                    target, self.worker_config.mem_fraction_static
                 )
                 pending = max(
                     0, products - self.tensor_store.resident_bytes(target)
@@ -892,25 +896,11 @@ class Worker:
             self.runner.capture(
                 tokenizer=self.tokenizer, latents=self.latent_pool
             )
-            warmup_requests(self)
         # A host rank is ready once its codecs load, so a missing codec
         # surfaces here and not under a request.
         if self.codec_slot:
             require_media_codecs(VIDEO_CODEC, AUDIO_CODEC)
         self.runner.complete_startup()
-
-        # Startup scenarios must release their requests before service
-        # admission.
-        if self.requests.request_ids():
-            raise RuntimeError("startup completed with resident requests")
-
-        # Warmup batches advance the executor's batch id and collective
-        # sequence. The executor rejects a non-increasing batch id at
-        # admission and, on a multi-rank worker, a non-increasing collective
-        # sequence at launch, so reset both to accept the engine's first
-        # batch.
-        self.executor._last_batch_id = -1
-        self.executor._last_collective_seq = -1
         check_startup_storage(
             self.worker_config,
             self._layout.arena.device_product_bytes,

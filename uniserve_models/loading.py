@@ -45,6 +45,8 @@ from uniserve.nn.moe import ExpertLinear
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizationConfig, Quantizer
 
+from .tokenizer import read_vocabulary, token_id
+
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)
 
@@ -247,92 +249,6 @@ def _fetch(root, names, repository, revision, io):
         tuple(executor.map(fetch, sorted(names)))
 
 
-def _source_files(source, root, inventory, io):
-    """Choose the declared file encoding before downloading checkpoint payloads."""  # noqa: E501
-    # This applies the selection rule of ``checkpoint.Config.resolve`` to the
-    # inventory before the payloads exist locally: explicit filenames first,
-    # then a sharded index, then every weight file of the format. The two
-    # must stay in agreement, or ``resolve`` looks for a file this function
-    # did not fetch. An index is read from ``root``, so the sidecar fetch
-    # must precede this call.
-    directory = PurePosixPath(source.directory)
-    available = {
-        name for name in inventory if PurePosixPath(name).parent == directory
-    }
-    formats = ("safetensors", "pt") if io.format == "auto" else (io.format,)
-    suffixes = {"safetensors": {".safetensors"}, "pt": {".pt", ".bin"}}
-
-    # An explicit filename list wins over any index or layout convention.
-    if source.filenames:
-        for filename in source.filenames:
-            name = (directory / filename).as_posix()
-            if name in available and any(
-                Path(name).suffix in suffixes[format] for format in formats
-            ):
-                return (name,)
-        raise FileNotFoundError(
-            f"source {source.name!r} requires one of {source.filenames!r}"
-        )
-
-    for format in formats:
-        pattern = (
-            "*.safetensors.index.json"
-            if format == "safetensors"
-            else "*.bin.index.json"
-        )
-        indexes = sorted(
-            name
-            for name in available
-            if fnmatch.fnmatchcase(PurePosixPath(name).name, pattern)
-        )
-        if len(indexes) > 1:
-            raise ValueError(
-                f"source {source.name!r} has multiple {format} indexes"
-            )
-
-        if indexes:
-            # A sharded index declares its payload files relative to the
-            # source directory.
-            mapping = _json(root / indexes[0]).get("weight_map")
-            if not isinstance(mapping, dict) or not mapping:
-                raise ValueError(
-                    "checkpoint index requires a nonempty weight_map"
-                )
-            paths = tuple(PurePosixPath(name) for name in set(mapping.values()))
-            if any(path.is_absolute() or ".." in path.parts for path in paths):
-                raise ValueError(
-                    "checkpoint index paths must stay inside their directory"
-                )
-            names = tuple((directory / path).as_posix() for path in paths)
-            if set(names).difference(inventory):
-                raise FileNotFoundError(
-                    "checkpoint index references a missing or excluded shard"
-                )
-            return names
-
-        # Without an index, every weight file in the directory is a payload;
-        # training state saved alongside the model is not part of it.
-        names = tuple(
-            name
-            for name in available
-            if Path(name).suffix in suffixes[format]
-            and Path(name).name
-            not in {
-                "training_args.bin",
-                "optimizer.pt",
-                "optimizer.bin",
-                "scheduler.pt",
-                "scaler.pt",
-            }
-        )
-        if names:
-            return names
-
-    raise FileNotFoundError(
-        f"source {source.name!r} has no {io.format} checkpoint weights"
-    )
-
-
 def _safetensors_headers(repository, revision, names, io):
     """Read the tensor entries of Hub safetensors files from their headers.
 
@@ -396,7 +312,7 @@ def _config_sources(package, located, io):
             sources[declaration.name] = declaration.resolve(root, io=io)
             continue
 
-        names = _source_files(declaration, root, inventory, io)
+        names = declaration.select(inventory, root=root, io=io)
         if io.mode != "dummy":
             _fetch(root, names, repository, revision, io)
             sources[declaration.name] = declaration.resolve(root, io=io)
@@ -421,43 +337,6 @@ def _config_sources(package, located, io):
     return sources
 
 
-def _tokenizer_vocabulary(path: Path) -> dict[str, object]:
-    """Map token text to ID from a ``tokenizer.json`` model and added tokens.
-
-    The model vocabulary is an object from token text to ID or, for a
-    Unigram model, a list of ``[text, score]`` rows whose position is the ID;
-    ``added_tokens`` is a list of objects carrying ``content`` and ``id``.
-    Added tokens override the model vocabulary. Any other layout raises
-    ``ValueError``; IDs are returned unchecked for ``_tokens`` to validate.
-    """
-    data = _json(path)
-    model = data.get("model", {})
-    vocabulary = model.get("vocab", {}) if isinstance(model, dict) else None
-    added = data.get("added_tokens", [])
-
-    if isinstance(vocabulary, list) and all(
-        isinstance(row, list) and row and isinstance(row[0], str)
-        for row in vocabulary
-    ):
-        vocabulary = {row[0]: index for index, row in enumerate(vocabulary)}
-    if (
-        not isinstance(vocabulary, dict)
-        or not isinstance(added, list)
-        or any(
-            not isinstance(entry, dict)
-            or not isinstance(entry.get("content"), str)
-            or "id" not in entry
-            for entry in added
-        )
-    ):
-        raise ValueError(f"tokenizer metadata {path} has a malformed layout")
-
-    return {
-        **vocabulary,
-        **{entry["content"]: entry["id"] for entry in added},
-    }
-
-
 def _tokens(processor, root):
     """Fill declared start/end feature-injection token IDs from checkpoint tokenizer files."""  # noqa: E501
     # Only tokens declared by text without an ID are resolved; a processor
@@ -476,40 +355,11 @@ def _tokens(processor, root):
     if not required:
         return processor
 
-    # Merge every vocabulary spelling a checkpoint may carry; later files
-    # override earlier ones for the same token text.
-    vocabulary: dict[str, object] = {}
-    if (root / "tokenizer.json").is_file():
-        vocabulary.update(_tokenizer_vocabulary(root / "tokenizer.json"))
-    for filename in ("vocab.json", "added_tokens.json"):
-        if (root / filename).is_file():
-            vocabulary.update(_json(root / filename))
-
-    path = root / "tokenizer_config.json"
-    if path.is_file():
-        # ``added_tokens_decoder`` maps each decimal ID to an object whose
-        # ``content`` is the token text.
-        decoder = _json(path).get("added_tokens_decoder", {})
-        if not isinstance(decoder, dict) or any(
-            not isinstance(entry, dict)
-            or not isinstance(entry.get("content"), str)
-            for entry in decoder.values()
-        ):
-            raise ValueError(
-                f"tokenizer metadata {path} has a malformed layout"
-            )
-        vocabulary.update(
-            {entry["content"]: int(index) for index, entry in decoder.items()}
-        )
-
-    updates = {}
-    for name, token in required.items():
-        index = vocabulary.get(token)
-        if type(index) is not int or index < 0:
-            raise ValueError(
-                f"tokenizer metadata does not define declared token {token!r}"
-            )
-        updates[name + "_id"] = index
+    vocabulary = read_vocabulary(root)
+    updates = {
+        name + "_id": token_id(vocabulary, token)
+        for name, token in required.items()
+    }
     return replace(processor, feature_injection=replace(injection, **updates))
 
 
@@ -995,8 +845,8 @@ def read_config(
         if snapshot.repository is not None and io.mode != "dummy":
             _fetch(
                 snapshot.root,
-                _source_files(
-                    declaration, snapshot.root, snapshot.inventory, io
+                declaration.select(
+                    snapshot.inventory, root=snapshot.root, io=io
                 ),
                 snapshot.repository,
                 snapshot.revision,
@@ -1031,13 +881,11 @@ def read_config(
         else None
     )
 
-    # The package's "default" preset, else its "bf16" preset, else the
-    # ``weights.Config`` defaults; the quantization metadata below refines
-    # this base or, for a ModelOpt export, replaces it.
+    # The first preset a package lists is its dense checkpoint's own numerical
+    # representation; the quantization metadata below refines this base or,
+    # for a ModelOpt export, replaces it.
     precisions = package.precisions(model_config)
-    precision = precisions.get(
-        "default", precisions.get("bf16", weight_options.Config())
-    )
+    precision = next(iter(precisions.values()))
     checkpoint_format = None
     quantization = metadata.get("quantization_config")
     if quantization is not None and not isinstance(quantization, dict):

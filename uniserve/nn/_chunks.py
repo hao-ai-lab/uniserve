@@ -8,7 +8,7 @@ from typing import TypeGuard
 
 import torch
 
-from uniserve.distributed.chunks import gather_chunks
+from uniserve.distributed.chunks import gather_chunks, payload_rows
 from uniserve.quantization import QuantizedTensor, Quantizer, ScaleLayout
 
 from . import _binding
@@ -24,14 +24,6 @@ def tensor_statistics(quantizer: Quantizer | None) -> TypeGuard[Quantizer]:
     preserve that domain while encoding bounded row intervals.
     """
     return quantizer is not None and quantizer.requires_complete_source
-
-
-def _projection_chunk_rows(width: int, dtype: torch.dtype) -> int:
-    """Bound one projected source interval to an aligned 64 MiB payload."""
-    return max(
-        128,
-        (64 * 1024 * 1024 // (width * dtype.itemsize) // 128) * 128,
-    )
 
 
 def _partition(module, x, token_slice, num_tokens):
@@ -237,7 +229,7 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
             # A singleton group has no transport to impose payload bounds.
             # Preserve the same bound locally so calibrated block-scaled
             # projections do not materialize full-sequence MLP intermediates.
-            chunk_rows = _projection_chunk_rows(width, value.dtype)
+            chunk_rows = payload_rows(width, value.dtype.itemsize)
             for start in range(0, value.shape[0], chunk_rows):
                 stop = min(value.shape[0], start + chunk_rows)
                 yield (
@@ -273,7 +265,7 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
         # Use the same payload bound as complete-input row gathers. Producer
         # intervals need not force smaller GEMMs or additional peer
         # publications.
-        chunk_rows = _projection_chunk_rows(width, dtype)
+        chunk_rows = payload_rows(width, dtype.itemsize)
         backend_rank = group.backend_order.index(group.rank)
         pending = []
         staged = cursor = 0

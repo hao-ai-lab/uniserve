@@ -21,8 +21,8 @@ class CUDAStream:
     Ingress/output event slots are reused in submission order on the worker.
 
     The stream also owns its :attr:`communication`: the communicators that
-    enqueue collectives on it, their registered windows and the storage behind
-    them. Execution contexts on the stream borrow these resources, and
+    enqueue collectives on it and the transport buffers its gathers borrow.
+    Execution contexts on the stream borrow these resources, and
     :meth:`close` retires them collectively with the stream.
     """
 
@@ -31,9 +31,7 @@ class CUDAStream:
         *,
         device: torch.device,
         stream: torch.cuda.Stream,
-        sm_count: int,
         green: Any = None,
-        context: Any = None,
         raw_stream: Any = None,
         event_slots: int = 2,
         parent: CUDAStream | None = None,
@@ -45,9 +43,7 @@ class CUDAStream:
 
         self.device = device
         self.stream = stream
-        self.sm_count = int(sm_count)
         self.green = green
-        self.context = context
         self.raw_stream = raw_stream
         self._parent = parent
         self._closed = False
@@ -70,41 +66,9 @@ class CUDAStream:
         """Own the resources bound to an existing full-device PyTorch stream.
 
         The PyTorch stream remains its creator's; closing this owner retires
-        the communicators, windows and storage bound to the stream.
+        the communicators and gather pools bound to the stream.
         """
-        return cls(
-            device=stream.device,
-            stream=stream,
-            sm_count=torch.cuda.get_device_properties(
-                stream.device
-            ).multi_processor_count,
-            event_slots=event_slots,
-        )
-
-    @property
-    def full_device(self) -> bool:
-        return self.green is None
-
-    def verify(self) -> None:
-        """Verify that the native stream retains its configured SM partition."""
-        if self.green is None:
-            return
-
-        cu = driver()
-        associated = cuda_value(
-            cu.cuStreamGetGreenCtx(self.raw_stream), "query stream context"
-        )
-        if int(associated) != int(self.green):
-            raise CUDAError("stream is detached from its Green Context")
-
-        resource = cuda_value(
-            cu.cuGreenCtxGetDevResource(
-                self.green, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
-            ),
-            "query Green Context SM resource",
-        )
-        if int(resource.sm.smCount) != self.sm_count:
-            raise CUDAError("Green Context SM resource changed after startup")
+        return cls(device=stream.device, stream=stream, event_slots=event_slots)
 
     def wait(self, producer: torch.cuda.Stream) -> None:
         """Order this stream after a producer.
@@ -166,9 +130,7 @@ class CUDAStream:
             return CUDAStream(
                 device=self.device,
                 stream=stream,
-                sm_count=self.sm_count,
                 green=self.green,
-                context=self.context,
                 raw_stream=raw,
                 event_slots=len(self._ingress_events),
                 parent=self,
@@ -235,7 +197,6 @@ class CUDAStream:
             self._output_events = ()
             self.raw_stream = None
             self.green = None
-            self.context = None
             self._parent = None
 
 
@@ -324,9 +285,6 @@ def partition_streams(
                 cu, cuda_device, (lane_resource,)
             )
             acquisition.callback(_destroy_context, lane_green)
-            context = cuda_value(
-                cu.cuCtxFromGreenCtx(lane_green), "resolve lane context"
-            )
             raw_stream = cuda_value(
                 cu.cuGreenCtxStreamCreate(
                     lane_green, int(cu.CUstream_flags.CU_STREAM_NON_BLOCKING), 0
@@ -342,20 +300,11 @@ def partition_streams(
                     f"CUDA stream received {sm_count} SMs, "
                     f"expected {requested_count}"
                 )
-            associated = cuda_value(
-                cu.cuStreamGetGreenCtx(raw_stream), "query lane origin stream"
-            )
-            if int(associated) != int(lane_green):
-                raise CUDAError(
-                    "lane origin stream has the wrong Green Context"
-                )
 
             realized.append(
                 CUDAStream(
                     device=device,
-                    sm_count=sm_count,
                     green=lane_green,
-                    context=context,
                     raw_stream=raw_stream,
                     stream=torch.cuda.ExternalStream(
                         int(raw_stream), device=device
@@ -370,10 +319,6 @@ def partition_streams(
                 )
                 partitions.callback(_destroy_context, remainder_green)
                 current_resource = _green_resource(cu, remainder_green)
-        if sum(item.sm_count for item in realized) != requested:
-            raise CUDAError(
-                "lane SM resources do not form the configured disjoint total"
-            )
 
         partitions.close()
     except BaseException as error:

@@ -77,6 +77,7 @@ def read_conditions(
     patches: torch.Tensor | None,
     vision: TubeletEncoder,
     sample_rate: int,
+    frame_rate: int,
     ffmpeg: str,
 ) -> None:
     """Decode a request's conditions into its condition products.
@@ -85,8 +86,8 @@ def read_conditions(
     ``condition_pixels``, ``condition_samples`` and ``vision_pixels``
     storage, each None when no condition contributes to it. ``vision``
     packs the conditioner's patch rows, ``sample_rate`` is the audio
-    encoder's rate and ``ffmpeg`` the executable reference videos decode
-    with.
+    encoder's rate, ``frame_rate`` the output frame rate reference videos
+    resample to and ``ffmpeg`` the executable they decode with.
 
     Raises:
         ValueError: A condition decodes to other extents than planned, or
@@ -113,7 +114,10 @@ def read_conditions(
         else:
             assert condition.video is not None
             frames = read_video(
-                media_path(source), condition.video, ffmpeg=ffmpeg
+                media_path(source),
+                condition.video,
+                frame_rate=frame_rate,
+                ffmpeg=ffmpeg,
             )
         view = condition.vision
         if view is None:
@@ -185,7 +189,7 @@ def execute(
     state: BatchState,
     tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> PendingOutput:
     """Schedule one request's media reading on the rank's host lane.
 
@@ -206,14 +210,17 @@ def execute(
     reservations = request.host.tasks
     if len(reservations) != 1:
         raise RuntimeError("media reading has no reserved lane slot")
-    vision = capability(model_runner.model, TubeletEncoder)
-    audio = capability(model_runner.model, AudioEncoder)
+    vision = capability(model_executor.model, TubeletEncoder)
+    audio = capability(model_executor.model, AudioEncoder)
     if vision is None or audio is None:
         raise RuntimeError("media reading requires the condition encoders")
+    postprocessor = model_executor.video_postprocessor
+    if postprocessor is None:
+        raise RuntimeError("media reading requires the output frame rate")
 
     # Each product's storage is reserved now and filled by the host task;
     # the products are published only once it completes.
-    declared = model_runner.outputs.get(call.component, ())
+    declared = model_executor.outputs.get(call.component, ())
     products = {}
     for output in call.outputs:
         if output.output_index >= len(declared):
@@ -237,7 +244,8 @@ def execute(
             patches=target(VISION_PIXELS),
             vision=vision,
             sample_rate=audio.sample_rate,
-            ffmpeg=model_runner.worker_config.ffmpeg,
+            frame_rate=postprocessor.frame_rate,
+            ffmpeg=model_executor.worker_config.ffmpeg,
         ),
         profile_name=(
             "uniserve.host.read "
@@ -271,7 +279,6 @@ def execute(
     request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.host.tasks = (task,)
     request.host.finish = publish
     request.products = ()

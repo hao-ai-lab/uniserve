@@ -8,8 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
-    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationFeatures, GenerationLimits,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageTrigger, ModelDtype,
+    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, ImageEncoderInput,
+    ImageGenerationConfig, ImageTrigger, MediaCall, ModelDtype,
 };
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
@@ -23,11 +23,6 @@ use crate::profile::tokenizer::HuggingFaceTokenizer;
 /// System instruction used under `GenerationConstraint::Default` when the
 /// request supplies none.
 const DEFAULT_SYSTEM_PROMPT: &str = "You should first think about the planning process in the mind and then generate the image. \n     The planning process is enclosed within <think> </think> tags, i.e. <think> planning process here </think> image here";
-/// System instruction that establishes Bagel reasoning and answer delimiters.
-///
-/// `serving::omni` places it before the input images of an understanding-only
-/// text prompt, framed by [`BagelProfile::wrap_context_text`].
-pub const CONTEXT_SYSTEM_PROMPT: &str = "\nLet's think step by step to answer the question. For text-based thinking, enclose the process within <think> </think>, e.g. <think> thinking process here </think>. For visual thinking, enclose the content within <image_start> </image_end>, e.g. <image_start> thinking image here </image_end>. Finally conclude with the final answer wrapped in <answer></answer> tags, i.e.<answer> answer here </answer>.\n";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// Loaded Bagel profile and tokenizer assets.
@@ -53,8 +48,18 @@ impl BagelProfile {
     pub const ID: &'static str = "bagel";
     /// Pixel-to-latent downsampling factor.
     pub const LATENT_DOWNSAMPLE: u32 = 16;
-    /// Maximum reusable encoder products tracked by the profile.
-    pub const ENCODER_CACHE_ENTRIES: usize = 256;
+    /// Elements of one latent unit: 16 VAE latent channels over a 2x2 latent
+    /// patch.
+    const LATENT_UNIT_ELEMENTS: u64 = 16 * 2 * 2;
+    /// The resize every input or fed-back image goes through before the VAE,
+    /// as `(max_side, min_side, stride, max_pixels)`; the stride is the
+    /// VAE's `LATENT_DOWNSAMPLE`.
+    const VAE_RESIZE: (u32, u32, u32, u64) = (1024, 512, 16, 1_806_336);
+    /// The resize the ViT applies to the VAE canvas, as `VAE_RESIZE` is
+    /// stated; its stride is the ViT patch size.
+    const VIT_RESIZE: (u32, u32, u32, u64) = (980, 224, 14, 1_806_336);
+    /// Start- and end-of-image tokens that frame an image's grid.
+    const MARKER_TOKENS: u32 = 2;
     /// Primary checkpoint files in the order the worker's loader tries them
     /// (`uniserve_models/bagel/weights.py`); the first present one holds the
     /// latent position table.
@@ -94,32 +99,45 @@ impl BagelProfile {
             })
     }
 
-    /// Returns bounded runtime capabilities for the selected dtype.
+    /// Returns the profile's runtime sizing for the selected dtype.
     ///
-    /// These are profile ceilings. The engine scheduler's
-    /// `resolve_generation_limits` clamps the latent, grid-token, feature-byte,
-    /// and encoder-cache limits to the capacities the loaded worker reports and
-    /// drops features whose calls the worker does not support.
+    /// The grid-token bounds are those of the largest image the resize
+    /// policies produce: an image at the VAE's maximum side, and the ViT grid
+    /// of that canvas. The latent capacity, the vision feature bytes and the
+    /// encoder cache are not stated here: the checkpoint's latent grid bounds
+    /// a canvas's sides (`ResolutionPolicy::max_side`), and the engine
+    /// scheduler's `resolve_generation_limits` takes the rest from the
+    /// capacities the loaded worker reports, with its served features from
+    /// its call kinds.
     pub fn runtime_limits(model_dtype: ModelDtype) -> GenerationLimits {
         let dtype_bytes = model_dtype_bytes(model_dtype);
-        // `GenerationRequest::image_latent_bytes` divides the latent feature
-        // bytes by `max_vae_grid_tokens` to get the bytes per latent unit:
-        // 16 VAE latent channels over a 2x2 latent patch.
+        let vae_tokens = Self::max_grid_tokens(Self::VAE_RESIZE);
+        let vit_tokens = Self::max_grid_tokens(Self::VIT_RESIZE);
+        let latent_bytes_per_unit = Self::LATENT_UNIT_ELEMENTS * dtype_bytes;
         GenerationLimits {
-            features: GenerationFeatures::UNDERSTANDING
-                | GenerationFeatures::VISION_ENCODE
-                | GenerationFeatures::LATENT_ENCODE
-                | GenerationFeatures::IMAGE_GENERATION,
-            max_latent_units: 1_024,
+            max_latent_units: u64::MAX,
             latent_downsample: Self::LATENT_DOWNSAMPLE,
-            max_vae_grid_tokens: 1_026,
-            max_vit_grid_tokens: 4_902,
-            max_latent_feature_bytes: 1_026 * 16 * 2 * 2 * dtype_bytes,
-            max_vision_feature_bytes: 4_902 * 3_584 * dtype_bytes,
-            commit_marker_tokens: 2,
+            max_vae_grid_tokens: vae_tokens,
+            max_vit_grid_tokens: vit_tokens,
+            latent_bytes_per_unit,
+            max_latent_feature_bytes: u64::from(vae_tokens) * latent_bytes_per_unit,
+            max_vision_feature_bytes: u64::MAX,
+            commit_marker_tokens: Self::MARKER_TOKENS,
             max_cfg_branches: 3,
-            encoder_cache_entries: Self::ENCODER_CACHE_ENTRIES as u32,
+            encoder_cache_entries: u32::MAX,
+            ..GenerationLimits::default()
         }
+    }
+
+    /// The most tokens, framing markers included, an image can have after a
+    /// `(max_side, min_side, stride, max_pixels)` resize: the grid of a
+    /// canvas at the longest side on both axes, held to the pixel bound.
+    fn max_grid_tokens((max_side, _, stride, max_pixels): (u32, u32, u32, u64)) -> u32 {
+        let cells_per_side = u64::from(max_side / stride);
+        let grid = (cells_per_side * cells_per_side).min(max_pixels / u64::from(stride).pow(2));
+        u32::try_from(grid)
+            .unwrap_or(u32::MAX)
+            .saturating_add(Self::MARKER_TOKENS)
     }
 
     /// Resolves required control tokens from the loaded tokenizer.
@@ -145,12 +163,12 @@ impl BagelProfile {
         };
         let image_encoders = vec![
             ImageEncoderInput {
-                encoder: ImageIngestStep::VaeEncode,
+                encoder: MediaCall::LatentEncoding,
                 num_kv_tokens: None,
                 max_kv_tokens: None,
             },
             ImageEncoderInput {
-                encoder: ImageIngestStep::VitEncode,
+                encoder: MediaCall::VisionEncoding,
                 num_kv_tokens: None,
                 max_kv_tokens: None,
             },
@@ -167,7 +185,7 @@ impl BagelProfile {
             },
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
-                encoder: ImageIngestStep::VaeEncode,
+                encoder: MediaCall::LatentEncoding,
                 num_kv_tokens: None,
                 max_kv_tokens: None,
             }],
@@ -191,7 +209,6 @@ impl BagelProfile {
                 timestep_shift: 1.0,
                 seed: None,
                 max_images: 1,
-                max_images_limit: 16,
             },
             // The denoiser reads a latent patch's position embedding from
             // table row `row * max_latent_size + col`, so a canvas wider than
@@ -223,24 +240,21 @@ impl BagelProfile {
     /// - `Default` places the system instruction directly after
     ///   `<|im_start|>`, with no role line, followed by a user turn and an open
     ///   assistant turn.
-    /// - `UndOnly` without images renders a plain user turn and an open
-    ///   assistant turn.
-    /// - `UndOnly` with images encodes the prompt text alone.
+    /// - `UndOnly` renders a plain user turn and an open assistant turn.
     /// - `GenOnly` wraps the prompt with [`Self::wrap_context_text`].
     ///
     /// `system_prompt` applies only under `Default`; `assistant_prefix`
-    /// applies only to the `Default` and image-free `UndOnly` layouts.
+    /// applies only to the `Default` and `UndOnly` layouts.
     pub fn render_prompt_ids(
         &self,
         tokenizer: &HuggingFaceTokenizer,
         constraint: GenerationConstraint,
-        has_images: bool,
         prompt: &str,
         system_prompt: Option<&str>,
         assistant_prefix: Option<&str>,
     ) -> crate::profile::tokenizer::Result<Vec<u32>> {
-        match (constraint, has_images) {
-            (GenerationConstraint::Default, _) => encode(
+        match constraint {
+            GenerationConstraint::Default => encode(
                 tokenizer,
                 &format!(
                     "<|im_start|>{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
@@ -249,7 +263,7 @@ impl BagelProfile {
                     assistant_prefix.unwrap_or("")
                 ),
             ),
-            (GenerationConstraint::UndOnly, false) => encode(
+            GenerationConstraint::UndOnly => encode(
                 tokenizer,
                 &format!(
                     "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
@@ -257,8 +271,7 @@ impl BagelProfile {
                     assistant_prefix.unwrap_or("")
                 ),
             ),
-            (GenerationConstraint::UndOnly, true) => encode(tokenizer, prompt),
-            (GenerationConstraint::GenOnly, _) => self.wrap_context_text(tokenizer, prompt),
+            GenerationConstraint::GenOnly => self.wrap_context_text(tokenizer, prompt),
         }
     }
 
@@ -302,22 +315,28 @@ impl BagelProfile {
         height: u32,
         _image_count: usize,
     ) -> assets::Result<Vec<ImageEncoderInput>> {
-        let vae_tokens = stride_resize_tokens(width, height, &[(1024, 512, 16, 1_806_336)], 16, 2)?;
+        let vae_tokens = stride_resize_tokens(
+            width,
+            height,
+            &[Self::VAE_RESIZE],
+            Self::VAE_RESIZE.2,
+            Self::MARKER_TOKENS,
+        )?;
         let vit_tokens = stride_resize_tokens(
             width,
             height,
-            &[(1024, 512, 16, 1_806_336), (980, 224, 14, 1_806_336)],
-            14,
-            2,
+            &[Self::VAE_RESIZE, Self::VIT_RESIZE],
+            Self::VIT_RESIZE.2,
+            Self::MARKER_TOKENS,
         )?;
         Ok(vec![
             ImageEncoderInput {
-                encoder: ImageIngestStep::VaeEncode,
+                encoder: MediaCall::LatentEncoding,
                 num_kv_tokens: Some(vae_tokens),
                 max_kv_tokens: None,
             },
             ImageEncoderInput {
-                encoder: ImageIngestStep::VitEncode,
+                encoder: MediaCall::VisionEncoding,
                 num_kv_tokens: Some(vit_tokens),
                 max_kv_tokens: None,
             },
@@ -334,11 +353,17 @@ impl BagelProfile {
         width: u32,
         height: u32,
     ) -> assets::Result<ImageGenerationConfig> {
-        let tokens = stride_resize_tokens(width, height, &[(1024, 512, 16, 1_806_336)], 16, 2)?;
+        let tokens = stride_resize_tokens(
+            width,
+            height,
+            &[Self::VAE_RESIZE],
+            Self::VAE_RESIZE.2,
+            Self::MARKER_TOKENS,
+        )?;
         let mut policy = self.image_generation.clone();
         if policy.feedback_source.is_none()
             || policy.feedback_encoders.len() != 1
-            || policy.feedback_encoders[0].encoder != ImageIngestStep::VaeEncode
+            || policy.feedback_encoders[0].encoder != MediaCall::LatentEncoding
         {
             return Err(assets::Error::invalid(
                 "image feedback encoders do not match the model processor",

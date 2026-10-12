@@ -89,7 +89,7 @@ def test_graph_context_validation_rejects_foreign_compute():
     try:
         with torch.cuda.graph(graph, stream=stream):
             torch.add(values, 1, out=output)
-        # No real CUDA context has the null handle. The captured computation
+        # No real CUDA context has the null handle. The captured call
         # therefore lies outside this declared set of allowed contexts.
         with pytest.raises(CUDAError, match="escaped its owning context"):
             verify_graph_context(graph, frozenset({0}))

@@ -6,13 +6,15 @@ storage or a TCP socket. ``StreamSignal`` turns CUDA stream completion into a
 readable descriptor for selector loops. ``atomic_store_u32`` and
 ``atomic_load_u32`` order the header words of shared-storage segments, which
 ``uniserve_worker.transport.segment`` reads and writes across processes.
+``ErrorCode`` is the schema's failure-class enum, the one definition the
+worker raises, reports and logs its failures with.
 """
 
 from types import TracebackType
-from typing import Any, Final, Self, final
+from typing import Any, ClassVar, Self, final
 
 __all__ = [
-    "DEBUG_BUILD",
+    "ErrorCode",
     "Server",
     "StreamSignal",
     "atomic_load_u32",
@@ -20,8 +22,38 @@ __all__ = [
     "service_name",
 ]
 
-DEBUG_BUILD: Final[bool]
-"""Whether the extension was compiled with debug assertions."""
+@final
+class ErrorCode:
+    """A failure class of a worker.
+
+    One class serves a call's completion and an error response. Members are
+    hashable and equal only to themselves; ``str`` spells the snake_case name
+    the engine logs, for example ``"input_error"``. The engine stops serving on
+    ``INVARIANT_VIOLATION``.
+    """
+
+    # The call kind is not one the worker's model implements.
+    UNSUPPORTED_CALL: ClassVar[ErrorCode]
+    # Call, batch or product metadata violates the protocol.
+    INVALID_DESCRIPTOR: ClassVar[ErrorCode]
+    # The worker's launch configuration cannot provide what a call needs.
+    UNSUPPORTED_SETUP: ClassVar[ErrorCode]
+    # A staged execution input is invalid for its declared route.
+    INPUT_ERROR: ClassVar[ErrorCode]
+    # Device computation failed.
+    COMPUTE_ERROR: ClassVar[ErrorCode]
+    # A reserved or physical resource could not satisfy the call.
+    RESOURCE_ERROR: ClassVar[ErrorCode]
+    # An invariant failed within the worker.
+    INVARIANT_VIOLATION: ClassVar[ErrorCode]
+    # The worker process is unsafe for further work.
+    FATAL_WORKER_FAILURE: ClassVar[ErrorCode]
+    # The worker refuses the request itself: its admitted size does not fit
+    # what the model serves or the worker provisioned.
+    INVALID_REQUEST: ClassVar[ErrorCode]
+
+    def __hash__(self) -> int: ...
+    def __eq__(self, other: object) -> bool: ...
 
 @final
 class Server:
@@ -38,13 +70,11 @@ class Server:
     def __new__(
         cls,
         service_name: str,
-        max_payload: int = 1_048_576,
         max_inflight: int = 1,
         transport: str = ...,
     ) -> Self:
         """Bind this rank's channel.
 
-        The channel bounds payload size in bytes and in-flight capacity:
         ``max_inflight`` counts outstanding requests for shared storage and
         queued response frames for a socket. ``transport`` is ``"iceoryx2"``,
         the default, for a rank on the head's host, which serves shared
@@ -188,11 +218,41 @@ class StreamSignal:
         """
         ...
 
+SOCKET_CHANNEL: str
+"""The channel mechanism name of a rank off the head's host: a TCP stream."""
+
 def service_name(id: str) -> str:
     """Return the shared-storage service name for one endpoint identifier.
 
     A rank names its own channel endpoint and reports it to the head, so both
     sides must spell the name the same way; this function is that spelling.
+    """
+    ...
+
+def call_kinds() -> list[str]:
+    """Return the spelling of every call kind in the schema's order.
+
+    A worker report lists its supported calls in this order.
+    """
+    ...
+
+def state_advancing_calls() -> list[str]:
+    """Return the spelling of every call kind that advances request state."""
+    ...
+
+def relay_row_bytes() -> int:
+    """Return the bytes one request slot's lane holds of relayed scalars.
+
+    A worker sizes its request-relay arenas per (request slot, lane) row
+    from this value.
+    """
+    ...
+
+def product_edges() -> list[tuple[str, str]]:
+    """Return the persistent-product edges of the video graph.
+
+    Each ``(producer, reader)`` pair names media calls whose products travel
+    through persistent tensor storage, as the schema's graph states them.
     """
     ...
 
