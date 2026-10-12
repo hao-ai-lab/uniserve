@@ -52,7 +52,8 @@ def base(checkpoint):
 
 def test_t2va_fasth3_resolves_its_trained_rungs(checkpoint):
     config = read_config(checkpoint, IOConfig(), sources={})
-    # A t2va student replaces the release's transformer partition.
+    # A t2va student replaces the release's transformer partition and
+    # serves its tasks.
     assert set(config.denoisers) == {"transformer"}
     denoiser = config.denoisers["transformer"]
     assert denoiser.grids == {
@@ -64,7 +65,7 @@ def test_t2va_fasth3_resolves_its_trained_rungs(checkpoint):
         ),
     }
     assert denoiser.attention == SparseAttention(tile=64, sparsity=0.9)
-    assert denoiser.tasks == ("t2va",)
+    assert denoiser.tasks == ("t2va", "fl2va")
     # The student generates its 12 training buckets: 21:9, 16:9, 4:3, 1:1,
     # 3:4 and 9:16 at 768p, then at 480p, by the (short edge, aspect ratio)
     # a request names them with.

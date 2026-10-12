@@ -15,7 +15,7 @@
       "transformer": {
         "ranks": [0, 1, 2, 3, 4, 5, 6, 7],
         "parallel_config": {
-          "sequence_parallel": { "kind": "allgather", "allgather_degree": 8 }
+          "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 8 }
         }
       },
       "text_encoder": {
@@ -27,6 +27,11 @@
         "parallel_config": {}
       },
       "audio_decoder": {
+        "ranks": [0, 1, 2, 3, 4, 5, 6, 7],
+        "parallel_config": {},
+        "distribution": "temporal_units"
+      },
+      "latent_encoder": {
         "ranks": [0, 1, 2, 3, 4, 5, 6, 7],
         "parallel_config": {},
         "distribution": "temporal_units"
@@ -45,6 +50,7 @@
       { "node": "localhost", "device": "cpu" },
       { "node": "localhost", "device": "cpu" },
       { "node": "localhost", "device": "cpu" },
+      { "node": "localhost", "device": "cpu" },
       { "node": "localhost", "device": "cpu" }
     ],
     "components": {
@@ -54,6 +60,10 @@
       },
       "muxer": {
         "ranks": [8],
+        "parallel_config": {}
+      },
+      "media_reader": {
+        "ranks": [9],
         "parallel_config": {}
       }
     },

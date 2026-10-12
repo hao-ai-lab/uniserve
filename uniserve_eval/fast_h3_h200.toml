@@ -11,7 +11,7 @@ artifact_root = "artifacts/minimax_h3/fasth3-h200"
 [servers.h200-ulysses4]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax_h3/fasth3-ulysses4.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "5", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax_h3/ulysses4.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "5", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
 
 [servers.h200-ulysses4.environment]
 CUDA_VISIBLE_DEVICES = "0,1,2,3"
@@ -46,7 +46,7 @@ points = ["h200-ulysses4-5s-1k"]
 [servers.h200-ulysses8]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax_h3/fasth3-ulysses8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax_h3/ulysses8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
 
 [servers.h200-ulysses8.environment]
 CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
@@ -186,7 +186,7 @@ points = ["h200-ulysses8-5s-1k", "h200-ulysses8-5s-10k", "h200-ulysses8-10s-1k",
 [servers.h200-gather8]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax_h3/fasth3-gather8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax_h3/gather8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
 
 [servers.h200-gather8.environment]
 CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
@@ -218,7 +218,7 @@ videos_per_second = "higher"
 [servers.h200-fp8-ulysses8]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax_h3/fasth3-ulysses8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"components":{"mlp":"fp8"}}']
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax_h3/ulysses8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"components":{"mlp":"fp8"}}']
 
 [servers.h200-fp8-ulysses8.environment]
 CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"

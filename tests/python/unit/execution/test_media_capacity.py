@@ -12,6 +12,7 @@ from tests.python.fixtures.h3 import (
     base_config,
     fasth3_config,
     omniref_denoiser,
+    text_only_config,
 )
 from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
@@ -343,12 +344,12 @@ def test_the_largest_condition_set_follows_the_served_tasks():
     the target canvas. A reference request carries up to nine images and
     three videos: images of the widest reference raster, 4:1 at the
     2048-pixel short edge, and videos of the generated 124 frames with their
-    124 / 24 seconds of 32 kHz sound. A dense network packs the keyframes
-    beside them; the segment packing holds none.
+    124 / 24 seconds of 32 kHz sound, after the keyframes.
     """
     with torch.device("meta"):
         base = Model(base_config())
-        text_only = Model(fasth3_config()).transformer
+        text_only = Model(text_only_config()).transformer
+        student = Model(fasth3_config()).transformer
         segmented = Model(
             replace(
                 base_config(),
@@ -361,10 +362,11 @@ def test_the_largest_condition_set_follows_the_served_tasks():
     )
     assert text_only.max_conditions(124, WIDE) == ()
     assert base.transformer.max_conditions(124, WIDE) == keyframes
+    assert student.max_conditions(124, WIDE) == keyframes
 
     for denoiser, leading in (
         (base.transformer_ref, keyframes),
-        (segmented, ()),
+        (segmented, keyframes),
     ):
         conditions = denoiser.max_conditions(124, WIDE)
         references = conditions[len(leading) :]

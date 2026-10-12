@@ -3,11 +3,12 @@
 Serves the published Ulysses-4 deployments and sends the seed-42 requests
 of the packaged conditioned workloads (``uniserve_eval/workloads/minimax_h3``):
 the official first-frame request (W3) on the base release's ``transformer``
-deployment, and the image-plus-audio (W4) and official video-plus-audio (W5)
-reference requests on the ``transformer_ref`` deployment, with the base
-release's reference DiT and with a FastH3 OmniRef export. An OmniRef
-deployment that states a smaller condition capacity than the image-plus-audio
-request takes refuses it, naming its rows. Condition media are read from
+deployment and on a FastH3 DMD student of it, and the image-plus-audio (W4)
+and official video-plus-audio (W5) reference requests on the
+``transformer_ref`` deployment, with the base release's reference DiT and
+with a FastH3 OmniRef export. An OmniRef deployment that states a smaller
+condition capacity than the image-plus-audio request takes refuses it,
+naming its rows. Condition media are read from
 ``file://`` URIs under ``--media-directory``. Every served response is a
 complete MP4 at the canvas and frame count the request resolves to.
 """
@@ -152,6 +153,36 @@ def test_base_first_frame_request(tmp_path: Path) -> None:
         (tmp_path / "fl2va.mp4").write_bytes(response.content)
         # The 16:9 keyframe resolves the 1344x768 canvas; eight seconds
         # are 192 frames.
+        _check_media(response, width=1344, height=768, frames=192)
+
+
+def test_fasth3_first_frame_request(tmp_path: Path) -> None:
+    """A FastH3 DMD student serves its partition's keyframe requests."""
+    model = os.environ.get("UNISERVE_H3_MODEL")
+    if not model or not Path(model).is_dir():
+        pytest.fail(
+            "UNISERVE_H3_MODEL must name a FastH3 DMD export directory; "
+            "docs/minimax_h3/minimax_h3.md lists them"
+        )
+    inputs = _inputs()
+    port = find_free_port()
+    base = f"http://127.0.0.1:{port}"
+    # The student generates 16:9 at 768p; eight seconds admit W3.
+    options = ["--video-aspect-ratios", "16:9", "--max-video-seconds", "8"]
+    with (
+        server_process(
+            _command(model, "ulysses4.json", port, inputs, options),
+            base,
+            tmp_path / "server.log",
+            timeout_s=3600,
+        ),
+        httpx.Client(base_url=base, timeout=3600) as client,
+    ):
+        video = client.get("/v1/capabilities").json()["video"]
+        assert video["tasks"] == ["t2va", "fl2va"]
+
+        response = client.post("/v1/videos/sync", json=_request("w3", inputs))
+        (tmp_path / "fl2va.mp4").write_bytes(response.content)
         _check_media(response, width=1344, height=768, frames=192)
 
 

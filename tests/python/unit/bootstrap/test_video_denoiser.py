@@ -134,7 +134,7 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
         audio_sample_rate=model.audio_decoder.sample_rate,
         frames=frames,
     )
-    assert info.tasks == ("t2va",)
+    assert info.tasks == ("t2va", "fl2va")
     assert info.schedule_points == 5
     # Without a deployment's selection, every training bucket: 21:9, 16:9,
     # 4:3, 1:1, 3:4 and 9:16 at 768p, then at 480p.

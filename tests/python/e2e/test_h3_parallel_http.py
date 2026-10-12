@@ -511,7 +511,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         Path(__file__).resolve().parents[3]
         / "configs"
         / "minimax_h3"
-        / "fasth3-ulysses4.json"
+        / "ulysses4.json"
     )
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
@@ -560,8 +560,14 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         caps = client.get("/v1/capabilities").json()
         assert caps["model"] == "FastH3"
         video = caps["video"]
-        assert video["tasks"] == ["t2va"]
-        assert video["task_conditions"] == {"t2va": {"conditions": []}}
+        assert video["tasks"] == ["t2va", "fl2va"]
+        assert video["task_conditions"] == {
+            "t2va": {"conditions": []},
+            "fl2va": {
+                "keyframe_frame_indices": [[0], [-1], [0, -1]],
+                "aspect_ratio": "auto or W:H",
+            },
+        }
         # The default deployment prepares the 768p 16:9 and 9:16 buckets.
         assert video["canvas"]["short_edges"] == [768]
         assert video["canvas"]["aspect_ratios"] == ["16:9", "9:16"]
