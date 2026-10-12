@@ -1,26 +1,26 @@
 """A deployment serves exactly one of a checkpoint's video denoisers."""
 
-import math
-from dataclasses import replace
-
 import pytest
 import torch
 
 from tests.python.fixtures.h3 import (
-    WIDE,
     base_config,
     fasth3_config,
-    omniref_denoiser,
 )
-from uniserve.media import image, video
-from uniserve.model import Condition, ConditionRole, ConditionTiles
+from tests.python.fixtures.worker_config import cpu_worker_config
+from uniserve.model import ReferenceLimits
 from uniserve_models.minimax_h3 import Model
+from uniserve_models.minimax_h3.config import DMD_CANVASES, NAMED_CANVASES
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import media_builder, video_denoiser
-from uniserve_worker.bootstrap.report import video_denoiser_info
+from uniserve_worker.bootstrap.report import (
+    build_worker_layout,
+    frame_clips,
+    video_denoiser_info,
+)
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.protocol.call import MediaCall
-from uniserve_worker.protocol.worker_info import VideoDenoiserInfo
+from uniserve_worker.protocol.worker_info import FrameClips
 
 pytestmark = pytest.mark.unit
 
@@ -34,11 +34,26 @@ _HOST = (
 
 
 def _config(*placed: str) -> WorkerConfig:
-    return WorkerConfig(
+    return cpu_worker_config(
         device="cpu",
-        max_sequence_tokens=1024,
+        max_model_len=1024,
         max_video_seconds=5.0,
         deployment_components=(*_HOST, *placed),
+    )
+
+
+def _declared(info) -> tuple[tuple[int, str, int, int], ...]:
+    """Each declared canvas as (short edge, aspect ratio, width, height)."""
+    return tuple(
+        (c.short_edge, c.aspect_ratio, c.width, c.height) for c in info.canvases
+    )
+
+
+def _trained(canvases) -> tuple[tuple[int, str, int, int], ...]:
+    """A checkpoint's canvases as (short edge, aspect ratio, width, height)."""
+    return tuple(
+        (edge, ratio, canvas.width, canvas.height)
+        for (edge, ratio), canvas in canvases.items()
     )
 
 
@@ -48,7 +63,7 @@ def base():
         return Model(base_config())
 
 
-@pytest.mark.parametrize("placed", ["denoiser", "reference_denoiser"])
+@pytest.mark.parametrize("placed", ["transformer", "transformer_ref"])
 def test_the_placed_denoiser_receives_the_video_calls(base, placed):
     config = _config(placed)
     denoiser = video_denoiser(base, config)
@@ -60,29 +75,48 @@ def test_the_placed_denoiser_receives_the_video_calls(base, placed):
 
 
 def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
-    info = video_denoiser_info(video_denoiser(base, _config("denoiser")))
+    denoiser = video_denoiser(base, _config("transformer"))
+    info = video_denoiser_info(
+        denoiser,
+        frame_rate=base.video_postprocessor.frame_rate,
+        audio_sample_rate=base.audio_decoder.sample_rate,
+        frames=frame_clips(denoiser, base.video_encoder),
+    )
+    # A video is `17n + 5` frames of `n + 1` encoder clips: five latent
+    # frames per clip and two in the tail.
+    assert info.frames == FrameClips(
+        min_frames=22,
+        clip_frames=17,
+        clip_latent_frames=5,
+        tail_latent_frames=2,
+    )
     # The worker executes both tasks of the t2va/fl2va DiT on the released
     # schedule: 50 sigma points, video shift 12, audio shift 3, the canvas
-    # rule's canvas of every named aspect ratio and no checkpoint sequence
-    # bound.
+    # rule's canvas of every named aspect ratio at 768p.
     assert (info.tasks, info.schedule_points) == (("t2va", "fl2va"), 50)
     assert (info.video_shift, info.audio_shift) == (12.0, 3.0)
-    assert info.canvases == (
-        (1536, 672),
-        (1344, 768),
-        (1024, 768),
-        (768, 768),
-        (768, 1024),
-        (768, 1344),
+    assert _declared(info) == _trained(NAMED_CANVASES)
+
+    # It takes no references.
+    assert info.references == ReferenceLimits()
+
+    # The reference DiT serves ref2va alone, with the references the
+    # checkpoint documents: nine images, three videos and three audio tracks,
+    # twelve in all.
+    reference_denoiser = video_denoiser(base, _config("transformer_ref"))
+    reference = video_denoiser_info(
+        reference_denoiser,
+        frame_rate=base.video_postprocessor.frame_rate,
+        audio_sample_rate=base.audio_decoder.sample_rate,
+        frames=frame_clips(reference_denoiser, base.video_encoder),
     )
-    assert info.max_sequence_rows is None
+    assert reference.tasks == ("ref2va",)
+    assert reference.references == ReferenceLimits(
+        images=9, videos=3, audios=3, total=12
+    )
 
-    # The reference DiT serves ref2va alone.
-    reference = video_denoiser(base, _config("reference_denoiser"))
-    assert video_denoiser_info(reference).tasks == ("ref2va",)
 
-
-@pytest.mark.parametrize("placed", [(), ("denoiser", "reference_denoiser")])
+@pytest.mark.parametrize("placed", [(), ("transformer", "transformer_ref")])
 def test_a_deployment_places_exactly_one_denoiser(base, placed):
     with pytest.raises(ValueError, match="exactly one"):
         video_denoiser(base, _config(*placed))
@@ -92,73 +126,43 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
     with torch.device("meta"):
         model = Model(fasth3_config())
     # One candidate needs no deployment to name it.
-    denoiser = video_denoiser(model, WorkerConfig(device="cpu"))
-    info = video_denoiser_info(denoiser)
+    denoiser = video_denoiser(model, cpu_worker_config(device="cpu"))
+    frames = frame_clips(denoiser, model.video_encoder)
+    info = video_denoiser_info(
+        denoiser,
+        frame_rate=model.video_postprocessor.frame_rate,
+        audio_sample_rate=model.audio_decoder.sample_rate,
+        frames=frames,
+    )
     assert info.tasks == ("t2va",)
     assert info.schedule_points == 5
-    # Without a deployment's selection, every (width, height) training
-    # bucket: 21:9, 16:9, 4:3, 1:1, 3:4 and 9:16 at 768p, then at 480p.
-    assert info.canvases == (
-        (1536, 672),
-        (1344, 768),
-        (1024, 768),
-        (768, 768),
-        (768, 1024),
-        (768, 1344),
-        (992, 416),
-        (832, 480),
-        (640, 480),
-        (480, 480),
-        (480, 640),
-        (480, 832),
+    # Without a deployment's selection, every training bucket: 21:9, 16:9,
+    # 4:3, 1:1, 3:4 and 9:16 at 768p, then at 480p.
+    assert _declared(info) == _trained(DMD_CANVASES)
+    # A deployment's selection is declared in the order it prepares them.
+    chosen = {
+        name: DMD_CANVASES[name] for name in ((480, "16:9"), (768, "9:16"))
+    }
+    declared = video_denoiser_info(
+        denoiser,
+        frame_rate=model.video_postprocessor.frame_rate,
+        audio_sample_rate=model.audio_decoder.sample_rate,
+        frames=frames,
+        canvases=tuple(chosen.values()),
     )
-    served = (image.Config(480, 832), image.Config(1344, 768))
-    assert video_denoiser_info(denoiser, canvases=served).canvases == (
-        (832, 480),
-        (768, 1344),
-    )
+    assert _declared(declared) == _trained(chosen)
 
 
-def test_the_handshake_declares_how_the_denoiser_counts_condition_rows(base):
-    # Admission counts condition rows by the handshake's packing, so the
-    # declared tiles must reproduce the rows the denoiser itself counts.
-    dense = video_denoiser_info(
-        video_denoiser(base, _config("reference_denoiser"))
+def test_a_worker_reports_the_audio_rate_of_its_model(base):
+    config = cpu_worker_config(
+        device="cpu",
+        max_model_len=1024,
+        max_video_seconds=5.0,
+        deployment_components=(*_HOST, "transformer"),
+        max_request_pool_size=2,
+        max_batch_calls=2,
     )
-    assert dense.condition_tiles is None
-
-    with torch.device("meta"):
-        model = Model(
-            replace(
-                base_config(),
-                denoisers={"reference_denoiser": omniref_denoiser()},
-            )
-        )
-    denoiser = video_denoiser(model, _config("reference_denoiser"))
-    info = video_denoiser_info(denoiser)
-    assert info.condition_tiles == ConditionTiles(128, (4, 4, 8))
-    assert VideoDenoiserInfo.from_mapping(info.to_mapping(), "info") == info
-
-    # A 124-frame clip of a 1344x768 video with 5 s of soundtrack, a
-    # 2048x1152 image and a voice: whole tiles of the clip's (37, 24, 42)
-    # token grid and of every row group, each tile its 128 rows.
-    clip = Condition(ConditionRole.REFERENCE, video.Config(124, WIDE), 160_000)
-    picture = Condition(
-        ConditionRole.REFERENCE, video.Config(1, image.Config(2048, 1152))
+    declared = build_worker_layout(base, config, queue_depth=6).info
+    assert declared.video_denoiser.audio_sample_rate == (
+        base.audio_decoder.sample_rate
     )
-    voice = Condition(ConditionRole.REFERENCE, None, 96_000)
-    size = denoiser.make_size(
-        124, 300, canvas=WIDE, conditions=(clip, picture, voice)
-    )
-    tiles = info.condition_tiles
-    grid = (37, 768 // 32, 1344 // 32)
-    clip_tiles = math.prod(
-        math.ceil(extent / side) for extent, side in zip(grid, tiles.video)
-    )
-    # The soundtrack's 5 s and the voice's 3 s are 200 and 120 latents of
-    # 800 samples at 32 kHz, two stereo rows each; the image's raster is
-    # 64 x 36 rows.
-    group_tiles = sum(
-        math.ceil(rows / tiles.rows) for rows in (2 * 200, 64 * 36, 2 * 120)
-    )
-    assert size.condition_rows == tiles.rows * (clip_tiles + group_tiles)

@@ -5,8 +5,8 @@
 //! [`ImageInput`] values (the encoded file bytes, their header dimensions, and
 //! a content hash) before model preprocessing runs, so network I/O stays on
 //! the async runtime and never enters the blocking preprocessing pool. Chat
-//! `image_url` parts and programmatic prompts reach model preprocessing in
-//! this same form, whatever their source.
+//! `image_url` parts reach model preprocessing in this same form, whatever
+//! their source.
 
 mod fetch;
 mod image;

@@ -26,7 +26,6 @@ from uniserve_worker.errors import WorkerError, classify
 from uniserve_worker.execution.executor import Submission
 from uniserve_worker.profiling import record_failure, worker_range_name
 from uniserve_worker.protocol import messages
-from uniserve_worker.protocol.batch import Batch
 from uniserve_worker.protocol.worker_info import RequestKind, ResponseKind
 
 if TYPE_CHECKING:
@@ -68,7 +67,7 @@ class Service:
         self.worker = worker
         self.endpoint = endpoint
         # Accepted requests whose responses are not yet sent. Its length is
-        # bounded by `WorkerInfo.queue_depth`, and every in-flight executor
+        # bounded by `Worker.queue_depth`, and every in-flight executor
         # batch has an entry here, so `Executor.submit` never sees a full
         # admission queue from this loop.
         self._pending: deque[PendingResponse] = deque()
@@ -119,7 +118,7 @@ class Service:
 
                 if (
                     not self._closing
-                    and len(self._pending) < self.worker.info.queue_depth
+                    and len(self._pending) < self.worker.queue_depth
                 ):
                     request = self.endpoint.try_recv()
                     if request is not None:
@@ -254,15 +253,8 @@ class Service:
                 )
                 submission = None
             else:
-                raw_batch = messages.required(request, "batch", kind)
-                # The IPC extension delivers a constructed `Batch`; a plain
-                # mapping is decoded and validated here.
-                with profile_range("uniserve.worker.batch_decode"):
-                    batch = (
-                        raw_batch
-                        if isinstance(raw_batch, Batch)
-                        else Batch.from_mapping(raw_batch)
-                    )
+                # The IPC extension delivers a constructed `Batch`.
+                batch = messages.required(request, "batch", kind)
                 submission = self.worker.submit(batch)
                 response = messages.response(ResponseKind.RESULT)
             self._pending.append(
@@ -313,7 +305,7 @@ class Service:
                     batch_id=None
                     if submission is None
                     else submission.batch_id,
-                    rank=self.worker.info.endpoint.rank,
+                    rank=int(self.worker.worker_config.rank),
                 )
             ):
                 response = messages.finalize_response(response)

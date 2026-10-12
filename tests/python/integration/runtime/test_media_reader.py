@@ -2,9 +2,9 @@
 
 Each case reads the media of a recorded diffusers reference run through the
 media reader's ``read_conditions``, from shared memory, with the descriptors
-the planner derives from the media's probed facts
-(``processing.plan_request``). The reader's operations are the reference
-conditioning's own, in its order, so every product is compared bit for bit:
+the reference's sizes give (``tests/python/fixtures/h3_conditions.py``). The
+reader's operations are the reference conditioning's own, in its order, so
+every product is compared bit for bit:
 
 - the conditioner's patch rows with the recorded processor output
   (``qwen_pixel_values`` and ``qwen_pixel_values_videos``): the same decode,
@@ -19,13 +19,20 @@ A video's encoded frames come from the same single FFmpeg pass as the frames
 the conditioner samples, so the sampled frames' equality also checks the
 pass.
 
+Every image reference the MiniMax-H3 workloads condition on is also read at
+its planned raster and compared with Pillow's own LANCZOS resize of the
+decoded file, byte for byte, since the reader runs that resize as bands on
+several threads.
+
 The cases need the reference artifacts (``UNISERVE_MINIMAX_H3_REFERENCE``,
-holding ``inputs/media`` and ``reference/diffusers``) and the FFmpeg build
-the reference decoded with (``UNISERVE_FFMPEG``, with ``ffprobe`` beside it).
+holding ``inputs/media`` and ``reference/diffusers``); the recorded runs'
+cases also need the FFmpeg build the reference decoded with
+(``UNISERVE_FFMPEG``, with ``ffprobe`` beside it).
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -37,19 +44,27 @@ import torch
 from safetensors.torch import load_file
 
 from tests.python.fixtures.h3_conditions import (
-    FPS,
     SAMPLE_RATE,
     published,
     read,
     recorded_request,
     vision_encoder,
 )
+from uniserve.media import image
+from uniserve_models.minimax_h3.packing import FPS
+from uniserve_worker.media.reader import read_image
+from uniserve_worker.protocol.video import ImageFit
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.model("minimax_h3"),
     pytest.mark.slow,
 ]
+
+
+def _nearest_multiple(value: float) -> int:
+    """Round a side to the nearest multiple of 32, half to even."""
+    return max(32, round(value / 32) * 32)
 
 
 @pytest.fixture(scope="module")
@@ -93,9 +108,7 @@ def test_conditions_read_as_the_reference_conditioning(case, root, ffmpeg):
     from diffusers.utils import load_image
 
     with published() as publish:
-        run, plan, paths, conditions = recorded_request(
-            root, case, ffmpeg, publish
-        )
+        run, request, paths, conditions = recorded_request(root, case, publish)
         pixels, samples, patches = read(conditions, vision_encoder(), ffmpeg)
 
     # The conditioner's rows, split by modality as the processor batches
@@ -142,8 +155,50 @@ def test_conditions_read_as_the_reference_conditioning(case, root, ffmpeg):
             continue
         waveform, rate = references._decode_audio_file(path)
         expected = MiniMaxH3Ref2VASetupStep._normalize_audio_condition(
-            waveform, rate, SAMPLE_RATE, max_duration=plan.num_frames / FPS
+            waveform, rate, SAMPLE_RATE, max_duration=request.num_frames / FPS
         )
         count = condition.audio.samples
         assert torch.equal(samples[offset : offset + count], expected.T)
         offset += count
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "hf_character_action_reference.png",
+        "official_fl2va_0_image.png",
+        "hf_fashion_glasses_reference_3.png",
+        "square_character_action_reference.png",
+        "square_official_fl2va_0_image.png",
+        "square_fashion_glasses_reference_1.png",
+        "square_fashion_glasses_reference_2.png",
+        "square_fashion_glasses_reference_3.png",
+        "square_fl2va_clay_fox_reference.png",
+        "square_h3_cinematic_shot_3s.png",
+        "square_h3_suspense_title_2s.png",
+        "square_robot_arm_red_cube_1s.png",
+    ],
+)
+@pytest.mark.parametrize("enlarge", (False, True))
+def test_image_references_resize_as_pillow(name, enlarge, root):
+    from PIL import Image, ImageOps
+
+    data = (root / "inputs/media" / name).read_bytes()
+    decoded = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+    decoded = decoded.convert("RGB")
+    # Every image here is smaller than its 2048 short edge: it keeps its
+    # own size on the 32-pixel grid, or is enlarged to that edge as the
+    # reference pipeline enlarges it.
+    width, height = decoded.size
+    scale = 2048 / min(width, height) if enlarge else 1.0
+    raster = image.Config(
+        height=_nearest_multiple(height * scale),
+        width=_nearest_multiple(width * scale),
+    )
+    fit = ImageFit(resized=raster, left=0, top=0, size=raster)
+
+    expected = decoded.resize(
+        (raster.width, raster.height), Image.Resampling.LANCZOS
+    )
+    pixels = read_image(data, fit)
+    np.testing.assert_array_equal(pixels[0], np.asarray(expected))

@@ -1,28 +1,14 @@
 """Video Sparse Attention selection and compressed block computation."""
 
-from .inputs import (
-    DENSE_TILE,
-    TILE_SIZES,
-    BlockInput,
-    Input,
-    NormRope,
-    Pattern,
-    Regions,
-    Workspace,
-)
+from .inputs import DENSE_TILE, BlockInput, Pattern, Segments
+from .layer import BlockAttention
+from .segments import SegmentAttention
 
 __all__ = [
     "DENSE_TILE",
-    "TILE_SIZES",
+    "BlockAttention",
     "BlockInput",
-    "Input",
-    "NormRope",
     "Pattern",
-    "Regions",
-    "Workspace",
+    "SegmentAttention",
+    "Segments",
 ]
-
-from .layer import Attention, BlockAttention
-from .regions import RegionAttention
-
-__all__ += ["Attention", "BlockAttention", "RegionAttention"]

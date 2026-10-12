@@ -20,7 +20,7 @@ from uniserve.nn.attention import (
     SequenceLengths,
     VarlenInput,
 )
-from uniserve.nn.functional import patchify, qk_norm_rope
+from uniserve.nn.functional import Rounding, patchify, qk_norm_rope
 from uniserve.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
 from uniserve.nn.mlp import GatedMLP
 from uniserve.nn.norm import RMSNorm
@@ -114,6 +114,11 @@ class Attention(nn.Module):
             sin,
             eps=self.eps,
             axis_dims=(half, half),
+            # SGLang rounds the normalized head and then rotates in FP32,
+            # rounding once; Transformers rounds after every operation. No
+            # recipe of ``qk_norm_rope`` reproduces either exactly, so the
+            # fused single-rounding evaluation stands.
+            rounding=Rounding.ONCE,
         )
         attended = self.attention(query, key, self.value_norm(value), attention)
         return self.output(attended.flatten(1))

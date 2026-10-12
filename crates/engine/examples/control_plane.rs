@@ -16,15 +16,24 @@ use std::time::Duration;
 use uniserve_core::EngineCoreOutput;
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageParams, ImageTrigger,
+    ImageEncoderInput, ImageGenerationConfig, ImageParams, ImageTrigger, MediaCall, ModelDtype,
     RequestId, SamplingParams,
 };
-use uniserve_engine::{EngineHandle, Scheduler, SimEngine, SimExecutor, SpecialTokenIds};
+use uniserve_engine::{EngineHandle, Scheduler, SchedulerConfig, SimEngine, SimExecutor};
 
 fn main() {
-    let ctrl = SpecialTokenIds::default();
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let sched = Scheduler::new(executor, ctrl, 32).unwrap();
+    let sched = Scheduler::new(
+        executor,
+        SimEngine::special_tokens(),
+        SchedulerConfig {
+            max_batch: 32,
+            ..Default::default()
+        },
+        ModelDtype::BFloat16,
+        SimEngine::generation_limits(),
+    )
+    .unwrap();
 
     // The scheduler runs on its own thread; this thread submits through the
     // handle and drains each request's event receiver, as a server would.
@@ -44,7 +53,7 @@ fn main() {
             feedback_next_token: FeedbackNextToken::EndOfImage,
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
-                encoder: ImageIngestStep::VitEncode,
+                encoder: MediaCall::VisionEncoding,
                 num_kv_tokens: None,
                 max_kv_tokens: None,
             }],
@@ -66,6 +75,7 @@ fn main() {
             latent_downsample: 16,
             max_vae_grid_tokens: 64,
             max_vit_grid_tokens: 64,
+            latent_bytes_per_unit: (1 << 20) / 64,
             max_latent_feature_bytes: 1 << 20,
             max_vision_feature_bytes: 1 << 20,
             commit_marker_tokens: 2,
@@ -80,6 +90,7 @@ fn main() {
             constraint,
             sampling: SamplingParams::default(),
             image,
+            max_images: 1,
             max_und_tokens: 20,
             include_stop_token: false,
             stop_strings: Vec::new(),
@@ -88,7 +99,6 @@ fn main() {
             cache,
             image_generation: policy,
             readout: Vec::new(),
-            canvas: None,
         };
         request
             .validate_resources(&limits)

@@ -16,7 +16,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
-from uniserve_worker.errors import invalid_descriptor
+from uniserve.runtime.resources import close_resources
+from uniserve_worker.errors import ErrorCode, invalid_descriptor
 from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.calls import _predicated_outcome
@@ -45,7 +46,6 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -59,14 +59,13 @@ def dispatch_batch(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
     transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
@@ -75,9 +74,11 @@ def dispatch_batch(
     """Execute the batch's active calls and align outcomes with its call order.
 
     Calls whose output ``reserve_outputs`` marked ``CallStatus.PREDICATED``
-    are not executed; ``_predicated_outcome`` stages their outcome. The
-    returned tuple holds one outcome per call of ``state.batch.calls``, in
-    that order.
+    are not executed; ``_predicated_outcome`` stages their outcome. A call
+    of a request this rank refused (``RequestState.refusal``) is not
+    executed either; ``refused_output`` reports the refusal. The returned
+    tuple holds one outcome per call of ``state.batch.calls``, in that
+    order.
 
     A failure raises and aborts the homogeneous batch; its owner discards all
     provisional outputs before reporting the error.
@@ -95,7 +96,7 @@ def dispatch_batch(
         for device in dict.fromkeys(
             device
             for call in active
-            for device in model_runner.call_devices(call)
+            for device in model_executor.call_devices(call)
         ):
             state.output_buffer.begin_device(device)
 
@@ -104,11 +105,12 @@ def dispatch_batch(
     locations: list[int] = []
 
     for call_index, call in enumerate(batch_calls):
-        if (
-            state.pending_output(call.request_key.request_id).status
-            is CallStatus.PREDICATED
-        ):
+        pending = state.pending_output(call.request_key.request_id)
+        if pending.status is CallStatus.PREDICATED:
             outcomes[call_index] = _predicated_outcome(call, state=state)
+            continue
+        if pending.request.refusal is not None:
+            outcomes[call_index] = refused_output(pending, tensor_store)
             continue
         locations.append(call_index)
         scheduled.append(call)
@@ -119,14 +121,13 @@ def dispatch_batch(
         tuple(scheduled),
         kv_cache=kv_cache,
         tensor_store=tensor_store,
-        worker_info=worker_info,
         latent_pool=latent_pool,
         media_mux=media_mux,
         publication_transports=publication_transports,
         transports=transports,
         request_tables=request_tables,
         request_pool=request_pool,
-        model_runner=model_runner,
+        model_executor=model_executor,
         decode_state=decode_state,
         sampling_group=sampling_group,
         tokenizer=tokenizer,
@@ -141,6 +142,27 @@ def dispatch_batch(
     return tuple(cast(PendingOutput, outcome) for outcome in outcomes)
 
 
+def refused_output(
+    pending: PendingOutput, tensor_store: TensorStore
+) -> PendingOutput:
+    """Report a call of a refused request without running it.
+
+    The call fills none of its reserved writes and configures none of the
+    host tasks reserved for it, so both are abandoned: an unconfigured task
+    left with the output would be submitted when the output materializes.
+    The output reports ``ErrorCode.INVALID_REQUEST`` with the refusal's
+    reason, which the engine returns to the client.
+    """
+    tensor_store.abandon_writes(tuple(pending.writes))
+    pending.writes.clear()
+    tasks, pending.host.tasks = pending.host.tasks, ()
+    close_resources(*(task.abandon for task in tasks))
+    pending.status = CallStatus.ERROR
+    pending.error_code = ErrorCode.INVALID_REQUEST
+    pending.error_message = pending.request.refusal
+    return pending
+
+
 def _execute_ready_actions(
     frontier: tuple[int, ...],
     scheduled: tuple[Call, ...],
@@ -149,14 +171,13 @@ def _execute_ready_actions(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
     transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     config: WorkerConfig,
 ) -> None:
     """Execute a frontier that contains no model-forward rows.
@@ -164,7 +185,7 @@ def _execute_ready_actions(
     Each call dispatches by kind to its owning module and runs inside
     ``state.scope()``, which makes the batch stream current when the batch
     has one. On a video worker (``video_postprocessor`` set), device
-    computation also lands here: a request's vision and condition latent
+    call also lands here: a request's vision and condition latent
     encodings through ``conditions``, and denoising and decode rounds
     through ``media.execute``. Calls that already have an outcome are
     skipped.
@@ -198,24 +219,23 @@ def _execute_ready_actions(
                     latent_pool=latent_pool,
                     publication_transports=publication_transports,
                     request_tables=request_tables,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             # Latent preparation belongs to diffusion only on image workers;
             # a video worker's latent preparation falls through to media.
             elif (
                 call.kind is MediaCall.LATENT_PREPARATION
-                and model_runner.image_builder is not None
+                and model_executor.image_builder is not None
             ):
                 assert latent_pool is not None
                 result = diffusion.prepare_latent(
                     call,
                     kv_cache=kv_cache,
-                    worker_info=worker_info,
                     latent_pool=latent_pool,
                     publication_transports=publication_transports,
                     request_tables=request_tables,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     config=config,
                     state=state,
                 )
@@ -224,29 +244,29 @@ def _execute_ready_actions(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             elif (
                 call.kind is MediaCall.VISION_ENCODING
-                and model_runner.video_postprocessor is not None
+                and model_executor.video_postprocessor is not None
             ):
                 result = conditions.encode_vision(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             elif (
                 call.kind is MediaCall.LATENT_ENCODING
-                and model_runner.video_postprocessor is not None
+                and model_executor.video_postprocessor is not None
             ):
                 result = conditions.encode_latents(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             elif call.kind is MediaCall.TEXT_ENCODING:
@@ -254,7 +274,7 @@ def _execute_ready_actions(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             elif call.kind in HOST_MEDIA_CALLS:
@@ -264,16 +284,16 @@ def _execute_ready_actions(
                     media_mux=media_mux,
                     publication_transports=publication_transports,
                     transports=transports,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
-            elif model_runner.video_postprocessor is not None:
+            elif model_executor.video_postprocessor is not None:
                 result = media.execute(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
                     request_pool=request_pool,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             else:
@@ -287,14 +307,13 @@ def _execute_calls(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
     transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
@@ -360,8 +379,8 @@ def _execute_calls(
         # request's condition encodings included, are media actions. When
         # the frontier holds forward work, only those calls run in this
         # round; the other ready calls stay live and run in a later round.
-        images = model_runner.image_builder is not None
-        videos = model_runner.video_postprocessor is not None
+        images = model_executor.image_builder is not None
+        videos = model_executor.video_postprocessor is not None
         numerical = tuple(
             index
             for index in frontier
@@ -389,14 +408,13 @@ def _execute_calls(
                 state=state,
                 kv_cache=kv_cache,
                 tensor_store=tensor_store,
-                worker_info=worker_info,
                 latent_pool=latent_pool,
                 media_mux=media_mux,
                 publication_transports=publication_transports,
                 transports=transports,
                 request_tables=request_tables,
                 request_pool=request_pool,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 config=config,
             )
             continue
@@ -404,7 +422,7 @@ def _execute_calls(
         if images:
             # An image worker always holds its latent pool.
             assert latent_pool is not None
-            trajectories, step_count = initialize_trajectories(
+            trajectories = initialize_trajectories(
                 numerical,
                 scheduled,
                 outcomes,
@@ -412,99 +430,89 @@ def _execute_calls(
                 kv_cache=kv_cache,
                 latent_pool=latent_pool,
                 request_tables=request_tables,
-                model_runner=model_runner,
+                model_executor=model_executor,
             )
         else:
-            trajectories, step_count = {}, 1
+            trajectories = {}
 
-        # step_count is the longest declared solver interval among the opened
-        # trajectories; a trajectory with fewer steps drops out once its
-        # interval ends.
-        for offset in range(step_count):
-            # The numerical schedule is local to this loop. Accepted request
-            # progress is published only after the complete declared interval.
-            if trajectories:
-                assert latent_pool is not None
-                step_inputs = prepare_diffusion_step(
-                    offset,
-                    trajectories,
-                    scheduled,
-                    outcomes,
-                    state=state,
-                    kv_cache=kv_cache,
-                    latent_pool=latent_pool,
-                    request_tables=request_tables,
-                    model_runner=model_runner,
-                    decode_state=decode_state,
-                    sampling_group=sampling_group,
-                    tokenizer=tokenizer,
-                )
-            else:
-                step_inputs = {}
+        # The numerical schedule is local to this round. Accepted request
+        # progress is published with the batch commit.
+        if trajectories:
+            assert latent_pool is not None
+            step_inputs = prepare_diffusion_step(
+                trajectories,
+                scheduled,
+                outcomes,
+                state=state,
+                kv_cache=kv_cache,
+                latent_pool=latent_pool,
+                request_tables=request_tables,
+                model_executor=model_executor,
+                decode_state=decode_state,
+                sampling_group=sampling_group,
+                tokenizer=tokenizer,
+            )
+        else:
+            step_inputs = {}
 
-            forward, prepared_images = prepare_forward_rows(
-                numerical,
-                offset,
+        forward, prepared_images = prepare_forward_rows(
+            numerical,
+            step_inputs,
+            trajectories,
+            scheduled,
+            outcomes,
+            state=state,
+            tensor_store=tensor_store,
+            latent_pool=latent_pool,
+            request_tables=request_tables,
+            model_executor=model_executor,
+            decode_state=decode_state,
+        )
+
+        values = (
+            forward_values(
+                model_executor,
+                tuple((task, scheduled[index]) for index, task in forward),
+                cache=kv_cache,
+                tables=request_tables,
+                states=decode_state,
+                sampling_group=sampling_group,
+                state=state,
+            )
+            if forward
+            else ()
+        )
+
+        predictions = publish_forward_values(
+            forward,
+            values,
+            prepared_images,
+            trajectories,
+            scheduled,
+            outcomes,
+            state=state,
+            tensor_store=tensor_store,
+            publication_transports=publication_transports,
+            model_executor=model_executor,
+            request_tables=request_tables,
+            decode_state=decode_state,
+            sampling_group=sampling_group,
+            config=config,
+        )
+
+        if predictions:
+            assert latent_pool is not None
+            integrate_predictions(
+                predictions,
                 step_inputs,
                 trajectories,
                 scheduled,
                 outcomes,
                 state=state,
-                tensor_store=tensor_store,
                 latent_pool=latent_pool,
-                request_tables=request_tables,
-                model_runner=model_runner,
-                decode_state=decode_state,
-            )
-
-            values = (
-                forward_values(
-                    model_runner,
-                    tuple((task, scheduled[index]) for index, task in forward),
-                    cache=kv_cache,
-                    tables=request_tables,
-                    states=decode_state,
-                    sampling_group=sampling_group,
-                    state=state,
-                    retain_sampling=offset + 1 < step_count,
-                )
-                if forward
-                else ()
-            )
-
-            predictions = publish_forward_values(
-                forward,
-                values,
-                prepared_images,
-                trajectories,
-                scheduled,
-                outcomes,
-                state=state,
-                tensor_store=tensor_store,
-                worker_info=worker_info,
                 publication_transports=publication_transports,
-                model_runner=model_runner,
                 request_tables=request_tables,
-                decode_state=decode_state,
-                sampling_group=sampling_group,
+                model_executor=model_executor,
                 config=config,
             )
-
-            if predictions:
-                assert latent_pool is not None
-                integrate_predictions(
-                    predictions,
-                    step_inputs,
-                    trajectories,
-                    offset,
-                    scheduled,
-                    outcomes,
-                    state=state,
-                    worker_info=worker_info,
-                    latent_pool=latent_pool,
-                    publication_transports=publication_transports,
-                    request_tables=request_tables,
-                    model_runner=model_runner,
-                    config=config,
-                )
     return outcomes

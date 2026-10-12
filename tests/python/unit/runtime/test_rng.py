@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from uniserve.nn.rng import (
-    DRAW_LAYOUT_PROPOSAL,
+    DRAW_LAYOUT_FLOW_NOISE,
     DRAW_LAYOUT_TARGET,
     normal_noise,
     sampling_key,
@@ -65,7 +65,7 @@ def test_sampling_draw_is_stable_and_coordinate_scoped() -> None:
     )
 
 
-def test_draw_layout_separates_proposal_and_target_spaces() -> None:
+def test_draw_layout_separates_the_target_and_flow_noise_spaces() -> None:
     target = sampling_key(
         41,
         engine_id=3,
@@ -73,13 +73,13 @@ def test_draw_layout_separates_proposal_and_target_spaces() -> None:
         request_epoch=2,
         draw_layout=DRAW_LAYOUT_TARGET,
     )
-    proposal = sampling_key(
+    noise = sampling_key(
         41,
         engine_id=3,
         request_id=7,
         request_epoch=2,
-        draw_layout=DRAW_LAYOUT_PROPOSAL,
+        draw_layout=DRAW_LAYOUT_FLOW_NOISE,
     )
 
-    assert target != proposal
-    assert sampling_uniform(target, 19) != sampling_uniform(proposal, 19)
+    assert target != noise
+    assert sampling_uniform(target, 19) != sampling_uniform(noise, 19)

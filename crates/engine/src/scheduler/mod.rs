@@ -31,7 +31,7 @@
 //! - `allocation` and `placement`: storage ownership and worker placement.
 //! - `control`: cancellation and frontend lifecycle commands.
 //! - `config`, `stats`, and `stats_report`: limits and statistics.
-//! - `image_artifact`: validation of worker-produced PNG artifacts.
+//! - `image_artifact`: metadata of worker-produced PNG artifacts.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -39,14 +39,12 @@ mod config;
 mod stats;
 pub(crate) mod stats_report;
 
-pub(crate) use config::MAX_NUM_SEQS;
-use config::MAX_NUM_WAITING;
 pub use config::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulerConfig, SchedulingPolicy,
+    DEFAULT_MAX_NUM_SEQS, SchedulerConfig, SchedulingPolicy,
 };
 pub(crate) use execution::generation_consuming_calls;
-pub(crate) use run::{MAX_FLOW_PREFIX_ROWS, flow_prefix_rows};
+pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,
@@ -72,15 +70,14 @@ pub(crate) use crate::executor::{
     BatchResult, ExecutionBatch, Executor, ExecutorSubmitError, RequestPlacement,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use std::env;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::scheduler::generation::{
-    BlockCursor, GenerationPhase as Phase, consumes_image_features, is_feedback_computation,
+    BlockCursor, GenerationPhase as Phase, consumes_image_features, is_feedback_call,
     is_prompt_extend,
 };
 
@@ -90,21 +87,21 @@ use crate::storage::{
     BufferPool, BufferSpan, KVCacheManager, LatentPages, LatentPool, RequestPool, RequestSlot,
 };
 use crossbeam_channel::Receiver;
+use uniserve_core::RequestId;
 use uniserve_core::{
-    ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest, MediaKind,
-    PositionLogprobs, Request, SharedMedia, TokenLogprob,
+    ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest,
+    GenerationRequestError, MediaKind, PositionLogprobs, Request, SharedMedia, TokenLogprob,
 };
-use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
-use uniserve_core::{ImageIngestStep, RejectionKind, UnitId, encoder_cache_key};
+use uniserve_core::{RejectionKind, UnitId, encoder_cache_key};
 use uniserve_worker_ipc::{
-    ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
+    BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
-    DimBound, ForwardBatch, ForwardStats, LatentParams, NewRequest, RequestKey, SamplingState,
+    DimBound, ForwardBatch, ForwardStats, GenerationParams, NewRequest, RequestKey, SamplingState,
     ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
 
-use crate::executor::WorkerFailure;
-use crate::scheduler::image_artifact::validate_png_artifact;
+use crate::executor::{RankBuffer, WorkerFailure};
+use crate::scheduler::image_artifact::png_artifact_info;
 use allocation::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
     UnknownMediaWorker,
@@ -114,13 +111,6 @@ use generation::RequestState;
 use graph::{VideoGraph, product};
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
 use output::RequestOutput;
-
-/// Number of denoising steps planned for one scheduling burst by default.
-pub(crate) const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
-/// Upper bound on concurrently reserved transfer calls. Construction clamps
-/// the executor's `queue_depth * max_batch_calls` to between one and this
-/// value to form `Scheduler::transfer_capacity`.
-const MAX_INFLIGHT_TRANSFERS: usize = 256;
 
 /// Execution lane a call kind is batched in (see `batch_kind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,17 +134,13 @@ const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
 /// results before ready decode work takes precedence over further prefill
 /// (`Scheduler::select_batch_kind`).
 const PREFILL_WINDOW_CREDITS: usize = 2;
-/// Environment variable overriding `DEFAULT_DENOISE_STEP_BURST`; a missing,
-/// unparsable, or zero value selects the default.
-const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
 
-/// Builds a validated image-completion event from a base64 PNG payload.
+/// Builds an image-completion event from a base64 PNG payload.
 ///
-/// Fully decodes the PNG through `validate_png_artifact`; returns `None` when
-/// the payload is not valid base64 or not a fully decodable PNG with nonzero
-/// dimensions.
+/// Reads the dimensions and size through `png_artifact_info`; returns `None`
+/// when the payload has no PNG header with nonzero dimensions.
 fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<EngineCoreOutput> {
-    let metadata = validate_png_artifact(&pixels_png_b64, None)?;
+    let metadata = png_artifact_info(&pixels_png_b64)?;
     Some(EngineCoreOutput::ImageDone {
         image_id,
         height: metadata.height,
@@ -168,8 +154,7 @@ fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<EngineCoreO
 /// Model token identifiers used for sequence and image-content boundaries.
 ///
 /// Serving resolves these from the loaded model's configuration in the server
-/// crate (`special_token_ids`); the `Default` values serve schedulers that
-/// tests and examples construct directly.
+/// crate (`special_token_ids`).
 pub struct SpecialTokenIds {
     /// Beginning-of-sequence token identifier.
     pub bos: u32,
@@ -179,16 +164,6 @@ pub struct SpecialTokenIds {
     pub eos: Vec<u32>,
     /// Token identifier that terminates encoded image content.
     pub end_of_image: u32,
-}
-
-impl Default for SpecialTokenIds {
-    fn default() -> Self {
-        Self {
-            bos: 151644,
-            eos: vec![151645, 151643],
-            end_of_image: 151653,
-        }
-    }
 }
 
 /// Request-held reference to a reusable encoder-cache entry.
@@ -204,6 +179,10 @@ pub(crate) enum TerminalIntent {
     None,
     Finish(FinishReason),
     Failure(String),
+    /// A worker refused the request itself (`ErrorCode::InvalidRequest`),
+    /// for the reason it stated; the client receives an invalid-request
+    /// rejection.
+    Rejected(String),
 }
 
 impl TerminalIntent {
@@ -212,8 +191,8 @@ impl TerminalIntent {
         !matches!(self, Self::None)
     }
 
-    /// Records a finish reason unless a terminal intent (finish or failure)
-    /// is already recorded; the first recorded intent wins.
+    /// Records a finish reason unless a terminal intent (finish, failure or
+    /// rejection) is already recorded; the first recorded intent wins.
     fn finish(&mut self, reason: FinishReason) {
         if matches!(self, Self::None) {
             *self = Self::Finish(reason);
@@ -222,13 +201,13 @@ impl TerminalIntent {
 }
 
 /// Negative-prompt KV prefix of a token request whose image generation uses
-/// more than one guidance branch (`Scheduler::ensure_flow_prefix`).
+/// more than one guidance branch (`Scheduler::ensure_guidance_prefix`).
 ///
 /// The prefix holds its own request-pool slot and KV allocation, separate
 /// from the request's main `RequestAllocations`, until
-/// `Scheduler::free_flow_prefix` releases them after the last denoising step
+/// `Scheduler::free_guidance_prefix` releases them after the last denoising step
 /// or the request finishes.
-struct FlowPrefixState {
+struct GuidancePrefixState {
     allocations: RequestAllocations,
     /// Units per KV group, as `(group_id, unit_ids)`, not yet declared to the
     /// worker; the next denoising call drains them as fresh-unit allocations.
@@ -239,7 +218,7 @@ struct FlowPrefixState {
     diffusion_finalized: bool,
 }
 
-impl FlowPrefixState {
+impl GuidancePrefixState {
     /// Returns the request-pool index.
     fn request_pool_idx(&self) -> u32 {
         self.allocations.request_slot()
@@ -305,7 +284,6 @@ struct MediaFlowState {
     denoising: Denoising,
     scheduled_decode_units: u32,
     scheduled_encode_units: u32,
-    encoded_video_units: u32,
     audio_decoding_scheduled: bool,
     audio_encoding_scheduled: bool,
     audio_encoded: bool,
@@ -336,6 +314,7 @@ enum WorkerRegistration {
 enum DiffusionTerminal {
     Completed(ArtifactEvent),
     Failed(String),
+    Rejected(String),
     Finished(FinishReason),
 }
 
@@ -348,32 +327,6 @@ struct PendingMedia {
     queued_at: f64,
 }
 
-/// Permissive unified-multimodal limits for a scheduler built without
-/// model-derived limits.
-///
-/// `Scheduler::with_config_for_family` uses them for `RuntimeFamily::Umm`, and
-/// `EngineConfig::sim` uses them as its default. Construction intersects them
-/// with worker-reported capacities (`resolve_generation_limits` in `run`), so
-/// the effective bounds come from the loaded workers. A serving deployment
-/// supplies model limits through `EngineConfig`.
-pub(crate) fn unbounded_umm_generation_limits() -> uniserve_core::GenerationLimits {
-    uniserve_core::GenerationLimits {
-        features: uniserve_core::GenerationFeatures::UNDERSTANDING
-            | uniserve_core::GenerationFeatures::VISION_ENCODE
-            | uniserve_core::GenerationFeatures::LATENT_ENCODE
-            | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
-        max_latent_units: u64::MAX,
-        latent_downsample: 16,
-        max_vae_grid_tokens: u32::MAX,
-        max_vit_grid_tokens: u32::MAX,
-        max_latent_feature_bytes: 256 << 20,
-        max_vision_feature_bytes: 256 << 20,
-        commit_marker_tokens: 2,
-        max_cfg_branches: 3,
-        encoder_cache_entries: 256,
-    }
-}
-
 /// Single-threaded owner of scheduling, storage, execution, and request state.
 pub struct Scheduler {
     executor: Box<dyn Executor>,
@@ -384,7 +337,6 @@ pub struct Scheduler {
     /// Aggregate capacity view of the loaded workers.
     info: WorkerInfo,
     generation_limits: uniserve_core::GenerationLimits,
-    family: RuntimeFamily,
     ctrl: SpecialTokenIds,
     /// Token requests awaiting admission, in admission order: arrival order,
     /// or priority then arrival under the priority policy.
@@ -399,8 +351,6 @@ pub struct Scheduler {
     /// Maximum number of transfer calls holding a reservation at once
     /// (`Inflight::num_pending_transfers`).
     transfer_capacity: usize,
-    /// Maximum denoising steps one call covers.
-    denoise_step_burst: u16,
     /// IPC dtype of image latents, mapped from the model dtype by
     /// `worker_float_dtype`.
     latent_dtype: Option<DType>,
@@ -439,17 +389,6 @@ impl Scheduler {
     fn invariant_broken(&mut self, invariant: &str) {
         tracing::error!(invariant, "scheduler invariant broken; stopping the engine");
         self.fatal = true;
-    }
-
-    /// Determines whether this service's configured model accepts a request family.
-    const fn accepts_family(&self, family: RuntimeFamily) -> bool {
-        matches!(
-            (self.family, family),
-            (RuntimeFamily::Ar, RuntimeFamily::Ar)
-                | (RuntimeFamily::Diffusion, RuntimeFamily::Diffusion)
-                | (RuntimeFamily::Umm, RuntimeFamily::Ar | RuntimeFamily::Umm)
-                | (RuntimeFamily::BlockDiffusion, RuntimeFamily::BlockDiffusion)
-        )
     }
 }
 
@@ -495,7 +434,7 @@ fn add_worker_forward_map(target: &Mutex<BTreeMap<String, u64>>, delta: &BTreeMa
 /// The sorted, deduplicated list holds the request's stop token ids, the EOS
 /// ids unless `ignore_eos` is set, and the image-generation trigger when the
 /// request generates images through a direct trigger token. It reaches the
-/// worker in `ArRequestParams::finish_token_ids` and bounds verified-draft
+/// worker in `GenerationParams::finish_token_ids` and bounds verified-draft
 /// prefixes in `validate_generation_result`.
 ///
 /// Terminal stop/EOS tokens end the request. A direct Gen trigger instead ends
@@ -588,32 +527,21 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
     value.div_ceil(divisor)
 }
 
-/// Returns the maximum number of output events one in-flight call can add to
-/// its request's event journal.
-///
-/// `Scheduler::output_window_ready` charges this for every in-flight call; the
-/// per-kind counts must stay in step with `Scheduler::next_output_bound`,
-/// which charges the same events before the call is planned.
-fn call_output_bound(code: CallKind, bounds: &uniserve_worker_ipc::Bounds) -> usize {
-    match code {
-        CallKind::Forward(ForwardMode::Verify) => (bounds.max_tokens as usize)
-            .saturating_mul(2)
-            .saturating_add(2),
-        CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,
-        CallKind::Media(MediaCall::Denoising) => (bounds.max_tokens as usize).saturating_add(2),
-        CallKind::Media(MediaCall::VideoDecoding) => 2,
-        CallKind::Media(MediaCall::ImageDecoding) => 3,
-        _ => 2,
-    }
-}
+/// Output events a call kind with no entry in `output_bound` can add to its
+/// request's event journal.
+const DEFAULT_OUTPUT_EVENTS: usize = 2;
 
-/// Reads the denoising burst size from the environment.
-fn denoise_step_burst_from_env() -> u16 {
-    env::var(DENOISE_STEP_BURST_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u16>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_DENOISE_STEP_BURST)
+/// Returns the maximum number of output events one call of kind `code` can
+/// add to its request's event journal.
+///
+/// `Scheduler::output_window_ready` charges this for every in-flight call and
+/// for the call the request plans next.
+fn output_bound(code: CallKind) -> usize {
+    match code {
+        CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,
+        CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding) => 3,
+        _ => DEFAULT_OUTPUT_EVENTS,
+    }
 }
 
 /// Returns the number of classifier-free-guidance branches.

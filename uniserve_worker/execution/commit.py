@@ -30,7 +30,7 @@ import torch
 from uniserve.tensors import concatenate_views
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution.batch import BatchState
-from uniserve_worker.execution.output import PendingOutput, logprob_entries
+from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.execution.transfer import _release_locators
 from uniserve_worker.profiling import _forward_stats, record_component
 from uniserve_worker.protocol.batch import TensorPublication
@@ -40,9 +40,9 @@ from uniserve_worker.transport.exports import validate_exports
 
 if TYPE_CHECKING:
     from uniserve_worker.config.execution.execution import WorkerConfig
+    from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
@@ -61,7 +61,7 @@ def commit_batch(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
+    model_executor: ModelExecutor,
     latent_pool: LatentPool | None,
     request_pool: RequestPool,
     decode_state: DecodeState | None,
@@ -120,38 +120,8 @@ def commit_batch(
                     raise invalid_descriptor(
                         "KV publication differs from its declared output"
                     )
-                if (
-                    sum(tensor.nbytes for tensor in outcome.kv_output.tensors)
-                    > call.bounds.max_transfer_bytes
-                ):
-                    raise invalid_descriptor(
-                        "KV publication exceeds its transfer-byte bound"
-                    )
-                # Called only for its check, which raises when the descriptor
-                # exceeds ``MAX_TRANSFER_HANDLE_BYTES`` or names an unknown
-                # transport.
-                outcome.kv_output.encoded_size_bound()
 
-            # The bound covers score values and prompt-position counts; framing
-            # is owned by the single IPC result message, not by stored products.
-            # Each entry is one 12-byte ``TokenLogprob`` of the IPC schema and
-            # each reported row adds 4 bytes, the same costs the engine's
-            # ``logprob_result_bytes`` uses to size ``max_completion_bytes``.
-            logprob_bytes = (
-                0
-                if outcome.token.logprob_range is None
-                else 4
-                + 12 * logprob_entries(outcome, outcome.token.logprob_range)
-            ) + sum(
-                4 + 12 * logprob_entries(outcome, span)
-                for span in outcome.token.prompt_logprob_ranges
-            )
-            if logprob_bytes > call.bounds.max_completion_bytes:
-                raise invalid_descriptor(
-                    "logprob result exceeds its registered completion capacity"
-                )
-
-            reports_output = config.rank == worker_info.output_rank(
+            reports_output = config.rank == model_executor.output_rank(
                 call.component
             )
             report_products.extend(outcome.products)
@@ -443,18 +413,14 @@ def _validate_completion_products(
 ) -> None:
     """Require each completion product to be declared by its call.
 
-    Raises ``invalid_descriptor`` for an undeclared product, and for a
-    product whose locators exceed ``MAX_TRANSFER_HANDLE_BYTES`` or name an
-    unknown transport.
+    Raises ``invalid_descriptor`` for an undeclared product.
     """
     declared = {output: output for output in call.tensor_outputs()}
     for product in products:
-        reference = declared.get(product.product)
-        if reference is None:
+        if product.product not in declared:
             raise invalid_descriptor(
                 "completion carries a product not declared by its call"
             )
-        product.encoded_size_bound()
 
 
 def _publish_predicates(

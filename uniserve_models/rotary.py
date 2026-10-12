@@ -14,15 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from uniserve.nn.rope import (
-    DynamicScaling,
-    LinearScaling,
-    LlamaScaling,
-    LongRoPEScaling,
-    ProportionalScaling,
-    RoPEScaling,
-    YaRNScaling,
-)
+from uniserve.nn.rope import ProportionalScaling, RoPEScaling, YaRNScaling
 
 __all__ = ["Rotary", "alias", "read_rotary"]
 
@@ -86,7 +78,8 @@ def read_rotary(
 
     Raises:
         ValueError: When the rotary maps are not objects, aliases disagree,
-            or the recipe is unknown.
+            or the recipe is not ``default``, ``yarn`` or ``proportional``,
+            the recipes the model packages serve.
     """
     # The recipe name comes from rope_type, falling back to the type key,
     # and every type key present must name the same recipe.
@@ -116,10 +109,6 @@ def read_rotary(
         factor = option("factor")
         original = option("original_max_position_embeddings", default_original)
         match kind:
-            case "linear":
-                recipe = LinearScaling(factor)
-            case "dynamic":
-                recipe = DynamicScaling(factor)
             case "proportional":
                 recipe = ProportionalScaling(factor)
             case "yarn":
@@ -132,30 +121,6 @@ def read_rotary(
                     option("mscale"),
                     option("mscale_all_dim"),
                     option("truncate", True),
-                )
-            case "longrope":
-                short = option("short_factor", ())
-                long = option("long_factor", ())
-                if not all(
-                    isinstance(factors, (list, tuple))
-                    for factors in (short, long)
-                ):
-                    raise ValueError(
-                        f"{owner} LongRoPE short and long factors must be lists"
-                    )
-                recipe = LongRoPEScaling(
-                    factor,
-                    original,
-                    option("attention_factor"),
-                    tuple(short),
-                    tuple(long),
-                )
-            case "llama3":
-                recipe = LlamaScaling(
-                    factor,
-                    original,
-                    option("low_freq_factor", 1.0),
-                    option("high_freq_factor", 4.0),
                 )
             case _:
                 raise ValueError(f"unsupported {owner} rotary recipe {kind!r}")

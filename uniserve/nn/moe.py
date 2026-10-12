@@ -14,7 +14,7 @@ from uniserve.quantization import Quantizer
 
 __all__ = ["ExpertLinear", "FusedMoE", "Routes", "TopK"]
 
-Activation = Literal["silu", "gelu_tanh"]
+Activation = Literal["silu", "gelu_pytorch_tanh"]
 
 
 class TopK(nn.Module):
@@ -131,7 +131,7 @@ class FusedMoE(nn.Module):
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
-        if activation not in ("silu", "gelu_tanh"):
+        if activation not in ("silu", "gelu_pytorch_tanh"):
             raise ValueError(f"unsupported expert activation {activation!r}")
         if type(top_k) is not int or not 0 < top_k <= num_experts:
             raise ValueError(

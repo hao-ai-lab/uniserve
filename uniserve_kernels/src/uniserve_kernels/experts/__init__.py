@@ -23,6 +23,10 @@ from typing import Any
 
 import torch
 
+#: The gated activations FC1 implements, by checkpoint name, with the name
+#: the kernel class spells each: SwiGLU and tanh-approximated GeGLU.
+_KERNEL_ACTIVATIONS = {"silu": "silu", "gelu_pytorch_tanh": "gelu_tanh"}
+
 #: (MMA tile M, N), cluster (M, N): the FC1 tactics. M 256 runs two-CTA MMA
 #: over a cluster pair. N tiles hold one or two pairs of 64 up and gate
 #: columns; wider tiles reuse each input gather for twice as many outputs.
@@ -75,7 +79,7 @@ def unsupported(
         return "N must be a multiple of 128"
     if not (hidden.is_contiguous() and weights.is_contiguous()):
         return "operands must be contiguous"
-    if activation not in ("silu", "gelu_tanh"):
+    if activation not in _KERNEL_ACTIVATIONS:
         return f"unsupported gated activation {activation!r}"
     return None
 
@@ -160,7 +164,7 @@ def gather_gemm(
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
             topk=top_k,
-            activation=activation,
+            activation=_KERNEL_ACTIVATIONS[activation],
         )
 
     key = ("gather", mma_tiler_mn, cluster_shape_mn, activation, top_k)

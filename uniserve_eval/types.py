@@ -75,7 +75,10 @@ class LoadConfig:
             measured requests, or ``None`` for no limit.
         warmup_requests: Number of concurrent warmup requests, all built
             from the first row and completed before measurement; ``0`` skips
-            warmup.
+            warmup. A point with a ``warmup_manifest`` or a session trace
+            sends none of them.
+        warmup_manifest: JSON Lines file whose rows are the point's warmup
+            requests, in file order, in place of the repeated first row.
         seed: Seeds row shuffling in the datasets that shuffle, arrival
             intervals, and the image or video generation seed of rows that
             carry none. The chat sampling ``seed`` comes from
@@ -101,8 +104,6 @@ class LoadConfig:
             raise ValueError("max_concurrency must be positive")
         if self.warmup_requests < 0:
             raise ValueError("warmup_requests must be non-negative")
-        if self.warmup_manifest and self.warmup_requests:
-            raise ValueError("warmup_manifest requires warmup_requests = 0")
         if (
             not math.isfinite(self.request_timeout_s)
             or self.request_timeout_s <= 0
@@ -210,11 +211,13 @@ VIDEO_SCHEDULE_FIELDS = (
     "audio_flow_shift",
 )
 
-# Schedule fields a baseline backend receives. A baseline runs whatever
-# schedule it is sent, so a point measuring one must state each of these.
-# FastVideo takes the sigma point count alone; its shifts come from the
-# checkpoint's inference contract and cannot be sent.
-_BASELINE_SCHEDULE_FIELDS = {
+# Schedule fields each backend receives. A baseline runs whatever schedule it
+# is sent, so a point measuring one must state each of these. FastVideo takes
+# the sigma point count alone; its shifts come from the checkpoint's inference
+# contract and cannot be sent. UniServe's checkpoint fixes its schedule, so a
+# UniServe point states none.
+_SCHEDULE_FIELDS = {
+    "uniserve": frozenset(),
     "sglang": frozenset(VIDEO_SCHEDULE_FIELDS),
     "vllm-omni": frozenset(VIDEO_SCHEDULE_FIELDS),
     "fastvideo": frozenset({"num_inference_steps"}),
@@ -233,11 +236,11 @@ class VideoConfig:
 
     ``num_inference_steps``, ``flow_shift`` and ``audio_flow_shift`` state the
     sampling schedule the point measures: sigma points including the clean
-    endpoint, and the video and audio schedule shifts. UniServe receives them
-    when set and refuses a schedule other than its checkpoint's, so they are
-    optional there. A baseline runs the schedule it is sent and requires
-    them: SGLang and vLLM-Omni need all three, and FastVideo, whose shifts
-    come from its checkpoint, needs the point count and refuses the shifts.
+    endpoint, and the video and audio schedule shifts. UniServe's checkpoint
+    fixes its schedule, so a UniServe point states none. A baseline runs the
+    schedule it is sent and requires them: SGLang and vLLM-Omni need all
+    three, and FastVideo, whose shifts come from its checkpoint, needs the
+    point count and refuses the shifts.
 
     ``condition_root`` is the directory that the condition media paths of
     fl2va and ref2va rows are relative to; a t2va point has none. Every
@@ -331,9 +334,7 @@ class VideoConfig:
             ):
                 raise ValueError(f"video {name} must be finite and positive")
 
-        required = _BASELINE_SCHEDULE_FIELDS.get(self.backend)
-        if required is None:
-            return
+        required = _SCHEDULE_FIELDS[self.backend]
         stated = {
             name
             for name in VIDEO_SCHEDULE_FIELDS

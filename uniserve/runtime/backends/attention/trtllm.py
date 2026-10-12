@@ -3,14 +3,40 @@
 import torch
 
 from uniserve.nn.attention.inputs import PagedInput
-from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
 
 from . import Backend as _Backend
+from . import CachePages
 from . import Operator as _Operator
 from ._sequences import causal_runs
 
-__all__ = ["Backend"]
+__all__ = ["Backend", "unsupported"]
+
+
+def unsupported(
+    *, head_dim, dtype, pages: CachePages | None, window: int | None
+) -> str | None:
+    """Return why the TensorRT-LLM kernels cannot serve a layer, or None.
+
+    ``pages`` describes the layer's bound prefix cache, or is None for a
+    layer without one.
+    """
+    if dtype not in {torch.float16, torch.bfloat16}:
+        return "requires FP16 or BF16 queries"
+    if pages is not None and pages.quantized:
+        return "does not consume per-block FP8 prefix scales"
+    if head_dim in {64, 128, 256}:
+        return None
+    if head_dim != 512:
+        return "requires head dimension 64, 128, 256 or 512"
+
+    # The pinned SM100 cubins provide head dimension 512 context kernels only
+    # for causal and dense masks, over 16-, 32- and 64-token pages.
+    if window is not None:
+        return "has no windowed head dimension 512 kernels"
+    if pages is None or pages.block_size not in {16, 32, 64}:
+        return "serves head dimension 512 only over 16-, 32- or 64-token pages"
+    return None
 
 
 def _head_major(value):
@@ -53,24 +79,14 @@ class _TRTLLM(_Operator):
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
         from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
-        if self.head_dim not in {64, 128, 256, 512}:
-            raise ValueError(
-                "TensorRT-LLM MHA requires head dimension 64, 128, 256 or 512"
-            )
-        if self.head_dim == 512 and self.window is not None:
-            # The pinned SM100 cubins provide head dimension 512 context
-            # kernels only for causal and dense masks, not sliding windows.
-            raise ValueError(
-                "TensorRT-LLM MHA has no windowed head dimension 512 kernels"
-            )
-        if self.dtype not in {torch.float16, torch.bfloat16}:
-            raise ValueError("TensorRT-LLM MHA requires FP16 or BF16 queries")
-        if self.cache is not None and isinstance(
-            self.cache.key, QuantizedTensor
-        ):
-            raise ValueError(
-                "TensorRT-LLM MHA does not consume per-block FP8 prefix scales"
-            )
+        problem = unsupported(
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            pages=None if self.cache is None else CachePages.of(self.cache),
+            window=self.window,
+        )
+        if problem is not None:
+            raise ValueError(f"TensorRT-LLM MHA {problem}")
         self._decode = trtllm_batch_decode_with_kv_cache
         self._prefill = trtllm_batch_context_with_kv_cache
         self.workspace["scratch"].zero_()
@@ -99,8 +115,8 @@ class _TRTLLM(_Operator):
         self._validate(q, k, v, batch, out)
 
         if q.shape[0] == 0:
-            if batch.write_indices is not None:
-                self.update_cache(k, v, indices=batch.write_indices)
+            if batch.slot_mapping is not None:
+                self.update_cache(k, v, slot_mapping=batch.slot_mapping)
             return out
 
         if q.ndim != 3 or (
@@ -137,10 +153,10 @@ class _TRTLLM(_Operator):
             else torch.empty(out.shape, dtype=out.dtype, device=out.device)
         )
 
-        if len(set(batch.causal)) > 1 and batch.write_indices is not None:
+        if len(set(batch.causal)) > 1 and batch.slot_mapping is not None:
             # Causal runs slice query domains. Commit the complete write once
-            # before those runs, whose inputs then carry no write indices.
-            self.update_cache(k, v, indices=batch.write_indices)
+            # before those runs, whose inputs then carry no slot mapping.
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
 
         for query_slice, _, run in causal_runs(batch):
             query = q[query_slice]

@@ -11,10 +11,11 @@ use uniserve_worker_ipc::{ForwardMode, MediaCall};
 
 /// Intersects model requirements with capacities actually loaded by the worker.
 ///
-/// A generation feature survives only when every call kind it needs is in the
-/// aggregate `supported_calls`; numeric limits are clamped to the reported
-/// latent, batch-token, encoder-entry, buffer-pool, and encoder-cache
-/// capacities.
+/// The workers state which generation features are served: a feature is
+/// available when every call kind it needs is in the aggregate
+/// `supported_calls`, whatever the model description lists. Numeric limits
+/// are clamped to the reported latent, batch-token, encoder-entry,
+/// buffer-pool, and encoder-cache capacities.
 fn resolve_generation_limits(
     mut limits: uniserve_core::GenerationLimits,
     info: &WorkerInfo,
@@ -44,7 +45,7 @@ fn resolve_generation_limits(
     {
         available.insert(uniserve_core::GenerationFeatures::TOKEN_DENOISING);
     }
-    limits.features &= available;
+    limits.features = available;
 
     limits.max_latent_units = limits.max_latent_units.min(info.latent_capacity_units());
     let latent_bound = limits.max_latent_units.min(u64::from(u32::MAX)) as u32;
@@ -64,16 +65,16 @@ fn resolve_generation_limits(
 }
 
 /// Largest number of request-pool rows a runtime keeps outside
-/// `max_num_seqs` (`flow_prefix_rows`). A launch sizes worker request pools
+/// `max_num_seqs` (`guidance_prefix_rows`). A launch sizes worker request pools
 /// before the loaded capabilities decide the actual reserve.
-pub(crate) const MAX_FLOW_PREFIX_ROWS: usize = 1;
+pub(crate) const MAX_GUIDANCE_PREFIX_ROWS: usize = 1;
 
 /// Request-pool rows the runtime keeps outside `max_num_seqs`.
 ///
 /// A KV runtime with denoising keeps one row: a running request's
-/// multi-branch guidance prefix (`Scheduler::ensure_flow_prefix`) allocates
+/// multi-branch guidance prefix (`Scheduler::ensure_guidance_prefix`) allocates
 /// its own row from the same request pool. Other runtimes keep none.
-pub(crate) fn flow_prefix_rows(info: &WorkerInfo) -> usize {
+pub(crate) fn guidance_prefix_rows(info: &WorkerInfo) -> usize {
     usize::from(
         info.uses_kv()
             && info
@@ -83,133 +84,15 @@ pub(crate) fn flow_prefix_rows(info: &WorkerInfo) -> usize {
 }
 
 impl Scheduler {
-    /// Constructs an engine loop with the default scheduler configuration.
-    ///
-    /// Fails when the executor exposes an invalid aggregate capacity view.
-    pub fn new(
-        executor: Box<dyn Executor>,
-        ctrl: SpecialTokenIds,
-        max_batch: usize,
-    ) -> anyhow::Result<Self> {
-        Self::with_config(
-            executor,
-            ctrl,
-            SchedulerConfig {
-                max_batch,
-                ..Default::default()
-            },
-        )
-    }
-
-    /// Constructs an engine loop with an explicit scheduling policy.
-    ///
-    /// Fails when the executor exposes an invalid aggregate capacity view.
-    pub fn with_policy(
-        executor: Box<dyn Executor>,
-        ctrl: SpecialTokenIds,
-        max_batch: usize,
-        policy: SchedulingPolicy,
-    ) -> anyhow::Result<Self> {
-        Self::with_config(
-            executor,
-            ctrl,
-            SchedulerConfig {
-                max_batch,
-                policy,
-                ..Default::default()
-            },
-        )
-    }
-
-    /// Constructs an engine loop and infers its runtime family from worker capabilities.
-    ///
-    /// Fails when the executor exposes an invalid aggregate capacity view.
-    pub fn with_config(
-        executor: Box<dyn Executor>,
-        ctrl: SpecialTokenIds,
-        config: SchedulerConfig,
-    ) -> anyhow::Result<Self> {
-        let info = executor.info().runtime_info()?;
-
-        // Without text decode, token-canvas denoising makes the runtime
-        // block-diffusion and latent preparation makes it diffusion-only;
-        // otherwise any denoising, vision-encoding, or latent-encoding
-        // capability makes the runtime unified multimodal; everything else is
-        // autoregressive.
-        let calls = &info.supported_calls;
-        let decodes = calls.contains(&CallKind::Forward(ForwardMode::Decode));
-        let family = if calls.contains(&CallKind::Forward(ForwardMode::TokenDenoising)) && !decodes
-        {
-            RuntimeFamily::BlockDiffusion
-        } else if calls.contains(&CallKind::Media(MediaCall::LatentPreparation)) && !decodes {
-            RuntimeFamily::Diffusion
-        } else if calls.contains(&CallKind::Media(MediaCall::Denoising))
-            || (calls.contains(&CallKind::Media(MediaCall::VisionEncoding))
-                || calls.contains(&CallKind::Media(MediaCall::LatentEncoding)))
-        {
-            RuntimeFamily::Umm
-        } else {
-            RuntimeFamily::Ar
-        };
-
-        Self::with_config_for_family(executor, ctrl, config, family)
-    }
-
-    /// Constructs an engine loop for an explicit runtime family.
-    ///
-    /// Fails when the executor exposes an invalid aggregate capacity view.
-    pub fn with_config_for_family(
-        executor: Box<dyn Executor>,
-        ctrl: SpecialTokenIds,
-        config: SchedulerConfig,
-        family: RuntimeFamily,
-    ) -> anyhow::Result<Self> {
-        // Unified runtimes start from unbounded limits; `with_model_limits`
-        // clamps them to the worker-reported capacities.
-        let generation_limits = match family {
-            RuntimeFamily::Umm => unbounded_umm_generation_limits(),
-            // Canvas readouts over prompts that may carry encoded images.
-            RuntimeFamily::BlockDiffusion => uniserve_core::GenerationLimits {
-                features: uniserve_core::GenerationFeatures::TOKEN_DENOISING
-                    | uniserve_core::GenerationFeatures::VISION_ENCODE,
-                latent_downsample: 1,
-                max_vit_grid_tokens: u32::MAX,
-                max_vision_feature_bytes: 256 << 20,
-                max_cfg_branches: 1,
-                encoder_cache_entries: 256,
-                ..Default::default()
-            },
-            RuntimeFamily::Ar | RuntimeFamily::Diffusion => uniserve_core::GenerationLimits {
-                features: if family == RuntimeFamily::Ar {
-                    uniserve_core::GenerationFeatures::UNDERSTANDING
-                } else {
-                    uniserve_core::GenerationFeatures::empty()
-                },
-                latent_downsample: 1,
-                max_cfg_branches: 1,
-                ..Default::default()
-            },
-        };
-        Self::with_model_limits(
-            executor,
-            ctrl,
-            config,
-            family,
-            uniserve_core::ModelDtype::BFloat16,
-            generation_limits,
-        )
-    }
-
     /// Constructs an engine loop from explicit scheduler and model capabilities.
     ///
     /// Worker limits clamp scheduler concurrency and resource capacities.
     ///
     /// Fails when the executor exposes an invalid aggregate capacity view.
-    pub fn with_model_limits(
+    pub fn new(
         executor: Box<dyn Executor>,
         ctrl: SpecialTokenIds,
         mut config: SchedulerConfig,
-        family: RuntimeFamily,
         model_dtype: uniserve_core::ModelDtype,
         generation_limits: uniserve_core::GenerationLimits,
     ) -> anyhow::Result<Self> {
@@ -227,12 +110,20 @@ impl Scheduler {
                     .any(|kind| matches!(kind, CallKind::Media(_)))
             })
             .map(|(id, worker)| {
+                let pools = executor.info();
+                let no_components = BTreeMap::new();
+                let components = pools
+                    .placements
+                    .get(id)
+                    .map_or(&no_components, |placement| &placement.components);
                 (
                     id.clone(),
-                    MediaStorage {
-                        requests: RequestPool::new(worker.request_slots as usize),
-                        buffers: BufferPool::new(worker.buffer_pool_bytes),
-                    },
+                    MediaStorage::new(
+                        worker.request_slots as usize,
+                        &pools.rank_buffer_bytes(id),
+                        components,
+                        &info.media_components,
+                    ),
                 )
             })
             .collect();
@@ -240,24 +131,24 @@ impl Scheduler {
         // Queue and batch limits cannot exceed the physical executor envelope.
         let max_batch_calls = info.max_batch_calls as usize;
         let max_batch_tokens = info.max_batch_tokens as usize;
-        let transfer_capacity = (info.queue_depth as usize)
-            .saturating_mul(max_batch_calls)
-            .clamp(1, MAX_INFLIGHT_TRANSFERS);
+        // Each worker reports the transfer entries its transport holds in
+        // flight; the merged record carries the narrowest.
+        let transfer_capacity = info.transfer_tickets as usize;
 
-        config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
+        config.max_num_waiting = config.max_num_waiting.map(|bound| bound.max(1));
 
         // The request pool also holds the rows the runtime keeps outside
-        // `max_num_seqs` (`flow_prefix_rows`); `set_max_num_seqs` applies the
-        // same reserve. `EngineCore::new` launches workers with enough rows
-        // and refuses a token runtime whose workers hold fewer, so this clamp
-        // lowers the limit only for a supplied executor or for workers that
-        // fit their request pools to device storage.
+        // `max_num_seqs` (`guidance_prefix_rows`). `EngineCore::new` launches
+        // workers with enough rows and refuses a token runtime whose workers
+        // hold fewer, so this clamp lowers the limit only for a supplied
+        // executor or for workers that fit their request pools to device
+        // storage.
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
-            .saturating_sub(flow_prefix_rows(&info))
+            .saturating_sub(guidance_prefix_rows(&info))
             .max(1);
 
-        let requested_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
+        let requested_seqs = config.max_num_seqs.max(1);
         if requested_seqs > main_request_capacity {
             tracing::warn!(
                 requested = requested_seqs,
@@ -272,6 +163,21 @@ impl Scheduler {
             config.max_batch = config.max_batch.min(max_batch_calls.max(1));
         }
 
+        // A canvas step and a block commit each spend a whole canvas of one
+        // scheduling step's token budget, so the deployment's canvas must
+        // fit it.
+        if let Some(canvas) = config.canvas {
+            if let Some(parameter) = canvas.invalid_parameter() {
+                anyhow::bail!("block-diffusion sampling parameter `{parameter}` is out of range");
+            }
+            anyhow::ensure!(
+                canvas.canvas_length as usize <= config.max_num_batched_tokens,
+                "a {}-token generation canvas exceeds the {}-token step budget",
+                canvas.canvas_length,
+                config.max_num_batched_tokens
+            );
+        }
+
         // Storage and scheduler statistics share the resolved worker capacities.
         let cache = KVCacheManager::from_worker_info(&info);
         let stats = Arc::new(SchedulerStats::default());
@@ -279,10 +185,6 @@ impl Scheduler {
             cache.as_ref().map_or(0, KVCacheManager::usable_units),
             Ordering::Relaxed,
         );
-
-        // Environment switches select scheduling behavior without changing the
-        // model capabilities.
-        let denoise_step_burst = denoise_step_burst_from_env();
 
         // Runtime state remains single-owner; executors receive immutable batch
         // inputs assembled from these queues and request records.
@@ -298,7 +200,6 @@ impl Scheduler {
                 reserved_encoder_entries: 0,
                 request_pool: RequestPool::new(info.request_slots as usize),
                 latent_pool: LatentPool::new(info.latent_pages, info.latent_page_units),
-                reserved_units: 0,
                 buffer_pool: BufferPool::new(info.buffer_pool_bytes),
                 media_storage,
                 encoder_buffers: HashMap::new(),
@@ -306,7 +207,6 @@ impl Scheduler {
             },
             info,
             generation_limits,
-            family,
             ctrl,
             waiting: VecDeque::new(),
             waiting_media: VecDeque::new(),
@@ -314,7 +214,6 @@ impl Scheduler {
             running_media: HashMap::new(),
             retiring_requests: HashMap::new(),
             transfer_capacity,
-            denoise_step_burst,
             latent_dtype,
             engine_id: 1,
             next_product_generation: 1,
@@ -328,11 +227,6 @@ impl Scheduler {
         })
     }
 
-    /// Returns the active scheduling policy.
-    pub fn policy(&self) -> SchedulingPolicy {
-        self.config.policy
-    }
-
     /// Returns the effective scheduler configuration.
     pub fn config(&self) -> &SchedulerConfig {
         &self.config
@@ -343,41 +237,6 @@ impl Scheduler {
         if let Some(cache) = self.storage.cache.as_mut() {
             cache.set_prefix_cache(on);
         }
-    }
-
-    /// Selects the hash algorithm used for prefix-cache keys.
-    pub fn set_hash_algo(&mut self, algo: HashAlgo) {
-        if let Some(cache) = self.storage.cache.as_mut() {
-            cache.set_hash_algo(algo);
-        }
-    }
-
-    /// Configures the per-step token budget.
-    pub fn set_token_budget(&mut self, tokens: usize) {
-        self.config.max_num_batched_tokens = tokens.max(1);
-    }
-
-    /// Sets the token threshold above which prefill is chunked.
-    pub fn set_long_prefill_threshold(&mut self, n: usize) {
-        self.config.long_prefill_threshold = n.max(1);
-    }
-
-    /// Sets the resident sequence limit within the worker slot capacity.
-    ///
-    /// Keeps the flow-prefix slot reserve applied at construction.
-    pub fn set_max_num_seqs(&mut self, n: usize) {
-        let capacity = self
-            .storage
-            .request_pool
-            .capacity()
-            .saturating_sub(flow_prefix_rows(&self.info))
-            .max(1);
-        self.config.max_num_seqs = n.clamp(1, capacity);
-    }
-
-    /// Caps waiting and terminal-output-retained request state.
-    pub fn set_max_num_waiting(&mut self, n: usize) {
-        self.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
     }
 
     /// Returns the executor's aggregate worker capabilities.

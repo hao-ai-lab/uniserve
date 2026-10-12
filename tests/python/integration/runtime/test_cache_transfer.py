@@ -15,10 +15,8 @@ from uniserve.runtime import EventPool
 from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.transfer import (
-    MAX_TRANSFER_HANDLE_BYTES,
     KvGroupTransfer,
     KvTransfer,
-    Locator,
     TensorTransfer,
 )
 from uniserve_worker.storage.block_tables import GroupTable
@@ -42,7 +40,7 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
         total_layers=2,
         total_kv_heads=1,
         num_pages=3,
-        page_size=256,
+        block_size=256,
         device="cpu",
         request_pool_size=2,
         table_width=1,
@@ -50,14 +48,14 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
     publications = pool
     events = EventPool()
     consumer = make_transport(
-        "shm", byte_capacity=8192, ticket_capacity=2, event_pool=events
+        "posix_shm", byte_capacity=8192, ticket_capacity=2, event_pool=events
     )
     write = None
     process.start()
     child.close()
     try:
         assert parent.poll(30), "shared-storage publisher did not start"
-        locator = Locator.from_mapping(parent.recv())
+        locator = parent.recv()
         source = _buffer(1)
         field = TensorTransfer(shape=shape, locations=(locator,))
         publication = KvTransfer(
@@ -169,7 +167,7 @@ def test_kv_publications_isolate_request_epochs() -> None:
         total_layers=1,
         total_kv_heads=1,
         num_pages=2,
-        page_size=4,
+        block_size=4,
         device="cpu",
         request_pool_size=1,
         table_width=1,
@@ -227,13 +225,13 @@ def test_kv_publications_isolate_request_epochs() -> None:
     "backend,device",
     (
         ("local", "cpu"),
-        ("shm", "cpu"),
-        pytest.param("shm", "cuda:0", marks=pytest.mark.gpu),
+        ("posix_shm", "cpu"),
+        pytest.param("posix_shm", "cuda:0", marks=pytest.mark.gpu),
         pytest.param("cuda_vmm", "cuda:0", marks=pytest.mark.gpu),
     ),
 )
 @pytest.mark.parametrize(
-    "source_dtype,target_dtype,page_size",
+    "source_dtype,target_dtype,block_size",
     (
         ("bfloat16", "bfloat16", 2),
         ("float8_e4m3fn", "float8_e4m3fn", 4),
@@ -248,7 +246,7 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
     device: str,
     source_dtype: str,
     target_dtype: str,
-    page_size: int,
+    block_size: int,
 ) -> None:
     pools = [
         mha_pool(
@@ -260,18 +258,18 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
             total_layers=2,
             total_kv_heads=1,
             num_pages=6,
-            page_size=size,
+            block_size=size,
             device=device,
             request_pool_size=1,
             table_width=4,
         )
-        for size, dtype in ((4, source_dtype), (page_size, target_dtype))
+        for size, dtype in ((4, source_dtype), (block_size, target_dtype))
     ]
     tables = [pool.block_tables for pool in pools]
-    pages = ((4, 1), (3, 1, 4, 5) if page_size == 2 else (3, 1))
+    pages = ((4, 1), (3, 1, 4, 5) if block_size == 2 else (3, 1))
     for table, pool, assigned in zip(tables, pools, pages, strict=True):
         table.install(
-            ((1, 0, 0, assigned, len(assigned) * pool.shapes[0].page_tokens),)
+            ((1, 0, 0, assigned, len(assigned) * pool.shapes[0].block_size),)
         )
     publications = [pool for pool, table in zip(pools, tables, strict=True)]
     events = [EventPool(), EventPool()]
@@ -344,7 +342,7 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                             tables=_tables(
                                 pools[1],
                                 destination_pages,
-                                len(pages[1]) * page_size,
+                                len(pages[1]) * block_size,
                             ),
                             initialized_units=initialized,
                             transports={transports[1].name: transports[1]},
@@ -352,7 +350,7 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
             write = publications[1].prepare_install(
                 publication,
                 request_pool_idx=1,
-                tables=_tables(pools[1], pages[1], len(pages[1]) * page_size),
+                tables=_tables(pools[1], pages[1], len(pages[1]) * block_size),
                 initialized_units=pages[1] if start == 0 else (),
                 transports={transports[1].name: transports[1]},
             )
@@ -392,7 +390,7 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                 untouched = (
                     pools[1]
                     .cache.state(pools[1].cache.groups[0].layers[layer])
-                    .read((2,), start=0, length=page_size)
+                    .read((2,), start=0, length=block_size)
                 )
                 for field in untouched:
                     assert field is not None
@@ -435,7 +433,7 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
 @pytest.mark.parametrize(
     "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
 )
-@pytest.mark.parametrize("target_page_size", (4, 8))
+@pytest.mark.parametrize("target_block_size", (4, 8))
 def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     source_ranks: int,
     target_ranks: int,
@@ -445,7 +443,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     source_dtype: str,
     target_dtype: str,
     device: str,
-    target_page_size: int,
+    target_block_size: int,
 ) -> None:
     """Consumer layer/head regions gather required producer pages and scales."""
     total_layers = 5 if max(source_stages, target_stages) > 1 else 2
@@ -465,12 +463,12 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
             dtype=torch.bfloat16,
             store_dtype=getattr(torch, dtype),
             num_pages=4,
-            page_size=page_size,
+            block_size=block_size,
             device=device,
             request_pool_size=1,
             table_width=2,
         )
-        for heads, offset, dtype, page_size, layer_start, layer_end in (
+        for heads, offset, dtype, block_size, layer_start, layer_end in (
             *(
                 (
                     source_heads,
@@ -488,7 +486,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                     target_heads,
                     rank * target_heads,
                     target_dtype,
-                    target_page_size,
+                    target_block_size,
                     total_layers * stage // target_stages,
                     total_layers * (stage + 1) // target_stages,
                 )
@@ -500,10 +498,10 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     tables = [pool.block_tables for pool in pools]
     pages = (3, 1)
     for pool, table in zip(pools, tables, strict=True):
-        table.install(((1, 0, 0, pages, 2 * pool.shapes[0].page_tokens),))
+        table.install(((1, 0, 0, pages, 2 * pool.shapes[0].block_size),))
     owners = [pool for pool, table in zip(pools, tables, strict=True)]
     events = [EventPool() for _ in pools]
-    backend = "cuda_vmm" if device.startswith("cuda") else "shm"
+    backend = "cuda_vmm" if device.startswith("cuda") else "posix_shm"
     transports = [
         make_transport(
             backend, byte_capacity=32768, ticket_capacity=32, event_pool=event
@@ -571,7 +569,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                 write = owner.prepare_install(
                     merged,
                     request_pool_idx=1,
-                    tables=_tables(pool, pages, 2 * pool.shapes[0].page_tokens),
+                    tables=_tables(pool, pages, 2 * pool.shapes[0].block_size),
                     initialized_units=pages if start == 0 else (),
                     transports={backend: transport},
                 )
@@ -627,7 +625,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
 @pytest.mark.parametrize(
     "mechanisms,device",
     (
-        (("local", "shm"), "cpu"),
+        (("local", "posix_shm"), "cpu"),
         pytest.param(("local", "cuda_vmm"), "cuda:0", marks=pytest.mark.gpu),
     ),
 )
@@ -656,7 +654,7 @@ def test_deep_kv_publication_fits_its_descriptor_and_installs(
             dtype=torch.bfloat16,
             store_dtype=getattr(torch, dtype),
             num_pages=4,
-            page_size=4,
+            block_size=4,
             device=device,
             request_pool_size=1,
             table_width=2,
@@ -666,7 +664,7 @@ def test_deep_kv_publication_fits_its_descriptor_and_installs(
     sources, target = pools[:2], pools[2]
     for pool in pools:
         pool.block_tables.install(
-            ((1, 0, 0, pages, 2 * pool.shapes[0].page_tokens),)
+            ((1, 0, 0, pages, 2 * pool.shapes[0].block_size),)
         )
     events = [EventPool() for _ in pools]
     transports = [
@@ -728,14 +726,13 @@ def test_deep_kv_publication_fits_its_descriptor_and_installs(
             shards.append(shard)
 
         merged = _merged(shards)
-        assert merged.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES
 
         # The consumer reads each layer's region over the peer mechanism.
         peer = mechanisms[1]
         write = target.prepare_install(
             merged,
             request_pool_idx=1,
-            tables=_tables(target, pages, 2 * target.shapes[0].page_tokens),
+            tables=_tables(target, pages, 2 * target.shapes[0].block_size),
             initialized_units=pages,
             transports={peer: transports[2][peer]},
         )
@@ -784,7 +781,7 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
             store_dtype=torch.float8_e4m3fn,
             total_layers=1,
             num_pages=2,
-            page_size=4,
+            block_size=4,
             device="cpu",
             request_pool_size=1,
             table_width=1,

@@ -113,23 +113,27 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--data-parallel-size` | `1` | Independent replicas, each with its own scheduler, KV cache and ranks |
 | `--expert-parallel` | Off | Shard routed experts across data-parallel replicas or dedicated expert workers |
 | `--expert-exchange` | `alltoall` | NVLink token exchange, `deepep` elastic dispatch/combine, `megamoe` fused experts, or `dwdp` asynchronous expert-weight prefetch |
-| `--expert-microbatches` | `1` | One to four independent microbatches; values above one require dedicated experts |
+| `--expert-microbatches` | `1` | Independent microbatches; values above one require dedicated experts |
 | `--max-video-seconds` | `15` | Longest admitted clip, from 4 to 15 seconds |
-| `--max-model-len` | Model configuration | Context-length ceiling |
-| `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities prepared at startup |
+| `--max-model-len` | The checkpoint's `max_position_embeddings`; 16384 prompt tokens for a MiniMax-H3 pipeline; 8192 when neither exists | Context-length ceiling |
+| `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities below `--max-model-len`, the largest capacity, prepared at startup |
 | `--max-running-requests` | `128`, clamped to worker capacity | Scheduler active-request bound |
+| `--max-queued-requests` | Unbounded | Requests the scheduler holds waiting or with undelivered events before it rejects a submission as overloaded |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
-| `--page-size` | Chosen by the worker | Base KV page size supported by every cache group's attention readers. |
-| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |
-| `--chunked-prefill-size` | `8192` | Per-request prefill bound |
-| `--mem-fraction-static` | `0.70` | Each rank's share of device storage |
+| `--block-size` | Chosen by the worker | Tokens per KV page of the widest cache group, supported by every cache group's attention readers |
+| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget; a video pipeline refuses it |
+| `--chunked-prefill-size` | `8192` | Per-request prefill bound; a video pipeline refuses it |
+| `--mem-fraction-static` | `0.70` | Each rank's share of device memory for weights and KV cache |
 | `--graph-policy` | `auto` | CUDA graph policy: `auto`, `full`, or `off` |
 | `--quantization-config` | `{}`, the `quality` preset | Precision preset or per-component overrides |
-| `--attention-backend` | `auto` | Attention provider selection; explicit provider names select that implementation |
+| `--attention-backend` | `auto` | Attention provider for every call: `torch`, `flash_attn`, `flash_attn_4`, `flashinfer`, `trtllm`, `sgl_kernel` or `prefix_block`; `auto` selects a native kernel per call |
 | `--api-key` | Unset | Bearer token for public routes |
 | `--request-timeout` | Unset | Seconds until response headers; streamed bodies are not bounded |
-| `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation and System One requests; video requests use video job slots |
+| `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation, System One and synchronous video requests |
+| `--video-job-retention` | `3600` | Seconds a completed or failed asynchronous video job stays retrievable |
+| `--max-video-job-bytes` | `1073741824` | Bytes of generated video the asynchronous jobs keep, retained artifacts and unfinished downloads together |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
+| `--watchdog-timeout` | `300` | Seconds a batch may run without any rank making progress before the worker group is replaced |
 | `--image-fetch-timeout` | `20` | Seconds allowed to fetch one `http(s)` image URL, including redirects and the complete body |
 | `--image-fetch-max-bytes` | `20000000` | Largest accepted input image in bytes, for fetched URLs and `data:` URLs alike |
 | `--allow-private-image-urls` | Off | Allow image URLs that resolve to loopback, private, link-local, unique-local, or cloud metadata addresses |
@@ -138,7 +142,7 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--readout-candidates` | `variants` | Sum supported answer-token spellings, or use `primary` for only the space-prefixed spelling |
 | `--diffusion-generation-config` | Checkpoint `generation_config.json` | DiffusionGemma block-diffusion sampling for every reply, as a JSON object that replaces any of `max_denoising_steps`, `entropy_bound`, `t_min`, `t_max`, `confidence_threshold`, and `stability_threshold` |
 
-On a GPU, startup captures CUDA graphs for decode steps and for prefill steps before the server reports ready, and serving replays them. Graphs cover every step the scheduler forms. Prefill graphs hold up to `--max-num-batched-tokens` prompt tokens (plus one image's feature tokens for models that read images) and up to 31 prompts; decode graphs hold up to 128 requests. Both hold at most `--max-running-requests` and at most as many requests as the KV pool holds a page of every cache group for. The worker reports these bounds, and the scheduler never places more requests in one prefill or decode step. A prefill or decode step that no captured graph holds fails instead of running eagerly. Larger token budgets capture more graphs, so startup takes longer. Startup also runs every image encoder and decoder once, so the `uniserve-kernel-table` line it logs names the kernel of every call the server makes. `--graph-policy off` serves every call without graphs.
+On a GPU, startup captures CUDA graphs for decode steps and for prefill steps before the server reports ready, and serving replays them. Prefill graphs hold up to `--max-num-batched-tokens` prompt tokens (plus one image's feature tokens for models that read images), and prefill and decode graphs hold as many requests as a step may contain: at most `--max-running-requests` and at most as many requests as the KV pool holds a page of every cache group for. A prefill or decode step runs eagerly only when a launch names smaller graph sizes that do not hold it. Larger token budgets capture more graphs, so startup takes longer. Startup also runs every image encoder and decoder once, so the `uniserve-kernel-table` line it logs names the kernel of every call the server makes. `--graph-policy off` serves every call without graphs.
 
 Run `uniserve serve --help` for the complete option set.
 
@@ -193,7 +197,7 @@ UNISERVE_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2 \
 
 The serving evaluator runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. Benchmark points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
 
-For decision-session replay, use the `systemone` dataset with a non-empty `session_id` on every JSONL row. The evaluator preserves file order within each session and sends the next decision only after that session's previous response. Set `load.request_rate = inf`, `load.warmup_requests = 0`, and `load.max_concurrency` to the number of sessions. Each initial cold request is included in the measured trace. Session identifiers are benchmark metadata and are not sent to the model. Rows without session identifiers retain the seeded shuffled workload behavior.
+For decision-session replay, use the `systemone` dataset with a non-empty `session_id` on every JSONL row. The evaluator preserves file order within each session and sends the next decision only after that session's previous response. Set `load.request_rate = inf`; the sessions run concurrently, one request in flight per session. A session trace has no repeated-row warmup: each initial cold request is included in the measured trace. Session identifiers are benchmark metadata and are not sent to the model. Rows without session identifiers retain the seeded shuffled workload behavior.
 
 ## Repository layout
 
@@ -205,7 +209,7 @@ crates/worker-ipc/                       Worker messages, serialization, and ice
 crates/worker-ipc-py/                    Python worker IPC extension
 crates/engine/                           Scheduler, executors, and engine process
 crates/server/                           Model profiles, serving funnel, HTTP API, and engine clients
-crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints
+crates/bin/uniserve/                     `serve` CLI entrypoint
 crates/bin/uniserve-host/                Per-host launcher for multi-host deployments
 crates/bin/dynamo-worker/                NVIDIA Dynamo worker backend
 uniserve/                                 Numerical layers, loading, and resource binding

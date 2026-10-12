@@ -6,7 +6,7 @@
 //! Once the rank reports its endpoint through `registration::RankRegistry`,
 //! `PendingRank::adopt` binds a `RankChannel` to it and yields a
 //! `RankProcess`, which `WorkerGroup` (in `instance`) drives:
-//! `finish_startup` validates the rank's startup report, `submit_batch` and
+//! `finish_startup` receives the rank's startup report, `submit_batch` and
 //! `poll_batch` exchange batches and results, and `close_ranks` or
 //! `terminate` retires the rank.
 //!
@@ -106,15 +106,21 @@ impl std::str::FromStr for LaneConfig {
     /// Parses one JSON lane descriptor, as the `--lane` option passes it.
     ///
     /// Refuses invalid JSON, a field outside the lane schema, an empty
-    /// `lane_id`, a zero `sm_budget`, and an empty domain list or one with an
-    /// unknown or repeated selector. The worker validates the remaining
-    /// constraints, such as positive batch and in-flight limits, when it
-    /// reads the lane.
+    /// `lane_id`, a zero `sm_budget`, a zero batch or in-flight limit, and an
+    /// empty domain list or one with an unknown or repeated selector. The
+    /// worker checks only what spans lanes: that lane ids are distinct and
+    /// that no call kind binds to two lanes.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let lane: Self = serde_json::from_str(value)
             .map_err(|error| format!("invalid execution lane JSON: {error}"))?;
         if lane.lane_id.is_empty()
             || lane.sm_budget == 0
+            || [
+                lane.max_batch_calls,
+                lane.max_batch_tokens,
+                lane.max_inflight,
+            ]
+            .contains(&Some(0))
             || lane.domains.is_empty()
             || lane
                 .domains
@@ -190,16 +196,51 @@ impl std::str::FromStr for FlashInferBackend {
 /// Error returned for an unsupported FlashInfer backend name.
 pub struct FlashInferBackendParseError(String);
 
+impl WorkerProcessArgs {
+    /// Call batches kept in flight against a rank unless a launch sets its
+    /// queue depth.
+    pub const DEFAULT_QUEUE_DEPTH: usize = 2;
+    /// Checkpoint loader format that detects the files' own format.
+    pub const DEFAULT_LOAD_FORMAT: &'static str = "auto";
+    /// Share of device memory a rank may hold for weights and KV cache.
+    pub const DEFAULT_MEM_FRACTION_STATIC: f64 = 0.70;
+    /// Attention provider selection: the worker picks one per call.
+    pub const DEFAULT_ATTENTION_BACKEND: &'static str = "auto";
+    /// CUDA graph policy that captures what the deployment's calls need.
+    pub const DEFAULT_GRAPH_POLICY: &'static str = "auto";
+    /// FlashInfer workspace capacity in bytes.
+    pub const DEFAULT_FLASHINFER_WORKSPACE_SIZE: u64 = 512 * 1024 * 1024;
+    /// FlashInfer backend of decode attention.
+    pub const DEFAULT_FLASHINFER_DECODE_BACKEND: FlashInferBackend = FlashInferBackend::Fa2;
+    /// FlashInfer backend of prefill attention.
+    pub const DEFAULT_FLASHINFER_PREFILL_BACKEND: FlashInferBackend = FlashInferBackend::Auto;
+    /// The `ffmpeg` executable a media reader decodes reference videos with.
+    pub const DEFAULT_FFMPEG: &'static str = "ffmpeg";
+    /// Longest video duration, in seconds, a worker sizes its resident media
+    /// state for.
+    pub const DEFAULT_MAX_VIDEO_SECONDS: f64 = 15.0;
+    /// Independent microbatches of attention and remote experts.
+    pub const DEFAULT_EXPERT_MICROBATCHES: u32 = 1;
+    /// Numeric data type of model parameters and activations.
+    pub const DEFAULT_MODEL_DTYPE: uniserve_core::ModelDtype = uniserve_core::ModelDtype::BFloat16;
+    /// Whether every prefill call replays a CUDA graph.
+    pub const DEFAULT_PREFILL_CUDA_GRAPH: bool = true;
+    /// Whether image denoising calls replay CUDA graphs.
+    pub const DEFAULT_FLOW_CUDA_GRAPH: bool = true;
+}
+
 impl Default for WorkerProcessArgs {
     /// Returns worker launch settings suitable for a single local rank.
+    ///
+    /// The tuning values are the `DEFAULT_*` constants of this type, which
+    /// the `uniserve` command line also takes as its option defaults.
     fn default() -> Self {
         Self {
             worker_id: "worker".into(),
             python: "python3".into(),
             launcher_timeout: std::time::Duration::from_secs(120),
+            watchdog_timeout: std::time::Duration::from_secs(300),
             model: String::new(),
-            checkpoint_identity: None,
-            base_model: None,
             ranks: vec![crate::WorkerRank {
                 node: "localhost".into(),
                 device: "cuda:0".into(),
@@ -211,80 +252,59 @@ impl Default for WorkerProcessArgs {
             role: crate::WorkerRole::Model,
             peers: Default::default(),
             stub: false,
-            queue_depth: 2,
-            req_slot_cap: 1 << 20,
-            resp_slot_cap: 8 << 20,
-            kv_token_capacity: None,
+            queue_depth: Self::DEFAULT_QUEUE_DEPTH,
+            max_total_tokens: None,
             block_size: None,
             max_batch_calls: 128,
             max_batch_tokens: 16_384,
             // The engine's default running-request limit plus the largest
             // row reserve a runtime keeps outside it.
             max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
-                + crate::scheduler::MAX_FLOW_PREFIX_ROWS) as u32,
-            attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,
-            capability_groups: Vec::new(),
+                + crate::scheduler::MAX_GUIDANCE_PREFIX_ROWS)
+                as u32,
+            attention_backend: Self::DEFAULT_ATTENTION_BACKEND.into(),
             transfer: Default::default(),
-            load_format: "auto".to_string(),
+            load_format: Self::DEFAULT_LOAD_FORMAT.to_string(),
             download_dir: None,
             load_threads: None,
-            checksum_manifest: None,
-            model_dtype: uniserve_core::ModelDtype::BFloat16,
+            model_dtype: Self::DEFAULT_MODEL_DTYPE,
             quantization_config: serde_json::json!({}),
             kv_cache_dtype: None,
-            kv_storage_fraction: 0.70,
+            mem_fraction_static: Self::DEFAULT_MEM_FRACTION_STATIC,
             mesh: None,
             distributed_backend: None,
             lanes: Vec::new(),
-            graph_policy: "auto".into(),
+            graph_policy: Self::DEFAULT_GRAPH_POLICY.into(),
             decode_graph_batch_sizes: None,
-            prefill_cuda_graph: true,
+            prefill_cuda_graph: Self::DEFAULT_PREFILL_CUDA_GRAPH,
             prefill_outputs: true,
             prefill_graph_token_sizes: None,
-            flow_cuda_graph: true,
+            flow_cuda_graph: Self::DEFAULT_FLOW_CUDA_GRAPH,
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
             video_text_capacities: None,
-            video_frame_sizes: None,
+            video_resolutions: None,
+            video_aspect_ratios: None,
             canvas_sampling: None,
-            flashinfer_workspace_size: 512 * 1024 * 1024,
+            flashinfer_workspace_size: Self::DEFAULT_FLASHINFER_WORKSPACE_SIZE,
             flashinfer_use_tensor_core: None,
-            flashinfer_decode_backend: FlashInferBackend::Fa2,
-            flashinfer_prefill_backend: FlashInferBackend::Auto,
+            flashinfer_decode_backend: Self::DEFAULT_FLASHINFER_DECODE_BACKEND,
+            flashinfer_prefill_backend: Self::DEFAULT_FLASHINFER_PREFILL_BACKEND,
             flashinfer_decode_split_tile_size: None,
             flashinfer_prefill_split_tile_size: None,
             flashinfer_disable_split_kv: false,
             max_model_len: 8192,
-            max_video_seconds: 15.0,
-            max_condition_rows: 0,
-            ffmpeg: "ffmpeg".into(),
+            max_video_seconds: Self::DEFAULT_MAX_VIDEO_SECONDS,
+            max_condition_rows: None,
+            ffmpeg: Self::DEFAULT_FFMPEG.into(),
             min_video_seconds: None,
             expert_parallel: None,
-            expert_microbatches: 1,
+            expert_microbatches: Self::DEFAULT_EXPERT_MICROBATCHES,
         }
     }
 }
 
 impl WorkerProcessArgs {
-    /// Derives the checkpoint identity once when the model is a local
-    /// directory the head can read.
-    ///
-    /// A Hub identifier or a model this host cannot read yields no
-    /// expectation; `refuse_checkpoint_mismatch` then holds the ranks to rank
-    /// 0's report instead. An identity already stated by the caller is kept,
-    /// and a stub launch derives none. Fails when the checkpoint directory or
-    /// a file in it cannot be read.
-    pub(super) fn derive_checkpoint_identity(&mut self) -> anyhow::Result<()> {
-        if self.checkpoint_identity.is_some() || self.stub {
-            return Ok(());
-        }
-        let root = std::path::Path::new(&self.model);
-        if root.is_dir() {
-            self.checkpoint_identity = Some(super::checkpoint::checkpoint_identity(root)?);
-        }
-        Ok(())
-    }
-
     /// Returns one rank's index among the ranks on its own host and that
     /// host's rank count.
     ///
@@ -326,12 +346,11 @@ impl WorkerProcessArgs {
 
     /// Builds the typed launch descriptor the worker process consumes.
     ///
-    /// Every tuning value is stated explicitly, so the launching side is the
+    /// Every launch value is stated explicitly, so the launching side is the
     /// single source of defaults and the worker never re-derives one. The keys
     /// become attributes of the namespace `WorkerProcessArgs.from_namespace`
-    /// reads, and the worker refuses a descriptor missing any key listed in
-    /// `REQUIRED_FIELDS` (`uniserve_worker.bootstrap.cli`). Only the process
-    /// identity and the descriptor's path travel on argv.
+    /// reads (`uniserve_worker.bootstrap.cli`), which needs every one of them.
+    /// Only the process identity and the descriptor's path travel on argv.
     ///
     /// `rank` must index `self.ranks`. Fails when a host-relative rank value
     /// does not fit `u32` or the component configuration does not serialize.
@@ -344,7 +363,6 @@ impl WorkerProcessArgs {
         expert_listen_fd: Option<std::os::fd::RawFd>,
     ) -> anyhow::Result<serde_json::Value> {
         let depth = self.queue_depth.max(1);
-        let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
         // Resolve mechanism ownership from the physical rank's incident edges.
         let (transfer_backends, publish_backends) =
             self.transfer.rank_backends(&self.worker_id, rank);
@@ -357,7 +375,6 @@ impl WorkerProcessArgs {
         };
 
         let mut fields = serde_json::Map::new();
-        fields.insert("worker_id".into(), json!(self.worker_id));
         fields.insert("registration_address".into(), json!(registration));
         // The placement decides the mechanism and the rank names the endpoint:
         // a rank on the head's host can offer shared storage, a rank elsewhere
@@ -392,16 +409,7 @@ impl WorkerProcessArgs {
             json!(self.transfer.products_cross_hosts(&self.worker_id, rank)),
         );
         fields.insert("queue_depth".into(), json!(depth));
-        fields.insert("ipc_payload_cap".into(), json!(max_payload));
         fields.insert("model".into(), json!(self.model));
-        // The expectation travels only when the head could derive one; a
-        // rank then refuses a checkpoint whose identity differs from it.
-        if let Some(identity) = &self.checkpoint_identity {
-            fields.insert("checkpoint_identity".into(), json!(identity));
-        }
-        if let Some(base) = &self.base_model {
-            fields.insert("base_model".into(), json!(base));
-        }
         fields.insert("device".into(), json!(self.ranks[rank as usize].device));
         fields.insert("rank".into(), json!(rank));
         fields.insert("local_rank".into(), json!(self.host_slot(rank)?.0));
@@ -417,15 +425,6 @@ impl WorkerProcessArgs {
             .chain(self.components.keys())
             .collect::<std::collections::BTreeSet<_>>();
         fields.insert("deployment_components".into(), json!(deployment));
-        // Null lets the worker serve every capability group it implements.
-        fields.insert(
-            "supported_calls".into(),
-            if self.capability_groups.is_empty() {
-                Value::Null
-            } else {
-                json!(self.capability_groups.join(","))
-            },
-        );
         fields.insert("transfer_backends".into(), json!(names(&transfer_backends)));
         fields.insert("publish_backends".into(), json!(names(&publish_backends)));
         // Every rank of a group connects to the collective store at this
@@ -474,14 +473,10 @@ impl WorkerProcessArgs {
                     .collect::<Vec<_>>()
             ),
         );
-        // The worker refuses `no_model` without `allow_stub`, so a stub
-        // launch states both.
         fields.insert("no_model".into(), json!(self.stub));
-        fields.insert("allow_stub".into(), json!(self.stub));
         fields.insert("load_format".into(), json!(self.load_format));
         fields.insert("download_dir".into(), json!(self.download_dir));
         fields.insert("load_threads".into(), json!(self.load_threads));
-        fields.insert("checksum_manifest".into(), json!(self.checksum_manifest));
         fields.insert("model_dtype".into(), json!(self.model_dtype.as_str()));
         fields.insert(
             "quantization_config".into(),
@@ -491,12 +486,12 @@ impl WorkerProcessArgs {
             "kv_cache_dtype".into(),
             json!(self.kv_cache_dtype.as_ref().map(|value| value.as_str())),
         );
-        fields.insert("kv_memory_fraction".into(), json!(self.kv_storage_fraction));
-        fields.insert("kv_token_capacity".into(), json!(self.kv_token_capacity));
         fields.insert(
-            "attention_backend".into(),
-            json!(self.attention_backend.as_name()),
+            "mem_fraction_static".into(),
+            json!(self.mem_fraction_static),
         );
+        fields.insert("max_total_tokens".into(), json!(self.max_total_tokens));
+        fields.insert("attention_backend".into(), json!(self.attention_backend));
         fields.insert("block_size".into(), json!(self.block_size));
         fields.insert("max_batch_calls".into(), json!(self.max_batch_calls));
         fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));
@@ -530,7 +525,11 @@ impl WorkerProcessArgs {
             "video_text_capacities".into(),
             json!(self.video_text_capacities),
         );
-        fields.insert("video_frame_sizes".into(), json!(self.video_frame_sizes));
+        fields.insert("video_resolutions".into(), json!(self.video_resolutions));
+        fields.insert(
+            "video_aspect_ratios".into(),
+            json!(self.video_aspect_ratios),
+        );
         fields.insert(
             "canvas_sampling".into(),
             serde_json::to_value(self.canvas_sampling)?,
@@ -590,12 +589,10 @@ pub(super) struct RankProcess {
     /// lifetime; dropping it deletes the file.
     _launch_descriptor: tempfile::TempDir,
     /// Most requests outstanding at once. `adopt` also sizes the channel
-    /// with it (see `RankChannel::connect`), and `finish_startup` requires
-    /// the worker to report the same `queue_depth`.
+    /// with it (see `RankChannel::connect`).
     depth: usize,
+    /// The rank this process was launched as.
     rank: u32,
-    world_size: u32,
-    expected_components: std::collections::BTreeMap<String, uniserve_core::ComponentConfig>,
     /// Submitted batches awaiting a response, by message identity.
     pending: HashMap<u64, PendingRecord>,
     /// Routed results and errors, in arrival order, that `poll_batch` has
@@ -636,18 +633,17 @@ pub(super) struct PendingRank {
     /// this value drops, as it does when the launch fails.
     child: PendingChild,
     rank: u32,
-    world_size: u32,
+    /// Channel mechanism the launch descriptor asked this rank to serve its
+    /// endpoint over.
+    transport: &'static str,
     /// Channel sizing `adopt` passes to `RankChannel::connect`.
     depth: usize,
-    /// Largest frame payload in bytes, in either direction.
-    max_payload: usize,
     /// Moves by adoption alongside the process it cancels.
     startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Retains the launch descriptor until the rank has read it; adoption
     /// transfers it to the `RankProcess`, which keeps it for the rank's
     /// lifetime.
     launch_descriptor: tempfile::TempDir,
-    components: std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
 }
 
 /// The process of a launched rank that has not been adopted yet, when this
@@ -767,7 +763,6 @@ impl PendingRank {
         registration: &str,
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
-        let max_payload = args.req_slot_cap.max(args.resp_slot_cap).max(1);
         let world_size = args.world_size();
 
         let descriptor_directory = tempfile::Builder::new()
@@ -843,12 +838,10 @@ impl PendingRank {
             return Ok(Self {
                 child: PendingChild(None),
                 rank,
-                world_size,
+                transport: args.channel_transport(rank),
                 depth,
-                max_payload,
                 startup_abort,
                 launch_descriptor: descriptor_directory,
-                components: args.components.clone(),
             });
         }
         let child = cmd.spawn().context("spawning python worker")?;
@@ -856,18 +849,11 @@ impl PendingRank {
         Ok(Self {
             child: PendingChild(Some(child)),
             rank,
-            world_size,
+            transport: args.channel_transport(rank),
             depth,
-            max_payload,
             startup_abort,
             launch_descriptor: descriptor_directory,
-            components: args.components.clone(),
         })
-    }
-
-    /// Returns the rank this process was launched as.
-    pub(crate) fn rank(&self) -> u32 {
-        self.rank
     }
 
     /// Fails by name when the rank exited before reporting its endpoint.
@@ -892,25 +878,20 @@ impl PendingRank {
         }
     }
 
-    /// Binds this rank's channel to the endpoint and mechanism the rank reported.
+    /// Binds this rank's channel to the endpoint the rank reported, over the
+    /// mechanism the launch asked it to serve.
     ///
     /// The returned `RankProcess` owns the rank's process, when this engine
     /// spawned it, and a death watcher for it when one can be started. Its
     /// `info` stays the default until `RankProcess::finish_startup` runs.
-    pub(crate) fn adopt(self, transport: &str, endpoint: &str) -> anyhow::Result<RankProcess> {
+    pub(crate) fn adopt(self, endpoint: &str) -> anyhow::Result<RankProcess> {
         let rank = self.rank;
+        let transport = self.transport;
         // The process stays owned here until the channel exists, so a failed
         // connection terminates the rank instead of orphaning it.
-        let client = RankChannel::connect(
-            transport,
-            endpoint,
-            self.max_payload,
-            self.depth,
-            CHANNEL_CONNECT_TIMEOUT,
-        )
-        .with_context(|| format!("connecting to the channel rank {rank} reported"))?;
-        // The mechanism and endpoint are the rank's choice, so the head records
-        // what it bound.
+        let client = RankChannel::connect(transport, endpoint, self.depth, CHANNEL_CONNECT_TIMEOUT)
+            .with_context(|| format!("connecting to the channel rank {rank} reported"))?;
+        // The rank names its own endpoint, so the head records what it bound.
         tracing::info!(
             rank,
             transport,
@@ -921,12 +902,10 @@ impl PendingRank {
         let PendingRank {
             child,
             rank,
-            world_size,
+            transport: _,
             depth,
-            max_payload: _,
             startup_abort,
             launch_descriptor,
-            components,
         } = self;
         let child = child.release();
         // A watcher observes a process identifier, so only a rank this engine
@@ -947,8 +926,6 @@ impl PendingRank {
             _launch_descriptor: launch_descriptor,
             depth,
             rank,
-            world_size,
-            expected_components: components,
             pending: HashMap::new(),
             ready: VecDeque::new(),
             next_message_id: 1,
@@ -970,19 +947,18 @@ impl Drop for PendingChild {
 }
 
 impl RankProcess {
-    /// Waits for the rank's startup report and checks it against the launch.
+    /// Waits for the rank's startup report.
     ///
     /// The rank answers the info request only once its model is built and
     /// warmed up, so once the request is sent this blocks for the rank's
     /// whole preparation, bounded by the rank's liveness and the startup
-    /// cancellation flag rather than a deadline. The report must be valid,
-    /// match the launched queue depth, rank, world size, and components, and
-    /// state the resolved model dtype and attention backend. On success it
-    /// becomes `info`; on failure `info` is unchanged.
+    /// cancellation flag rather than a deadline. The codec has validated the
+    /// report when it decoded it. On success it becomes `info`; on failure
+    /// `info` is unchanged.
     pub(crate) fn finish_startup(&mut self) -> anyhow::Result<()> {
         let message_id = self.alloc_call_id();
         let mut request = WorkerRequest::info();
-        request.set_call_id(Some(message_id));
+        request.set_message_id(Some(message_id));
         let pending =
             self.send_request_with_timeout(&request, "Worker startup", WORKER_CONNECT_TIMEOUT)?;
         let response = self
@@ -1002,36 +978,6 @@ impl RankProcess {
             }
             other => bail!("unexpected startup response: {:?}", other.kind()),
         };
-
-        info.validate()
-            .context("worker reported invalid worker info during startup")?;
-        let host_depth = self.depth as u32;
-        anyhow::ensure!(
-            info.queue_depth == host_depth,
-            "worker queue_depth {} does not match launched depth {}",
-            info.queue_depth,
-            host_depth
-        );
-        anyhow::ensure!(
-            info.endpoint.rank == self.rank && info.world_size == self.world_size,
-            "worker process rank/world_size ({}/{}) does not match launched topology ({}/{})",
-            info.endpoint.rank,
-            info.world_size,
-            self.rank,
-            self.world_size
-        );
-        anyhow::ensure!(
-            info.components
-                .iter()
-                .map(|entry| (entry.name.clone(), entry.config.clone()))
-                .collect::<std::collections::BTreeMap<_, _>>()
-                == self.expected_components,
-            "worker resolved component configuration disagrees with configuration"
-        );
-        anyhow::ensure!(
-            !info.model_dtype.is_empty() && !info.attention_backend.is_empty(),
-            "worker omitted resolved numerical settings"
-        );
 
         self.check_worker("Worker startup")?;
         self.info = info;
@@ -1318,7 +1264,7 @@ impl RankProcess {
         let batch_id = batch.batch_id;
         let message_id = self.alloc_call_id();
         let mut req = WorkerRequest::submit(batch);
-        req.set_call_id(Some(message_id));
+        req.set_message_id(Some(message_id));
         let pending = match self.client.send_request_attempt(&req) {
             Ok(pending) => pending,
             Err(uniserve_worker_ipc::IpcError::WouldBlock) => {
@@ -1434,7 +1380,7 @@ impl RankProcess {
             if !matches!(self.child.as_mut().map(Child::try_wait), Some(Ok(Some(_)))) {
                 let message_id = self.alloc_call_id();
                 let mut req = WorkerRequest::close();
-                req.set_call_id(Some(message_id));
+                req.set_message_id(Some(message_id));
                 acknowledgment = self.send_request_checked(&req, "shutdown").ok();
             }
         }
@@ -1598,30 +1544,9 @@ impl Drop for RankProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaneConfig, WorkerProcessArgs, allocator_environment};
+    use super::{LaneConfig, allocator_environment};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
-
-    /// A rank receives the operator's local base checkpoint under the key
-    /// the worker reads, and no key when the operator named none, so the
-    /// worker then reads the base from the Hugging Face cache.
-    #[test]
-    fn the_launch_descriptor_carries_a_named_base_checkpoint() {
-        let mut args = WorkerProcessArgs {
-            model: "/models/FastH3-OmniRef".into(),
-            ..WorkerProcessArgs::default()
-        };
-        let descriptor = args
-            .launch_descriptor(0, "127.0.0.1:1", None, None, None)
-            .expect("descriptor");
-        assert!(descriptor.get("base_model").is_none());
-
-        args.base_model = Some("/models/MiniMax-H3".into());
-        let descriptor = args
-            .launch_descriptor(0, "127.0.0.1:1", None, None, None)
-            .expect("descriptor");
-        assert_eq!(descriptor["base_model"], "/models/MiniMax-H3");
-    }
 
     /// `--lane` accepts only the fields the worker applies, so a misspelled
     /// optional limit fails at argument parsing instead of leaving the lane
@@ -1637,19 +1562,17 @@ mod tests {
         }
     }
 
-    /// A lane partitions compute only: its calls share the worker-wide KV
-    /// and latent pools, whose placement the scheduler owns, so a lane
-    /// naming a capacity of its own is refused rather than accepted without
-    /// effect.
+    /// A configured batch or in-flight limit is positive: zero would leave
+    /// the lane unable to run any call.
     #[test]
-    fn a_lane_naming_a_pool_capacity_is_refused() {
+    fn a_lane_with_a_zero_limit_is_refused() {
         let lane = r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]"#;
-        for capacity in [
-            r#""kv_capacity_tokens":4096"#,
-            r#""latent_capacity_units":8"#,
-        ] {
-            let parsed = format!("{lane},{capacity}}}").parse::<LaneConfig>();
-            assert!(parsed.is_err(), "{capacity} must be refused");
+
+        for limit in ["max_batch_calls", "max_batch_tokens", "max_inflight"] {
+            let zero = format!(r#"{lane},"{limit}":0}}"#).parse::<LaneConfig>();
+            assert!(zero.is_err(), "{limit} of zero must be refused");
+            let positive = format!(r#"{lane},"{limit}":1}}"#).parse::<LaneConfig>();
+            assert!(positive.is_ok(), "{limit} of one must be accepted");
         }
     }
 

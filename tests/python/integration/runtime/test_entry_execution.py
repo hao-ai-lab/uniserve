@@ -21,11 +21,12 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.encoding import Model as EncodedModel
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.transport import make_transport
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image, video
 from uniserve.runtime import EventPool
 from uniserve_worker.config.deployment import ComponentConfig, ParallelConfig
-from uniserve_worker.config.execution import LaneConfig, WorkerConfig
+from uniserve_worker.config.execution import LaneConfig
 from uniserve_worker.errors import InputError
 from uniserve_worker.execution import media
 from uniserve_worker.execution.model_executor import ModelExecutor
@@ -35,7 +36,7 @@ from uniserve_worker.protocol.batch import (
     Batch,
     BufferAllocation,
     DecodeRange,
-    DiffusionParams,
+    DiffusionSamplingParams,
     NewRequest,
     Start,
     TensorPublication,
@@ -63,12 +64,11 @@ from uniserve_worker.protocol.transfer import (
     WorkerEndpoint,
 )
 from uniserve_worker.protocol.video import VideoAdmission, VideoTask
-from uniserve_worker.protocol.worker_info import WorkerInfo
 from uniserve_worker.transport.fetch import fetch_tensor
 
 pytestmark = pytest.mark.integration
 
-# A four-frame single-pixel clip: one window of the fixture decoder.
+# A four-frame single-pixel video: one clip of the fixture decoder.
 PIXEL = video.Config(4, image.Config(1, 1))
 
 
@@ -116,8 +116,8 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
         group.device,
     )
     runner = ModelExecutor(
-        DecodedModel(DecoderConfig(window=25)),
-        WorkerConfig(rank=rank, world_size=4),
+        DecodedModel(DecoderConfig(clip_length=25)),
+        cpu_worker_config(rank=rank, world_size=4),
         bindings={"reconstruction": binding},
     )
     try:
@@ -194,7 +194,7 @@ def test_audio_decoding_ranks_reconstruct_contiguous_unit_runs(
         )
         runner = ModelExecutor(
             model,
-            WorkerConfig(rank=rank, world_size=len(ranks)),
+            cpu_worker_config(rank=rank, world_size=len(ranks)),
             bindings={"audio_decoder": binding},
             entry_points=audio_entry_points(AUDIO_CONFIG),
         )
@@ -237,7 +237,7 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(
     runners = [
         ModelExecutor(
             model,
-            WorkerConfig(device=device),
+            cpu_worker_config(device=device),
             bindings=_encoder_bindings(model, components, device),
         )
         for _ in range(2)
@@ -259,7 +259,7 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(
             return normalized.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
         def decode(runner):
-            return media.decode_video_unit(
+            return media.decode_video_clip(
                 runner, "reconstruction", source, slice(0, 4), PIXEL
             ).values[0]
 
@@ -295,11 +295,11 @@ def test_module_call_statistics_count_the_call_without_tokens():
     )
     runner = ModelExecutor(
         model,
-        WorkerConfig(device="cpu"),
+        cpu_worker_config(device="cpu"),
         bindings=_encoder_bindings(model, components),
     )
     try:
-        output = media.decode_video_unit(
+        output = media.decode_video_clip(
             runner, "reconstruction", torch.zeros(4, 3), slice(0, 4), PIXEL
         )
     finally:
@@ -329,7 +329,7 @@ def test_conditioning_executes_only_on_its_declared_pipeline_stage(rank):
     )
     runner = ModelExecutor(
         model,
-        WorkerConfig(rank=rank, world_size=2),
+        cpu_worker_config(rank=rank, world_size=2),
         bindings={"conditioner": binding},
     )
     try:
@@ -362,7 +362,7 @@ def test_a_batch_reading_more_regions_than_read_tickets_completes():
         byte_capacity=1 << 16,
         ticket_capacity=1,
         event_pool=events,
-        source=WorkerEndpoint.local("producer"),
+        source=WorkerEndpoint.local(),
     )
     local = worker.transports["local"]
     assert local.capacity.ticket_capacity == 4
@@ -491,7 +491,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
 ):
     device = "cpu" if execution_device == "cpu" else "cuda:0"
     model = EncodedModel().to(device)
-    execution = WorkerConfig(
+    execution = cpu_worker_config(
         graph_policy="off",
         lanes=(
             LaneConfig(
@@ -538,8 +538,8 @@ def test_text_encoder_call_publishes_consumable_conditioning(
                 NewRequest(
                     key,
                     request_pool_idx=1,
-                    diffusion=DiffusionParams(
-                        22, 3, 4, 1000, width=1344, height=768
+                    diffusion=DiffusionSamplingParams(
+                        22, 3, 1000, width=1344, height=768
                     ),
                     video=VideoAdmission(
                         VideoTask.T2VA, text_tags=(1,) * len(prompt)
@@ -652,7 +652,7 @@ def test_text_entry_stages_successive_bounded_inputs(device):
     model = EncodedModel().to(device)
     runner = ModelExecutor(
         model,
-        WorkerConfig(device=device, max_sequence_tokens=16),
+        cpu_worker_config(device=device, max_model_len=16),
         bindings=_encoder_bindings(
             model, (("text_encoder", ComponentConfig((0,))),), device
         ),
@@ -689,18 +689,17 @@ def test_worker_reports_text_bounds_and_executes_dense_attention_without_kv():
     )
     with execution_worker(
         model,
-        execution=WorkerConfig(
-            max_sequence_tokens=16, graph_policy="off", model_dtype="float32"
+        execution=cpu_worker_config(
+            max_model_len=16, graph_policy="off", model_dtype="float32"
         ),
         components=components,
         bindings=_encoder_bindings(model, components),
     ) as worker:
-        info = WorkerInfo.from_mapping(worker.info.to_mapping())
+        info = worker.info
         assert info.kv_cache is None
         component = next(
             value for value in info.components if value.name == "text_encoder"
         )
-        assert component.config.ranks == (0,)
         assert component.outputs == (
             OutputInfo(
                 "conditioning",
@@ -742,7 +741,9 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
         admission = NewRequest(
             key,
             request_pool_idx=1,
-            diffusion=DiffusionParams(22, 3, 4, 1000, width=1344, height=768),
+            diffusion=DiffusionSamplingParams(
+                22, 3, 1000, width=1344, height=768
+            ),
             video=VideoAdmission(VideoTask.T2VA, text_tags=(1, 1, 1)),
             prompt_token_ids=(3, 8, 1),
         )
@@ -761,9 +762,9 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
 
 @pytest.mark.gpu
 def test_decoder_graphs_share_backing_and_match_eager_decoding():
-    """Every captured decoder segment views one input and one output.
+    """Every captured decoder clip output views one input and one output.
 
-    A window decodes at its segment, so each raster captures one graph.
+    A clip decodes at its clip output, so each raster captures one graph.
     Graphs captured largest first replay in any order and reproduce the
     eager reconstruction exactly, so sharing their backing loses nothing.
     """
@@ -778,7 +779,7 @@ def test_decoder_graphs_share_backing_and_match_eager_decoding():
     graphs, eager = (
         ModelExecutor(
             model,
-            WorkerConfig(device=device, graph_policy=policy),
+            cpu_worker_config(device=device, graph_policy=policy),
             bindings=_encoder_bindings(model, components, device),
         )
         for policy in ("auto", "off")
@@ -788,16 +789,16 @@ def test_decoder_graphs_share_backing_and_match_eager_decoding():
         for height, width in ((2, 3), (2, 2), (1, 1))
     )
 
-    def decode(runner, size, window, latent):
-        return media.decode_video_unit(
+    def decode(runner, size, clip, latent):
+        return media.decode_video_clip(
             runner,
             "reconstruction",
             latent,
-            slice(4 * window, 4 * window + 4),
+            slice(4 * clip, 4 * clip + 4),
             size,
         ).values[0]
 
-    calls = [(size, window) for size in sizes for window in range(2)]
+    calls = [(size, clip) for size in sizes for clip in range(2)]
     try:
         generator = torch.Generator(device=device).manual_seed(0)
 
@@ -806,9 +807,9 @@ def test_decoder_graphs_share_backing_and_match_eager_decoding():
             rows = size.num_frames * size.frame.height * size.frame.width
             return torch.randn(rows, 3, generator=generator, device=device)
 
-        # Startup captures every segment, largest first.
-        for size, window in calls:
-            decode(graphs, size, window, source(size))
+        # Startup captures every clip output, largest first.
+        for size, clip in calls:
+            decode(graphs, size, clip, source(size))
         entries = list(graphs._module_entries.values())
         assert len(entries) == len(sizes)
         captured = [
@@ -823,10 +824,10 @@ def test_decoder_graphs_share_backing_and_match_eager_decoding():
         )
 
         # Replays in a different order match eager decoding bit for bit.
-        for size, window in reversed(calls[1:] + calls[:1]):
+        for size, clip in reversed(calls[1:] + calls[:1]):
             value = source(size)
-            replayed = decode(graphs, size, window, value)
-            reference = decode(eager, size, window, value)
+            replayed = decode(graphs, size, clip, value)
+            reference = decode(eager, size, clip, value)
             torch.testing.assert_close(replayed, reference, rtol=0, atol=0)
         outputs = set()
         for graph in captured:

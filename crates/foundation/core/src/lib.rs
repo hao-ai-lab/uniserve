@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 /// Serializable statistics and observer-facing wire values.
 pub mod codec;
 mod events;
-/// Handing a bound socket to a rank process at its launch.
+/// The head-launcher messages and handing a bound socket to a rank process at
+/// its launch.
 pub mod launch;
 mod media;
 mod video;
@@ -32,24 +33,18 @@ pub use video::{
 };
 /// Multimodal generation descriptors, resource bounds, and validation.
 pub mod generation;
-/// Counter-based Philox random-number generation.
-pub mod philox;
-/// Deterministic token sampling and log-probability scoring.
-pub mod sampling;
 pub use codec::stats::ForwardStats;
 pub use events::{
     ArtifactEvent, Canvas, DiffusionRequest, DiffusionRequestError, DiffusionSamplingParams,
     EngineCoreOutput, FinishReason, MediaKind, PositionLogprobs, RejectionKind, Request,
-    RuntimeFamily, StopReason, TokenLogprob, VideoTask,
+    StopReason, TokenLogprob, VideoTask,
 };
 pub use generation::{
     CachePolicy, CanvasSampling, FeedbackNextToken, FeedbackSource, GenerationConstraint,
     GenerationConstraintParseError, GenerationFeatures, GenerationLimits, GenerationRequest,
     GenerationRequestError, GenerationResourceError, ImageEncoderInput, ImageGenerationConfig,
-    ImageIngestStep, ImageInput, ImageTrigger, MultimodalInputs, ReadoutRow, ReadoutSlot,
-    encoder_cache_key,
+    ImageInput, ImageTrigger, MultimodalInputs, ReadoutRow, ReadoutSlot, encoder_cache_key,
 };
-pub use sampling::{SampleOutput, score_token_logprobs, try_apply_sampling_counts};
 
 /// Thread-safe notification used to wake an engine after command enqueue.
 ///
@@ -170,7 +165,7 @@ pub struct UnitId(pub u32);
 )]
 pub struct RequestId(pub u64);
 
-/// Logical computation identity, preserved when a scheduler batch is split across workers.
+/// Logical call identity, preserved when a scheduler batch is split across workers.
 /// The request index is the ordinal assigned at selection, before physical row packing.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
@@ -188,6 +183,94 @@ impl CallId {
             batch_id,
             request_index,
         }
+    }
+}
+
+/// A concrete media-input, encoder, diffusion, decoder, or media-output
+/// call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum MediaCall {
+    /// Decodes a video request's condition media on a host rank into the
+    /// inputs of the vision and latent encoders.
+    MediaReading,
+    VisionEncoding,
+    LatentEncoding,
+    TextEncoding,
+    LatentPreparation,
+    Denoising,
+    ImageDecoding,
+    VideoDecoding,
+    AudioDecoding,
+    VideoEncoding,
+    AudioEncoding,
+    Muxing,
+}
+
+impl MediaCall {
+    /// Every media call in declaration order.
+    ///
+    /// `worker-ipc-py` indexes a Python enum table built from this array with
+    /// `call as usize`, so the order must match the declaration order.
+    pub const ALL: [Self; 12] = [
+        Self::MediaReading,
+        Self::VisionEncoding,
+        Self::LatentEncoding,
+        Self::TextEncoding,
+        Self::LatentPreparation,
+        Self::Denoising,
+        Self::ImageDecoding,
+        Self::VideoDecoding,
+        Self::AudioDecoding,
+        Self::VideoEncoding,
+        Self::AudioEncoding,
+        Self::Muxing,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MediaReading => "media_reading",
+            Self::VisionEncoding => "vision_encoding",
+            Self::LatentEncoding => "latent_encoding",
+            Self::TextEncoding => "text_encoding",
+            Self::LatentPreparation => "latent_preparation",
+            Self::Denoising => "denoising",
+            Self::ImageDecoding => "image_decoding",
+            Self::VideoDecoding => "video_decoding",
+            Self::AudioDecoding => "audio_decoding",
+            Self::VideoEncoding => "video_encoding",
+            Self::AudioEncoding => "audio_encoding",
+            Self::Muxing => "muxing",
+        }
+    }
+
+    /// Returns the calls that read this call's products in a video request's
+    /// graph.
+    ///
+    /// A producing call's readers are the calls whose inputs it declares, in
+    /// the order the graph consumes them. The engine plans consumption from
+    /// this table and the worker sizes persistent product storage from it
+    /// ([`Self::reads_resident_state`] separates the readers of resident
+    /// state).
+    pub const fn readers(self) -> &'static [Self] {
+        match self {
+            Self::MediaReading => &[Self::VisionEncoding, Self::LatentEncoding],
+            Self::VisionEncoding => &[Self::TextEncoding],
+            Self::TextEncoding | Self::LatentEncoding => &[Self::LatentPreparation],
+            Self::LatentPreparation => &[Self::Denoising],
+            Self::Denoising => &[Self::Denoising, Self::VideoDecoding, Self::AudioDecoding],
+            Self::VideoDecoding => &[Self::VideoEncoding],
+            Self::VideoEncoding => &[Self::Muxing],
+            Self::AudioDecoding => &[Self::AudioEncoding],
+            Self::ImageDecoding | Self::AudioEncoding | Self::Muxing => &[],
+        }
+    }
+
+    /// Returns whether this call reads its predecessor's trajectory from the
+    /// denoiser's resident state instead of a persistent product.
+    pub const fn reads_resident_state(self) -> bool {
+        matches!(self, Self::Denoising)
     }
 }
 
@@ -317,8 +400,7 @@ pub struct KvCacheDtypeParseError(String);
 ///
 /// Worker-side math (temperature, top_k, top_p, min_p, typical_p, penalties,
 /// logit_bias, allowed and forced tokens) operates on the logits tensor inside
-/// the worker, and the engine simulator applies the same math through
-/// [`sampling::try_apply_sampling_counts`]. The engine scheduler enforces the
+/// the worker. The engine scheduler enforces the
 /// control-flow fields on the host: `min_tokens` and `bad_words_ids` become
 /// per-step suppression masks, and `ignore_eos` decides whether a sampled EOS
 /// finishes the request. Fields are scalars or small id/weight lists — never
@@ -373,9 +455,6 @@ pub struct SamplingParams {
     /// How many highest-probability alternatives to return per scored prompt position.
     #[serde(default)]
     pub n_prompt_logprobs: u32,
-    /// Token IDs whose log probabilities are returned at every scored position.
-    #[serde(default)]
-    pub logprob_token_ids: Vec<u32>,
     /// Bad-word token sequences: generation may not complete any of these.
     /// Enforced host-side by masking the completing token.
     #[serde(default)]
@@ -457,7 +536,7 @@ pub enum SamplingParamsError {
 impl SamplingParams {
     /// Returns whether generated-token logprobs are enabled.
     pub fn generated_logprobs_requested(&self) -> bool {
-        self.return_logprobs || self.n_logprobs > 0 || !self.logprob_token_ids.is_empty()
+        self.return_logprobs || self.n_logprobs > 0
     }
 
     /// Returns whether prompt-token logprobs are enabled.
@@ -559,7 +638,6 @@ impl Default for SamplingParams {
             n_logprobs: 0,
             return_prompt_logprobs: false,
             n_prompt_logprobs: 0,
-            logprob_token_ids: Vec::new(),
             bad_words_ids: Vec::new(),
             allowed_token_ids: None,
             typical_p: 1.0,
@@ -569,9 +647,6 @@ impl Default for SamplingParams {
 }
 
 /// Image-generation parameters bounded for scheduler admission.
-///
-/// `max_images` limits the total media work and feedback resources reachable by
-/// one request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageParams {
     /// Number of denoising steps.
@@ -597,14 +672,6 @@ pub struct ImageParams {
     pub seed: Option<u64>,
     /// Negative text conditioning prompt.
     pub negative_prompt: String,
-    /// Maximum images this request may generate.
-    pub max_images: u16,
-    /// Optional per-image prompt overrides.
-    #[serde(default)]
-    pub image_prompts: Vec<String>,
-    /// Whether completed image bytes remain available to the caller.
-    #[serde(default = "default_retain_images")]
-    pub retain_images: bool,
 }
 
 impl ImageParams {
@@ -636,66 +703,38 @@ fn default_timestep_shift() -> f32 {
     1.0
 }
 
-/// Returns the default policy that retains materialized image bytes.
-fn default_retain_images() -> bool {
-    true
-}
-
 /// Validation failure returned by [`ImageParams::validate`].
 ///
 /// Each variant names the offending field and the bound it violated so the
 /// caller can report a precise input error before scheduling diffusion work.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ImageParamsError {
-    /// Denoising step count lies outside its supported range.
-    #[error("steps must be in 1..={max}, got {got}")]
-    Steps {
-        /// Supplied step count.
-        got: u16,
-        /// Maximum supported step count.
-        max: u16,
-    },
-    /// Image height violates range or alignment requirements.
-    #[error("height must be a non-zero multiple of {multiple} in {min}..={max}, got {got}")]
+    /// Denoising step count is zero.
+    #[error("steps must be positive")]
+    Steps,
+    /// Image height is zero or not a multiple of the grid.
+    #[error("height must be a non-zero multiple of {multiple}, got {got}")]
     Height {
         /// Supplied height.
         got: u32,
-        /// Minimum supported height.
-        min: u32,
-        /// Maximum supported height.
-        max: u32,
         /// Required height alignment.
         multiple: u32,
     },
-    /// Image width violates range or alignment requirements.
-    #[error("width must be a non-zero multiple of {multiple} in {min}..={max}, got {got}")]
+    /// Image width is zero or not a multiple of the grid.
+    #[error("width must be a non-zero multiple of {multiple}, got {got}")]
     Width {
         /// Supplied width.
         got: u32,
-        /// Minimum supported width.
-        min: u32,
-        /// Maximum supported width.
-        max: u32,
         /// Required width alignment.
         multiple: u32,
     },
-    /// A guidance scale is non-finite or exceeds its supported range.
-    #[error("{field} must be finite and in 0.0..={max}, got {got}")]
+    /// A guidance scale is non-finite or negative.
+    #[error("{field} must be finite and non-negative, got {got}")]
     CfgScale {
         /// Name of the invalid scale.
         field: &'static str,
         /// Supplied scale.
         got: f32,
-        /// Maximum supported scale.
-        max: f32,
-    },
-    /// Per-request image count lies outside its supported range.
-    #[error("max_images must be in 1..={max}, got {got}")]
-    MaxImages {
-        /// Supplied image count.
-        got: u16,
-        /// Maximum supported image count.
-        max: u16,
     },
     /// A floating-point parameter is NaN or infinite.
     #[error("{field} must be finite, got {got}")]
@@ -766,71 +805,43 @@ impl std::fmt::Display for CfgRenorm {
 pub struct CfgRenormParseError(String);
 
 impl ImageParams {
-    /// Upper bound on diffusion steps.
-    pub const MAX_STEPS: u16 = 1000;
-    /// Minimum supported image dimension in pixels.
-    pub const MIN_DIM: u32 = 16;
-    /// Maximum supported image dimension in pixels.
-    pub const MAX_DIM: u32 = 4096;
     /// Required divisibility for each image dimension.
     pub const DIM_MULTIPLE: u32 = 16;
-    /// Upper bound on any single CFG scale.
-    pub const MAX_CFG_SCALE: f32 = 100.0;
-    /// Upper bound on `max_images` per request.
-    pub const MAX_IMAGES: u16 = 256;
 
     /// Validates diffusion parameters before they reach the worker.
     ///
     /// Callers include `GenerationRequest::validate` and the worker IPC
-    /// `NewRequest::validate`. `height` and `width` must each be non-zero,
-    /// within `MIN_DIM..=MAX_DIM`, and a multiple of `DIM_MULTIPLE`. The
-    /// first violation found is returned.
+    /// `NewRequest::validate`. `height` and `width` must each be non-zero
+    /// and a multiple of `DIM_MULTIPLE`. The model's own limits bound the
+    /// image's extent and the schedule's length at admission. The first
+    /// violation found is returned.
     pub fn validate(&self) -> Result<(), ImageParamsError> {
-        // Bound discrete work before validating shape- and guidance-dependent
-        // values.
-        if self.steps == 0 || self.steps > Self::MAX_STEPS {
-            return Err(ImageParamsError::Steps {
-                got: self.steps,
-                max: Self::MAX_STEPS,
-            });
+        if self.steps == 0 {
+            return Err(ImageParamsError::Steps);
         }
 
-        // Both dimensions obey the same positive, bounded, aligned grid
-        // contract.
-        let check_dim = |got: u32| -> bool {
-            got != 0
-                && (Self::MIN_DIM..=Self::MAX_DIM).contains(&got)
-                && got.is_multiple_of(Self::DIM_MULTIPLE)
-        };
+        // Both dimensions obey the same positive, aligned grid contract.
+        let check_dim = |got: u32| -> bool { got != 0 && got.is_multiple_of(Self::DIM_MULTIPLE) };
         if !check_dim(self.height) {
             return Err(ImageParamsError::Height {
                 got: self.height,
-                min: Self::MIN_DIM,
-                max: Self::MAX_DIM,
                 multiple: Self::DIM_MULTIPLE,
             });
         }
         if !check_dim(self.width) {
             return Err(ImageParamsError::Width {
                 got: self.width,
-                min: Self::MIN_DIM,
-                max: Self::MAX_DIM,
                 multiple: Self::DIM_MULTIPLE,
             });
         }
 
-        // Each guidance axis accepts finite non-negative scaling up to the
-        // runtime-independent request bound.
+        // Each guidance axis accepts finite non-negative scaling.
         for (field, scale) in [
             ("cfg_text_scale", self.cfg_text_scale),
             ("cfg_img_scale", self.cfg_img_scale),
         ] {
-            if !scale.is_finite() || !(0.0..=Self::MAX_CFG_SCALE).contains(&scale) {
-                return Err(ImageParamsError::CfgScale {
-                    field,
-                    got: scale,
-                    max: Self::MAX_CFG_SCALE,
-                });
+            if !scale.is_finite() || scale < 0.0 {
+                return Err(ImageParamsError::CfgScale { field, got: scale });
             }
         }
 
@@ -854,12 +865,6 @@ impl ImageParams {
             });
         }
 
-        if self.max_images == 0 || self.max_images > Self::MAX_IMAGES {
-            return Err(ImageParamsError::MaxImages {
-                got: self.max_images,
-                max: Self::MAX_IMAGES,
-            });
-        }
         Ok(())
     }
 }
@@ -879,9 +884,6 @@ impl Default for ImageParams {
             width: 512,
             seed: None,
             negative_prompt: String::new(),
-            max_images: 1,
-            image_prompts: Vec::new(),
-            retain_images: true,
         }
     }
 }
@@ -923,10 +925,6 @@ pub enum KvGroupKind {
     SlidingWindow {
         /// History tokens any reader of the group needs.
         window: u32,
-        /// Prefix tokens retained outside the window. The unit pool keeps one
-        /// contiguous run of pages per table, so validation rejects a
-        /// nonzero sink.
-        sink: u32,
     },
 }
 
@@ -942,7 +940,7 @@ impl KvGroupKind {
 
 /// One KV-cache group of a worker's unit pool, reported at handshake.
 ///
-/// A logical page of the group holds `page_tokens` tokens of every layer in
+/// A logical page of the group holds `block_size` tokens of every layer in
 /// the group and occupies `units_per_page` physical units. Unit and column
 /// geometry belong to the worker; the scheduler only needs the page shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -951,7 +949,7 @@ pub struct KvCacheGroup {
     #[serde(default)]
     pub kind: KvGroupKind,
     /// Tokens stored per logical page; a power of two.
-    pub page_tokens: u32,
+    pub block_size: u32,
     /// Physical units one logical page occupies.
     pub units_per_page: u32,
     /// Global cache-layer ids of this rank's layers in the group, in the
@@ -972,27 +970,11 @@ impl KvCacheGroup {
     /// geometry, whatever layers and heads each rank stores.
     pub fn same_page_shape(&self, other: &Self) -> bool {
         self.kind == other.kind
-            && self.page_tokens == other.page_tokens
+            && self.block_size == other.block_size
             && self.units_per_page == other.units_per_page
             && self.total_kv_heads == other.total_kv_heads
             && self.head_dim == other.head_dim
     }
-}
-
-/// Algorithm used to derive prefix-cache block keys.
-///
-/// The engine's `block_hash` chains each page's key through its parent's key
-/// with either algorithm. FNV-1a is a non-cryptographic hash, while SHA-256
-/// is a cryptographic digest truncated to the cache's 64-bit key space. Both
-/// keys can collide, so a prefix hit also compares the page's tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum HashAlgo {
-    /// 64-bit FNV-1a hashing.
-    #[default]
-    Fnv1a,
-    /// SHA-256 truncated to the cache's 64-bit key space.
-    Sha256,
 }
 
 #[cfg(test)]
@@ -1024,19 +1006,7 @@ mod tests {
             steps: 0,
             ..Default::default()
         };
-        assert!(matches!(
-            bad_steps.validate(),
-            Err(ImageParamsError::Steps { .. })
-        ));
-
-        let too_many_steps = ImageParams {
-            steps: ImageParams::MAX_STEPS + 1,
-            ..Default::default()
-        };
-        assert!(matches!(
-            too_many_steps.validate(),
-            Err(ImageParamsError::Steps { .. })
-        ));
+        assert!(matches!(bad_steps.validate(), Err(ImageParamsError::Steps)));
 
         let zero_height = ImageParams {
             height: 0,
@@ -1056,15 +1026,6 @@ mod tests {
             Err(ImageParamsError::Width { .. })
         ));
 
-        let huge_dim = ImageParams {
-            width: ImageParams::MAX_DIM + ImageParams::DIM_MULTIPLE,
-            ..Default::default()
-        };
-        assert!(matches!(
-            huge_dim.validate(),
-            Err(ImageParamsError::Width { .. })
-        ));
-
         let nan_scale = ImageParams {
             cfg_text_scale: f32::NAN,
             ..Default::default()
@@ -1081,15 +1042,6 @@ mod tests {
         assert!(matches!(
             neg_scale.validate(),
             Err(ImageParamsError::CfgScale { .. })
-        ));
-
-        let zero_images = ImageParams {
-            max_images: 0,
-            ..Default::default()
-        };
-        assert!(matches!(
-            zero_images.validate(),
-            Err(ImageParamsError::MaxImages { .. })
         ));
     }
 

@@ -22,70 +22,28 @@ from uniserve.distributed.mesh import Communicator
 class SymmetricStorage:
     """Owned allocation with peer views ordered by logical membership."""
 
-    coordinator: Communicator
     local: torch.Tensor
     peers: tuple[torch.Tensor, ...]
     handle: Any
 
-    @property
-    def rank(self) -> int:
-        return self.coordinator.rank
 
-    @property
-    def size(self) -> int:
-        return self.coordinator.size
-
-    def fence(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        """Publish arrival on the allocation's group with stream ordering."""
-        if tuple(input.shape) != (1,) or tuple(output.shape) != (self.size,):
-            raise ValueError(
-                "symmetric-storage fence buffers do not match group membership"
-            )
-        self.coordinator.all_gather_into(output, input)
-
-
-def _peer_identities(
-    group: Communicator,
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
-    address: str,
-) -> list[tuple[str, str, tuple[int, ...], str]]:
-    """Exchange and validate what each rank of the group is allocating.
-
-    Peers map one another's physical storage, so every rank must be on one host
-    and allocating the same shape. The result is ordered by the group's ranks.
-    """
-    identity = (socket.gethostname(), address, shape, str(dtype))
-    identities: list[tuple[str, str, tuple[int, ...], str] | None] = [
-        None
-    ] * group.size
-    dist.all_gather_object(identities, identity, group=group._require())
-    if any(
-        peer is None
-        or (peer[0], peer[2], peer[3]) != (identity[0], shape, str(dtype))
-        for peer in identities
-    ):
-        raise ValueError("peer tensors require matching shapes on one host")
-
+def _gathered_addresses(group: Communicator, address: str) -> list[str]:
+    """Collect every rank's descriptor-socket address, in the group's order."""
+    gathered: list[str | None] = [None] * group.size
+    dist.all_gather_object(gathered, address, group=group._require())
     backend_ranks = sorted(group.ranks)
-    ordered = [identities[backend_ranks.index(rank)] for rank in group.ranks]
+    ordered = [gathered[backend_ranks.index(rank)] for rank in group.ranks]
     assert all(peer is not None for peer in ordered)
     return ordered  # type: ignore[return-value]
 
 
-def _gathered_handles(
-    group: Communicator,
-    handle: bytes,
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
-) -> list[bytes]:
+def _gathered_handles(group: Communicator, handle: bytes) -> list[bytes]:
     """Collect every owner's fabric handle, in rank order.
 
     A fabric handle names storage rather than a file this process holds open, so
     it is meaningful in any process that receives it and travels as an ordinary
     payload.
     """
-    _peer_identities(group, shape, dtype, "")
     handles: list[bytes | None] = [None] * group.size
     dist.all_gather_object(handles, handle, group=group._require())
     backend_ranks = sorted(group.ranks)
@@ -97,10 +55,7 @@ def _gathered_handles(
 
 @contextmanager
 def _rotated_descriptors(
-    group: Communicator,
-    handle: bytes,
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
+    group: Communicator, handle: bytes
 ) -> Iterator[list[bytes]]:
     """Hold every owner's descriptor open, in rank order, for the body.
 
@@ -123,8 +78,8 @@ def _rotated_descriptors(
             channel.settimeout(
                 dist.constants.default_pg_timeout.total_seconds()
             )
-            ordered = _peer_identities(group, shape, dtype, address)
-            destination = ordered[(group.rank + 1) % group.size]
+            addresses = _gathered_addresses(group, address)
+            destination = addresses[(group.rank + 1) % group.size]
 
             try:
                 current = int.from_bytes(handle, sys.byteorder)
@@ -140,7 +95,7 @@ def _rotated_descriptors(
                             )
                         ],
                         0,
-                        destination[1],
+                        destination,
                     )
                     _payload, received, _flags, _address = socket.recv_fds(
                         channel, 1, 1
@@ -185,10 +140,8 @@ def allocate_peer_tensor(
         if group.size == 1:
             return allocation.map_peers([handle])
         if fabric:
-            return allocation.map_peers(
-                _gathered_handles(group, handle, shape, dtype)
-            )
-        with _rotated_descriptors(group, handle, shape, dtype) as descriptors:
+            return allocation.map_peers(_gathered_handles(group, handle))
+        with _rotated_descriptors(group, handle) as descriptors:
             return allocation.map_peers(descriptors)
     finally:
         # A descriptor export opens a file this process owns, and the mapping
@@ -247,5 +200,5 @@ def allocate_symmetric_storage(
             handle.get_buffer(backend_ranks.index(rank), shape, dtype)
             for rank in group.ranks
         )
-    workspace = SymmetricStorage(group, local, peers, handle)
+    workspace = SymmetricStorage(local, peers, handle)
     return workspace

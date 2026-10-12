@@ -36,6 +36,7 @@ class Denoiser(ImageDenoiser):
     """
 
     framing_tokens = 2
+    rope_advance = 2
 
     @property
     def max_sequence_tokens(self) -> int:

@@ -80,7 +80,7 @@ impl WorkerRequest {
     }
 
     /// Replaces the request-response correlation identity (`message_id`).
-    pub fn set_call_id(&mut self, value: Option<u64>) {
+    pub fn set_message_id(&mut self, value: Option<u64>) {
         match self {
             Self::Info { message_id }
             | Self::Submit { message_id, .. }
@@ -121,12 +121,27 @@ impl WorkerRequest {
 pub enum ResponseKind {
     /// Worker capability response.
     Info,
-    /// Partial or terminal run result.
+    /// Partial or terminal batch result.
     Result,
     /// Successful control acknowledgement.
     Ok,
     /// Structured worker failure.
     Error,
+}
+
+impl ResponseKind {
+    /// Every response kind in declaration order.
+    pub const ALL: [Self; 4] = [Self::Info, Self::Result, Self::Ok, Self::Error];
+
+    /// Returns the stable wire name for this response kind.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Result => "result",
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
 }
 
 /// Request and call identity attached to a worker error.
@@ -143,8 +158,8 @@ pub struct ErrorCallIdentity {
 pub struct WorkerResponseError {
     /// Human-readable failure description.
     pub message: String,
-    /// Optional stable machine-readable error code.
-    pub code: Option<String>,
+    /// Failure class.
+    pub code: ErrorCode,
     /// Whether the worker is unsafe to serve further requests.
     pub fatal: bool,
     /// Optional worker phase that failed.
@@ -169,11 +184,11 @@ pub enum WorkerResponse {
         /// Loaded worker capabilities.
         info: WorkerInfo,
     },
-    /// Returns partial or terminal run progress.
+    /// Returns partial or terminal batch progress.
     Result {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
-        /// Physical run result.
+        /// Physical batch result.
         result: BatchOutput,
     },
     /// Acknowledges a successful control request.
@@ -212,7 +227,7 @@ impl WorkerResponse {
     }
 
     /// Replaces the request-response correlation identity (`message_id`).
-    pub fn set_call_id(&mut self, value: Option<u64>) {
+    pub fn set_message_id(&mut self, value: Option<u64>) {
         match self {
             Self::Info { message_id, .. }
             | Self::Result { message_id, .. }
@@ -221,8 +236,8 @@ impl WorkerResponse {
         }
     }
 
-    /// Returns the run result carried by this response, if any.
-    pub const fn report(&self) -> Option<&BatchOutput> {
+    /// Returns the batch result carried by this response, if any.
+    pub const fn output(&self) -> Option<&BatchOutput> {
         match self {
             Self::Result { result, .. } => Some(result),
             _ => None,
@@ -237,7 +252,7 @@ impl WorkerResponse {
         }
     }
 
-    /// Constructs a run-result response.
+    /// Constructs a batch-result response.
     pub fn result(result: BatchOutput) -> Self {
         Self::Result {
             message_id: None,

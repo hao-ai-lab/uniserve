@@ -30,7 +30,7 @@ pytestmark = [
 # One block over a 16-token-page prefix, with the head layout of the
 # model's sliding-window attention layers.
 _PREFIX = 700
-_PAGE_TOKENS = 16
+_BLOCK_SIZE = 16
 _QUERY_HEADS, _KV_HEADS, _HEAD_DIM = 16, 8, 256
 _ROTATED = 128
 _EPS = 1e-6
@@ -49,8 +49,8 @@ def _operands(tokens):
         return torch.full(shape, float("nan"), dtype=dtype, device="cuda")
 
     projected = (_QUERY_HEADS + _KV_HEADS) * _HEAD_DIM
-    pages = -(-_PREFIX // _PAGE_TOKENS)
-    cache_shape = (pages + 1, _PAGE_TOKENS, _KV_HEADS, _HEAD_DIM)
+    pages = -(-_PREFIX // _BLOCK_SIZE)
+    cache_shape = (pages + 1, _BLOCK_SIZE, _KV_HEADS, _HEAD_DIM)
     width = _QUERY_HEADS * _HEAD_DIM // 2
 
     inputs = {

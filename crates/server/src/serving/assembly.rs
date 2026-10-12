@@ -174,8 +174,6 @@ async fn emit_terminal(
         internal_tokens: done.internal_token_count.min(u32::MAX as usize) as u32,
         image_count: accounting.image_count,
         image_steps: accounting.image_steps,
-        cache: context.event.cache.clone(),
-        resources: context.event.resources.clone(),
         timings: RuntimeTimings {
             compile_us: context.event.compile_duration_us,
             queue_us: accounting.queue_us,
@@ -325,8 +323,6 @@ pub(super) async fn assemble_chat_event_stream(
                 }
                 y.yield_ok(RequestOutput::Accepted {
                     request_id: request_id.clone(),
-                    served_name: event_context.served_name.clone(),
-                    description: event_context.description.clone(),
                     compile_duration_us: event_context.compile_duration_us,
                     prompt_token_count: prompt_token_ids.len(),
                     prompt_token_ids: prompt_token_ids.to_vec(),
@@ -339,8 +335,6 @@ pub(super) async fn assemble_chat_event_stream(
                         request_id: request_id.clone(),
                         queued_at: Some(queued_at),
                         scheduled_at: Some(scheduled_at),
-                        cache: event_context.cache.clone(),
-                        resources: event_context.resources.clone(),
                     })
                     .await;
                     event_context
@@ -495,8 +489,6 @@ impl RawAssemblerState {
     ) {
         y.yield_ok(RequestOutput::Accepted {
             request_id: request_id.clone(),
-            served_name: event_context.served_name.clone(),
-            description: event_context.description.clone(),
             compile_duration_us: event_context.compile_duration_us,
             prompt_token_count: prompt_token_ids.len(),
             prompt_token_ids: prompt_token_ids.to_vec(),
@@ -509,8 +501,6 @@ impl RawAssemblerState {
                 request_id: request_id.clone(),
                 queued_at: Some(queued_at),
                 scheduled_at: Some(scheduled_at),
-                cache: event_context.cache.clone(),
-                resources: event_context.resources.clone(),
             })
             .await;
         }
@@ -787,8 +777,6 @@ pub(super) async fn assemble_event_stream(
                         request_id: request_id.clone(),
                         queued_at: Some(queued_at),
                         scheduled_at: Some(scheduled_at),
-                        cache: event_context.cache.clone(),
-                        resources: event_context.resources.clone(),
                     })
                     .await;
                 } else {
@@ -1140,8 +1128,6 @@ pub(super) async fn assemble_media_event_stream(
 ) -> Result<()> {
     y.yield_ok(RequestOutput::Accepted {
         request_id: request_id.clone(),
-        served_name: context.served_name.clone(),
-        description: context.description.clone(),
         compile_duration_us: context.compile_duration_us,
         prompt_token_count: prompt_tokens,
         prompt_token_ids: Vec::new(),
@@ -1162,8 +1148,6 @@ pub(super) async fn assemble_media_event_stream(
                     request_id: request_id.clone(),
                     queued_at: Some(queued_at),
                     scheduled_at: Some(scheduled_at),
-                    cache: context.cache.clone(),
-                    resources: context.resources.clone(),
                 })
                 .await;
             }

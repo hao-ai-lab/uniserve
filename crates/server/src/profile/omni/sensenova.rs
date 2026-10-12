@@ -7,8 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
-    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationFeatures, GenerationLimits,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageTrigger, ModelDtype,
+    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, ImageEncoderInput,
+    ImageGenerationConfig, ImageTrigger, MediaCall, ModelDtype,
 };
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
@@ -54,8 +54,14 @@ impl SenseNovaProfile {
     pub const ID: &'static str = "sensenova";
     /// Pixel-to-latent downsampling factor.
     pub const LATENT_DOWNSAMPLE: u32 = 32;
-    /// Maximum reusable encoder products tracked by the profile.
-    pub const ENCODER_CACHE_ENTRIES: usize = 256;
+    /// Elements of one latent unit: the RGB pixels of a
+    /// `LATENT_DOWNSAMPLE` x `LATENT_DOWNSAMPLE` patch.
+    const LATENT_UNIT_ELEMENTS: u64 =
+        3 * Self::LATENT_DOWNSAMPLE as u64 * Self::LATENT_DOWNSAMPLE as u64;
+    /// Pixels per ViT grid token along each axis.
+    const VISION_STRIDE: u32 = 32;
+    /// Tokens a generated image's feedback adds to its ViT grid.
+    const FEEDBACK_MARKER_TOKENS: u32 = 1;
     /// Lower pixel bound of an image in the model's patch preprocessing.
     const MIN_IMAGE_PIXELS: u64 = 512 * 512;
     /// Upper pixel bound of any single image.
@@ -63,30 +69,41 @@ impl SenseNovaProfile {
     /// Pixel budget a request's input images share.
     const MAX_TOTAL_PIXELS: u64 = 4096 * 4096;
 
-    /// Returns bounded runtime capabilities for the selected dtype.
+    /// Returns the profile's runtime sizing for the selected dtype.
     ///
-    /// These are profile ceilings. The engine scheduler's
-    /// `resolve_generation_limits` clamps the latent, grid-token, feature-byte,
-    /// and encoder-cache limits to the capacities the loaded worker reports and
-    /// drops features whose calls the worker does not support.
-    pub fn runtime_limits(model_dtype: ModelDtype) -> GenerationLimits {
+    /// Each bound is the largest image the profile admits: the largest
+    /// resolution bucket for a generated canvas, and the pixel bound of an
+    /// input image, plus the feedback marker, for the ViT grid. The latent
+    /// capacity, the vision feature bytes and the encoder cache are not
+    /// stated here: the engine scheduler's `resolve_generation_limits` takes
+    /// them from the capacities the loaded worker reports, with its served
+    /// features from its call kinds.
+    pub fn runtime_limits(&self, model_dtype: ModelDtype) -> GenerationLimits {
         let dtype_bytes = model_dtype_bytes(model_dtype);
-        // `GenerationRequest::image_latent_bytes` divides the latent feature
-        // bytes by `max_vae_grid_tokens` to get the bytes per latent unit:
-        // a 3-channel 32x32 pixel patch.
+        let unit_pixels = u64::from(Self::LATENT_DOWNSAMPLE).pow(2);
+        let max_latent_units = self
+            .resolution_policy
+            .buckets
+            .iter()
+            .map(|bucket| u64::from(bucket.width) * u64::from(bucket.height) / unit_pixels)
+            .max()
+            .unwrap_or(0);
+        let max_vision_units = Self::MAX_IMAGE_PIXELS / u64::from(Self::VISION_STRIDE).pow(2);
+        let latent_bytes_per_unit = Self::LATENT_UNIT_ELEMENTS * dtype_bytes;
         GenerationLimits {
-            features: GenerationFeatures::UNDERSTANDING
-                | GenerationFeatures::VISION_ENCODE
-                | GenerationFeatures::IMAGE_GENERATION,
-            max_latent_units: 4_096,
+            max_latent_units: u64::MAX,
             latent_downsample: Self::LATENT_DOWNSAMPLE,
-            max_vae_grid_tokens: 4_096,
-            max_vit_grid_tokens: 4_900,
-            max_latent_feature_bytes: 4_096 * 3 * 32 * 32 * dtype_bytes,
-            max_vision_feature_bytes: 4_900 * 4_096 * dtype_bytes,
+            max_vae_grid_tokens: u32::try_from(max_latent_units).unwrap_or(u32::MAX),
+            max_vit_grid_tokens: u32::try_from(max_vision_units)
+                .unwrap_or(u32::MAX)
+                .saturating_add(Self::FEEDBACK_MARKER_TOKENS),
+            latent_bytes_per_unit,
+            max_latent_feature_bytes: max_latent_units * latent_bytes_per_unit,
+            max_vision_feature_bytes: u64::MAX,
             commit_marker_tokens: 0,
             max_cfg_branches: 3,
-            encoder_cache_entries: Self::ENCODER_CACHE_ENTRIES as u32,
+            encoder_cache_entries: u32::MAX,
+            ..GenerationLimits::default()
         }
     }
 
@@ -109,7 +126,7 @@ impl SenseNovaProfile {
             end_of_image_text,
         };
         let image_encoders = vec![ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: None,
             max_kv_tokens: None,
         }];
@@ -125,7 +142,7 @@ impl SenseNovaProfile {
             },
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
-                encoder: ImageIngestStep::VitEncode,
+                encoder: MediaCall::VisionEncoding,
                 num_kv_tokens: None,
                 max_kv_tokens: None,
             }],
@@ -145,7 +162,6 @@ impl SenseNovaProfile {
                 timestep_shift: 3.0,
                 seed: Some(42),
                 max_images: 4,
-                max_images_limit: 10,
             },
             resolution_policy,
             output_filter: OutputFilterPolicy {
@@ -255,14 +271,14 @@ impl SenseNovaProfile {
         let tokens = pixel_bound_tokens(
             width,
             height,
-            32,
+            Self::VISION_STRIDE,
             Self::MIN_IMAGE_PIXELS,
             Self::input_image_max_pixels(image_count),
-            32,
+            Self::VISION_STRIDE,
             0,
         )?;
         Ok(vec![ImageEncoderInput {
-            encoder: ImageIngestStep::VitEncode,
+            encoder: MediaCall::VisionEncoding,
             num_kv_tokens: Some(tokens),
             max_kv_tokens: None,
         }])
@@ -283,16 +299,16 @@ impl SenseNovaProfile {
         let tokens = pixel_bound_tokens(
             width,
             height,
-            32,
+            Self::VISION_STRIDE,
             Self::MIN_IMAGE_PIXELS,
             Self::MAX_IMAGE_PIXELS,
-            32,
-            1,
+            Self::VISION_STRIDE,
+            Self::FEEDBACK_MARKER_TOKENS,
         )?;
         let mut policy = self.image_generation.clone();
         if policy.feedback_source.is_none()
             || policy.feedback_encoders.len() != 1
-            || policy.feedback_encoders[0].encoder != ImageIngestStep::VitEncode
+            || policy.feedback_encoders[0].encoder != MediaCall::VisionEncoding
         {
             return Err(assets::Error::invalid(
                 "image feedback encoders do not match the model processor",

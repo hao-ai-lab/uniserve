@@ -7,7 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
-from uniserve.nn.functional import frame_pad
+from uniserve.nn.functional import frame_norm_pad, frame_pad
 
 
 class ResidualBlock(nn.Module):
@@ -125,8 +125,24 @@ class CausalConv3d(nn.Conv3d):
     ``spatial_padding`` pixels pad both sides of height and width in
     ``spatial_padding_mode``. ``temporal_padding`` zero frames precede the
     input and none follow it, so no output frame reads a later input frame.
-    ``forward`` pads (``uniserve.nn.functional.frame_pad``) and convolves;
-    ``convolve`` takes input already padded by ``padding_extents``.
+    ``forward`` pads (``uniserve.nn.functional.frame_pad``) into
+    ``memory_format`` storage and convolves; ``convolve`` takes input already
+    padded by ``padding_extents``. The storage order changes only how the
+    convolution reads its input: a channels-last input reaches convolution
+    kernels that compute channels-last without a transposition, and the
+    result follows that order.
+
+    ``forward(values, norm=norm)`` convolves the pre-activation
+    ``silu(norm(values))`` of a ``FrameGroupNorm``, which
+    ``uniserve.nn.functional.frame_norm_pad`` normalizes, activates and pads
+    together, bit for bit as the three operations compute it.
+
+    ``add_bias=False`` returns the convolution without its bias, for a
+    caller that adds it with ``uniserve.nn.functional.bias_add``. PyTorch
+    adds the bias of a cuDNN convolution in a separate pass after it, so the
+    sum equals the biased convolution bit for bit, and ``bias_add`` also
+    stores a channels-last result channel-first and adds a residual in that
+    pass.
     """
 
     def __init__(
@@ -139,6 +155,7 @@ class CausalConv3d(nn.Conv3d):
         spatial_padding: int = 0,
         temporal_padding: int = 0,
         spatial_padding_mode: str = "reflect",
+        memory_format: torch.memory_format = torch.contiguous_format,
     ):
         super().__init__(
             in_channels, out_channels, kernel_size, stride=stride, padding=0
@@ -146,6 +163,12 @@ class CausalConv3d(nn.Conv3d):
         self.spatial_padding = spatial_padding
         self.temporal_padding = temporal_padding
         self.spatial_padding_mode = spatial_padding_mode
+        self.memory_format = memory_format
+        # The weight is stored in the input's order, which the convolution
+        # would otherwise convert it to on every call.
+        self.weight = nn.Parameter(
+            self.weight.detach().contiguous(memory_format=memory_format)
+        )
 
     @property
     def padding_extents(self) -> tuple[int, int, int, int, int]:
@@ -153,16 +176,42 @@ class CausalConv3d(nn.Conv3d):
         extent = self.spatial_padding
         return (extent, extent, extent, extent, self.temporal_padding)
 
-    def convolve(self, padded: torch.Tensor) -> torch.Tensor:
+    def convolve(
+        self, padded: torch.Tensor, *, add_bias: bool = True
+    ) -> torch.Tensor:
         """Convolve input that already carries this convolution's padding."""
-        return F.conv3d(padded, self.weight, self.bias, stride=self.stride)
+        bias = self.bias if add_bias else None
+        return F.conv3d(padded, self.weight, bias, stride=self.stride)
 
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        values: torch.Tensor,
+        norm: "FrameGroupNorm | None" = None,
+        *,
+        add_bias: bool = True,
+    ) -> torch.Tensor:
+        if norm is not None:
+            return self.convolve(
+                frame_norm_pad(
+                    values,
+                    self.padding_extents,
+                    groups=norm.num_groups,
+                    weight=norm.weight,
+                    bias=norm.bias,
+                    eps=norm.eps,
+                    mode=self.spatial_padding_mode,
+                    memory_format=self.memory_format,
+                ),
+                add_bias=add_bias,
+            )
         if self.spatial_padding or self.temporal_padding:
             values = frame_pad(
-                values, self.padding_extents, mode=self.spatial_padding_mode
+                values,
+                self.padding_extents,
+                mode=self.spatial_padding_mode,
+                memory_format=self.memory_format,
             )
-        return self.convolve(values)
+        return self.convolve(values, add_bias=add_bias)
 
 
 class FrameGroupNorm(nn.GroupNorm):
@@ -189,7 +238,7 @@ class DiagonalGaussian(nn.Module):
     """Split mean/log-variance moments and optionally sample the posterior.
 
     ``log_variance_range`` clamps the log-variance before it scales the
-    noise, as latent diffusion codecs bound it against overflow; None leaves
+    noise, as latent diffusion VAEs bound it against overflow; None leaves
     it unbounded. A sample draws standard normal noise from ``generator`` on
     the moments' device unless the caller supplies ``noise``, a draw with the
     mean's shape, dtype and device. A caller that reproduces a reference

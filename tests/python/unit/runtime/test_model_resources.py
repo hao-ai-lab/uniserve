@@ -7,14 +7,16 @@ from dataclasses import replace
 import pytest
 import torch
 
-from tests.python.fixtures.worker_config import stub_worker_config
+from tests.python.fixtures.worker_config import (
+    cpu_worker_config,
+    stub_worker_config,
+)
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.tensors import BufferConfig
 from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.capacity import (
     latent_trajectory_bytes,
-    model_arena_capacity,
     request_tensor_window,
     tensor_slot_capacity,
 )
@@ -170,7 +172,6 @@ def test_worker_info_reports_capabilities_and_cache_limits():
         TEST_MODEL,
         TEST_WORKER_CONFIG,
         image_processor=image_processor(),
-        model_name="test-model",
     )
     info = layout.info
 
@@ -180,13 +181,12 @@ def test_worker_info_reports_capabilities_and_cache_limits():
     assert sum(len(group.layer_ids) for group in info.kv_cache.groups) == len(
         TEST_MODEL.cache_config.layers
     )
-    assert info.model_name == "test-model"
 
 
 def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
     worker_config = replace(
         TEST_WORKER_CONFIG,
-        kv_token_capacity=1024 + 1,
+        max_total_tokens=1024 + 1,
     )
 
     layout = build_worker_layout(
@@ -223,27 +223,25 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
     layout = build_worker_layout(
         TEST_MODEL, worker_config, image_processor=image_processor()
     )
-    assert layout.info.encoder_entry_bytes == latent_trajectory_bytes(
-        1024,
-        3 * 16**2,
-        4,
+    trajectory = latent_trajectory_bytes(1024, 3 * 16**2, 4)
+    assert layout.info.encoder_entry_bytes == trajectory
+    assert layout.arena.transfer_bytes >= (
+        trajectory * layout.arena.transfer_tickets
     )
-    arena = model_arena_capacity(
+
+
+def test_worker_reports_a_transfer_entry_per_queued_call() -> None:
+    depth = 3
+    layout = build_worker_layout(
         TEST_MODEL,
-        worker_config,
-        queue_depth=1,
-        completion_payload_bytes=1024,
-        num_units=2,
-        request_pool_size=4,
-        num_latent_pages=5,
-        latent_page_units=4,
-        latent_width=1024,
-        max_latent_feature_bytes=1,
-        max_vision_feature_bytes=1,
-        unit_bytes=1,
+        TEST_WORKER_CONFIG,
+        image_processor=image_processor(),
+        queue_depth=depth,
     )
-    expected = latent_trajectory_bytes(1024, 1024, 4)
-    assert arena.transfer_bytes == expected * arena.transfer_tickets
+
+    queued_calls = depth * TEST_WORKER_CONFIG.max_batch_calls
+    assert layout.info.transfer_tickets == queued_calls
+    assert layout.info.host_lane_capacity == queued_calls
 
 
 @pytest.mark.parametrize(
@@ -252,7 +250,6 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
         lambda: replace(TEST_WORKER_CONFIG, rank=1, world_size=1),
         lambda: replace(TEST_WORKER_CONFIG, world_size=0),
         lambda: replace(TEST_WORKER_CONFIG, block_size=0),
-        lambda: replace(TEST_WORKER_CONFIG, model_dtype="bf16"),
     ],
 )
 def test_worker_worker_config_rejects_invalid_runtime_geometry(worker_config):
@@ -271,7 +268,6 @@ def test_result_publication_rejects_unrepresentable_numerical_outputs(
     from uniserve.model import TextEncoder
     from uniserve.tensors import OutputLayout
     from uniserve_worker.bootstrap.outputs import resolve_outputs
-    from uniserve_worker.config.execution import WorkerConfig
 
     class FeatureEncoder(TextEncoder):
         def output_layout(self, num_tokens, _deployment_dtype):
@@ -287,13 +283,12 @@ def test_result_publication_rejects_unrepresentable_numerical_outputs(
     model = EncodedModel()
     model.text_encoder = FeatureEncoder(model.text_encoder.network, (0,))
     with pytest.raises(ValueError, match=message):
-        resolve_outputs(model, WorkerConfig())
+        resolve_outputs(model, cpu_worker_config())
 
 
 def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     from tests.python.fixtures.encoding import Config
     from tests.python.fixtures.encoding import Model as EncodedModel
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.protocol.batch import BufferAllocation
     from uniserve_worker.protocol.identity import CallId, RequestKey
     from uniserve_worker.protocol.tensor import StaticDim, TensorRef
@@ -302,9 +297,9 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     model = EncodedModel(Config(hidden_size=7))
     # The fixture's encoder is built at the default float dtype, which is
     # what a deployment running it would declare.
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cpu",
-        max_sequence_tokens=3,
+        max_model_len=3,
         max_request_pool_size=2,
         model_dtype="float32",
     )
@@ -312,7 +307,6 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
         model,
         config,
         queue_depth=8,
-        completion_payload_bytes=1024,
         components=(("text_encoder", ComponentConfig((0,))),),
     ).info
     arena = BufferPool(byte_capacity=info.buffer_pool_bytes, devices=("cpu",))
@@ -488,6 +482,62 @@ def test_product_capacity_backs_produced_and_consumed_products_whole(
         bindings=bindings,
         media_components=components,
     ) == expected.get(rank, 0)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_product_capacity_backs_products_on_every_member_of_a_tensor_group(
+    rank,
+):
+    from uniserve.distributed.mesh import DeviceMesh
+    from uniserve_worker.bootstrap.capacity import local_product_storage_bytes
+    from uniserve_worker.config.deployment import (
+        ComponentConfig,
+        ParallelConfig,
+    )
+    from uniserve_worker.model_executor.component_binding import (
+        ComponentBinding,
+    )
+    from uniserve_worker.protocol.call import MediaCall
+    from uniserve_worker.protocol.tensor import (
+        DType,
+        OutputInfo,
+        ShapeBound,
+        StaticDim,
+    )
+
+    # Both members of a tensor-parallel component execute each of its calls,
+    # and the engine hands each of them a span for the call's persistent
+    # outputs, so each backs the products although one replica publishes.
+    config = ComponentConfig(
+        (0, 1), parallel_config=ParallelConfig(tensor_parallel_size=2)
+    )
+    group = Communicator((0, 1), rank)
+    binding = ComponentBinding(
+        "encode",
+        config,
+        group,
+        DeviceMesh(
+            ranks=config.ranks,
+            rank=rank,
+            shape=tuple(size for _, size in config.parallel_config.dimensions),
+            axes=tuple(axis for axis, _ in config.parallel_config.dimensions),
+        ),
+        group.device,
+    )
+    outputs = {
+        "encode": (
+            OutputInfo("embedding", DType.F32, ShapeBound((StaticDim(128),))),
+        )
+    }
+
+    assert (
+        local_product_storage_bytes(
+            outputs,
+            bindings={"encode": binding},
+            media_components={MediaCall.TEXT_ENCODING: "encode"},
+        )
+        == 512
+    )
 
 
 @pytest.mark.parametrize("start,stop", [(2, 5), (5, 5)])

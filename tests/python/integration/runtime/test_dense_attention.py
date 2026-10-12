@@ -155,8 +155,8 @@ def test_fp32_dense_attention_preserves_precision_and_visibility(
             torch.float64,
             None,
             r"no native attention kernel on sm\d+ serves 8 query and 2 KV "
-            r"heads of dimension 128, torch.float64 queries without a prefix "
-            r"cache",
+            r"heads of dimension 128, torch.float64 queries without a K/V "
+            r"cache, reading the whole history",
         ),
         (
             torch.bfloat16,

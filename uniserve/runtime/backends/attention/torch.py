@@ -68,9 +68,11 @@ def _paged(value, table, length):
 
     count = (length + value.shape[1] - 1) // value.shape[1]
     if table.numel() < count:
-        raise ValueError(
-            "block table does not cover the requested key sequence"
-        )
+        # ``PagedInput`` validates that its rows' tables cover their keys when
+        # it is built. A table that is still short here belongs to a graph's
+        # padding sequence, whose table is cleared (page zero, valid storage)
+        # and whose queries read disposable values that are discarded.
+        table = torch.nn.functional.pad(table, (0, count - table.numel()))
 
     indices = table[:count].to(device=value.device, dtype=torch.int64)
     if isinstance(value, QuantizedTensor):
@@ -333,9 +335,9 @@ class _TorchOperator(_Operator):
 
         if (
             isinstance(batch, (PagedInput, SegmentedInput))
-            and batch.write_indices is not None
+            and batch.slot_mapping is not None
         ):
-            self.update_cache(k, v, indices=batch.write_indices)
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
 
         if isinstance(batch, DenseInput):
             return out.copy_(

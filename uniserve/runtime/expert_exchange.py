@@ -84,8 +84,9 @@ class ExpertExchange:
     ``source_group`` lists the global ranks executing each local forward
     together (for example a tensor-parallel worker). Its members must all
     submit work before any may start that forward. Omission makes each
-    source independent; expert-only ranks have no source group. All ranks
-    must declare consistent, disjoint memberships at construction.
+    source independent; expert-only ranks have no source group. Every
+    source rank declares its own group, which the deployment forms from the
+    ranks of one worker, and all ranks learn the groups at construction.
     """
 
     def __init__(
@@ -130,24 +131,6 @@ class ExpertExchange:
         dist.all_gather_object(
             memberships, tuple(source_group), group=group._require()
         )
-        sources = set(group.ranks[:source_count])
-        for index, members in enumerate(memberships):
-            expected_source = index < source_count
-            if (
-                members is None
-                or bool(members) != expected_source
-                or len(set(members)) != len(members)
-                or not set(members) <= sources
-                or (expected_source and group.ranks[index] not in members)
-                or any(
-                    memberships[group.ranks.index(member)] != members
-                    for member in members
-                )
-            ):
-                raise ValueError(
-                    "expert sources must declare disjoint, consistent "
-                    "groups of ranks that execute each forward together"
-                )
         self._source_groups = tuple(
             tuple(group.ranks.index(member) for member in members)
             for members in dict.fromkeys(memberships)

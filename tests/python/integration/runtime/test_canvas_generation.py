@@ -7,14 +7,14 @@ block; the finishing step reports the block's tokens, which the engine
 commits to the context as a prefill before the next block starts at step
 zero. The tokens and the step that finishes each block must equal the
 public model driven directly by the block-diffusion sampler of
-``uniserve.diffusion.canvas``: a prompt pass that writes a prefix cache,
+``uniserve.diffusion.canvas``: a prompt pass that writes a K/V cache,
 then per step a canvas pass that reads it with the previous step's
 self-conditioning, in FP32 on the CPU with the torch attention backend. A
 step may be queued behind the one before it, predicated on that step's
 completion, as the engine queues steps; queued behind the finishing step it
 is predicated and leaves the canvas as the finishing step left it. A step
-that does not continue its slot's canvas, or of a canvas whose sampling is
-not the one the worker serves, is refused.
+that does not continue its slot's canvas is refused. Every canvas runs under
+the sampling the worker is launched with.
 """
 
 from dataclasses import replace
@@ -50,13 +50,13 @@ from uniserve.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve.runtime import ExecutionContext, PrefixCache
-from uniserve.runtime.prefix_cache import plan_units
+from uniserve.runtime import ExecutionContext, KVCache
+from uniserve.runtime.kv_cache import plan_units
 from uniserve.sampling import SamplingParams
+from uniserve_worker.config.execution import CanvasSampling
 from uniserve_worker.protocol.batch import (
     Batch,
     CacheUnitAllocation,
-    CanvasSampling,
     Finish,
     GenerationParams,
     NewRequest,
@@ -102,14 +102,12 @@ EARLY = replace(ADMITTED, confidence_threshold=100.0, stability_threshold=0)
 EARLY_SAMPLING = replace(SAMPLING, confidence=100.0, stability=0)
 
 
-def _admission(canvas=ADMITTED):
+def _admission():
     return Start(
         NewRequest(
             REQUEST,
             SLOT,
-            generation=GenerationParams(
-                sampling=SamplingParams(seed=SEED), canvas=canvas
-            ),
+            generation=GenerationParams(sampling=SamplingParams(seed=SEED)),
         )
     )
 
@@ -156,9 +154,13 @@ class _Reference:
         self.sampling = sampling
         self.model = load_diffusion_gemma(root)
         config = self.model.text.cache_config
-        tables = len(plan_units(config, block_size=PAGE).tables)
-        self.cache = PrefixCache(
-            config, num_units=tables * PAGES, block_size=PAGE, device="cpu"
+        planes = plan_units(config, block_size=PAGE)
+        tables = len(planes.tables)
+        self.cache = KVCache(
+            config,
+            planes,
+            num_units=tables * PAGES,
+            device="cpu",
         )
         self.context = ExecutionContext(
             self.model, cache=self.cache, attention="torch"
@@ -284,11 +286,11 @@ def _expected_blocks(root, prompt, sampling=SAMPLING):
     return expected
 
 
-def _admitted_prompt(worker, prompt, canvas=ADMITTED):
-    """Admit the request with ``canvas`` sampling and prefill ``prompt``."""
+def _admitted_prompt(worker, prompt):
+    """Admit the request and prefill ``prompt``."""
     prefill = replace(
         _prefill(1, 0, tokens=prompt),
-        commands=(_admission(canvas),),
+        commands=(_admission(),),
         block_tables=_tables(13 + 2 * CANVAS),
         new_cache_units=tuple(
             CacheUnitAllocation(SLOT, table.group_id, table.unit_ids)
@@ -318,10 +320,7 @@ def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
                 worker, _step(batch, context, block, step)
             ).completions
             assert record.status is CallStatus.OK
-            assert (record.position, record.kv_visible_len) == (
-                context,
-                context,
-            )
+            assert record.kv_visible_len == context
             return tuple(record.committed_tokens)
 
         actual = _block(run, 13, 0, 2)
@@ -386,7 +385,7 @@ def test_queued_steps_give_the_blocks_of_steps_that_wait(tmp_path):
     worker = _worker(tmp_path, queue_depth=2, canvas_sampling=EARLY)
     actual, queued = [], []
     with worker:
-        _admitted_prompt(worker, prompt, EARLY)
+        _admitted_prompt(worker, prompt)
         batch = 2
         for block in (0, 1):
             context = 13 + block * CANVAS
@@ -420,16 +419,13 @@ def test_queued_steps_give_the_blocks_of_steps_that_wait(tmp_path):
         assert not record.committed_tokens
 
 
-def _first_step_status(root, admitted, step):
-    """Admit with ``admitted`` sampling; the status of canvas step ``step``.
-
-    The worker serves ``ADMITTED``.
-    """
+def _first_step_status(root, step):
+    """Admit the request; the status of its first canvas step, ``step``."""
     worker = _worker(root, canvas_sampling=ADMITTED)
     with worker:
         prefill = replace(
             _prefill(1, 0, tokens=list(range(7, 20))),
-            commands=(_admission(admitted),),
+            commands=(_admission(),),
             new_cache_units=tuple(
                 CacheUnitAllocation(SLOT, table.group_id, table.unit_ids)
                 for table in _tables(13)
@@ -444,15 +440,8 @@ def _first_step_status(root, admitted, step):
 def test_a_step_that_skips_its_canvas_is_refused(tmp_path):
     """A slot's canvas starts at step zero and advances one step per call."""
     diffusion_gemma_checkpoint(tmp_path)
-    assert _first_step_status(tmp_path, ADMITTED, 1) is CallStatus.ERROR
-
-
-def test_a_canvas_with_other_sampling_is_refused(tmp_path):
-    """A worker steps only canvases of the sampling it serves."""
-    diffusion_gemma_checkpoint(tmp_path)
-    other = replace(ADMITTED, max_steps=ADMITTED.max_steps + 1)
-    assert _first_step_status(tmp_path, other, 0) is CallStatus.ERROR
-    assert _first_step_status(tmp_path, ADMITTED, 0) is CallStatus.OK
+    assert _first_step_status(tmp_path, 1) is CallStatus.ERROR
+    assert _first_step_status(tmp_path, 0) is CallStatus.OK
 
 
 # A second request, in its own slot and cache units.
@@ -548,7 +537,7 @@ def test_a_batch_of_canvas_steps_reports_each_rows_outcome(tmp_path):
                         SECOND,
                         SECOND_SLOT,
                         generation=GenerationParams(
-                            sampling=SamplingParams(seed=SEED), canvas=ADMITTED
+                            sampling=SamplingParams(seed=SEED)
                         ),
                     )
                 ),

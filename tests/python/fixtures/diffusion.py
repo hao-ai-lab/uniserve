@@ -50,6 +50,14 @@ class LinearDenoiser(Denoiser[DenoiserInput[Size], Size]):
         with torch.no_grad():
             self.projection.weight.fill_(0.25)
 
+    def make_schedules(self, steps, *, shift, device):
+        return {
+            name: self.grids[name].schedule(
+                steps=steps, shift=shift, device=device
+            )
+            for name in self.modalities
+        }
+
     def latent_shape(self, modality, size):
         if modality not in self.modalities:
             raise ValueError("unknown latent modality")

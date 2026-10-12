@@ -15,7 +15,7 @@ from torch import nn
 from uniserve.model import PhasedLayer, TransformerDecoder
 from uniserve.nn.attention import Attention as ScaledAttention
 from uniserve.nn.attention import AttentionBatch
-from uniserve.nn.functional import qk_norm_rope, sandwich_rms_norm
+from uniserve.nn.functional import Rounding, qk_norm_rope, sandwich_rms_norm
 from uniserve.nn.linear import (
     Linear,
     MergedColumnParallelLinear,
@@ -134,6 +134,11 @@ class Attention(nn.Module):
             (sin,),
             eps=self.eps,
             axis_dims=(self.head_dim,),
+            # SGLang rounds the normalized head and then rotates in FP32,
+            # rounding once; Transformers rounds after every operation. No
+            # recipe of ``qk_norm_rope`` reproduces either exactly, so the
+            # fused single-rounding evaluation stands.
+            rounding=Rounding.ONCE,
         )
         return query, key, value
 
@@ -190,7 +195,7 @@ class MoE(nn.Module):
             size,
             config.moe_intermediate_size,
             top_k=config.top_k_experts,
-            activation="gelu_tanh",
+            activation="gelu_pytorch_tanh",
         )
         self.output_norm = RMSNorm(size, eps)
 

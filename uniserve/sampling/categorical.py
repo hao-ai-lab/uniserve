@@ -17,10 +17,7 @@ def sample_categorical(
     entries own an empty interval and are never selected: a draw of exactly
     0.0 skips leading masked entries, and a draw at or above a float32 total
     that rounds below one selects the last positive-mass entry. This is
-    FlashInfer's sampling-from-probabilities boundary rule, and the
-    simulator's ``sample_categorical`` in ``uniserve_core::sampling`` applies
-    the same rule; ``tests/python/generated/sampling_rng_parity.json`` pins
-    it for both.
+    FlashInfer's sampling-from-probabilities boundary rule.
 
     The selection uses only tensor operations without host synchronization,
     so it runs under ``torch.compile(fullgraph=True)`` and CUDA graph capture.

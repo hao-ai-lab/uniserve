@@ -60,7 +60,7 @@ def test_decode_publication_and_staging_follow_live_request_coordinates(
             ("query_lengths", torch.int32),
         )
     }
-    outputs["write_indices"] = torch.empty(
+    outputs["slot_mapping"] = torch.empty(
         (2, capacity), dtype=torch.int64, device=device
     )
     outputs["positions"] = torch.full(
@@ -152,7 +152,7 @@ def test_decode_publication_and_staging_follow_live_request_coordinates(
         )
         # Each token writes the unit of its page, counted from the table's
         # first installed page, at its offset in the page.
-        writes = [
+        slot_mapping = [
             [
                 int(units[table, s, length // 2 - start]) * 2 + length % 2
                 for s in live
@@ -163,4 +163,4 @@ def test_decode_publication_and_staging_follow_live_request_coordinates(
             + [-1] * padding
             for table in range(2)
         ]
-        assert outputs["write_indices"].tolist() == writes
+        assert outputs["slot_mapping"].tolist() == slot_mapping

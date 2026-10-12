@@ -27,7 +27,8 @@ the entries are for::
 
     python -m uniserve.runtime.backends.moe.tactics --provider cutlass \
         --format bfloat16 --experts 128 --hidden 2816 --intermediate 704 \
-        --top-k 8 --activation gelu_tanh [--tokens 1 2 4 ...] [--output FILE]
+        --top-k 8 --activation gelu_pytorch_tanh [--tokens 1 2 4 ...] \
+        [--output FILE]
 
 Entries of other keys in the file stay. Weights and hidden states are
 random; the kernels' speed depends on the values only through power draw,

@@ -387,22 +387,18 @@ class TextRunner(ModelRunner):
         """Choose a captured text graph bucket and pad the batch to it.
 
         Only buckets that startup captures are candidates. A decode batch
-        (one query token per row) must fit a decode bucket. With prefill
-        graphs enabled, every other batch must fit a prefill bucket of its
+        (one query token per row) is padded to a decode bucket. With prefill
+        graphs enabled, every other batch is padded to a prefill bucket of its
         causality and embedding replacement that evaluates hidden states,
         or, when every row selects ``CACHE``, a cache-only bucket if the
-        runner has any. Returns ``None`` for eager
-        execution (graphs disabled, the batch ineligible, or prefill graphs
-        disabled for a non-decode batch),
-        otherwise ``(key, padded_batch,
-        True)``; a decode key starts with ``"text"`` and a prefill key with
-        ``"prefill"``, and both carry the ``text_shape`` tuple second. In an
-        expert step, the local bucket's tokens and the shared transfer
-        capacity select separate dimensions of its captured graph.
-
-        Raises:
-            CUDAGraphError: No decode bucket holds a decode batch, or prefill
-                graphs are enabled and no prefill bucket holds another batch.
+        runner has any. Returns ``None`` for eager execution: graphs
+        disabled, the batch ineligible, prefill graphs disabled for a
+        non-decode batch, or no captured bucket holds the batch. Otherwise
+        returns ``(key, padded_batch, True)``; a decode key starts with
+        ``"text"`` and a prefill key with ``"prefill"``, and both carry the
+        ``text_shape`` tuple second. In an expert step, the local bucket's
+        tokens and the shared transfer capacity select separate dimensions of
+        its captured graph.
         """
         if not eligible or not self.pools:
             return None
@@ -422,7 +418,7 @@ class TextRunner(ModelRunner):
             table_widths=self.table_widths,
         )
         if shape is None:
-            raise CUDAGraphError(self._unserved(batch, decode=decode))
+            return None
 
         if shape[-1]:
             if batch.decode_force_finish is None:
@@ -487,60 +483,6 @@ class TextRunner(ModelRunner):
                 shape for shape in self.prefill_shapes if shape.outputs
             )
         return family
-
-    def _unserved(self, batch, *, decode):
-        """Describe a batch no captured bucket holds and the captured range."""
-        inputs = batch.inputs
-        if decode:
-            captured = (
-                f"its captured decode graphs hold up to "
-                f"{max(self.decode_shapes)} rows"
-                if self.decode_shapes
-                else "no decode graph is captured"
-            )
-            return (
-                f"{self.name} has no decode graph for a call of "
-                f"{batch.row_count} rows; {captured}"
-            )
-        causality = {
-            flag
-            for entry in inputs.attention.entries.values()
-            for flag in entry.causal
-        }
-        kind = (
-            "mixed-causality"
-            if len(causality) > 1
-            else "causal"
-            if True in causality
-            else "non-causal"
-        )
-        embeddings = inputs.embeddings is not None
-        dynamic = any(
-            entry.causal_values is not None
-            for entry in inputs.attention.entries.values()
-        )
-        shapes = tuple(
-            shape
-            for shape in self._prefill_family(batch)
-            if (
-                shape.causal is None if dynamic else causality == {shape.causal}
-            )
-            and shape.embeddings == embeddings
-        )
-        captured = (
-            "its captured prefill graphs hold up to "
-            f"{max(shape.row_bucket for shape in shapes) - 1} rows and "
-            f"{max(shape.token_bucket for shape in shapes)} tokens"
-            if shapes
-            else "no prefill graph of that kind is captured"
-        )
-        return (
-            f"{self.name} has no prefill graph for a {kind} "
-            f"{batch.forward_mode.value} call of {batch.row_count} rows and "
-            f"{inputs.input_ids.numel()} tokens"
-            + (" with embedding replacement" if embeddings else "")
-            + f"; {captured}"
-        )
 
     def capture_graph(self, key, execution, forward):
         """Capture a prefill bucket's hidden states or its K/V cache writes.

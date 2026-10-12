@@ -3,9 +3,8 @@
 The kernel is ``SparseAttentionSm100`` from ``_vsa_cute_kernel``, a cuDNN
 frontend block-64 kernel with its own correction epilogue. Callers pass
 channel-contiguous ``[rows, heads, 128]`` tensors; this module views them as
-``[1, heads, rows, 128]`` without copying. Among the backends in
-``uniserve.runtime.backends.attention.vsa``, ``cute`` uses it for every call
-and ``sm100`` uses it for row production and for the complete-call shapes
+``[1, heads, rows, 128]`` without copying. The ``sm100`` backend in
+``uniserve.runtime.backends.attention.vsa`` uses it for the shapes
 :func:`should_use` selects.
 
 Each distinct specialization key (see ``_compile_key``) compiles one executor
@@ -128,9 +127,9 @@ def _compile_key(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
-    block_indices: torch.Tensor,
-    block_counts: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    q2k_index: torch.Tensor,
+    q2k_num: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
     use_int64_kv_strides: bool,
     lse: torch.Tensor | None,
     allow_empty_blocks: bool,
@@ -169,9 +168,9 @@ def _compile_key(
                 key,
                 value,
                 output,
-                block_indices,
-                block_counts,
-                valid_sizes,
+                q2k_index,
+                q2k_num,
+                variable_block_sizes,
             )
         ),
     )
@@ -182,9 +181,9 @@ def _compile(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
-    block_indices: torch.Tensor,
-    block_counts: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    q2k_index: torch.Tensor,
+    q2k_num: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
     use_int64_kv_strides: bool,
     lse: torch.Tensor | None,
     allow_empty_blocks: bool,
@@ -222,11 +221,11 @@ def _compile(
         _dynamic_tensor(output),
         None if lse is None else _dynamic_tensor(lse),
         _SOFTMAX_SCALE,
-        _dynamic_tensor(block_indices),
-        _dynamic_tensor(valid_sizes),
+        _dynamic_tensor(q2k_index),
+        _dynamic_tensor(variable_block_sizes),
         # Uniform block count; unused because per-tile counts follow.
         0,
-        _dynamic_tensor(block_counts),
+        _dynamic_tensor(q2k_num),
         # No key-split offsets: num_splits is 1.
         None,
         # The stream is an explicit argument of every launch.
@@ -240,9 +239,9 @@ def _validate(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
-    block_indices: torch.Tensor,
-    block_counts: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    q2k_index: torch.Tensor,
+    q2k_num: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
     lse: torch.Tensor | None,
 ) -> None:
     """Check tensor ranks, dtypes, shapes, devices, strides and alignment.
@@ -305,11 +304,11 @@ def _validate(
         raise ValueError("CuTe sparse attention rows must be a multiple of 64")
     blocks = rows // 64
     if (
-        block_indices.ndim != 3
-        or tuple(block_indices.shape[:2]) != (query.shape[1], blocks)
-        or block_indices.shape[2] < 1
-        or block_counts.shape != (query.shape[1], blocks)
-        or valid_sizes.shape != (key.shape[0] // 64,)
+        q2k_index.ndim != 3
+        or tuple(q2k_index.shape[:2]) != (query.shape[1], blocks)
+        or q2k_index.shape[2] < 1
+        or q2k_num.shape != (query.shape[1], blocks)
+        or variable_block_sizes.shape != (key.shape[0] // 64,)
     ):
         raise ValueError("CuTe sparse attention metadata does not match Q/K/V")
     if any(
@@ -317,7 +316,7 @@ def _validate(
         or tensor.device != query.device
         or not tensor.is_contiguous()
         or tensor.data_ptr() % 16
-        for tensor in (block_indices, block_counts, valid_sizes)
+        for tensor in (q2k_index, q2k_num, variable_block_sizes)
     ):
         raise ValueError(
             "CuTe sparse attention metadata must be aligned contiguous int32"
@@ -340,9 +339,9 @@ def block_sparse_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
-    block_indices: torch.Tensor,
-    block_counts: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    q2k_index: torch.Tensor,
+    q2k_num: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
     *,
     lse: torch.Tensor | None = None,
     allow_empty_blocks: bool = False,
@@ -360,9 +359,9 @@ def block_sparse_attention(
         value: BF16 tensor with ``key``'s shape.
         output: Contiguous BF16 or FP32 tensor with ``query``'s shape,
             written in place.
-        block_indices: int32 ``[heads, query tiles, selected]`` key-block IDs.
-        block_counts: int32 ``[heads, query tiles]`` selected-block counts.
-        valid_sizes: int32 ``[key tiles]`` valid keys per 64-key block.
+        q2k_index: int32 ``[heads, query tiles, selected]`` key-block IDs.
+        q2k_num: int32 ``[heads, query tiles]`` selected-block counts.
+        variable_block_sizes: int32 ``[key tiles]`` valid keys per 64-key block.
         lse: Optional contiguous FP32 ``[heads, query rows]`` output.
         allow_empty_blocks: Use the specialization that tests each query
             tile for a zero count; otherwise every tile runs the non-empty
@@ -386,9 +385,9 @@ def block_sparse_attention(
         key,
         value,
         output,
-        block_indices,
-        block_counts,
-        valid_sizes,
+        q2k_index,
+        q2k_num,
+        variable_block_sizes,
         lse,
     )
     with torch.cuda.device(query.device):
@@ -398,8 +397,8 @@ def block_sparse_attention(
         k_bhsd = key.unsqueeze(0).transpose(1, 2)
         v_bhsd = value.unsqueeze(0).transpose(1, 2)
         o_bhsd = output.unsqueeze(0).transpose(1, 2)
-        indices = block_indices.unsqueeze(0)
-        counts = block_counts.unsqueeze(0)
+        indices = q2k_index.unsqueeze(0)
+        counts = q2k_num.unsqueeze(0)
         lse_bhq = None if lse is None else lse.unsqueeze(0)
 
         if _requires_int64_kv_strides is None:
@@ -417,7 +416,7 @@ def block_sparse_attention(
             o_bhsd,
             indices,
             counts,
-            valid_sizes,
+            variable_block_sizes,
             use_int64_kv_strides,
             lse_bhq,
             allow_empty_blocks,
@@ -436,7 +435,7 @@ def block_sparse_attention(
                 o_bhsd,
                 indices,
                 counts,
-                valid_sizes,
+                variable_block_sizes,
                 use_int64_kv_strides,
                 lse_bhq,
                 allow_empty_blocks,
@@ -455,7 +454,7 @@ def block_sparse_attention(
             None if lse_bhq is None else lse_bhq.detach(),
             scale,
             indices.detach(),
-            valid_sizes.detach(),
+            variable_block_sizes.detach(),
             0,
             counts.detach(),
             None,

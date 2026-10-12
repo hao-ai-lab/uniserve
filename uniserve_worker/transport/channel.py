@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import logging
-import time
 import uuid
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
@@ -37,8 +35,6 @@ from uniserve_worker.transport.ticket import TransferTicket
 
 if TYPE_CHECKING:
     import torch
-
-_LOG = logging.getLogger(__name__)
 
 
 class ChannelTransport(Transport):
@@ -81,18 +77,6 @@ class ChannelTransport(Transport):
             name="uniserve-channel-read",
             event_pool=event_pool,
         )
-        # What carrying a product on the channel costs this rank. A publication
-        # blocks on its own stream and then copies the bytes out, and both are
-        # on the batch's critical path, so each is counted separately from the
-        # payload they move.
-        self._published = 0
-        self._payload_bytes = 0
-        self._largest_payload = 0
-        self._synchronize_seconds = 0.0
-        self._longest_synchronize = 0.0
-        self._copy_seconds = 0.0
-        self._fetched = 0
-        self._fetch_seconds = 0.0
 
     def endpoint(self) -> str:
         return self._endpoint
@@ -133,22 +117,11 @@ class ChannelTransport(Transport):
                 # The producer waits here for its own writes: the bytes leave
                 # with the result, so nothing downstream can fence them. This
                 # is the publication's synchronize cost.
-                started = time.perf_counter()
                 with profile_range("channel_publish_synchronize"):
                     torch.cuda.current_stream(first.device).synchronize()
-                waited = time.perf_counter() - started
-                self._synchronize_seconds += waited
-                self._longest_synchronize = max(
-                    self._longest_synchronize, waited
-                )
 
-            started = time.perf_counter()
             with profile_range("channel_publish_payload"):
                 payload = bytes(packed.flatten().view(torch.uint8).numpy())
-            self._copy_seconds += time.perf_counter() - started
-            self._published += 1
-            self._payload_bytes += nbytes
-            self._largest_payload = max(self._largest_payload, nbytes)
 
             return Locator(
                 source=self.source,
@@ -185,7 +158,6 @@ class ChannelTransport(Transport):
         if not isinstance(handle, ChannelTransfer):
             raise invalid_descriptor("channel read requires a channel locator")
         target = read_destination(locator, device, destination, region)
-        started = time.perf_counter()
         with profile_range("channel_fetch_payload"):
             payload = torch.frombuffer(
                 bytearray(handle.payload), dtype=resolve_dtype(locator.dtype)
@@ -197,8 +169,6 @@ class ChannelTransport(Transport):
                 carried.copy_(payload)
             else:
                 carried = payload
-        self._fetch_seconds += time.perf_counter() - started
-        self._fetched += 1
         if region is not None:
             if not _slices.within(region, locator.shape):
                 raise invalid_descriptor(
@@ -249,24 +219,5 @@ class ChannelTransport(Transport):
         return handle
 
     def close(self) -> None:
-        """Report what the channel cost this rank, then release its reads."""
-        if self._published or self._fetched:
-            mean = (
-                self._payload_bytes // self._published if self._published else 0
-            )
-            _LOG.info(
-                "channel transport retired: published=%d payload_total=%d "
-                "payload_mean=%d payload_max=%d synchronize_ms_total=%.3f "
-                "synchronize_ms_max=%.3f copy_ms_total=%.3f fetched=%d "
-                "fetch_ms_total=%.3f",
-                self._published,
-                self._payload_bytes,
-                mean,
-                self._largest_payload,
-                self._synchronize_seconds * 1e3,
-                self._longest_synchronize * 1e3,
-                self._copy_seconds * 1e3,
-                self._fetched,
-                self._fetch_seconds * 1e3,
-            )
+        """Release the channel's reads."""
         self._reads.close()

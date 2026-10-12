@@ -6,22 +6,24 @@
 //! their agreeing results into `WorkerResult`s, and replaces the whole group
 //! when a rank is lost. `WorkerExecutor` (in `executor`) submits explicitly
 //! targeted work to the groups of a deployment. `process` owns one rank's
-//! process and IPC channel, `registration` the addresses ranks rendezvous and
+//! process and IPC channel, `incarnations` the worker and rank each live incarnation
+//! serves, `registration` the addresses ranks rendezvous and
 //! report their endpoints at, `launcher` the per-host launchers that start
-//! ranks placed on other hosts, `checkpoint` the checkpoint identity every
-//! rank is checked against, and `death_watch` the Linux watcher that fires a
-//! rank channel's death wake when a rank process this engine spawned exits.
+//! ranks placed on other hosts, and `death_watch` the Linux watcher that
+//! fires a rank channel's death wake when a rank process this engine spawned
+//! exits.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-mod checkpoint;
 mod death_watch;
 mod executor;
+mod incarnations;
 mod instance;
 mod launcher;
 mod process;
 mod registration;
 
 pub use executor::WorkerExecutor;
+pub(crate) use incarnations::IncarnationRegistry;
 pub use instance::{CallReaders, WorkerGroup};
 pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig};
 use process::{PendingRank, RankProcess};
@@ -49,16 +51,6 @@ pub struct WorkerProcessArgs {
     pub python: std::path::PathBuf,
     /// Model identifier or local model path.
     pub model: String,
-    /// Identity of the checkpoint at `model`, derived by the head when the
-    /// model is a local directory of a non-stub launch and left unset
-    /// otherwise. Every rank verifies the checkpoint it loads against it and
-    /// reports what it loaded; a launch fills it once before any rank starts.
-    pub checkpoint_identity: Option<String>,
-    /// Local copy of the base checkpoint a component export at `model` pins,
-    /// passed to every rank, which verifies its revision from its Hugging
-    /// Face download records. Unset, ranks read the base from the Hugging
-    /// Face cache; a checkpoint that pins no base refuses one.
-    pub base_model: Option<std::path::PathBuf>,
     /// Ordered physical members of this WorkerGroup instance.
     pub ranks: Vec<crate::WorkerRank>,
     /// This process's own host identity. The engine owns exactly the ranks
@@ -83,20 +75,21 @@ pub struct WorkerProcessArgs {
     /// Deployments differ in how quickly that happens, so it is a launch value
     /// rather than a constant.
     pub launcher_timeout: std::time::Duration,
+    /// Longest a submitted batch may go without any rank making progress
+    /// before the group is treated as hung and replaced, failing the
+    /// requests it holds. A rank that dies is detected at once; this bounds
+    /// a rank that is alive but stuck, for example in a collective.
+    pub watchdog_timeout: std::time::Duration,
     /// Launch the worker without model weights, using its deterministic test
     /// model. Only the engine's own tests and examples set this; the serving
     /// command line cannot request it.
     pub stub: bool,
     /// Maximum number of physical runs concurrently in flight per rank.
     pub queue_depth: usize,
-    /// Request IPC slot capacity in bytes.
-    pub req_slot_cap: usize,
-    /// Response IPC slot capacity in bytes.
-    pub resp_slot_cap: usize,
     /// Optional KV cache capacity expressed in tokens.
-    pub kv_token_capacity: Option<u64>,
+    pub max_total_tokens: Option<u64>,
     /// Tokens per KV page of the cache group with the widest token rows;
-    /// the worker derives every other group's page size from it. `None`
+    /// the worker derives every other group's block size from it. `None`
     /// lets the worker choose it from its cache layers and attention
     /// kernels.
     pub block_size: Option<u32>,
@@ -109,11 +102,10 @@ pub struct WorkerProcessArgs {
     /// and block tables. A worker that fits its request tensors to device
     /// storage takes this as the largest pool it may choose.
     pub max_request_pool_size: u32,
-    /// Attention implementation selected for model execution.
-    pub attention_backend: uniserve_worker_ipc::AttentionBackend,
-    /// Optional public worker capability selectors; empty uses the model default.
-    /// Startup resolves each selector to its concrete computation set.
-    pub capability_groups: Vec<String>,
+    /// Attention provider name, forwarded to the worker verbatim. The
+    /// worker's attention registry owns the names and refuses one it does
+    /// not provide; `auto` lets it select per call.
+    pub attention_backend: String,
     /// Product transport exposed by the worker pool.
     pub transfer: crate::executor::TransferConfig,
     /// Checkpoint loader format.
@@ -122,18 +114,16 @@ pub struct WorkerProcessArgs {
     pub download_dir: Option<std::path::PathBuf>,
     /// Optional number of concurrent checkpoint reader threads.
     pub load_threads: Option<u32>,
-    /// Optional manifest of checkpoint file checksums.
-    pub checksum_manifest: Option<std::path::PathBuf>,
     /// Numeric data type used by model parameters and activations.
     pub model_dtype: uniserve_core::ModelDtype,
     /// WorkerGroup-specific quantization policy.
     pub quantization_config: serde_json::Value,
     /// Numeric data type used by the KV cache, when explicitly selected.
     pub kv_cache_dtype: Option<uniserve_core::KvCacheDtype>,
-    /// Each rank's share of its device's total storage, which bounds the
-    /// process's static allocations; `WorkerConfig::validate_storage_fraction`
-    /// states its range.
-    pub kv_storage_fraction: f64,
+    /// Each rank's share of its device's total memory, which bounds the
+    /// process's static allocations, weights and KV cache;
+    /// `WorkerConfig::validate_mem_fraction_static` states its range.
+    pub mem_fraction_static: f64,
     /// Optional device mesh specification for staged model components.
     pub mesh: Option<String>,
     /// Optional process-world communication backend.
@@ -142,7 +132,8 @@ pub struct WorkerProcessArgs {
     pub lanes: Vec<LaneConfig>,
     /// Module graph coverage policy: off, auto, or full.
     pub graph_policy: String,
-    /// Optional decode batch sizes selected for CUDA graph capture.
+    /// Optional decode batch sizes selected for CUDA graph capture; absent,
+    /// the worker captures every size up to the rows a call may hold.
     pub decode_graph_batch_sizes: Option<String>,
     /// Whether every prefill call replays a CUDA graph captured at
     /// startup; without it prefill runs eagerly, for debugging.
@@ -163,14 +154,21 @@ pub struct WorkerProcessArgs {
     /// Optional text capacities, in prompt tokens, of a video denoiser's
     /// layouts, as a comma-separated increasing list.
     pub video_text_capacities: Option<String>,
-    /// Optional canvases a video worker prepares and admits, as
-    /// comma-separated `HEIGHTxWIDTH`; `None` prepares the denoiser's own.
-    pub video_frame_sizes: Option<String>,
+    /// Optional resolution classes (`768p`) a video worker prepares, as a
+    /// comma-separated list. Crossed with `video_aspect_ratios`, they name
+    /// the canvases the worker prepares and admits; the model refuses a name
+    /// it does not generate. `None` takes every resolution class the
+    /// denoiser generates.
+    pub video_resolutions: Option<String>,
+    /// Optional aspect ratios (`16:9`) a video worker prepares, as a
+    /// comma-separated list; `None` takes every aspect ratio the denoiser
+    /// generates.
+    pub video_aspect_ratios: Option<String>,
     /// Block-diffusion sampling of every canvas the deployment generates, as
     /// the server resolves it; `None` when the served model generates no
-    /// canvases. The worker keeps the argmax history its stability
-    /// threshold needs, prepares its canvas steps for exactly this sampling,
-    /// and refuses a request that carries another.
+    /// canvases. The scheduler plans canvas steps under it and the worker
+    /// keeps the argmax history its stability threshold needs and prepares
+    /// its canvas steps for it: requests do not carry sampling.
     pub canvas_sampling: Option<uniserve_core::CanvasSampling>,
     /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,
@@ -191,8 +189,9 @@ pub struct WorkerProcessArgs {
     /// Maximum accepted video duration in seconds.
     pub max_video_seconds: f64,
     /// Most denoiser rows a video request's conditions may take, which bounds
-    /// the condition products a video worker provisions.
-    pub max_condition_rows: u32,
+    /// the condition products a video worker provisions. `None` provisions
+    /// the largest condition set the worker's denoiser admits.
+    pub max_condition_rows: Option<u32>,
     /// The `ffmpeg` executable a media reader decodes reference videos with.
     pub ffmpeg: std::path::PathBuf,
     /// Shortest video duration in seconds the serving API admits, which

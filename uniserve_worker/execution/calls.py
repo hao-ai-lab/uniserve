@@ -20,17 +20,6 @@ from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.storage.block_tables import BlockTables
 
 
-def output_generations(call: Call) -> tuple[int, ...]:
-    """Return the generation of each tensor output the call declares.
-
-    Values follow `Call.tensor_outputs` order. Handlers store them as the
-    completion's ``product_generations``.
-    """
-    return tuple(
-        int(reference.generation) for reference in call.tensor_outputs()
-    )
-
-
 def require_progress(output: PendingOutput) -> RequestProgress:
     """Return a pending output's progress for a state-consuming call.
 
@@ -47,7 +36,6 @@ def execution_runtime(
     request: PendingOutput,
     cache: tuple[int, int, int] | None,
     *,
-    flow_step: int | None = None,
     computed_len: int | None = None,
 ) -> RequestProgress:
     """Project the coordinates used by a call's numerical consumers.
@@ -56,8 +44,7 @@ def execution_runtime(
     ``cache`` None, the KV extents are kept from ``request.progress`` and
     ``computed_len`` is ignored. With a `cache_coordinates` tuple, the visible
     length comes from the tuple and the computed length equals it unless
-    ``computed_len`` is given. ``flow_step`` replaces the solver step when
-    given.
+    ``computed_len`` is given.
     """
     progress = request.progress
     if cache is None:
@@ -70,7 +57,6 @@ def execution_runtime(
         progress,
         kv_visible_len=visible,
         kv_computed_len=computed,
-        flow_step=progress.flow_step if flow_step is None else int(flow_step),
     )
 
 
@@ -140,13 +126,11 @@ def _predicated_outcome(
     """Mark a call whose completion predicate is false as predicated.
 
     Reuses the call's reserved `PendingOutput`: sets `CallStatus.PREDICATED`,
-    keeps its progress coordinates, and clears finish flags and product
-    generations, which a predicated completion must not carry
-    (`RequestOutput.validate` rejects them).
+    keeps its progress coordinates, and clears finish flags, which a
+    predicated completion must not carry.
     """
     request = state.pending_output(call.request_key.request_id)
     request.status = CallStatus.PREDICATED
     request.progress = execution_runtime(request, None)
     request.finish_flags = FinishFlags()
-    request.product_generations = ()
     return request

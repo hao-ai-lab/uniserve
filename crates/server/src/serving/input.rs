@@ -3,9 +3,7 @@
 //! [`PromptInput`] and the control structs ([`SamplingConfig`], [`StopConfig`],
 //! [`ImageGenControls`], [`DecodeControls`]) are the protocol-neutral request
 //! vocabulary. `serving::preprocessing` lowers the OpenAI wire requests into
-//! them, and [`TextPromptRequest`] bundles the control structs with a
-//! programmatic text prompt and optional input images.
-//! `InputProcessor::preprocess_generation` consumes them and splits each
+//! them. `InputProcessor::preprocess_generation` consumes them and splits each
 //! request into a `GenerationRequest`, which moves into the engine, and a
 //! [`ResponseOptions`], which the frontend keeps to assemble the response
 //! stream.
@@ -14,13 +12,12 @@ use std::collections::HashMap;
 
 use crate::serving::text::TextDecodeOptions;
 use crate::serving::text::tokenizer::DynTokenizer;
-use crate::serving::{CacheAccounting, ResourceAccounting, ServeRequestId};
 
-/// The public prompt: raw text or a chat conversation. Input images live in
-/// programmatic image inputs (and inside chat parts for the chat variant).
+/// The public prompt: the text of an image-generation request or a chat
+/// conversation. Input images live inside the parts of a chat conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptInput {
-    /// Plain text prompt.
+    /// Plain text prompt of an image-generation request.
     Text(String),
     /// Conversation, rendering options, and tools consumed by the chat
     /// renderer (`HfChatRenderer`).
@@ -105,8 +102,6 @@ pub struct StopConfig {
     pub logprobs: Option<i32>,
     /// Number of prompt-token alternatives included in log probabilities.
     pub prompt_logprobs: Option<i32>,
-    /// Additional token identifiers whose probabilities are reported.
-    pub logprob_token_ids: Option<Vec<u32>>,
 }
 
 /// Image-generation controls: dimensions, denoise steps, guidance controls,
@@ -139,10 +134,6 @@ pub struct ImageGenControls {
     pub seed: Option<u64>,
     /// Maximum number of generated images.
     pub max_images: Option<u16>,
-    /// Additional text prompts used by image-generation branches.
-    pub prompts: Vec<String>,
-    /// Whether generated image products remain available after response assembly.
-    pub retain_images: Option<bool>,
 }
 
 /// Per-token detail included in the public output.
@@ -176,70 +167,6 @@ impl Default for DecodeControls {
     }
 }
 
-/// A programmatic text prompt with optional context images. HTTP endpoints use
-/// their own request schemas and do not construct this value.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TextPromptRequest {
-    /// Caller-visible request identifier.
-    pub request_id: ServeRequestId,
-    /// Plain text passed through the model's text-prompt preprocessing.
-    pub prompt: String,
-    /// Top-level input images associated with the prompt. The omni
-    /// preprocessors compute their prompt positions; models without image
-    /// input reject them during feature validation.
-    pub images: Vec<crate::serving::media::ImageInput>,
-    /// Requested output modalities.
-    pub modalities: ModalitySelection,
-    /// Token sampling controls.
-    pub sampling: SamplingConfig,
-    /// Generation constraints and probability-reporting controls.
-    pub stop: StopConfig,
-    /// Optional negative prompt used for classifier-free guidance.
-    pub negative_text: Option<String>,
-    /// Image-generation controls when image output is requested.
-    pub image_gen: Option<ImageGenControls>,
-    /// Optional cache namespace isolating otherwise identical requests.
-    /// Combined with `cache_salt` into the engine cache isolation key by
-    /// `cache_isolation_key`; with both absent, the request uses the shared
-    /// cache partition.
-    pub cache_namespace: Option<String>,
-    /// Optional caller-provided value mixed into the cache isolation key.
-    pub cache_salt: Option<String>,
-    /// Whether existing prefix and encoder cache entries are ignored.
-    pub bypass_cache_read: bool,
-    /// Whether this request is excluded from cache storage.
-    pub no_cache_store: bool,
-    /// Scheduler priority for this request.
-    pub priority: i32,
-    /// Requested response detail.
-    pub output: OutputDetail,
-    /// Incremental text decoding controls.
-    pub decode: DecodeControls,
-}
-
-impl TextPromptRequest {
-    /// Creates a programmatic text-prompt request with model-default controls.
-    pub fn new(request_id: impl Into<ServeRequestId>, prompt: impl Into<String>) -> Self {
-        Self {
-            request_id: request_id.into(),
-            prompt: prompt.into(),
-            images: Vec::new(),
-            modalities: ModalitySelection::Text,
-            sampling: SamplingConfig::default(),
-            stop: StopConfig::default(),
-            negative_text: None,
-            image_gen: None,
-            cache_namespace: None,
-            cache_salt: None,
-            bypass_cache_read: false,
-            no_cache_store: false,
-            priority: 0,
-            output: OutputDetail::VisibleText,
-            decode: DecodeControls::default(),
-        }
-    }
-}
-
 /// Model-supplied committed-event processor selection, built by the per-model
 /// preprocessing that `InputProcessor::preprocess_generation` dispatches to.
 ///
@@ -249,8 +176,8 @@ pub enum OutputProcessorPolicy {
     /// Raw visible text.
     None,
     /// Chat reasoning and tool-call parsing over decoded text, selected for
-    /// the chat prompts of Qwen3 and DiffusionGemma (their text prompts use
-    /// `None`). The processor parses reasoning only when the server's
+    /// the chat prompts of Qwen3 and DiffusionGemma. The processor parses
+    /// reasoning only when the server's
     /// `reasoning_parsing` setting is on, and otherwise passes that text
     /// through as visible text; it parses tool calls only when
     /// `ChatRequest::tool_parsing_enabled` holds.
@@ -259,20 +186,9 @@ pub enum OutputProcessorPolicy {
     SenseNova(crate::profile::omni::OutputFilterPolicy),
 }
 
-/// Model identity stamped onto `Accepted` events.
-#[derive(Debug, Clone)]
-pub struct ModelEventIdentity {
-    /// Model name exposed through serving events.
-    pub served_name: String,
-    /// Stable profile description exposed through serving events.
-    pub description: String,
-}
-
 /// Tokenization resources and output requirements retained by the frontend.
 /// The corresponding generation request moves directly into the engine.
 pub struct ResponseOptions {
-    /// Caller-visible request identifier.
-    pub request_id: ServeRequestId,
     /// The model-bound tokenizer that owns decoding for this request.
     pub tokenizer: DynTokenizer,
     /// Copy of the prompt token identifiers submitted to the engine, kept
@@ -289,10 +205,4 @@ pub struct ResponseOptions {
     pub generated_logprobs_requested: bool,
     /// Model-selected semantic output processor.
     pub output_processor: OutputProcessorPolicy,
-    /// Model identity stamped onto accepted events.
-    pub identity: ModelEventIdentity,
-    /// Cache accounting limits propagated to the engine request.
-    pub cache: CacheAccounting,
-    /// Resource bounds propagated to admission control.
-    pub resources: ResourceAccounting,
 }

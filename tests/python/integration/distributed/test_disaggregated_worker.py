@@ -11,21 +11,21 @@ import torch
 import torch.multiprocessing as mp
 
 from tests.python.fixtures.checkpoints import qwen_moe_checkpoint
+from tests.python.fixtures.worker_config import cpu_worker_config
 from tests.python.integration.runtime.test_prefill_graphs import _call
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.nn.moe import FusedMoE
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve.runtime.process_groups import (
     Rendezvous,
     initialize_process_groups,
 )
 from uniserve_models import loading as models
-from uniserve_worker.bootstrap.cache import cache_info
+from uniserve_worker.bootstrap.cache import cache_info, plan_cache
 from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
 )
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.protocol.call import ForwardMode
@@ -51,20 +51,21 @@ def _worker(model, config, *, group=None, attention_ranks=1):
         if expert:
             runner.configure_experts()
         else:
-            cache = PrefixCache(
+            planes = plan_cache(model, config)
+            cache = KVCache(
                 model.cache_config,
+                planes,
                 num_units=32,
-                block_size=16,
                 device=config.device,
             )
             manager = KVCacheManager(
                 cache,
-                info=cache_info(model, config, num_units=32),
+                info=cache_info(model, planes, num_units=32),
                 request_pool_size=8,
                 table_width=4,
             )
             runner.configure_inputs(
-                input_config=input_buffer_config(model, config),
+                input_config=input_buffer_config(model, config, planes=planes),
                 kv_cache=manager,
                 latent_pool=None,
                 decode_predicates=torch.ones(
@@ -162,7 +163,7 @@ def _run(rank, local_rank, rendezvous, root, graphs, attention_tp, replicas):
         experts=(rank, 2 * attention_ranks, rendezvous),
     ) as groups:
         metadata = models.read_config(root)
-        config = WorkerConfig(
+        config = cpu_worker_config(
             rank=rank % attention_tp,
             world_size=attention_tp,
             device=str(device),
@@ -171,7 +172,7 @@ def _run(rank, local_rank, rendezvous, root, graphs, attention_tp, replicas):
             max_batch_calls=4,
             max_request_pool_size=8,
             max_batch_tokens=32,
-            max_sequence_tokens=64,
+            max_model_len=64,
             prefill_graph_token_sizes=(16, 32),
             decode_graph_batch_sizes=(1, 2, 4),
             graph_policy="off",

@@ -31,14 +31,14 @@ use crate::engine_client::EngineClient;
 pub use crate::profile::ModelDescription;
 use crate::profile::assets::ResolvedModelFiles;
 use crate::profile::{ModelConfig, ModelParameters};
-use crate::serving::LoadedModel;
 pub use crate::serving::chat::ChatTemplateContentFormatOption;
 pub use crate::serving::media::ImageFetchPolicy;
 use crate::serving::media::ImageFetcher;
 use crate::serving::systemone::ReadoutEncoder;
-use crate::serving::{InputProcessor, ServingRuntime};
+use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime};
+use crate::serving::{LoadedModel, LoadedRenderer};
 use anyhow::{Context as _, Result};
-pub use config::{Config, EngineSettings, HttpListenerMode, VideoMediaSettings};
+pub use config::{Config, EngineSettings, HttpListenerMode, VideoJobSettings, VideoMediaSettings};
 use tracing::info;
 pub use uniserve_engine::SchedulingPolicy;
 use uniserve_engine::{EngineConfig, SpecialTokenIds, WorkerProcessArgs};
@@ -83,17 +83,16 @@ fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
 ///
 /// # Errors
 ///
-/// Fails when the model assets cannot be resolved, when the per-run call
-/// bound (`max_batch`) or `max_num_batched_tokens`
-/// does not fit the worker's `u32` fields, when the engine fails to start, or
-/// when the model description cannot be bound to the capabilities the engine
-/// reports.
+/// Fails when the model assets cannot be resolved, when a token budget is
+/// configured for a video pipeline, when the per-run call bound (`max_batch`)
+/// or `max_num_batched_tokens` does not fit the worker's `u32` fields, when
+/// the engine fails to start, or when the model description cannot be bound
+/// to the capabilities the engine reports.
 pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let LoadedModel {
         config: mut model_config,
         tokenizer,
         renderer,
-        vision,
     } = ModelConfig::load(config)
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
@@ -107,9 +106,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 anyhow::anyhow!("invalid --diffusion-generation-config: {message}")
             })?;
     }
-    let runtime_family = model_config.runtime_family();
-    let effective_max_model_len = model_config.max_model_tokens();
-    let channel_payload_capacity = model_config.channel_payload_capacity();
+    let max_model_len = model_config.max_model_len;
     let control_tokens = special_token_ids(&model_config);
     let generation_limits =
         model_config.generation_limits(config.engine.worker_process.model_dtype);
@@ -122,47 +119,26 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     );
 
     // Admission limits running requests, not the worker's execution capacity.
-    // Media workers retain two internal state slots even when admission permits
-    // only one request. Keep their configured batch capacity independent.
+    // Media workers keep the resident request slots their queue depth
+    // pipelines even when admission permits fewer requests. Keep their
+    // configured batch capacity independent.
+    let budgets = config
+        .engine
+        .token_budgets(model_config.description().is_pipeline())?;
     let max_batch_calls = u32::try_from(config.engine.max_batch.max(1))
         .context("max_batch exceeds the worker field width")?;
-    let max_batch_tokens = u32::try_from(config.engine.max_num_batched_tokens)
+    let max_batch_tokens = u32::try_from(budgets.max_num_batched_tokens)
         .context("max_num_batched_tokens exceeds the worker field width")?;
 
-    // The model profile states the IPC payload its products need, and both
-    // directions of the worker channel must carry it: the request slot uses
-    // exactly that capacity, and the response slot uses the configured
-    // `resp_slot_cap` only when it is larger.
     let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
-        base_model: config.base_model.clone(),
-        req_slot_cap: channel_payload_capacity,
-        resp_slot_cap: config
-            .engine
-            .worker_process
-            .resp_slot_cap
-            .max(channel_payload_capacity),
         max_batch_calls,
         max_batch_tokens,
-        max_model_len: effective_max_model_len,
+        max_model_len,
         max_video_seconds: config.engine.max_video_seconds,
         max_condition_rows: config.engine.max_condition_rows,
         // Video workers provision only the frame counts the API admits.
         min_video_seconds: Some(crate::serving::MIN_VIDEO_SECONDS),
-        // Video workers prepare exactly the canvases of the configured
-        // resolutions and aspect ratios, and report them back as the only
-        // canvases requests may target.
-        video_frame_sizes: match &model_config.parameters {
-            crate::profile::ModelParameters::MiniMaxH3 { .. } => Some(
-                crate::profile::video::VideoRasters::new(
-                    &config.engine.video_resolutions,
-                    &config.engine.video_aspect_ratios,
-                )
-                .map_err(|message| anyhow::anyhow!("invalid video deployment: {message}"))?
-                .worker_frame_sizes(),
-            ),
-            _ => None,
-        },
         // Every generated canvas uses the served sampling, which the worker
         // sizes its canvas state for and prepares its canvas steps with.
         canvas_sampling: match &model_config.parameters {
@@ -177,16 +153,14 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         ..config.engine.worker_process.clone()
     };
     let engine_config = EngineConfig {
-        runtime_family,
         generation_limits,
         max_batch: config.engine.max_batch,
-        max_num_batched_tokens: config.engine.max_num_batched_tokens,
+        max_num_batched_tokens: budgets.max_num_batched_tokens,
         max_num_seqs: config.engine.max_num_seqs,
-        long_prefill_threshold: config.engine.long_prefill_threshold,
-        mixed_prefill_tokens: config.engine.mixed_prefill_tokens,
+        max_num_waiting: config.engine.max_num_waiting,
+        long_prefill_threshold: budgets.long_prefill_threshold,
         prefix_cache: config.engine.prefix_cache,
         scheduler_policy: config.engine.scheduler_policy,
-        max_model_len: effective_max_model_len,
         workers: config.engine.workers.clone(),
         transfer: config.engine.transfer.clone(),
         data_parallel_size: config.engine.data_parallel_size,
@@ -200,30 +174,46 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         EngineClient::connect(engine_config).context("failed to start the UniServe engine")?;
 
     let engine = Arc::new(client);
-    // The served context limit never exceeds the length the engine reports,
-    // which is the `max_model_len` passed in `engine_config`.
-    let route_max_model_len = effective_max_model_len.min(engine.max_model_len());
     // A video checkpoint serves what its placed denoiser declares in the
     // worker handshake, planned against the conditioner's vision processor.
-    let video = match &model_config.parameters {
-        crate::profile::ModelParameters::MiniMaxH3 { max_video_seconds } => {
+    let renderer = match renderer {
+        LoadedRenderer::Chat(renderer) => {
+            // No other served model's processor takes options.
+            anyhow::ensure!(
+                config.mm_processor_kwargs.is_empty(),
+                "invalid --mm-processor-kwargs: the processor of `{}` takes no options",
+                config.model
+            );
+            RequestRenderer::Chat(*renderer)
+        }
+        LoadedRenderer::Video(vision) => {
             let denoiser = engine
                 .video_denoiser()
                 .context("the video worker reported no video denoiser")?;
-            let vision = vision.context("the video checkpoint has no vision processor")?;
-            Some(
+            // Reference images are banded to the units one latent encoding
+            // round covers on the deployment's latent encoder while a
+            // request's prompt is encoded.
+            let latent_encoding_lane = engine
+                .media_lane_units(uniserve_engine::MediaCall::LatentEncoding)
+                .unwrap_or(1);
+            // The video processor's options are its reference sizing.
+            let references = crate::serving::video::plan::ReferenceConfig::from_kwargs(
+                &config.mm_processor_kwargs,
+            )
+            .map_err(|message| anyhow::anyhow!("invalid --mm-processor-kwargs: {message}"))?;
+            RequestRenderer::Video(
                 crate::serving::video::VideoService::new(
                     denoiser,
                     vision,
-                    *max_video_seconds,
-                    config.engine.max_condition_rows,
+                    config.engine.max_video_seconds,
+                    latent_encoding_lane,
                     &config.video_media,
+                    references,
                     Arc::clone(&tokenizer),
                 )
                 .context("failed to bind the video denoiser")?,
             )
         }
-        _ => None,
     };
 
     // A DiffusionGemma checkpoint serves the System One readout, whose
@@ -238,7 +228,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 Arc::clone(&tokenizer),
                 profile,
                 config.readout,
-                route_max_model_len,
+                max_model_len,
             )
             .context("failed to prepare the System One readout")?;
             info!(
@@ -257,10 +247,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         renderer,
         crate::serving::WorkerCapabilities {
             limits: engine.generation_limits(),
-            sampling_controls: engine.served_sampling_controls(),
-            max_model_tokens: route_max_model_len,
         },
-        video,
         config.reasoning_parsing,
     )
     .context("failed to bind the configured model description")?;
@@ -278,6 +265,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .with_api_key(config.api_key.clone())
             .with_request_timeout(config.request_timeout)
             .with_max_concurrent_requests(config.max_concurrent_requests)
-            .with_video_body_limit(config.video_media.body_limit()),
+            .with_video_body_limit(config.video_media.body_limit())
+            .with_video_jobs(config.video_jobs),
     ))
 }

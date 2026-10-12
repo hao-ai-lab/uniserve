@@ -132,7 +132,7 @@ def test_cancel_preserves_input_until_its_producer_completes() -> None:
 
 def test_abandoned_output_remains_readable_until_cpu_reader_finishes() -> None:
     events = EventPool()
-    outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
+    outputs = OutputPool(capacity=1, event_pool=events)
     pool = HostLane(max_inflight=1, workers=1)
     entered, finish = Event(), Event()
     buffer = outputs.acquire(1, token_capacity=8)

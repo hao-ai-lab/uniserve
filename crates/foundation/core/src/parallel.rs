@@ -9,10 +9,10 @@
 //! These types describe the layout only. [`SequenceParallel::size`] and
 //! [`ParallelConfig::world_size`] reject zero degrees and overflow, but the
 //! agreement between a component's ranks and its degrees is checked by
-//! `WorkerConfig::validate_members` in the engine, by `WorkerInfo::validate`
-//! in the worker IPC crate, and by the Python mirror's `ComponentConfig` in
-//! `uniserve_worker.config.deployment`. The same shape crosses the worker
-//! boundary as the flatbuffer `ParallelConfig` and `ComponentInfo` tables.
+//! `WorkerConfig::validate_members` in the engine and by the Python mirror's
+//! `ComponentConfig` in `uniserve_worker.config.deployment`. The engine
+//! hands the placement to each worker at launch; workers do not report it
+//! back.
 
 use serde::{Deserialize, Serialize};
 
@@ -31,8 +31,7 @@ const fn one() -> usize {
 /// One mutually exclusive sequence attention strategy.
 ///
 /// Serialized with a `kind` tag (`local`, `ulysses`, `allgather`, `hybrid`);
-/// an omitted degree defaults to one. The flatbuffer schema carries the same
-/// choice as the `SequenceParallel` union.
+/// an omitted degree defaults to one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SequenceParallel {
@@ -132,8 +131,8 @@ impl ParallelConfig {
 
 /// Components may distribute independent temporal decode units over local decoders.
 ///
-/// The flatbuffer `ComponentDistribution` enum encodes an absent distribution
-/// (`None` in [`ComponentConfig::distribution`]) as `Local`.
+/// An absent distribution (`None` in [`ComponentConfig::distribution`]) runs
+/// the component as one model-parallel group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentDistribution {
@@ -149,8 +148,7 @@ pub enum ComponentDistribution {
 /// Without a `distribution`, `ranks` form one model-parallel group and must
 /// number exactly `parallel_config.world_size()`. With a distribution, the
 /// parallel world size must be one. `WorkerConfig::validate_members` in the
-/// engine and `WorkerInfo::validate` in the worker IPC crate enforce both
-/// rules in Rust; this type does not.
+/// engine enforces both rules in Rust; this type does not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentConfig {

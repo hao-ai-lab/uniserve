@@ -16,7 +16,6 @@ from pathlib import Path
 
 from uniserve import loading
 from uniserve.loading import checkpoint
-from uniserve.nn.moe import Activation
 from uniserve.nn.rope import RoPEScaling, YaRNScaling
 
 from ..rotary import read_rotary
@@ -28,11 +27,13 @@ class Config:
 
     Field names follow the checkpoint ``config.json`` keys that
     ``read_config`` reads. ``head_dim`` may differ from
-    ``hidden_size // num_attention_heads``. ``rope_scaling`` is a typed
-    rotary recipe, None for plain rotary positions. ``mrope_sections`` gives
-    the interleaved multimodal rotary widths of a Qwen3-VL language model
-    (``MRotaryEmbedding``'s ``sections``); Qwen3 checkpoints rotate one
-    position axis and leave it None.
+    ``hidden_size // num_attention_heads``. ``hidden_act`` is the ``GatedMLP``
+    activation name that ``read_config`` resolves the checkpoint's name to.
+    ``rope_scaling`` is a typed rotary recipe, None for plain rotary
+    positions. ``mrope_sections`` gives the interleaved multimodal rotary
+    widths of a Qwen3-VL language model (``MRotaryEmbedding``'s
+    ``sections``); Qwen3 checkpoints rotate one position axis and leave it
+    None.
 
     A zero ``num_experts`` builds a dense ``GatedMLP`` of width
     ``intermediate_size`` in every layer (Qwen3). A positive value makes
@@ -46,8 +47,8 @@ class Config:
         ValueError: From ``__post_init__`` when a field has the wrong type or
             an invalid value, including odd ``head_dim``, query heads not
             divisible by KV heads, ``num_experts_per_tok`` above a nonzero
-            ``num_experts``, an unsupported ``hidden_act``, or an expert
-            activation no expert kernel implements.
+            ``num_experts``, or an expert activation no expert kernel
+            implements.
     """
 
     vocab_size: int
@@ -156,23 +157,10 @@ class Config:
                 "half the head dimension"
             )
 
-        # These are the aliases ``transformer._activation`` maps onto the
-        # gated MLP's activation kernels.
-        if self.hidden_act not in {
+        if self.num_experts and self.hidden_act not in {
             "silu",
-            "swish",
-            "silu_and_mul",
-            "swiglu",
-            "gelu",
-            "gelu_and_mul",
-            "geglu",
             "gelu_pytorch_tanh",
-            "gelu_tanh",
         }:
-            raise ValueError(
-                f"unsupported Qwen3 hidden_act {self.hidden_act!r}"
-            )
-        if self.num_experts and self.hidden_act not in _EXPERT_ACTIVATIONS:
             raise ValueError(
                 f"Qwen3-MoE experts do not implement {self.hidden_act!r}; "
                 "expert kernels gate with SiLU or tanh-approximated GELU"
@@ -187,20 +175,25 @@ class Config:
         )
 
 
-# ``hidden_act`` aliases and the expert gating each one names.
-_EXPERT_ACTIVATIONS: Mapping[str, Activation] = {
+# Transformers ``hidden_act`` names and the ``GatedMLP`` activation each one
+# selects.
+_GATED_ACTIVATIONS: Mapping[str, str] = {
     "silu": "silu",
     "swish": "silu",
-    "silu_and_mul": "silu",
-    "swiglu": "silu",
-    "gelu_pytorch_tanh": "gelu_tanh",
-    "gelu_tanh": "gelu_tanh",
+    "gelu": "gelu",
+    "gelu_pytorch_tanh": "gelu_pytorch_tanh",
 }
 
 
-def expert_activation(hidden_act: str) -> Activation:
-    """Name the ``FusedMoE`` gating that ``hidden_act`` specifies."""
-    return _EXPERT_ACTIVATIONS[hidden_act]
+def gated_activation(hidden_act: object, *, owner: str) -> str:
+    """Resolve a checkpoint's ``hidden_act`` to a ``GatedMLP`` activation.
+
+    A value that is not one of Transformers' names for SiLU, GELU or
+    tanh-approximated GELU raises ``ValueError`` naming ``owner``.
+    """
+    if not isinstance(hidden_act, str) or hidden_act not in _GATED_ACTIVATIONS:
+        raise ValueError(f"unsupported {owner} hidden_act {hidden_act!r}")
+    return _GATED_ACTIVATIONS[hidden_act]
 
 
 def _required_int(config: Mapping[str, object], name: str) -> int:
@@ -254,16 +247,6 @@ def _boolean(config: Mapping[str, object], name: str, default: bool) -> bool:
     return raw
 
 
-def _string(config: Mapping[str, object], name: str, default: str) -> str:
-    """Read a textual model setting with a default."""
-    raw = config.get(name, default)
-    if not isinstance(raw, str) or not raw:
-        raise ValueError(
-            f"Qwen3 config field {name!r} must be a non-empty string"
-        )
-    return raw
-
-
 def read_config(
     root: Path,
     io: loading.Config,
@@ -272,10 +255,10 @@ def read_config(
 ) -> Config:
     """Normalize checkpoint metadata into immutable decoder configuration.
 
-    ``architectures`` selects the family: ``Qwen3ForCausalLM`` (dense,
-    ``model_type`` qwen3) or ``Qwen3MoeForCausalLM`` (``model_type``
-    qwen3_moe). Each family's absent fields take Transformers' defaults for
-    that family, so a field means the same here as in the reference.
+    ``architectures`` selects the family: ``Qwen3ForCausalLM`` (dense) or
+    ``Qwen3MoeForCausalLM`` (mixture of experts). Each family's absent
+    fields take Transformers' defaults for that family, so a field means the
+    same here as in the reference.
 
     Args:
         root: Local checkpoint directory containing ``config.json``.
@@ -288,12 +271,11 @@ def read_config(
         The validated ``Config``.
 
     Raises:
-        ValueError: For invalid metadata, including an unknown or
-            inconsistent architecture and ``model_type``, a missing required
-            field, a field of the wrong type or value, conflicting aliases,
-            sliding-window attention, a rotary recipe other than default or
-            YaRN, a partial rotary width, and expert fields in a dense
-            checkpoint.
+        ValueError: For invalid metadata, including an unknown architecture,
+            a missing required field, a field of the wrong type or value,
+            conflicting aliases, sliding-window attention, a rotary recipe
+            other than default or YaRN, a partial rotary width, and expert
+            fields in a dense checkpoint.
     """
     config = json.loads((root / "config.json").read_text())
 
@@ -311,11 +293,6 @@ def read_config(
             f"{sorted(_FAMILIES)}"
         )
     family = _FAMILIES[architectures[0]]
-    if config.get("model_type", family.model_type) != family.model_type:
-        raise ValueError(
-            f"{architectures[0]} checkpoint has model_type "
-            f"{config['model_type']!r}, not {family.model_type!r}"
-        )
 
     hidden_size = _required_int(config, "hidden_size")
     num_attention_heads = _required_int(config, "num_attention_heads")
@@ -433,7 +410,9 @@ def read_config(
         num_attention_heads=num_attention_heads,
         num_key_value_heads=num_key_value_heads,
         head_dim=head_dim,
-        hidden_act=_string(config, "hidden_act", "silu"),
+        hidden_act=gated_activation(
+            config.get("hidden_act", "silu"), owner="Qwen3"
+        ),
         rms_norm_eps=_number(config, "rms_norm_eps", 1e-6),
         rope_theta=_positive_float(rotary.theta, "rope_theta"),
         rope_scaling=rotary.scaling,
@@ -466,15 +445,14 @@ class _Family:
     attention width; ``experts`` is None for dense checkpoints.
     """
 
-    model_type: str
     default_head_dim: int | None
     experts: _Experts | None
 
 
 # Defaults follow Transformers' Qwen3Config and Qwen3MoeConfig.
 _FAMILIES = {
-    "Qwen3ForCausalLM": _Family("qwen3", 128, None),
-    "Qwen3MoeForCausalLM": _Family("qwen3_moe", None, _Experts(128, 8, 768)),
+    "Qwen3ForCausalLM": _Family(128, None),
+    "Qwen3MoeForCausalLM": _Family(None, _Experts(128, 8, 768)),
 }
 
 _EXPERT_FIELDS = frozenset(

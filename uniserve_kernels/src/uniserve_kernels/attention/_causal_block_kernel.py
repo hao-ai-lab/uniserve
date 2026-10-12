@@ -90,7 +90,7 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
         head_dim: int,
         tile_rows: int,
         group_size: int,
-        page_tokens: int,
+        block_size: int,
         has_prefix_start: bool,
         has_start_page: bool,
         has_lse: bool,
@@ -100,7 +100,7 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
             head_dim=head_dim,
             tile_rows=tile_rows,
             group_size=group_size,
-            page_tokens=page_tokens,
+            block_size=block_size,
             query_window=False,
             has_window=False,
             has_prefix_start=has_prefix_start,
@@ -152,7 +152,7 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
         """Build tensor views and TMA descriptors, then launch the kernel.
 
         ``query``/``output`` are ``[tokens, Hq, D]``, ``key``/``value``
-        ``[tokens, Hkv, D]``, caches ``[pages, page_tokens, Hkv, D]``,
+        ``[tokens, Hkv, D]``, caches ``[pages, block_size, Hkv, D]``,
         ``block_table`` ``[B, W]`` int32, ``query_offsets`` ``[B + 1]``,
         ``prefix_lengths``/``start_page``/``prefix_start`` ``[B]`` int32 and
         ``lse`` ``[tokens, Hq]`` FP32. ``counters`` is the scheduler's int32
@@ -226,7 +226,7 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
             cute.make_layout(
                 (
                     self.atom_dims,
-                    self.page_tokens,
+                    self.block_size,
                     atoms,
                     kv_heads,
                     key_cache.shape[0],
@@ -245,7 +245,7 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
             cute.make_layout(
                 (
                     self.atom_dims,
-                    self.page_tokens,
+                    self.block_size,
                     atoms,
                     kv_heads,
                     value_cache.shape[0],
@@ -329,10 +329,10 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
                 stride=(1, self.atom_dims, self.atom_dims * self.half_keys),
             ),
         )
-        # A page slot is page_tokens rows of a stage: one TMA box when the
+        # A page slot is block_size rows of a stage: one TMA box when the
         # slot fills the stage, one per atom otherwise.
-        slot = cute.composition(ring, (self.atom_dims, self.page_tokens, 2))
-        slot_tile = (self.atom_dims, self.page_tokens, 2)
+        slot = cute.composition(ring, (self.atom_dims, self.block_size, 2))
+        slot_tile = (self.atom_dims, self.block_size, 2)
         stage_tile = (self.atom_dims, self.half_keys, 2)
 
         load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
@@ -772,11 +772,11 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
         )
 
         # Prefix tiles cover pages [lower_first // page, ceil(P / page)).
-        prefix_base = (lower_first // self.page_tokens) * self.page_tokens
+        prefix_base = (lower_first // self.block_size) * self.block_size
         prefix_tiles = Int32(0)
         if lower_first < prefix_len:
-            page_end = (prefix_len + self.page_tokens - 1) // self.page_tokens
-            prefix_span = page_end * self.page_tokens - prefix_base
+            page_end = (prefix_len + self.block_size - 1) // self.block_size
+            prefix_span = page_end * self.block_size - prefix_base
             prefix_tiles = (prefix_span + self.tile_keys - 1) // self.tile_keys
         # Block tiles past the one holding the last query are masked, so
         # they are not read.
@@ -1217,7 +1217,7 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
                 cute.make_layout(self.kv_stage, stride=cute.cosize(ring.outer)),
             ),
         )
-        slot_tile = (self.atom_dims, self.page_tokens, 2)
+        slot_tile = (self.atom_dims, self.block_size, 2)
         stage_tile = (self.atom_dims, self.half_keys, 2)
         s_slots = cute.group_modes(cute.flat_divide(s_ring, slot_tile), 0, 3)
         s_whole = cute.group_modes(cute.flat_divide(s_ring, stage_tile), 0, 3)
@@ -1525,11 +1525,9 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
                 lower = self.lower_bound(
                     query_pos, prefix_len, batch, prefix_start, window
                 )
-                page_end = (
-                    prefix_len + self.page_tokens - 1
-                ) // self.page_tokens
-                tail_start = (page_end - 1) * self.page_tokens
-                tail_shift = page_end * self.page_tokens - prefix_len
+                page_end = (prefix_len + self.block_size - 1) // self.block_size
+                tail_start = (page_end - 1) * self.block_size
+                tail_shift = page_end * self.block_size - prefix_len
                 # Prefix tokens below this bound are free of the shifted
                 # last page and its zero-filled leading rows.
                 clean_end = prefix_len
@@ -1543,7 +1541,7 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
                 # before the last page, [lower, tail_start), and the last
                 # page's written rows at or above the bound.
                 tail_first = cutlass.max(tail_start, lower) + tail_shift
-                tail_end = tail_start + self.page_tokens
+                tail_end = tail_start + self.block_size
 
                 row_max = -Float32.inf
                 row_sum = Float32(0.0)

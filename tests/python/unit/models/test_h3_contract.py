@@ -12,15 +12,15 @@ import torch
 
 from uniserve.diffusion import BlockGrid, RungGrid, UniformGrid
 from uniserve.loading import Config as IOConfig
-from uniserve.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     DenseAttention,
     Model,
     SparseAttention,
     entry_points,
 )
-from uniserve_models.minimax_h3.checkpoint import Kind, detect
-from uniserve_models.minimax_h3.config import Config, normalize, read_config
+from uniserve_models.minimax_h3.checkpoint import base_checkpoint, detect
+from uniserve_models.minimax_h3.config import Config, read_config
+from uniserve_models.minimax_h3.precision import weight_config
 
 pytestmark = pytest.mark.unit
 
@@ -34,7 +34,7 @@ def checkpoint(tmp_path):
 
 @pytest.fixture
 def base(checkpoint):
-    """A diffusers root holding both DiT partitions and no contract."""
+    """The base release: both DiT partitions and no FastH3 contract."""
     (checkpoint / "fastvideo_inference.json").unlink()
     shutil.copytree(checkpoint / "transformer", checkpoint / "transformer_ref")
     component = ["diffusers", "MiniMaxH3Transformer3DModel", {}]
@@ -50,43 +50,49 @@ def base(checkpoint):
     return checkpoint
 
 
-def test_full_vsa_checkpoint_resolves_its_trained_rungs(checkpoint):
+def test_t2va_fasth3_resolves_its_trained_rungs(checkpoint):
     config = read_config(checkpoint, IOConfig(), sources={})
-    assert set(config.denoisers) == {"denoiser"}
-    denoiser = config.denoisers["denoiser"]
+    # A t2va student replaces the release's transformer partition.
+    assert set(config.denoisers) == {"transformer"}
+    denoiser = config.denoisers["transformer"]
     assert denoiser.grids == {
-        "video": RungGrid((999, 749, 500, 250), shift=12.0, clock=1000.0),
-        "audio": RungGrid((999, 749, 500, 250), shift=3.0, clock=1000.0),
+        "video": RungGrid(
+            (999, 749, 500, 250), shift=12.0, num_train_timesteps=1000.0
+        ),
+        "audio": RungGrid(
+            (999, 749, 500, 250), shift=3.0, num_train_timesteps=1000.0
+        ),
     }
     assert denoiser.attention == SparseAttention(tile=64, sparsity=0.9)
     assert denoiser.tasks == ("t2va",)
-    # The export generates its 12 (width, height) training buckets: 21:9,
-    # 16:9, 4:3, 1:1, 3:4 and 9:16 at 768p, then at 480p.
-    assert [(canvas.width, canvas.height) for canvas in denoiser.canvases] == [
-        (1536, 672),
-        (1344, 768),
-        (1024, 768),
-        (768, 768),
-        (768, 1024),
-        (768, 1344),
-        (992, 416),
-        (832, 480),
-        (640, 480),
-        (480, 480),
-        (480, 640),
-        (480, 832),
-    ]
-    # FastH3 exports keep the single-rounding block epilogues.
-    assert denoiser.transformer.rounding is Rounding.ONCE
+    # The student generates its 12 training buckets: 21:9, 16:9, 4:3, 1:1,
+    # 3:4 and 9:16 at 768p, then at 480p, by the (short edge, aspect ratio)
+    # a request names them with.
+    assert {
+        name: (canvas.width, canvas.height)
+        for name, canvas in denoiser.canvases.items()
+    } == {
+        (768, "21:9"): (1536, 672),
+        (768, "16:9"): (1344, 768),
+        (768, "4:3"): (1024, 768),
+        (768, "1:1"): (768, 768),
+        (768, "3:4"): (768, 1024),
+        (768, "9:16"): (768, 1344),
+        (480, "21:9"): (992, 416),
+        (480, "16:9"): (832, 480),
+        (480, "4:3"): (640, 480),
+        (480, "1:1"): (480, 480),
+        (480, "3:4"): (480, 640),
+        (480, "9:16"): (480, 832),
+    }
 
 
-def test_diffusers_root_serves_both_task_families(base):
-    assert detect(base).kind is Kind.DIFFUSERS_ROOT
+def test_base_release_serves_both_task_families(base):
     config = read_config(base, IOConfig(), sources={})
-    assert set(config.denoisers) == {"denoiser", "reference_denoiser"}
+    assert set(config.denoisers) == {"transformer", "transformer_ref"}
     for name, tasks in (
-        ("denoiser", ("t2va", "fl2va")),
-        ("reference_denoiser", ("ref2va",)),
+        ("transformer", ("t2va", "fl2va")),
+        ("transformer_ref", ("ref2va",)),
     ):
         denoiser = config.denoisers[name]
         assert denoiser.tasks == tasks
@@ -96,62 +102,42 @@ def test_diffusers_root_serves_both_task_families(base):
             "audio": UniformGrid(50, shift=3.0),
         }
         assert denoiser.canvases is None
-        assert denoiser.max_sequence_rows is None
         # The released DiTs follow the diffusers eager BF16 arithmetic.
-        assert denoiser.transformer.rounding is Rounding.STEPWISE
-    points = entry_points(config)
-    assert {"denoiser", "reference_denoiser"} <= set(points)
+        points = entry_points(config)
+    assert {"transformer", "transformer_ref"} <= set(points)
     with torch.device("meta"):
         model = Model(config)
-    assert model.denoiser.num_steps == model.reference_denoiser.num_steps == 49
+    assert model.transformer.num_steps == model.transformer_ref.num_steps == 49
 
 
-def test_component_export_states_its_parallel_decoding_contract(checkpoint):
+def _ref2va_export(checkpoint, **fields):
+    """Turn the fixture into a ref2va student of the release's partition."""
     contract = {
-        "schema_version": "fasth3-inference-contract-v1",
         "model_type": "ref2va",
-        "attention_backend": "VIDEO_SPARSE_ATTN_H3",
-        "conditioning": "fixed_ordered_references_target_only_flow",
         "base_model_revision": "hf://MiniMaxAI/MiniMax-H3@9bfb6693",
-        "transformer_component": "transformer_ref",
-        "guidance_scale": 1.0,
-        "pdd_steps": 32,
         "pdd_step_indices": [0, 4, 8, 12, 16, 20, 24, 28, 32],
-        "transformer_forwards": 8,
-        "num_inference_steps": 8,
         "grid_max_t": 0.999,
-        "video_scheduler_shift": 12.0,
-        "audio_scheduler_shift": 3.0,
-        "vsa_ref_policy": "p2_multi_region",
         "vsa_ref_keep_rate": 0.1,
         "vsa_sparsity": 0.9,
         "vsa_tile_size": 128,
+        **fields,
     }
     (checkpoint / "fastvideo_inference.json").write_text(json.dumps(contract))
     shutil.move(checkpoint / "transformer", checkpoint / "transformer_ref")
-    layout = detect(checkpoint)
-    assert layout.kind is Kind.COMPONENT_EXPORT
-    assert dict(layout.denoisers) == {"reference_denoiser": "transformer_ref"}
-    assert (layout.base.repository, layout.base.revision) == (
-        "MiniMaxAI/MiniMax-H3",
-        "9bfb6693",
-    )
-    metadata = {
-        name: json.loads((checkpoint / relative).read_text())
-        for name, relative in (
-            ("text_encoder", "text_encoder/config.json"),
-            ("video_vae", "vae/config.json"),
-            ("audio_vae", "audio_vae/config.json"),
-            ("scheduler", "scheduler/scheduler_config.json"),
-            ("audio_scheduler", "audio_scheduler/scheduler_config.json"),
-        )
-    }
-    transformer = json.loads(
-        (checkpoint / "transformer_ref/config.json").read_text()
-    )
-    metadata["reference_denoiser"] = {**transformer, "pdd_steps": 32}
-    config = normalize(layout, metadata)
-    denoiser = config.denoisers["reference_denoiser"]
+    path = checkpoint / "transformer_ref/config.json"
+    transformer = json.loads(path.read_text())
+    path.write_text(json.dumps({**transformer, "pdd_steps": 32}))
+    return checkpoint
+
+
+def test_ref2va_fasth3_branches_from_the_reference_partition(checkpoint):
+    export = _ref2va_export(checkpoint)
+    layout = detect(export)
+    assert dict(layout.partitions) == {"transformer_ref": ("ref2va",)}
+    assert base_checkpoint(export) == ("MiniMaxAI/MiniMax-H3", "9bfb6693")
+
+    config = read_config(export, IOConfig(), sources={})
+    denoiser = config.denoisers["transformer_ref"]
     assert denoiser.transformer.output_heads == 32
     nodes = (0, 4, 8, 12, 16, 20, 24, 28, 32)
     assert denoiser.grids == {
@@ -162,26 +148,22 @@ def test_component_export_states_its_parallel_decoding_contract(checkpoint):
         tile=128, sparsity=0.9, reference_keep=0.1
     )
     assert denoiser.tasks == ("ref2va",)
-    assert denoiser.max_sequence_rows == 131_072
-    # Component exports follow their reference's eager BF16 arithmetic.
-    assert denoiser.transformer.rounding is Rounding.STEPWISE
-    # A student whose heads disagree with its contract is rejected.
-    metadata["reference_denoiser"] = {**transformer, "pdd_steps": 16}
-    with pytest.raises(ValueError, match="pdd_steps"):
-        normalize(layout, metadata)
+    assert denoiser.canvases is None
 
 
-def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
+def test_parallel_decoding_blocks_must_cover_the_heads(checkpoint):
+    export = _ref2va_export(checkpoint, pdd_step_indices=[0, 4, 8, 16])
+    with pytest.raises(ValueError, match="block grid"):
+        read_config(export, IOConfig(), sources={})
+
+
+def test_eight_step_checkpoint_owns_its_rungs_and_shifts(checkpoint):
     inference_path = checkpoint / "fastvideo_inference.json"
     inference = json.loads(inference_path.read_text())
     inference.update(
         {
-            "transformer_forwards": 8,
-            "num_inference_steps": 9,
             "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
             "vsa_sparsity": 0.8,
-            "video_scheduler_shift": 10.0,
-            "audio_scheduler_shift": 3.0,
         }
     )
     inference_path.write_text(json.dumps(inference))
@@ -192,11 +174,11 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
 
     config = read_config(checkpoint, IOConfig(), sources={})
 
-    denoiser = config.denoisers["denoiser"]
+    denoiser = config.denoisers["transformer"]
     rungs = (999, 874, 749, 624, 500, 375, 250, 125)
     assert denoiser.grids == {
-        "video": RungGrid(rungs, shift=10, clock=1000.0),
-        "audio": RungGrid(rungs, shift=3, clock=1000.0),
+        "video": RungGrid(rungs, shift=10, num_train_timesteps=1000.0),
+        "audio": RungGrid(rungs, shift=3, num_train_timesteps=1000.0),
     }
     assert denoiser.attention.sparsity == 0.8
     with torch.device("meta"):
@@ -205,7 +187,7 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
     # The first and last evaluations follow the shifted timestep equation
     # sigma = s t / (1 + (s - 1) t) with t = step / 1000 and each modality's
     # trained shift; the clean endpoint follows the last evaluation.
-    schedules = model.denoiser.make_schedules(8, shift=None, device="cpu")
+    schedules = model.transformer.make_schedules(device="cpu")
     for name, shift in (("video", 10.0), ("audio", 3.0)):
         sigmas = schedules[name].sigmas
         assert sigmas.shape == (9,)
@@ -216,31 +198,35 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
                 sigmas[index], torch.tensor(expected), rtol=0, atol=1e-7
             )
         assert sigmas[8] == 0
-    with pytest.raises(ValueError, match="evaluates the network 8 times"):
-        model.denoiser.make_schedules(4, shift=None, device="cpu")
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("field", "value", "error"),
     [
-        ("task", "ref2va"),
-        ("attention_backend", "FLASH_ATTN"),
-        ("guidance_scale", 3.0),
-        ("transformer_forwards", 50),
-        ("num_inference_steps", 4),
-        ("dmd_denoising_steps", [999, 999, 500, 250]),
-        ("dmd_denoising_steps", [1001, 749, 500, 250]),
-        ("vsa_sparsity", 1.0),
-        ("video_scheduler_shift", 10.0),
-        ("schema_version", "unknown"),
+        ("task", "t2i", "task"),
+        ("dmd_denoising_steps", [999, 999, 500, 250], "rungs"),
+        ("dmd_denoising_steps", [1001, 749, 500, 250], "rungs"),
+        ("vsa_sparsity", 1.0, "sparsity"),
+        ("vsa_tile_size", 32, "64 or 128 rows"),
     ],
 )
-def test_incompatible_checkpoint_is_rejected(checkpoint, field, value):
+def test_a_contract_the_model_cannot_compute_is_rejected(
+    checkpoint, field, value, error
+):
     path = checkpoint / "fastvideo_inference.json"
     manifest = json.loads(path.read_text())
     manifest[field] = value
     path.write_text(json.dumps(manifest))
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(ValueError, match=error):
+        read_config(checkpoint, IOConfig(), sources={})
+
+
+def test_a_contract_without_a_schedule_is_rejected(checkpoint):
+    path = checkpoint / "fastvideo_inference.json"
+    manifest = json.loads(path.read_text())
+    del manifest["dmd_denoising_steps"]
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="dmd_denoising_steps"):
         read_config(checkpoint, IOConfig(), sources={})
 
 
@@ -252,12 +238,9 @@ def test_architecture_without_variant_metadata_is_rejected(tmp_path):
 @pytest.mark.parametrize(
     "sidecar, field, value, error",
     [
-        (
-            "vae/config.json",
-            "decoder_num_layers",
-            35,
-            "video_vae.decoder_num_layers",
-        ),
+        ("vae/config.json", "clip_length", 33, "17-frame clips"),
+        ("vae/config.json", "token_drop", 2, "17-frame clips"),
+        ("audio_vae/config.json", "encoder_rates", [2, 4, 4, 5, 6], "hop 800"),
         (
             "audio_vae/config.json",
             "latents_std",
@@ -283,6 +266,41 @@ def test_h3_reader_rejects_unsupported_decoder_math(
         read_config(checkpoint, IOConfig(), sources={})
 
 
+def test_a_checkpoint_defines_its_own_network_dimensions(checkpoint):
+    """Layer counts come from the checkpoint, not from released defaults."""
+    transformer = checkpoint / "transformer/config.json"
+    values = json.loads(transformer.read_text())
+    transformer.write_text(json.dumps({**values, "num_layers": 7}))
+    vae = checkpoint / "vae/config.json"
+    values = json.loads(vae.read_text())
+    vae.write_text(json.dumps({**values, "decoder_num_layers": 35}))
+
+    config = read_config(checkpoint, IOConfig(), sources={})
+    assert config.denoisers["transformer"].transformer.num_hidden_layers == 7
+    assert config.video_vae.decoder_num_layers == 35
+
+    precision = weight_config(config)
+    layers = "transformer.transformer.layers"
+    assert f"{layers}.6.mlp" in precision.quantization
+    assert f"{layers}.7.mlp" not in precision.quantization
+    decoder = "video_decoder.decoder.decoder.decoder.layers"
+    assert f"{decoder}.34.qkv" in precision.dtypes
+    assert f"{decoder}.35.qkv" not in precision.dtypes
+
+
+def test_pixel_normalization_comes_from_the_checkpoint_processor(checkpoint):
+    path = checkpoint / "processor/preprocessor_config.json"
+    values = json.loads(path.read_text())
+    path.write_text(
+        json.dumps(
+            {**values, "image_mean": [0.1, 0.2, 0.3], "image_std": [1, 2, 3]}
+        )
+    )
+
+    pixels = read_config(checkpoint, IOConfig(), sources={}).text_encoder.pixels
+    assert (pixels.mean, pixels.std) == ((0.1, 0.2, 0.3), (1, 2, 3))
+
+
 def test_h3_reader_reports_missing_decoder_field(checkpoint):
     path = checkpoint / "vae/config.json"
     values = json.loads(path.read_text())
@@ -295,16 +313,17 @@ def test_h3_reader_reports_missing_decoder_field(checkpoint):
 
 
 def test_h3_direct_configuration_preserves_cross_component_dimensions():
-    from dataclasses import replace
-
-    from tests.python.fixtures.h3 import dmd_denoiser
-    from uniserve_models.minimax_h3 import audio_vae, video_vae
-    from uniserve_models.minimax_h3.encoder import TextEncoderConfig
+    from tests.python.fixtures.h3 import (
+        audio_vae_config,
+        dmd_denoiser,
+        text_encoder_config,
+        video_vae_config,
+    )
 
     with pytest.raises(ValueError, match="conditioning width"):
         Config(
-            text_encoder=replace(TextEncoderConfig(), hidden_size=4096),
-            denoisers={"denoiser": dmd_denoiser()},
-            video_vae=video_vae.Config(),
-            audio_vae=audio_vae.Config(),
+            text_encoder=text_encoder_config(hidden_size=4096),
+            denoisers={"transformer": dmd_denoiser()},
+            video_vae=video_vae_config(),
+            audio_vae=audio_vae_config(),
         )

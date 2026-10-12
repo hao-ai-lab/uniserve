@@ -105,7 +105,7 @@ def test_table_updates_and_release_preserve_all_queued_snapshots(device, depth):
         assert tables.verified_lengths.tolist() == [0, 0, 5, 0]
         assert tables.allocated_length(1) == tables.allocated_length(3) == 0
         assert tables.table(2, 0).units == (4, 5, 13)
-        # Every table names its group, page tokens and window (-1 for full).
+        # Every table names its group, block size and window (-1 for full).
         assert tables.table_shapes.cpu().tolist() == [
             [0, 4, -1],
             [1, 8, 8],
@@ -160,8 +160,6 @@ def test_release_bursts_do_not_wait_for_queued_device_work():
         (1, 0, 1, (2, 3), 13),
         # A unit table wider than the table capacity.
         (1, 0, 0, (2, 3, 4, 5), 8),
-        # The padding sentinel.
-        (1, 0, 0, (0, 3), 8),
     ),
 )
 def test_rejected_installation_changes_nothing(entry):

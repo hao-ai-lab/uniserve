@@ -11,7 +11,7 @@ from .encoder import LatentEncoder
 
 
 class PatchAutoencoder(nn.Module):
-    """Serialize a latent codec's image latents as canonical patch rows.
+    """Serialize a VAE's image latents as canonical patch rows.
 
     ``encoder`` samples and normalizes the latent of NCHW pixels and
     ``decoder`` restores pixels from it; their normalization defines the

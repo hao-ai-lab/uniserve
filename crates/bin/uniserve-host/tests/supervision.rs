@@ -2,14 +2,17 @@
 //!
 //! Each test binds a TCP listener that stands in for the head, starts the
 //! built `uniserve-host` binary against it, and exchanges the launcher's
-//! newline-delimited JSON messages: instructions to the launcher, and its
-//! presentation, reservation replies, and rank exit reports back.
+//! messages: instructions to the launcher, and its presentation, reservation
+//! replies, and rank exit reports back.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+use uniserve_core::launch::{Instruction, Presentation, RankExit, RankLaunch, Report};
 
 /// Kills and reaps the launcher process when a test ends, including when it
 /// panics.
@@ -22,13 +25,57 @@ impl Drop for Launcher {
     }
 }
 
-/// Reads one newline-terminated JSON message from the launcher, panicking if
-/// the read fails, including on the socket's read timeout, or if the line is
-/// not JSON, as at end of stream.
-fn receive(reader: &mut BufReader<TcpStream>) -> serde_json::Value {
+/// Reads one newline-terminated message line from the launcher, panicking if
+/// the read fails, including on the socket's read timeout.
+fn receive_line(reader: &mut BufReader<TcpStream>) -> String {
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    line
+}
+
+/// Reads one report from the launcher, panicking if it cannot be read or does
+/// not decode, as at end of stream.
+fn receive(reader: &mut BufReader<TcpStream>) -> Report {
+    serde_json::from_str(&receive_line(reader)).unwrap()
+}
+
+/// Sends the launcher one instruction as a line of JSON.
+fn send(stream: &mut TcpStream, instruction: &Instruction) {
+    writeln!(stream, "{}", serde_json::to_string(instruction).unwrap()).unwrap();
+}
+
+/// Returns the port of a reservation reply.
+fn reserved_port(report: Report) -> u16 {
+    match report {
+        Report::Reservation { port } => port,
+        other => panic!("expected a reservation, received {other:?}"),
+    }
+}
+
+/// Returns a spawn of `rank` of group `worker_id` under `generation`, run by
+/// `python` with `environment` and an empty descriptor.
+fn spawn(
+    worker_id: &str,
+    generation: u64,
+    rank: u32,
+    world_size: u32,
+    python: &str,
+    environment: &[(&str, &std::path::Path)],
+) -> Instruction {
+    Instruction::Spawn {
+        generation,
+        launch: RankLaunch {
+            rank,
+            worker_id: worker_id.to_owned(),
+            world_size,
+            python: python.to_owned(),
+            descriptor: serde_json::json!({}),
+            environment: environment
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.to_str().unwrap().to_owned()))
+                .collect::<HashMap<_, _>>(),
+        },
+    }
 }
 
 /// Starts a launcher against a head bound here and reads its presentation.
@@ -65,7 +112,8 @@ fn start_launcher_with(
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
-    assert_eq!(receive(&mut reader)["host"], "host");
+    let presentation: Presentation = serde_json::from_str(&receive_line(&mut reader)).unwrap();
+    assert_eq!(presentation.host, "host");
     (launcher, stream, reader)
 }
 
@@ -76,52 +124,53 @@ fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() 
     // A partial instruction must survive the supervisor's child-exit polling.
     // The pause outlasts the read timeout `supervise` sets on the head
     // connection, so the partial line spans more than one poll.
-    stream.write_all(b"{\"reserve\":").unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    stream.write_all(b"{\"worker_id\":\"first\"}}\n").unwrap();
-    let first = receive(&mut reader);
-    writeln!(
-        stream,
-        "{}",
-        serde_json::json!({"reserve": {"worker_id": "second"}})
-    )
+    let reserve = serde_json::to_string(&Instruction::Reserve {
+        worker_id: "first".to_owned(),
+    })
     .unwrap();
-    let second = receive(&mut reader);
-    assert_ne!(first["port"], second["port"]);
+    let (head, tail) = reserve.split_at(reserve.len() / 2);
+    stream.write_all(head.as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    writeln!(stream, "{tail}").unwrap();
+    let first = reserved_port(receive(&mut reader));
+    send(
+        &mut stream,
+        &Instruction::Reserve {
+            worker_id: "second".to_owned(),
+        },
+    );
+    let second = reserved_port(receive(&mut reader));
+    assert_ne!(first, second);
 
     // /bin/false is a real process with a known exit status; numerical worker
     // initialization is irrelevant to the host's independent exit reporting.
-    writeln!(
-        stream,
-        "{}",
-        serde_json::json!({"spawn": {
-            "rank": 0, "worker_id": "first", "generation": 3, "world_size": 1,
-            "python": "/bin/false", "descriptor": {}, "environment": {}
-        }})
-    )
-    .unwrap();
+    send(&mut stream, &spawn("first", 3, 0, 1, "/bin/false", &[]));
 
     // No further instruction is sent: the report must come from the
     // launcher's own polling of its ranks. It names the generation the
     // rank's spawn carried, which is how the head tells it from an exit of
     // the same rank before its group was relaunched.
-    let exit = receive(&mut reader);
-    assert_eq!(exit["worker_id"], "first");
-    assert_eq!(exit["generation"], 3);
-    assert_eq!(exit["rank"], 0);
-    assert_eq!(exit["status"], "exit status: 1");
+    assert_eq!(
+        receive(&mut reader),
+        Report::Exit(RankExit {
+            worker_id: "first".to_owned(),
+            generation: 3,
+            rank: 0,
+            status: "exit status: 1".to_owned(),
+        })
+    );
 }
 
 #[test]
 fn the_first_rank_serves_its_store_on_the_reserved_port() {
     let (_launcher, mut stream, mut reader) = start_launcher();
-    writeln!(
-        stream,
-        "{}",
-        serde_json::json!({"reserve": {"worker_id": "group"}})
-    )
-    .unwrap();
-    let port = receive(&mut reader)["port"].as_u64().unwrap() as u16;
+    send(
+        &mut stream,
+        &Instruction::Reserve {
+            worker_id: "group".to_owned(),
+        },
+    );
+    let port = reserved_port(receive(&mut reader));
 
     // The rank's module accepts one peer on the socket its descriptor names,
     // which is how a collective store serves on an inherited socket. The
@@ -140,16 +189,17 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
          peer.sendall(b'served\\n')\n",
     )
     .unwrap();
-    writeln!(
-        stream,
-        "{}",
-        serde_json::json!({"spawn": {
-            "rank": 0, "worker_id": "group", "generation": 0, "world_size": 2,
-            "python": "python3", "descriptor": {},
-            "environment": {"PYTHONPATH": modules.path()}
-        }})
-    )
-    .unwrap();
+    send(
+        &mut stream,
+        &spawn(
+            "group",
+            0,
+            0,
+            2,
+            "python3",
+            &[("PYTHONPATH", modules.path())],
+        ),
+    );
 
     // The reserved socket is already listening, so this connection waits in
     // its backlog until the rank starts and accepts it; the generous read
@@ -161,16 +211,15 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
     BufReader::new(peer).read_line(&mut served).unwrap();
     assert_eq!(served, "served\n");
 
-    let exit = receive(&mut reader);
     assert_eq!(
-        (
-            exit["worker_id"].as_str(),
-            exit["generation"].as_u64(),
-            exit["rank"].as_u64()
-        ),
-        (Some("group"), Some(0), Some(0))
+        receive(&mut reader),
+        Report::Exit(RankExit {
+            worker_id: "group".to_owned(),
+            generation: 0,
+            rank: 0,
+            status: "exit status: 0".to_owned(),
+        })
     );
-    assert_eq!(exit["status"], "exit status: 0");
     // The launcher kept no copy of the socket it handed over, so the port
     // closes with the rank that served it.
     assert_eq!(
@@ -206,16 +255,17 @@ impl StandIn {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        writeln!(
+        send(
             stream,
-            "{}",
-            serde_json::json!({"spawn": {
-                "rank": 1, "worker_id": group, "generation": 0, "world_size": 2,
-                "python": script, "descriptor": {},
-                "environment": {"RANK_PID_FILE": pid_file}
-            }})
-        )
-        .unwrap();
+            &spawn(
+                group,
+                0,
+                1,
+                2,
+                script.to_str().unwrap(),
+                &[("RANK_PID_FILE", &pid_file)],
+            ),
+        );
 
         let mut pid = None;
         assert!(
@@ -298,12 +348,12 @@ fn a_closed_log_pipe_does_not_end_supervision() {
 
     // The launcher still follows the head: a stop ends the group's rank, and
     // the head closing the connection ends the launcher cleanly.
-    writeln!(
-        stream,
-        "{}",
-        serde_json::json!({"stop": {"worker_id": "group"}})
-    )
-    .unwrap();
+    send(
+        &mut stream,
+        &Instruction::Stop {
+            worker_id: "group".to_owned(),
+        },
+    );
     assert!(
         eventually(|| !rank.alive()),
         "the stop did not end the rank"

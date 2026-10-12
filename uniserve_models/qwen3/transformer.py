@@ -8,6 +8,8 @@ model. Traversal, pipeline exchange and the final norm belong to the shared
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import nn
 
@@ -17,7 +19,7 @@ from uniserve.nn.attention import (
     AttentionBatch,
     RotaryQKVProjection,
 )
-from uniserve.nn.functional import add_rms_norm
+from uniserve.nn.functional import Rounding, add_rms_norm
 from uniserve.nn.linear import (
     Linear,
     QKVParallelLinear,
@@ -25,21 +27,11 @@ from uniserve.nn.linear import (
     VocabParallelEmbedding,
 )
 from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.moe import FusedMoE, TopK
+from uniserve.nn.moe import Activation, FusedMoE, TopK
 from uniserve.nn.norm import RMSNorm
 from uniserve.nn.rope import MRotaryEmbedding, RotaryEmbedding
 
-from .config import Config, expert_activation
-
-
-def _activation(name: str) -> str:
-    """Map checkpoint activation aliases onto the library's implemented kernels."""  # noqa: E501
-    if name in {"silu", "swish", "silu_and_mul", "swiglu"}:
-        return "silu"
-    if name in {"gelu", "gelu_and_mul", "geglu"}:
-        return "gelu"
-    # Config accepts only the aliases above and the two tanh GELU spellings.
-    return "gelu_pytorch_tanh"
+from .config import Config
 
 
 class Attention(nn.Module):
@@ -131,7 +123,8 @@ class MoE(nn.Module):
             config.hidden_size,
             config.moe_intermediate_size,
             top_k=config.num_experts_per_tok,
-            activation=expert_activation(config.hidden_act),
+            # ``Config`` admits only the gating the expert kernels implement.
+            activation=cast("Activation", config.hidden_act),
         )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -155,7 +148,13 @@ class TransformerLayer(nn.Module):
             else GatedMLP(
                 config.hidden_size,
                 config.intermediate_size,
-                activation=_activation(config.hidden_act),
+                activation=config.hidden_act,
+                # SGLang's fused kernel evaluates SiLU gating in FP32 and
+                # rounds once, as this layer's fused residual normalization
+                # does; vLLM's kernel and Transformers' module round per
+                # operation. The references disagree, so the recipe is the
+                # fused one this model's other kernels share.
+                rounding=Rounding.ONCE if config.hidden_act == "silu" else None,
             )
         )
 

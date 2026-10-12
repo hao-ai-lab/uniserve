@@ -160,7 +160,7 @@ def causal_runs(batch):
                     if table.start_page_host is None
                     else table.start_page_host[start:stop],
                 ),
-                write_indices=None,
+                slot_mapping=None,
             )
             key_slice = slice(None)
         else:

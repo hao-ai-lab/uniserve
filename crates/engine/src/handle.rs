@@ -9,15 +9,13 @@
 //! while a request's channel is full hands the events it could not send to
 //! the receiver, which yields them after the channel's buffered events.
 //!
-//! [`EventRx`] also drives output acknowledgement. It counts the text tokens
-//! of received `TextToken` and `TextTokens` events and reports consumed
-//! prefixes as
-//! [`Command::Acknowledge`]. A token request without stop strings is
-//! acknowledged on receipt; for a request with stop strings the frontend
-//! decoder calls [`EventRx::acknowledge_consumed_prefix`] after checking that
-//! a token completes no stop string, or [`EventRx::cancel_at_consumed_prefix`]
-//! on a match. Dropping an [`EventRx`] before a terminal event cancels the
-//! request at its acknowledged prefix.
+//! [`EventRx`] also carries the frontend decoder's stop-string decisions. The
+//! scheduler holds a token request with stop strings at a bounded number of
+//! resolved calls whose tokens await a decision; the decoder calls
+//! [`EventRx::acknowledge_consumed_prefix`] after checking that the tokens
+//! received so far complete no stop string, which reports them as
+//! [`Command::Acknowledge`], or [`EventRx::cancel_at_consumed_prefix`] on a
+//! match. Dropping an [`EventRx`] before a terminal event cancels the request.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::collections::VecDeque;
@@ -197,7 +195,9 @@ pub struct EventRx {
     handoff: Handoff,
     waker: uniserve_core::CommandWaker,
     cancellation: Option<EventCancellation>,
+    /// Text tokens of the received `TextToken` and `TextTokens` events.
     text_tokens_received: usize,
+    /// Text-token count of the last `Command::Acknowledge` sent.
     acknowledged_token_count: usize,
     on_finish: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
@@ -210,10 +210,9 @@ pub struct EventRx {
 struct EventCancellation {
     handle: EngineHandle,
     request_id: RequestId,
-    /// Acknowledge text tokens as soon as they are received. `submit` sets
-    /// this only for token requests without stop strings; for token requests
-    /// with stop strings the frontend decoder acknowledges explicitly.
-    acknowledge_on_receive: bool,
+    /// Whether the request's tokens await the frontend decoder's stop-string
+    /// decisions: set by `submit` for token requests with stop strings.
+    awaits_decoder: bool,
 }
 
 impl EventRx {
@@ -237,7 +236,7 @@ impl EventRx {
         self.on_finish = Some(Box::new(on_finish));
     }
 
-    /// Receives the next event and advances output acknowledgement state.
+    /// Receives the next event and advances the received token count.
     ///
     /// Returns `None` once the channel is closed and empty and every handed
     /// over event has been yielded, which also runs the completion callback.
@@ -289,23 +288,15 @@ impl EventRx {
             .pop_front()
     }
 
-    /// Updates acknowledgement and completion state for a received event.
+    /// Updates the received token count and completion state for a received
+    /// event.
     fn observe(&mut self, event: &EngineCoreOutput) {
         match event {
-            EngineCoreOutput::TextToken { .. } | EngineCoreOutput::TextTokens { .. } => {
-                let count = match event {
-                    EngineCoreOutput::TextTokens { ids } => ids.len(),
-                    _ => 1,
-                };
-                self.text_tokens_received = self.text_tokens_received.saturating_add(count);
-                if self
-                    .cancellation
-                    .as_ref()
-                    .filter(|cancellation| cancellation.acknowledge_on_receive)
-                    .is_some()
-                {
-                    self.acknowledge_consumed_prefix();
-                }
+            EngineCoreOutput::TextToken { .. } => {
+                self.text_tokens_received = self.text_tokens_received.saturating_add(1);
+            }
+            EngineCoreOutput::TextTokens { ids } => {
+                self.text_tokens_received = self.text_tokens_received.saturating_add(ids.len());
             }
             EngineCoreOutput::Finished { .. }
             | EngineCoreOutput::Rejected { .. }
@@ -316,16 +307,22 @@ impl EventRx {
         }
     }
 
-    /// Acknowledges every text token observed through this receiver.
+    /// Accepts every text token observed through this receiver as completing
+    /// no stop string, so the scheduler resolves the decisions they await.
     ///
-    /// Sends nothing when no token arrived since the last acknowledgement or
+    /// Sends nothing for a request without stop strings, whose tokens await
+    /// no decision, when no token arrived since the last acknowledgement, or
     /// when the receiver has no armed cancellation (built by `from_receiver`,
     /// finished, or already cancelled).
     pub fn acknowledge_consumed_prefix(&mut self) {
         if self.text_tokens_received <= self.acknowledged_token_count {
             return;
         }
-        if let Some(cancellation) = self.cancellation.as_ref() {
+        if let Some(cancellation) = self
+            .cancellation
+            .as_ref()
+            .filter(|cancellation| cancellation.awaits_decoder)
+        {
             let _ = cancellation.handle.send(Command::Acknowledge {
                 request_id: cancellation.request_id,
                 output_token_count: self.text_tokens_received,
@@ -334,30 +331,24 @@ impl EventRx {
         }
     }
 
-    /// Cancels the request at its last acknowledged public token prefix.
+    /// Cancels the request.
     pub fn cancel(&mut self) {
         self.cancel_at_consumed_prefix(StreamCancelCause::DroppedStream);
     }
 
-    /// Closes generation at the receiver's safe public-token boundary.
+    /// Closes generation after the tokens the consumer has received.
     ///
-    /// `DroppedStream` cancels at the acknowledged token count;
-    /// `StopStringMatched` stops successfully after every text token received
-    /// so far. Only the first cancellation of an armed receiver sends a
-    /// command; see `acknowledge_consumed_prefix` for when it is disarmed.
+    /// `DroppedStream` cancels the request; `StopStringMatched` finishes it
+    /// successfully with `Stop`. Only the first cancellation of an armed
+    /// receiver sends a command; see `acknowledge_consumed_prefix` for when
+    /// it is disarmed.
     pub fn cancel_at_consumed_prefix(&mut self, cause: StreamCancelCause) {
         let Some(cancellation) = self.cancellation.take() else {
             return;
         };
         let command = match cause {
-            StreamCancelCause::DroppedStream => Command::Cancel {
-                request_id: cancellation.request_id,
-                output_token_count: Some(self.acknowledged_token_count),
-            },
-            StreamCancelCause::StopStringMatched => Command::StopAt {
-                request_id: cancellation.request_id,
-                output_token_count: self.text_tokens_received,
-            },
+            StreamCancelCause::DroppedStream => Command::Cancel(cancellation.request_id),
+            StreamCancelCause::StopStringMatched => Command::Stop(cancellation.request_id),
         };
         let _ = cancellation.handle.send(command);
     }
@@ -372,15 +363,13 @@ impl EventRx {
 }
 
 impl Drop for EventRx {
-    /// Cancels an unfinished request at its acknowledged prefix, runs an unrun
-    /// completion callback, and wakes the scheduler so it observes the closed
-    /// channel.
+    /// Cancels an unfinished request, runs an unrun completion callback, and
+    /// wakes the scheduler so it observes the closed channel.
     fn drop(&mut self) {
         if let Some(cancellation) = self.cancellation.take() {
-            let _ = cancellation.handle.send(Command::Cancel {
-                request_id: cancellation.request_id,
-                output_token_count: Some(self.acknowledged_token_count),
-            });
+            let _ = cancellation
+                .handle
+                .send(Command::Cancel(cancellation.request_id));
         }
         if let Some(on_finish) = self.on_finish.take() {
             on_finish();
@@ -421,21 +410,13 @@ pub enum Command {
         /// Destination for public request events.
         event_tx: EventTx,
     },
-    /// Cancels a request at its acknowledged public-token boundary.
-    Cancel {
-        /// Request to cancel.
-        request_id: RequestId,
-        /// Safe public-token prefix, when known.
-        output_token_count: Option<usize>,
-    },
-    /// Frontend decoder matched a stop string at this exact token prefix.
-    StopAt {
-        /// Request whose decoder matched the stop string.
-        request_id: RequestId,
-        /// Exact public-token prefix at which generation stops.
-        output_token_count: usize,
-    },
-    /// Frontend decoder accepted this exact public token prefix.
+    /// Cancels a request on behalf of its consumer.
+    Cancel(RequestId),
+    /// Finishes a request with `Stop`: the frontend decoder matched one of
+    /// its stop strings.
+    Stop(RequestId),
+    /// Frontend decoder found that this public token prefix of a request with
+    /// stop strings completes none of them.
     Acknowledge {
         /// Request whose public output was consumed.
         request_id: RequestId,
@@ -502,12 +483,10 @@ impl EngineHandle {
     pub fn submit(&self, request: impl Into<Request>) -> Result<EventRx, SubmitError> {
         let request = request.into();
         let request_id = request.request_id();
-        // Stop-string matching happens in the frontend decoder, which must
-        // withhold acknowledgement until it has checked each token.
-        let acknowledge_on_receive = match &request {
-            Request::Ar(request) | Request::Umm(request) | Request::BlockDiffusion(request) => {
-                request.stop_strings.is_empty()
-            }
+        // Stop-string matching happens in the frontend decoder, which
+        // acknowledges each token it has checked.
+        let awaits_decoder = match &request {
+            Request::Generation(request) => !request.stop_strings.is_empty(),
             Request::Diffusion(_) => false,
         };
         let (event_tx, event_rx) = event_channel_with_waker(
@@ -515,7 +494,7 @@ impl EngineHandle {
             Some(EventCancellation {
                 handle: self.clone(),
                 request_id,
-                acknowledge_on_receive,
+                awaits_decoder,
             }),
         );
         self.send(Command::Submit {
@@ -526,28 +505,17 @@ impl EngineHandle {
         Ok(event_rx)
     }
 
-    /// Cancels a request without constraining its public output prefix.
+    /// Cancels a request.
     pub fn cancel(&self, id: RequestId) {
-        let _ = self.send(Command::Cancel {
-            request_id: id,
-            output_token_count: None,
-        });
+        let _ = self.send(Command::Cancel(id));
     }
-    /// Cancels a request after the specified public token count.
-    pub fn cancel_at(&self, id: RequestId, output_token_count: usize) {
-        let _ = self.send(Command::Cancel {
-            request_id: id,
-            output_token_count: Some(output_token_count),
-        });
+    /// Finishes a request successfully, as when its decoder matched a stop
+    /// string.
+    pub fn stop(&self, id: RequestId) {
+        let _ = self.send(Command::Stop(id));
     }
-    /// Finishes a request successfully at the specified public token count.
-    pub fn stop_at(&self, id: RequestId, output_token_count: usize) {
-        let _ = self.send(Command::StopAt {
-            request_id: id,
-            output_token_count,
-        });
-    }
-    /// Acknowledges consumption through the specified public token count.
+    /// Acknowledges that the first `output_token_count` public tokens of a
+    /// request with stop strings complete none of them.
     pub fn acknowledge_at(&self, id: RequestId, output_token_count: usize) {
         let _ = self.send(Command::Acknowledge {
             request_id: id,
@@ -585,6 +553,7 @@ mod tests {
             constraint,
             sampling: SamplingParams::default(),
             image: ImageParams::default(),
+            max_images: 1,
             max_und_tokens: 32,
             include_stop_token: false,
             stop_strings: Vec::new(),
@@ -593,7 +562,6 @@ mod tests {
             cache: Default::default(),
             image_generation: policy,
             readout: Vec::new(),
-            canvas: None,
         }
     }
 
@@ -614,11 +582,11 @@ mod tests {
         }
     }
 
-    /// A request without stop strings acknowledges tokens on receipt. When the
-    /// receiver drops after reading one of two published tokens, the cancel
-    /// covers only the token the consumer actually received.
+    /// Tokens of a request without stop strings await no decoder decision,
+    /// so receiving and accepting them sends nothing; dropping the receiver
+    /// before the terminal event cancels the request.
     #[test]
-    fn dropping_event_receiver_cancels_at_the_consumed_text_prefix() {
+    fn dropping_event_receiver_cancels_the_request() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let mut events = handle.submit(test_request(12)).unwrap();
@@ -633,83 +601,80 @@ mod tests {
                 logprob: None,
             })
             .unwrap();
-        event_tx
-            .send(EngineCoreOutput::TextToken {
-                id: 8,
-                logprob: None,
-            })
-            .unwrap();
-
         assert!(matches!(
             events.try_recv(),
             Ok(EngineCoreOutput::TextToken { id: 7, .. })
         ));
+        events.acknowledge_consumed_prefix();
         drop(events);
 
+        match rx.recv().unwrap() {
+            Command::Cancel(request_id) => assert_eq!(request_id, RequestId(12)),
+            _ => panic!("expected Cancel command"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The decoder of a request with stop strings reports each newly accepted
+    /// token prefix once, and a matched stop string finishes the request with
+    /// `Stop`.
+    #[test]
+    fn stop_string_request_reports_decoder_decisions() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+        let mut request = test_request(14);
+        request.stop_strings = vec!["end".to_string()];
+        let mut events = handle.submit(request).unwrap();
+        let event_tx = match rx.recv().unwrap() {
+            Command::Submit { event_tx, .. } => event_tx,
+            _ => panic!("expected Submit command"),
+        };
+
+        event_tx
+            .send(EngineCoreOutput::TextTokens { ids: vec![7, 8] })
+            .unwrap();
+        assert!(events.try_recv().is_ok());
+        events.acknowledge_consumed_prefix();
+        events.acknowledge_consumed_prefix();
         match rx.recv().unwrap() {
             Command::Acknowledge {
                 request_id,
                 output_token_count,
             } => {
-                assert_eq!(request_id, RequestId(12));
-                assert_eq!(output_token_count, 1);
+                assert_eq!(request_id, RequestId(14));
+                assert_eq!(output_token_count, 2);
             }
-            _ => panic!("expected consumed-prefix Acknowledge command"),
+            _ => panic!("expected Acknowledge command"),
         }
+
+        events.cancel_at_consumed_prefix(StreamCancelCause::StopStringMatched);
         match rx.recv().unwrap() {
-            Command::Cancel {
-                request_id,
-                output_token_count,
-            } => {
-                assert_eq!(request_id, RequestId(12));
-                assert_eq!(output_token_count, Some(1));
-            }
-            _ => panic!("expected exact-prefix Cancel command"),
+            Command::Stop(request_id) => assert_eq!(request_id, RequestId(14)),
+            _ => panic!("expected Stop command"),
         }
+        drop(events);
+        assert!(rx.try_recv().is_err());
     }
 
-    /// Cancellation, exact-prefix cancellation, semantic acknowledgement, and
-    /// server abort preserve their distinct command payloads.
+    /// Cancellation, stop, semantic acknowledgement, and server abort
+    /// preserve their distinct command payloads.
     #[test]
     fn request_control_commands_preserve_their_semantics() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
 
         handle.cancel(RequestId(1));
-        handle.cancel_at(RequestId(2), 7);
-        handle.stop_at(RequestId(4), 8);
+        handle.stop(RequestId(4));
         handle.acknowledge_at(RequestId(3), 9);
         handle.abort(RequestId(2));
 
         match rx.recv().unwrap() {
-            Command::Cancel {
-                request_id,
-                output_token_count,
-            } => {
-                assert_eq!(request_id, RequestId(1));
-                assert_eq!(output_token_count, None);
-            }
+            Command::Cancel(request_id) => assert_eq!(request_id, RequestId(1)),
             _ => panic!("expected Cancel command"),
         }
         match rx.recv().unwrap() {
-            Command::Cancel {
-                request_id,
-                output_token_count,
-            } => {
-                assert_eq!(request_id, RequestId(2));
-                assert_eq!(output_token_count, Some(7));
-            }
-            _ => panic!("expected exact-prefix Cancel command"),
-        }
-        match rx.recv().unwrap() {
-            Command::StopAt {
-                request_id,
-                output_token_count,
-            } => {
-                assert_eq!(request_id, RequestId(4));
-                assert_eq!(output_token_count, 8);
-            }
-            _ => panic!("expected exact-prefix Stop command"),
+            Command::Stop(request_id) => assert_eq!(request_id, RequestId(4)),
+            _ => panic!("expected Stop command"),
         }
         match rx.recv().unwrap() {
             Command::Acknowledge {

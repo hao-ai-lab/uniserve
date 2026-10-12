@@ -254,8 +254,8 @@ async def _send_chat_stream(
             return
         # Malformed event JSON becomes a `parse_error` event, which
         # `OpenAIChat.classify_events` rejects, instead of raising into the
-        # generic transport failure. Without `stop_on`, the body is read until
-        # the server closes it; latency still closes at the last event stamp.
+        # generic transport failure. The body is read until the server closes
+        # it; latency closes at the last event stamp.
         events = await aiter_sse_events(
             response_lines(response.content),
             stamp_time=True,

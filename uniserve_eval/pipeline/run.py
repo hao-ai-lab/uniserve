@@ -494,7 +494,8 @@ def _write_records(
     references them.
 
     Raises:
-        ValueError: Invalid image metadata or unsafe media request IDs.
+        ValueError: A content-addressed image sample collision or an
+            unsafe media request ID.
         FileExistsError: Different media already occupies the requested path.
     """
     for record in records:

@@ -120,11 +120,6 @@ def test_feedback_call_publishes_distinct_completion_relay_outputs() -> None:
     )
 
     assert report.completions[0].status is CallStatus.OK
-    assert set(report.completions[0].product_generations) == {
-        completion.generation,
-        token.generation,
-        transition.generation,
-    }
     _release_relay_outputs(worker, call)
 
 
@@ -190,26 +185,17 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         ),
     )
     completion = successor_report.completions[0]
-    completion.validate()
     assert completion.status is CallStatus.PREDICATED
     descendant_completion = descendant_report.completions[0]
-    descendant_completion.validate()
     assert descendant_completion.status is CallStatus.PREDICATED
     parent_report = finalized_report(worker, parent_report)
     parent_completion = parent_report.completions[0]
-    assert completion.position == parent_completion.position
     assert completion.kv_visible_len == parent_completion.kv_visible_len
     assert completion.kv_computed_len == parent_completion.kv_computed_len
-    assert (
-        completion.num_completed_steps == parent_completion.num_completed_steps
-    )
-    assert descendant_completion.position == completion.position
+    assert completion.step_index == parent_completion.step_index
     assert descendant_completion.kv_visible_len == completion.kv_visible_len
     assert descendant_completion.kv_computed_len == completion.kv_computed_len
-    assert (
-        descendant_completion.num_completed_steps
-        == completion.num_completed_steps
-    )
+    assert descendant_completion.step_index == completion.step_index
 
     selected = predecessor.call_id
 
@@ -232,7 +218,6 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         ),
     ).completions[0]
     assert later_completion.status is CallStatus.OK
-    assert later_completion.position == parent_completion.position + 1
 
     close_report = worker.submit(
         execution_batch(
@@ -324,7 +309,6 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     parent_completion = parent_report.completions[0]
     candidate_completion = candidate_report.completions[0]
     assert candidate_completion.status is CallStatus.PREDICATED
-    assert candidate_completion.position == parent_completion.position
     assert (
         candidate_completion.kv_visible_len == parent_completion.kv_visible_len
     )
@@ -332,11 +316,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         candidate_completion.kv_computed_len
         == parent_completion.kv_computed_len
     )
-    assert (
-        candidate_completion.num_completed_steps
-        == parent_completion.num_completed_steps
-    )
-    assert candidate_completion.product_generations == ()
+    assert candidate_completion.step_index == parent_completion.step_index
 
     parent_observation = record_completion(predecessor, parent_report)
     _release_relay_outputs(worker, initial, predecessor, candidate)
@@ -357,4 +337,3 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         ),
     )
     assert selected_report.completions[0].status is CallStatus.OK
-    assert selected_report.completions[0].product_generations

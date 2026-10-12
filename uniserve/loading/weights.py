@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -83,8 +83,11 @@ class ModuleMapping:
     """Map one checkpoint source onto a resident numerical module.
 
     required/optional name module parameters. nonresident names intentionally
-    unused checkpoint tensors, including entries belonging to absent PP layers.
-    post_load may compute derived constants while the source reader is open.
+    unused checkpoint tensors and nonresident_prefixes the name prefixes of
+    whole groups of them (a layer outside this pipeline stage, the half of a
+    VAE this module does not evaluate); both include entries belonging to
+    absent PP layers. post_load may compute derived constants while the
+    source reader is open.
     """
 
     module: nn.Module
@@ -94,6 +97,16 @@ class ModuleMapping:
     optional: frozenset[str] = frozenset()
     nonresident: frozenset[str] = frozenset()
     post_load: Callable[[checkpoint.Reader], None] | None = None
+    nonresident_prefixes: tuple[str, ...] = ()
+
+    def skips(self, names: Iterable[str]) -> set[str]:
+        """Return the checkpoint tensors among ``names`` this mapping leaves unused."""  # noqa: E501
+        return {
+            name
+            for name in names
+            if name in self.nonresident
+            or name.startswith(self.nonresident_prefixes)
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +197,23 @@ def _source_identity(weight):
             weight.dtype,
         )
     return id(weight)
+
+
+def _stored_like(value, placeholder):
+    """Return ``value`` in its placeholder's channels-last storage order.
+
+    A module that declares a channels-last weight, such as a convolution
+    reading channels-last input, keeps that storage once loaded; any other
+    value is returned unchanged.
+    """
+    if isinstance(value, QuantizedTensor) or placeholder.is_contiguous():
+        return value
+    for memory_format in (torch.channels_last, torch.channels_last_3d):
+        if placeholder.dim() == (
+            4 if memory_format is torch.channels_last else 5
+        ) and placeholder.is_contiguous(memory_format=memory_format):
+            return value.contiguous(memory_format=memory_format)
+    return value
 
 
 def _fp8_fragments(shape, fragments, *, device, dtype):
@@ -677,9 +707,7 @@ class _Loader:
             reports.append(
                 Report(
                     loaded,
-                    tuple(
-                        sorted(set(reader.names()) & module_mapping.nonresident)
-                    ),
+                    tuple(sorted(module_mapping.skips(reader.names()))),
                     tuple(
                         sorted(
                             module_mapping.required.difference(
@@ -734,13 +762,13 @@ class _Loader:
                     self._used[module_mapping.source].update(
                         _source_names(assignment.source)
                     )
-        # Nonresident declarations name logical weights. Their serialized
+        # Nonresident declarations select logical weights. Their serialized
         # encodings include scale fields just as resident assignments do;
         # account for those fields without reading their payloads.
         for module_mapping in (*self.mappings, *self.excluded):
             reader = self._readers.get(module_mapping.source)
             if reader is not None:
-                for name in set(reader.names()) & module_mapping.nonresident:
+                for name in module_mapping.skips(reader.names()):
                     self._used[module_mapping.source].update(
                         _source_names(reader.get(name))
                     )
@@ -929,7 +957,10 @@ class _Loader:
 
         # One resident Parameter object serves every module that shared the
         # original placeholder, preserving alias identity after the swap.
-        resident = nn.Parameter(value, requires_grad=parameter.requires_grad)
+        resident = nn.Parameter(
+            _stored_like(value, parameter),
+            requires_grad=parameter.requires_grad,
+        )
         for owner, name in self._aliases[key]:
             owner._parameters[name] = resident
         self._loaded.add(key)
@@ -1017,7 +1048,8 @@ class _Loader:
                         )
 
                     resident = nn.Parameter(
-                        value, requires_grad=parameter.requires_grad
+                        _stored_like(value, parameter),
+                        requires_grad=parameter.requires_grad,
                     )
                     for owner, field in self._aliases[key]:
                         owner._parameters[field] = resident

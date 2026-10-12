@@ -12,20 +12,18 @@ same two calls.
 A model package provides ``config_sources``, ``read_config``, ``Model``,
 ``checkpoint_sources``, ``checkpoint_mappings``, ``entry_points``,
 ``image_processor``, ``flow_prompt``, ``precisions`` and
-``checkpoint_precision``. A package whose checkpoints may be component
-exports, which hold some components and pin a base checkpoint for the rest,
-also provides ``base_checkpoint`` (see ``Base``). This module also implements
-the Python side of the checkpoint identity that ranks compare against the
-head, and recognizes calibrated ModelOpt NVFP4 exports.
+``checkpoint_precision``. A package whose checkpoints may omit components
+that a base revision supplies also provides ``base_checkpoint(root)``, which
+returns that revision's ``(repository, revision)`` or ``None``; a directory
+the checkpoint omits is then read from the base revision. This module also
+recognizes calibrated ModelOpt NVFP4 exports.
 """
 
 from __future__ import annotations
 
 import fnmatch
-import hashlib
 import json
 import math
-import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from importlib import import_module
@@ -46,6 +44,8 @@ from uniserve.nn.linear import Linear
 from uniserve.nn.moe import ExpertLinear
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizationConfig, Quantizer
+
+from .tokenizer import read_vocabulary, token_id
 
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)
@@ -71,28 +71,6 @@ _metadata_files = (
     "model_index.json",
     "modular_model_index.json",
 )
-
-
-@dataclass(frozen=True, slots=True)
-class Base:
-    """The pinned checkpoint a component export draws components from.
-
-    A package's ``base_checkpoint(root)`` returns one for a checkpoint
-    directory that holds only some of its components, else ``None``.
-    ``read_config`` then resolves the base, from the Hub cache at
-    ``revision`` or from a local copy the caller names, and reads every
-    source and sidecar under ``directories`` from it; the package's own
-    ``read_config`` receives the base directory as ``base``.
-
-    Attributes:
-        repository: Hub repository id of the base.
-        revision: The commit the export pins.
-        directories: Top-level component directories the base supplies.
-    """
-
-    repository: str
-    revision: str
-    directories: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,10 +117,6 @@ class Config(Generic[ConfigT, ModelT]):
             or ``None``.
         modules: Selected module paths; ``None`` selects the whole model.
         exclude_modules: Subtrees excluded from that selection by identity.
-        checkpoint_identity: Identity of the checkpoint, as defined by
-            ``checkpoint_identity``. Every rank of one instance must load the
-            same checkpoint, and the launching side derives the same value
-            for a local checkpoint directory.
     """  # noqa: D205
 
     model: ConfigT
@@ -158,7 +132,6 @@ class Config(Generic[ConfigT, ModelT]):
     image_processor: ImageProcessor | None
     flow_prompt: FlowPrompt | None
     modules: frozenset[str] | None
-    checkpoint_identity: str
     exclude_modules: frozenset[str] = frozenset()
 
     def __post_init__(self):
@@ -183,137 +156,6 @@ def _json(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"checkpoint metadata {path} must contain an object")
     return value
-
-
-# Sidecars whose contents enter the checkpoint identity. Every other file,
-# which in practice is a weight shard, contributes only its path and size, so
-# the identity stays cheap for a checkpoint of hundreds of gigabytes.
-_IDENTITY_CONTENT_SUFFIXES = frozenset({".json", ".jinja", ".model", ".txt"})
-
-# Top-level directories that hold training state rather than the served
-# checkpoint; the same exclusion read_config applies when collecting sidecars.
-_IDENTITY_EXCLUDED_DIRECTORIES = frozenset({"optimizer", "original"})
-
-
-def _identity_includes(name: str) -> bool:
-    """Apply the identity's file exclusions to one relative POSIX path.
-
-    A path is excluded when any component is hidden (starts with ``.``) or
-    when it lies under an excluded top-level directory.
-    """
-    parts = PurePosixPath(name).parts
-    if any(part.startswith(".") for part in parts):
-        return False
-    return not (len(parts) > 1 and parts[0] in _IDENTITY_EXCLUDED_DIRECTORIES)
-
-
-def _identity_digest(
-    files: Iterable[tuple[str, int]], content: Callable[[str], bytes]
-) -> str:
-    """Digest checkpoint files as the identity rule defines it.
-
-    ``files`` yields relative POSIX paths with their sizes in bytes; ``content``
-    reads the bytes of a sidecar whose contents the identity covers. The
-    digest feeds one SHA-256 with, per file in lexicographic byte order of its
-    path: the path bytes, NUL, the decimal size, NUL, and for a covered
-    sidecar the lowercase hex SHA-256 of its contents followed by NUL.
-    """
-    digest = hashlib.sha256()
-    for name, size in sorted(
-        ((name, size) for name, size in files if _identity_includes(name)),
-        key=lambda entry: os.fsencode(entry[0]),
-    ):
-        digest.update(os.fsencode(name))
-        digest.update(b"\0")
-        digest.update(str(size).encode("ascii"))
-        digest.update(b"\0")
-        if PurePosixPath(name).suffix in _IDENTITY_CONTENT_SUFFIXES:
-            digest.update(
-                hashlib.sha256(content(name)).hexdigest().encode("ascii")
-            )
-            digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _walk_checkpoint(root: Path) -> Iterable[tuple[str, int]]:
-    """Yield every checkpoint file under ``root`` with its size in bytes.
-
-    Hidden entries and the excluded top-level directories are not entered. A
-    symbolic link to a regular file counts as that file, which is how a
-    Hub cache snapshot references its blobs; a link to a directory is not
-    followed, so a checkpoint cannot alias itself into its own identity.
-    """
-    pending = [root]
-    while pending:
-        directory = pending.pop()
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                name = Path(entry.path).relative_to(root).as_posix()
-                if not _identity_includes(name):
-                    continue
-                if entry.is_dir(follow_symlinks=False):
-                    # An excluded top-level directory is pruned here; its
-                    # contents would fail the same predicate one level down.
-                    if (
-                        directory != root
-                        or entry.name not in _IDENTITY_EXCLUDED_DIRECTORIES
-                    ):
-                        pending.append(Path(entry.path))
-                elif entry.is_file():
-                    yield name, entry.stat().st_size
-
-
-def checkpoint_identity(root: Path) -> str:
-    """Identify the checkpoint stored in a local directory.
-
-    The identity is the lowercase hex SHA-256 defined by ``_identity_digest``
-    over every regular file under ``root``. The launching side derives the
-    same value for the directory it names, so a rank that resolves a
-    different checkpoint at the same path is refused by name.
-
-    When the head can read the directory, the engine computes the expected
-    value in Rust (``checkpoint_identity`` in the engine's
-    ``worker::checkpoint`` module), and
-    ``uniserve_worker.bootstrap.model_loader.verify_checkpoint_identity``
-    compares the two, so both implementations must agree byte for byte.
-    Their unit tests share one fixture and golden digest.
-    """
-    root = Path(root)
-    return _identity_digest(
-        _walk_checkpoint(root), lambda name: (root / name).read_bytes()
-    )
-
-
-def _hub_checkpoint_identity(repository: str, revision: str, io) -> str:
-    """Identify a pinned Hub revision without downloading its weights.
-
-    A snapshot directory holds only the shards this rank has fetched, so the
-    identity takes every file's path and size from the revision's tree and
-    reads sidecar contents through the cache. The result equals
-    ``checkpoint_identity`` of a complete local copy of the revision.
-    """
-    from huggingface_hub import HfApi, RepoFolder, hf_hub_download
-
-    # The recursive tree lists folders beside files; only files have sizes.
-    files = [
-        (entry.path, int(entry.size))
-        for entry in HfApi().list_repo_tree(
-            repo_id=repository, revision=revision, recursive=True
-        )
-        if not isinstance(entry, RepoFolder)
-    ]
-
-    def content(name: str) -> bytes:
-        return Path(
-            hf_hub_download(
-                repo_id=repository,
-                filename=name,
-                revision=revision,
-                cache_dir=io.download_dir,
-            )
-        ).read_bytes()
-
-    return _identity_digest(files, content)
 
 
 def _root(path: str | Path, io: loading.Config):
@@ -407,92 +249,6 @@ def _fetch(root, names, repository, revision, io):
         tuple(executor.map(fetch, sorted(names)))
 
 
-def _source_files(source, root, inventory, io):
-    """Choose the declared file encoding before downloading checkpoint payloads."""  # noqa: E501
-    # This applies the selection rule of ``checkpoint.Config.resolve`` to the
-    # inventory before the payloads exist locally: explicit filenames first,
-    # then a sharded index, then every weight file of the format. The two
-    # must stay in agreement, or ``resolve`` looks for a file this function
-    # did not fetch. An index is read from ``root``, so the sidecar fetch
-    # must precede this call.
-    directory = PurePosixPath(source.directory)
-    available = {
-        name for name in inventory if PurePosixPath(name).parent == directory
-    }
-    formats = ("safetensors", "pt") if io.format == "auto" else (io.format,)
-    suffixes = {"safetensors": {".safetensors"}, "pt": {".pt", ".bin"}}
-
-    # An explicit filename list wins over any index or layout convention.
-    if source.filenames:
-        for filename in source.filenames:
-            name = (directory / filename).as_posix()
-            if name in available and any(
-                Path(name).suffix in suffixes[format] for format in formats
-            ):
-                return (name,)
-        raise FileNotFoundError(
-            f"source {source.name!r} requires one of {source.filenames!r}"
-        )
-
-    for format in formats:
-        pattern = (
-            "*.safetensors.index.json"
-            if format == "safetensors"
-            else "*.bin.index.json"
-        )
-        indexes = sorted(
-            name
-            for name in available
-            if fnmatch.fnmatchcase(PurePosixPath(name).name, pattern)
-        )
-        if len(indexes) > 1:
-            raise ValueError(
-                f"source {source.name!r} has multiple {format} indexes"
-            )
-
-        if indexes:
-            # A sharded index declares its payload files relative to the
-            # source directory.
-            mapping = _json(root / indexes[0]).get("weight_map")
-            if not isinstance(mapping, dict) or not mapping:
-                raise ValueError(
-                    "checkpoint index requires a nonempty weight_map"
-                )
-            paths = tuple(PurePosixPath(name) for name in set(mapping.values()))
-            if any(path.is_absolute() or ".." in path.parts for path in paths):
-                raise ValueError(
-                    "checkpoint index paths must stay inside their directory"
-                )
-            names = tuple((directory / path).as_posix() for path in paths)
-            if set(names).difference(inventory):
-                raise FileNotFoundError(
-                    "checkpoint index references a missing or excluded shard"
-                )
-            return names
-
-        # Without an index, every weight file in the directory is a payload;
-        # training state saved alongside the model is not part of it.
-        names = tuple(
-            name
-            for name in available
-            if Path(name).suffix in suffixes[format]
-            and Path(name).name
-            not in {
-                "training_args.bin",
-                "optimizer.pt",
-                "optimizer.bin",
-                "scheduler.pt",
-                "scaler.pt",
-            }
-        )
-        if names:
-            return names
-
-    raise FileNotFoundError(
-        f"source {source.name!r} has no {io.format} checkpoint weights"
-    )
-
-
 def _safetensors_headers(repository, revision, names, io):
     """Read the tensor entries of Hub safetensors files from their headers.
 
@@ -556,7 +312,7 @@ def _config_sources(package, located, io):
             sources[declaration.name] = declaration.resolve(root, io=io)
             continue
 
-        names = _source_files(declaration, root, inventory, io)
+        names = declaration.select(inventory, root=root, io=io)
         if io.mode != "dummy":
             _fetch(root, names, repository, revision, io)
             sources[declaration.name] = declaration.resolve(root, io=io)
@@ -581,43 +337,6 @@ def _config_sources(package, located, io):
     return sources
 
 
-def _tokenizer_vocabulary(path: Path) -> dict[str, object]:
-    """Map token text to ID from a ``tokenizer.json`` model and added tokens.
-
-    The model vocabulary is an object from token text to ID or, for a
-    Unigram model, a list of ``[text, score]`` rows whose position is the ID;
-    ``added_tokens`` is a list of objects carrying ``content`` and ``id``.
-    Added tokens override the model vocabulary. Any other layout raises
-    ``ValueError``; IDs are returned unchecked for ``_tokens`` to validate.
-    """
-    data = _json(path)
-    model = data.get("model", {})
-    vocabulary = model.get("vocab", {}) if isinstance(model, dict) else None
-    added = data.get("added_tokens", [])
-
-    if isinstance(vocabulary, list) and all(
-        isinstance(row, list) and row and isinstance(row[0], str)
-        for row in vocabulary
-    ):
-        vocabulary = {row[0]: index for index, row in enumerate(vocabulary)}
-    if (
-        not isinstance(vocabulary, dict)
-        or not isinstance(added, list)
-        or any(
-            not isinstance(entry, dict)
-            or not isinstance(entry.get("content"), str)
-            or "id" not in entry
-            for entry in added
-        )
-    ):
-        raise ValueError(f"tokenizer metadata {path} has a malformed layout")
-
-    return {
-        **vocabulary,
-        **{entry["content"]: entry["id"] for entry in added},
-    }
-
-
 def _tokens(processor, root):
     """Fill declared start/end feature-injection token IDs from checkpoint tokenizer files."""  # noqa: E501
     # Only tokens declared by text without an ID are resolved; a processor
@@ -636,40 +355,11 @@ def _tokens(processor, root):
     if not required:
         return processor
 
-    # Merge every vocabulary spelling a checkpoint may carry; later files
-    # override earlier ones for the same token text.
-    vocabulary: dict[str, object] = {}
-    if (root / "tokenizer.json").is_file():
-        vocabulary.update(_tokenizer_vocabulary(root / "tokenizer.json"))
-    for filename in ("vocab.json", "added_tokens.json"):
-        if (root / filename).is_file():
-            vocabulary.update(_json(root / filename))
-
-    path = root / "tokenizer_config.json"
-    if path.is_file():
-        # ``added_tokens_decoder`` maps each decimal ID to an object whose
-        # ``content`` is the token text.
-        decoder = _json(path).get("added_tokens_decoder", {})
-        if not isinstance(decoder, dict) or any(
-            not isinstance(entry, dict)
-            or not isinstance(entry.get("content"), str)
-            for entry in decoder.values()
-        ):
-            raise ValueError(
-                f"tokenizer metadata {path} has a malformed layout"
-            )
-        vocabulary.update(
-            {entry["content"]: int(index) for index, entry in decoder.items()}
-        )
-
-    updates = {}
-    for name, token in required.items():
-        index = vocabulary.get(token)
-        if type(index) is not int or index < 0:
-            raise ValueError(
-                f"tokenizer metadata does not define declared token {token!r}"
-            )
-        updates[name + "_id"] = index
+    vocabulary = read_vocabulary(root)
+    updates = {
+        name + "_id": token_id(vocabulary, token)
+        for name, token in required.items()
+    }
     return replace(processor, feature_injection=replace(injection, **updates))
 
 
@@ -968,98 +658,20 @@ def _calibrated_quantization(
     }
 
 
-def _verify_revision(root: Path, base: Base) -> None:
-    """Refuse a local base whose files are not those of the pinned revision.
+def _base_snapshot(repository: str, revision: str, io) -> _Snapshot:
+    """Resolve the Hub snapshot of the base revision a checkpoint pins.
 
-    ``huggingface_hub`` records, for every file it downloads into a local
-    directory, ``.cache/huggingface/download/<path>.metadata``, whose first
-    line is the commit the file was downloaded at. Every file under the
-    directories the base supplies must carry a record of ``base.revision``.
+    The snapshot is read from the Hub cache and fetched into it when absent.
 
     Raises:
-        FileNotFoundError: A supplied directory is missing.
-        ValueError: A file has no download record, so its revision cannot be
-            verified, or its record names another commit.
+        FileNotFoundError: The revision publishes no model metadata.
     """
-    records = root / ".cache" / "huggingface" / "download"
-    unrecorded, mismatched = [], []
-    for directory in sorted(base.directories):
-        folder = root / directory
-        if not folder.is_dir():
-            raise FileNotFoundError(
-                f"base checkpoint {root} has no {directory} directory"
-            )
-        for path in sorted(folder.rglob("*")):
-            name = path.relative_to(root).as_posix()
-            if not path.is_file() or not _identity_includes(name):
-                continue
-            record = records / f"{name}.metadata"
-            if not record.is_file():
-                unrecorded.append(name)
-                continue
-            lines = record.read_text(encoding="utf-8").splitlines()
-            commit = lines[0].strip() if lines else ""
-            if commit != base.revision:
-                mismatched.append(f"{name} at {commit or 'no commit'}")
-    pinned = f"{base.repository}@{base.revision}"
-    if mismatched:
-        raise ValueError(
-            f"base checkpoint {root} is not {pinned}: its download records "
-            f"place {', '.join(mismatched[:4])}"
-            + (
-                f" and {len(mismatched) - 4} more"
-                if len(mismatched) > 4
-                else ""
-            )
-        )
-    if unrecorded:
-        raise ValueError(
-            f"base checkpoint {root} has no Hugging Face download record for "
-            f"{', '.join(unrecorded[:4])}"
-            + (
-                f" and {len(unrecorded) - 4} more"
-                if len(unrecorded) > 4
-                else ""
-            )
-            + f", so it cannot be verified as {pinned}"
-        )
-
-
-def _base_snapshot(base: Base, path: str | Path | None, io) -> _Snapshot:
-    """Resolve a component export's base checkpoint.
-
-    ``path`` names a local copy, verified against the pinned revision by its
-    download records (``_verify_revision``); without one the base is the
-    Hub snapshot of ``base.revision``, read from the Hub cache and fetched
-    into it when absent. Only files under ``base.directories`` are listed.
-
-    Raises:
-        FileNotFoundError: The local copy or a supplied directory is missing.
-        ValueError: The local copy is not the pinned revision.
-    """
-    if path is not None:
-        root = Path(path).expanduser()
-        if not root.is_dir():
-            raise FileNotFoundError(
-                f"base checkpoint {root} is not a directory"
-            )
-        _verify_revision(root, base)
-        repository = revision = None
-    else:
-        root, repository, revision = _root(
-            base.repository, replace(io, revision=base.revision)
-        )
-        if revision != base.revision:
-            raise ValueError(
-                f"the Hub resolved {base.repository}@{base.revision} to "
-                f"commit {revision}"
-            )
-    inventory = frozenset(
-        name
-        for name in _inventory(root, repository, revision, io)
-        if PurePosixPath(name).parts[0] in base.directories
+    root, repository, revision = _root(
+        repository, replace(io, revision=revision)
     )
-    return _Snapshot(root, repository, revision, inventory)
+    return _Snapshot(
+        root, repository, revision, _inventory(root, repository, revision, io)
+    )
 
 
 def _root_metadata(root: Path) -> dict:
@@ -1101,7 +713,6 @@ def read_config(
     io: loading.Config = loading.Config(),
     modules: frozenset[str] | None = None,
     exclude_modules: frozenset[str] = frozenset(),
-    base: str | Path | None = None,
 ) -> Config:
     """Normalize one local or immutable Hub snapshot without materializing a
     model.
@@ -1121,21 +732,15 @@ def read_config(
             whole model, and an empty set resolves no payload source.
         exclude_modules: Subtrees to leave unmaterialized, including their
             aliases. Their architecture metadata remains available.
-        base: A local copy of the base checkpoint a component export pins
-            (``Base``), verified against the pinned revision; without it the
-            base comes from the Hub cache at that revision. The checkpoint
-            identity remains the export's own.
 
     Raises:
-        FileNotFoundError: The checkpoint, its metadata, its base, or a
-            declared source's files cannot be found.
+        FileNotFoundError: The checkpoint, its metadata, its base revision,
+            or a declared source's files cannot be found.
         ValueError: The checkpoint metadata or selection is invalid or
             unsupported, including an architecture outside the catalog, a
             selected path that is not a module, and malformed architecture,
             model configuration, index, tokenizer or quantization metadata
-            (a required field that is missing or a field of the wrong type);
-            a ``base`` for a checkpoint that pins none; or a base that is not
-            the pinned revision.
+            (a required field that is missing or a field of the wrong type).
     """  # noqa: D205
     root, repository, revision = _root(path, io)
     metadata = _root_metadata(root)
@@ -1158,22 +763,16 @@ def read_config(
         and not name.startswith(("optimizer/", "original/"))
     }
     _fetch(root, sidecars, repository, revision, io)
-    identity = (
-        checkpoint_identity(root)
-        if repository is None
-        else _hub_checkpoint_identity(repository, revision, io)
-    )
 
-    # A component export reads the directories its base supplies from the
-    # base checkpoint, whose sidecars are fetched like the export's own.
+    # A checkpoint that pins a base revision reads the directories it omits
+    # from it, whose sidecars are fetched like the checkpoint's own.
     export = _Snapshot(root, repository, revision, inventory)
     declares_base = hasattr(package, "base_checkpoint")
     pinned = package.base_checkpoint(root) if declares_base else None
-    if pinned is None and base is not None:
-        raise ValueError(
-            f"checkpoint {root} pins no base checkpoint, so it takes no base"
-        )
-    supplier = None if pinned is None else _base_snapshot(pinned, base, io)
+    supplier = None
+    if pinned is not None:
+        base_repository, base_revision = pinned
+        supplier = _base_snapshot(base_repository, base_revision, io)
     if supplier is not None:
         _fetch(
             supplier.root,
@@ -1187,10 +786,11 @@ def read_config(
             io,
         )
 
+    held = {PurePosixPath(name).parts[0] for name in inventory}
+
     def located(directory: str) -> _Snapshot:
         parts = PurePosixPath(directory).parts
-        if pinned is not None and parts and parts[0] in pinned.directories:
-            assert supplier is not None
+        if supplier is not None and parts and parts[0] not in held:
             return supplier
         return export
 
@@ -1245,8 +845,8 @@ def read_config(
         if snapshot.repository is not None and io.mode != "dummy":
             _fetch(
                 snapshot.root,
-                _source_files(
-                    declaration, snapshot.root, snapshot.inventory, io
+                declaration.select(
+                    snapshot.inventory, root=snapshot.root, io=io
                 ),
                 snapshot.repository,
                 snapshot.revision,
@@ -1281,13 +881,11 @@ def read_config(
         else None
     )
 
-    # The package's "default" preset, else its "bf16" preset, else the
-    # ``weights.Config`` defaults; the quantization metadata below refines
-    # this base or, for a ModelOpt export, replaces it.
+    # The first preset a package lists is its dense checkpoint's own numerical
+    # representation; the quantization metadata below refines this base or,
+    # for a ModelOpt export, replaces it.
     precisions = package.precisions(model_config)
-    precision = precisions.get(
-        "default", precisions.get("bf16", weight_options.Config())
-    )
+    precision = next(iter(precisions.values()))
     checkpoint_format = None
     quantization = metadata.get("quantization_config")
     if quantization is not None and not isinstance(quantization, dict):
@@ -1397,7 +995,6 @@ def read_config(
         processor,
         package.flow_prompt,
         modules,
-        identity,
         exclude_modules,
     )
 

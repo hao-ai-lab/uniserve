@@ -11,7 +11,7 @@ class Config:
 
     Attributes:
         patch_size: Pixel side of one square patch, shared by the vision
-            encoder, latent codec, denoiser and image decoder. The worker
+            encoder, VAE, denoiser and image decoder. The worker
             builds ``Model`` with the default, which ``image_processor``'s
             fixed 16-pixel transforms assume.
     """

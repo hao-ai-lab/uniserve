@@ -87,14 +87,21 @@ def _bagel_config() -> dict[str, object]:
             "downsample": 2,
             "z_channels": 2,
         },
-        "start_of_image_id": 35,
-        "end_of_image_id": 36,
     }
 
 
-def _write_bagel_checkpoint(root: Path, metadata: dict[str, object]) -> None:
-    """Write BAGEL metadata and the primary shard's 3x3 position table."""
+def _write_bagel_checkpoint(
+    root: Path, metadata: dict[str, object], *, has_markers: bool = True
+) -> None:
+    """Write BAGEL metadata, its image markers and a 3x3 position table."""
     (root / "config.json").write_text(json.dumps(metadata))
+    added = [{"id": 34, "content": "<|im_end|>"}]
+    if has_markers:
+        added += [
+            {"id": 35, "content": "<|vision_start|>"},
+            {"id": 36, "content": "<|vision_end|>"},
+        ]
+    (root / "tokenizer.json").write_text(json.dumps({"added_tokens": added}))
     save_file(
         {"latent_pos_embed.pos_embed": torch.zeros(9, 32)},
         root / "ema.safetensors",
@@ -285,11 +292,11 @@ def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms
     )
     if mode == "eager":
         assert (downloaded, headers) == (
-            {"config.json", "ema.safetensors"},
+            {"config.json", "tokenizer.json", "ema.safetensors"},
             set(),
         )
     else:
-        assert downloaded == {"config.json"}
+        assert downloaded == {"config.json", "tokenizer.json"}
         assert headers == (set() if cached else {"ema.safetensors"})
     assert config.model.max_latent_size == 3
     assert config.image_processor.vit.resize.stride == 2
@@ -320,6 +327,10 @@ def _malformed_bagel_vision_epsilon(root: Path) -> None:
     _write_bagel_checkpoint(root, metadata)
 
 
+def _bagel_without_image_markers(root: Path) -> None:
+    _write_bagel_checkpoint(root, _bagel_config(), has_markers=False)
+
+
 def _bagel_without_vocabulary(root: Path) -> None:
     metadata = _bagel_config()
     del metadata["llm_config"]["vocab_size"]
@@ -344,6 +355,7 @@ def _sense_with_malformed_tokenizer(root: Path) -> None:
         _malformed_bagel_shift,
         _malformed_bagel_vision_epsilon,
         _bagel_without_vocabulary,
+        _bagel_without_image_markers,
         _sense_without_text_tower,
         _sense_with_malformed_tokenizer,
     ),

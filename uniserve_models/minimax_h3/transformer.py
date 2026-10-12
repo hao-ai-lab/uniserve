@@ -6,8 +6,9 @@ calls ``Transformer.forward`` once per solver step. Each
 ``TransformerLayer.forward_chunks`` yields ``(global row slice, rows)``
 chunks, so a layer's completed rows feed the next layer's attention
 projection before the whole shard is finished. Timestep conditioning comes
-from ``Modulation`` products that ``weights._prepare_modulation`` precomputes
-at load time for the fixed schedule; no timestep embedding runs per request.
+from ``AdaLNCache`` products that ``weights._prepare_adaln_cache``
+precomputes at load time for the fixed schedule; no timestep embedding runs
+per request.
 A parallel-decoding student's output projections are likewise fused per
 evaluation at load time (``StepProjection``).
 """
@@ -24,19 +25,19 @@ from torch.nn import functional as F
 
 from uniserve.distributed import DeviceMesh
 from uniserve.nn import (
+    AdaLNCache,
     ColumnParallelLinear,
     GatedMLP,
     Linear,
-    Modulation,
     RMSNorm,
     functional,
 )
 from uniserve.quantization import Quantizer
 
 from . import config as configs
-from .attention import Dense, RegionSparse, Sparse
+from .attention import Dense, Sparse
 from .config import TransformerConfig
-from .inputs import AttentionInput, RegionInput, SequenceInput
+from .inputs import SegmentInput, SequenceInput
 from .modulation import OutputNorm
 
 
@@ -46,11 +47,10 @@ class TransformerLayer(nn.Module):
     def __init__(
         self,
         config: TransformerConfig,
-        attention: Dense | Sparse | RegionSparse,
+        attention: Dense | Sparse,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.rounding = config.rounding
         self.norm = nn.ModuleList(
             (
                 RMSNorm(config.hidden_size, config.norm_eps),
@@ -58,10 +58,12 @@ class TransformerLayer(nn.Module):
             )
         )
         self.attention = attention
+        # The released network rounds the activated gate to BF16 before the
+        # product, as eager PyTorch does.
         self.mlp = GatedMLP(
             config.hidden_size,
             config.intermediate_size,
-            rounding=config.rounding,
+            rounding=functional.Rounding.STEPWISE,
         )
 
     @torch.inference_mode()
@@ -69,9 +71,9 @@ class TransformerLayer(nn.Module):
         self,
         hidden,
         modulation,
-        inputs: AttentionInput | SequenceInput | RegionInput,
+        inputs: SequenceInput | SegmentInput,
         *,
-        workspace,
+        tables: Mapping[str, torch.Tensor],
     ):
         """Connect token-local residual updates to the following layer's projection.
 
@@ -82,10 +84,9 @@ class TransformerLayer(nn.Module):
                 ``Transformer.forward`` passes the first layer one chunk
                 covering the shard.
             modulation: This layer's products at the current step,
-                ``[groups, 18 * hidden_size]``; see ``Transformer.modulation``.
+                ``[groups, 18 * hidden_size]``; see ``Transformer.adaln_cache``.
             inputs: The attention input of this rank's token shard.
-            workspace: ``modulation_indices``, rotary ``cos``/``sin`` and
-                this layer's attention scratch set.
+            tables: ``modulation_indices`` and the rotary ``cos``/``sin``.
 
         Yields:
             ``(global row slice, rows)`` output chunks covering the shard, or
@@ -112,7 +113,7 @@ class TransformerLayer(nn.Module):
                 )
             )
             source = chain((first,), chunks)
-        indices = workspace["modulation_indices"]
+        indices = tables["modulation_indices"]
 
         # Module containers hold one class each: the pre-attention and pre-MLP
         # RMSNorms, and the column-parallel gate/up branches.
@@ -151,30 +152,17 @@ class TransformerLayer(nn.Module):
                         indices[local],
                         eps=attention_norm.eps,
                         retain=hidden[local],
-                        rounding=self.rounding,
                     ),
                 )
 
         # Each attention kind reads the input of its own packing; the
         # transformer builds every layer's attention from the attention
         # configuration the denoiser packs its inputs by.
-        attention, cos, sin = self.attention, workspace["cos"], workspace["sin"]
+        attention, cos, sin = self.attention, tables["cos"], tables["sin"]
         if isinstance(attention, Dense) and isinstance(inputs, SequenceInput):
-            attended = attention.forward_chunks(
-                normalize(), cos, sin, inputs, workspace=workspace
-            )
-        elif isinstance(attention, Sparse) and isinstance(
-            inputs, AttentionInput
-        ):
-            attended = attention.forward_chunks(
-                normalize(), cos, sin, inputs, workspace=workspace
-            )
-        elif isinstance(attention, RegionSparse) and isinstance(
-            inputs, RegionInput
-        ):
-            attended = attention.forward_chunks(
-                normalize(), cos, sin, inputs, workspace=workspace
-            )
+            attended = attention.forward_chunks(normalize(), cos, sin, inputs)
+        elif isinstance(attention, Sparse) and isinstance(inputs, SegmentInput):
+            attended = attention.forward_chunks(normalize(), cos, sin, inputs)
         else:
             raise TypeError(
                 f"H3 {type(attention).__name__} attention does not read "
@@ -207,7 +195,6 @@ class TransformerLayer(nn.Module):
                         scale_mlp,
                         selected,
                         eps=mlp_norm.eps,
-                        rounding=self.rounding,
                     )
                 )
                 normalized: torch.Tensor = quantizer.from_tensors(
@@ -225,14 +212,12 @@ class TransformerLayer(nn.Module):
                     scale_mlp,
                     selected,
                     eps=mlp_norm.eps,
-                    rounding=self.rounding,
                 )
             return functional.gated_residual(
                 residual,
                 self.mlp(normalized),
                 gate_mlp,
                 selected,
-                rounding=self.rounding,
             )
 
         # Dynamic tensor-wide statistics (uncalibrated NVFP4, tensor-wide FP8)
@@ -258,14 +243,14 @@ class TransformerLayer(nn.Module):
         self,
         hidden,
         modulation,
-        inputs: AttentionInput | SequenceInput | RegionInput,
+        inputs: SequenceInput | SegmentInput,
         *,
-        workspace,
+        tables: Mapping[str, torch.Tensor],
     ):
         outputs = tuple(
             value
             for _, value in self.forward_chunks(
-                hidden, modulation, inputs, workspace=workspace
+                hidden, modulation, inputs, tables=tables
             )
         )
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
@@ -317,7 +302,7 @@ class Transformer(nn.Module):
     Construction builds every layer and both head pairs on each rank;
     ``weights._resident_layers`` then keeps only this pipeline stage's share.
     ``layers`` keys remain the global checkpoint layer numbers, while
-    ``modulation`` is indexed by resident position.
+    ``adaln_cache`` is indexed by resident position.
     """
 
     def __init__(
@@ -336,7 +321,7 @@ class Transformer(nn.Module):
             attention: Dense or sparse attention for every layer.
             entries: Distinct timestep values the schedule evaluates.
             steps: Network evaluations of the schedule.
-            groups: Timestep groups a step reads (see ``Modulation``).
+            groups: Timestep groups a step reads (see ``AdaLNCache``).
         """
         super().__init__()
         if any(
@@ -356,14 +341,12 @@ class Transformer(nn.Module):
             config.audio_channels, config.hidden_size, dtype=torch.float32
         )
 
-        def kind() -> Dense | Sparse | RegionSparse:
+        def kind() -> Dense | Sparse:
             if isinstance(attention, configs.DenseAttention):
                 return Dense(config)
-            if attention.reference_keep is None:
-                return Sparse(config, sparsity=attention.sparsity)
             # The sparsity and reference keep rate are request tables of the
-            # region packing (``packing.region_tables``).
-            return RegionSparse(config, tile=attention.tile)
+            # segment packing (``packing.segment_tables``).
+            return Sparse(config)
 
         self.layers = nn.ModuleDict(
             {
@@ -375,9 +358,9 @@ class Transformer(nn.Module):
         # [layer, entry, 3 token tags x 6 vectors x hidden] per transformer
         # layer and [entry, shift + scale] for the final output norm, with
         # the [step, group] entries each step reads. The empty tensors are
-        # placeholders that the post-load hook weights._prepare_modulation
+        # placeholders that the post-load hook weights._prepare_adaln_cache
         # replaces.
-        self.modulation = Modulation(
+        self.adaln_cache = AdaLNCache(
             torch.empty(
                 config.num_hidden_layers,
                 entries,
@@ -411,11 +394,10 @@ class Transformer(nn.Module):
     def forward(
         self,
         hidden: torch.Tensor,
-        inputs: AttentionInput | SequenceInput | RegionInput,
+        inputs: SequenceInput | SegmentInput,
         *,
         step: torch.Tensor,
         tables: Mapping[str, torch.Tensor],
-        workspace: Mapping[str, torch.Tensor],
     ) -> tuple[torch.Tensor, ...]:
         """Evaluate the layers over one token shard.
 
@@ -435,35 +417,15 @@ class Transformer(nn.Module):
         if pipeline.rank:
             pipeline.recv(src=pipeline.rank - 1, out=hidden)
 
-        buffers = {
-            **workspace,
-            "modulation_indices": tables["modulation_indices"],
-            "cos": tables["cos"],
-            "sin": tables["sin"],
-        }
         chunks = ((inputs.token_slice, hidden),)
         # [resident layer, group, 18 * hidden] products of this step.
-        modulation = self.modulation(step)
+        modulation = self.adaln_cache(step)
         for index, layer in enumerate(self.layers.values()):
             layer = cast(TransformerLayer, layer)
-            # Adjacent layers alternate between the two attention scratch sets
-            # that Denoiser.workspace_buffers declares, so a completed chunk
-            # can feed the next projection in place. The loop only composes
-            # generators; the layers run when ``chunks`` is consumed below.
-            prefix = f"attention.{index % 2}."
-            layer_buffers = {
-                **buffers,
-                **{
-                    name.removeprefix(prefix): value
-                    for name, value in workspace.items()
-                    if name.startswith(prefix)
-                },
-            }
+            # The loop only composes generators; the layers run when
+            # ``chunks`` is consumed below.
             chunks = layer.forward_chunks(
-                chunks,
-                modulation[index],
-                inputs,
-                workspace=layer_buffers,
+                chunks, modulation[index], inputs, tables=tables
             )
 
         outputs = tuple(value for _, value in chunks)
@@ -475,7 +437,7 @@ class Transformer(nn.Module):
         # The final pipeline stage projects each modality with its own head;
         # the output norm reads the generated video and audio timesteps,
         # groups 0 and 1.
-        modulation = self.modulation.output(step)
+        modulation = self.adaln_cache.output(step)
         results = []
         for index, (indices, projection) in enumerate(
             (

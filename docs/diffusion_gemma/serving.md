@@ -78,7 +78,7 @@ Readout settings are fixed for the deployment:
 
 For applications whose readout contract specifies 64-token canvases and primary candidates, append `--readout-canvas 64 --readout-candidates primary` to the serving command. Short canvases use graphs sized for their numerical length on independent replicas. These options change the model's input or answer projection, so qualify their accuracy and calibration on the application's data before choosing them. They do not change the canvas length used for chat generation.
 
-Attach images with `x_images`, an ordered list of 1–8 data URLs or HTTP(S) URLs. The prompt identifies them as Image 1, Image 2, and so on. Remote images follow the server's image-fetch limits and public-address policy, documented in the [main README](../../README.md#public-http-api).
+Attach images with `x_images`, an ordered list of one or more data URLs or HTTP(S) URLs, as many as the context holds. The prompt identifies them as Image 1, Image 2, and so on. Remote images follow the server's image-fetch limits and public-address policy, documented in the [main README](../../README.md#serving-options).
 
 Malformed System One requests return 422 with a `detail` list; an unknown served-model name returns 404; admission above a configured concurrency limit returns 503. Questions reject unknown fields. State and rubric fields accept strings and structured JSON values as described by the System One schema.
 
@@ -145,6 +145,6 @@ Each JSONL row supplies a unique `id`, `state`, `questions`, and optional `image
 .venv/bin/uniserve-eval --config profiles.toml run decision-workload
 ```
 
-For a closed-loop decision workload, place a nonempty `session_id` on every System One JSONL row, set `request_rate = inf`, `warmup_requests = 0`, and `max_concurrency` to the number of sessions. Each session sends its next request only after the previous response. Use distinct evolving states while retaining the prefix reuse the real application permits. Fixed-count traces include each session's initial cold request and final completion.
+For a closed-loop decision workload, place a nonempty `session_id` on every System One JSONL row and set `request_rate = inf`. Sessions run concurrently, and each sends its next request only after its previous response, so the number of sessions is the trace's concurrency. Use distinct evolving states while retaining the prefix reuse the real application permits. A session trace has no repeated-row warmup: fixed-count traces include each session's initial cold request and final completion.
 
 Record checkpoint revision, precision, topology, canvas length, candidate spellings, question layout, prefix-cache behavior, inputs, concurrency, and metric definitions. Run measurement points serially. A performance comparison with MCJev fast also needs to disclose its query-relative sliding canvas attention: UniServe follows HF DynamicCache semantics, with every canvas query attending to the same retained prefix and the complete canvas. Matching token IDs alone does not establish that these attention masks are equivalent. Compare task quality separately from latency and throughput.

@@ -6,9 +6,8 @@
 //! `ClientEndpoint` when the worker's own protocol handling is under test.
 //! The interpreter comes from `UNISERVE_WORKER_PYTHON` or the repository's
 //! `.venv/bin/python`. Several tests replace that interpreter with a small
-//! wrapper script that records a rank's process id, exits a chosen rank,
-//! reports a registration with an unsupported channel transport, or runs a
-//! fixture from `tests/python/fixtures` instead of the worker module.
+//! wrapper script that records a rank's process id, exits a chosen rank, or
+//! runs a fixture from `tests/python/fixtures` instead of the worker module.
 //!
 //! Faults and delays are injected at the OS boundary:
 //! `/proc/thread-self/children` and `/proc/<pid>/cmdline` locate a rank
@@ -30,17 +29,18 @@ use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode}
 
 use anyhow::Context as _;
 use uniserve_core::{
-    DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, Request, RequestId, RuntimeFamily,
+    DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, Request, RequestId,
     SamplingParams, UnitId,
 };
 use uniserve_engine::{
-    CallReaders, EngineConfig, EngineCore, Executor, WorkerConfig, WorkerFailure, WorkerGroup,
-    WorkerProcessArgs,
+    CallReaders, EngineConfig, EngineCore, Executor, RankBuffer, WorkerConfig, WorkerFailure,
+    WorkerGroup, WorkerProcessArgs,
 };
 use uniserve_worker_ipc::{
-    ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CacheUnitAllocation, Call, CallId,
-    CallKind, CallStatus, DType, DimBound, ErrorCode, ForwardBatch, Locator, NewRequest,
-    RequestKey, ShapeBound, TensorPublication, TensorRef, TransferHandle, TransferTransport,
+    Batch, BatchCommand, BlockTable, Bounds, BufferAllocation, CacheUnitAllocation, Call, CallId,
+    CallKind, CallStatus, DType, DimBound, ErrorCode, ForwardBatch, GenerationParams, Locator,
+    NewRequest, RequestKey, ShapeBound, TensorPublication, TensorRef, TransferHandle,
+    TransferTransport,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -53,7 +53,7 @@ static CHILD_LAUNCH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<()> {
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args();
     // The language backbone and the patch encoder hold a rank each, which is
     // the arrangement a model with several components is served in.
     args.components = [
@@ -167,16 +167,15 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
         request_key: second_key,
         call_id: CallId::new(3, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Media(MediaCall::VisionEncoding),
+        kind: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
-            max_latent_bytes: 8192,
             ..Bounds::default()
         },
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut encode = Batch::new(3, Vec::new(), vec![encode]);
     encode.collective_seq = 3;
@@ -193,7 +192,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
     assert_eq!(encode_report.results[0].output.status, CallStatus::Ok);
 
     // Closing a request releases every participating rank's physical storage.
-    worker.submit_batch(
+    worker.submit_placed(
         Batch::new(4, vec![], vec![]).with_commands(
             [first_key, second_key]
                 .into_iter()
@@ -203,7 +202,6 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
                 })
                 .collect(),
         ),
-        &CallReaders::new(),
     )?;
     let report = worker
         .poll_batch(Duration::from_secs(5))?
@@ -252,46 +250,6 @@ fn accept_reported_endpoint(listener: &std::net::TcpListener) -> anyhow::Result<
 }
 
 #[test]
-fn launch_refuses_a_rank_that_offers_an_unsupported_channel() -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    // A rank names its own endpoint, so the mechanism it offers is data the
-    // head has to check rather than a value it chose.
-    let directory = tempfile::tempdir()?;
-    let wrapper = directory.path().join("worker");
-    std::fs::write(
-        &wrapper,
-        r#"#!/usr/bin/env python3
-import json, socket, sys
-
-descriptor = json.load(open(sys.argv[sys.argv.index("--launch-descriptor") + 1]))
-host, _, port = descriptor["registration_address"].rpartition(":")
-report = {
-    "worker_id": descriptor["worker_id"],
-    "rank": descriptor["rank"],
-    "transport": "socket",
-    "endpoint": "unreachable",
-}
-with socket.create_connection((host, int(port)), timeout=60) as connection:
-    connection.sendall(json.dumps(report).encode() + b"\n")
-"#,
-    )?;
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-
-    let mut args = rank_group_args(1 << 20, 8 << 20);
-    args.python = wrapper;
-    let reported = match WorkerGroup::spawn(args) {
-        Ok(_) => anyhow::bail!("an unsupported channel transport was accepted"),
-        Err(error) => format!("{error:#}"),
-    };
-    assert!(
-        reported.contains("unsupported channel transport socket"),
-        "launch failure did not name the offered transport: {reported}"
-    );
-    Ok(())
-}
-
-#[test]
 fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
     use uniserve_worker_ipc::{ClientEndpoint, WorkerRequest, WorkerResponse};
 
@@ -311,8 +269,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
             .arg(&descriptor_path)
             .spawn()?;
         let result = (|| -> anyhow::Result<()> {
-            let client =
-                ClientEndpoint::connect(&accept_reported_endpoint(&listener)?, 1 << 20, 8)?;
+            let client = ClientEndpoint::connect(&accept_reported_endpoint(&listener)?, 8)?;
             let admission = text_admission(51, 1, 1)?;
             let batch = token_batch(
                 1,
@@ -326,7 +283,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 0,
             );
             let request = |mut request: WorkerRequest, message_id| {
-                request.set_call_id(Some(message_id));
+                request.set_message_id(Some(message_id));
                 request
             };
             let initial = client.send_request(&request(WorkerRequest::submit(batch.clone()), 1))?;
@@ -407,7 +364,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                     anyhow::bail!("duplicate submission was accepted");
                 };
                 anyhow::ensure!(
-                    error.code.as_deref() == Some("InvalidDescriptor"),
+                    error.code == ErrorCode::InvalidDescriptor,
                     "duplicate must be a protocol error"
                 );
             }
@@ -454,9 +411,9 @@ fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Resu
         .arg(&descriptor_path)
         .spawn()?;
     let result = (|| -> anyhow::Result<()> {
-        let client = ClientEndpoint::connect(&accept_reported_endpoint(&listener)?, 1 << 20, 8)?;
+        let client = ClientEndpoint::connect(&accept_reported_endpoint(&listener)?, 8)?;
         let request = |mut request: WorkerRequest, message_id| {
-            request.set_call_id(Some(message_id));
+            request.set_message_id(Some(message_id));
             request
         };
         let serve = |batch_id: u64, request_id: u64, slot: u32, message_id| -> anyhow::Result<()> {
@@ -537,10 +494,10 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
     // rank 0 (the patch encoder), and once with only the edges
     // `TransferConfig::with_worker_defaults` derives for this worker.
     for transfer in [
-        uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?,
+        uniserve_engine::TransferConfig::parse("worker:1->worker:0=posix_shm")?,
         uniserve_engine::TransferConfig::default(),
     ] {
-        let mut args = rank_group_args(1 << 20, 8 << 20);
+        let mut args = rank_group_args();
         args.components = [
             (
                 "model".into(),
@@ -559,7 +516,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             ranks: args.ranks.clone(),
             components: args.components.clone(),
             queue_depth: args.queue_depth,
-            storage_fraction: None,
+            mem_fraction_static: None,
         }])?;
         args.transfer = transfer.clone();
         let mut executor = WorkerExecutor::try_new(
@@ -584,7 +541,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
                         forward: batch.forward,
                         latent: batch.latent_params.into_iter().next(),
                         decode: batch.decode_ranges.into_iter().next(),
-                        buffers: batch.buffer_allocations,
+                        buffers: on_every_rank(batch.buffer_allocations),
                         readers: Default::default(),
                     },
                 )],
@@ -640,7 +597,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             request_key: admission.request_key,
             call_id: CallId::new(2, 0),
             component: "model".into(),
-            code: CallKind::Transfer(TransferMode::Tensor),
+            kind: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
                 max_transfer_bytes: value.max_bytes(),
                 ..Bounds::default()
@@ -648,7 +605,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
 
         let copy = TensorRef {
@@ -680,7 +637,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             request_key: admission.request_key,
             call_id: CallId::new(3, 0),
             component: "vision_encoder".into(),
-            code: CallKind::Transfer(TransferMode::Tensor),
+            kind: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
                 max_transfer_bytes: publication.max_bytes(),
                 ..Bounds::default()
@@ -688,7 +645,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         // Reads partial results until the submitted batch is done, requiring
         // every call to succeed and never to complete twice.
@@ -744,7 +701,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     // any result is read, so each successor starts from its predecessor's
     // device product rather than from a host observation.
     let transfer = uniserve_engine::TransferConfig::default();
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args();
     args.queue_depth = 4;
     let mut executor = WorkerExecutor::try_new(
         vec![(WorkerId("worker".into()), WorkerGroup::spawn(args)?)],
@@ -814,7 +771,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         logical_position: 3,
         kv_visible_len: 3,
         kv_computed_len: 5,
-        flow_step: 0,
     };
     for mut batch in [first, successor, verifier, resumed] {
         let batch_id = batch.batch_id;
@@ -828,7 +784,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
             forward: batch.forward,
             latent: None,
             decode: None,
-            buffers: batch.buffer_allocations,
+            buffers: on_every_rank(batch.buffer_allocations),
             readers: Default::default(),
         };
         executor.submit(ExecutionBatch::new(
@@ -866,7 +822,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     assert_eq!(outputs[&verify_id].kv_computed_len, 5);
     assert_eq!(outputs[&resumed_id].committed_tokens, vec![1002]);
     assert_eq!(outputs[&resumed_id].kv_visible_len, 4);
-    assert_eq!(outputs[&resumed_id].position, 4);
     executor.close()?;
     Ok(())
 }
@@ -877,8 +832,8 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
     use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
     use uniserve_worker_ipc::{BufferAllocation, DiffusionSamplingParams};
 
-    let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?;
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=posix_shm")?;
+    let mut args = rank_group_args();
     args.queue_depth = 3;
     args.transfer = transfer.clone();
     args.components = [
@@ -931,7 +886,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                     forward: batch.forward,
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
-                    buffers: batch.buffer_allocations,
+                    buffers: on_every_rank(batch.buffer_allocations),
                     readers: Default::default(),
                 },
             )],
@@ -947,7 +902,6 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         DiffusionSamplingParams {
             num_frames: 22,
             video_units: 1,
-            num_inference_steps: 4,
             seed: 1000,
             width: 1344,
             height: 768,
@@ -995,12 +949,12 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         request_key: key,
         call_id: CallId::new(1, 0),
         component: "model".into(),
-        code: CallKind::Media(MediaCall::VisionEncoding),
+        kind: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds::default(),
         inputs: vec![],
         outputs: vec![value.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut source = Batch::new(1, vec![admission], vec![produce]);
     source.buffer_allocations.push(BufferAllocation {
@@ -1038,7 +992,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         request_key: key,
         call_id: CallId::new(2, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: value.max_bytes(),
             ..Bounds::default()
@@ -1046,7 +1000,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         inputs: vec![value.clone()],
         outputs: vec![copied.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut consumer = Batch::new(2, vec![], vec![consume]);
     consumer.buffer_allocations.push(BufferAllocation {
@@ -1126,7 +1080,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                             assert!(!independent_returned);
                             independent_returned = true;
                         }
-                        computation => panic!("unexpected completed computation {computation:?}"),
+                        call => panic!("unexpected completed call {call:?}"),
                     }
                 }
             }
@@ -1146,9 +1100,9 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
     // Two one-rank instances whose products cross only over shared storage.
     // A product whose one location is in its producer's own address space
     // therefore has no way to the other instance.
-    let edges = "producer->consumer=shm,consumer->producer=shm";
+    let edges = "producer->consumer=posix_shm,consumer->producer=posix_shm";
     let spawn = |worker_id: &str| -> anyhow::Result<WorkerGroup> {
-        let mut args = rank_group_args(1 << 20, 8 << 20);
+        let mut args = rank_group_args();
         let binding = WorkerConfig::placed(
             &["localhost".to_owned()],
             "cpu",
@@ -1190,7 +1144,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
                     forward: batch.forward,
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
-                    buffers: batch.buffer_allocations,
+                    buffers: on_every_rank(batch.buffer_allocations),
                     readers: Default::default(),
                 },
             )],
@@ -1264,7 +1218,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
         request_key: key,
         call_id: CallId::new(2, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: value.max_bytes(),
             ..Bounds::default()
@@ -1272,7 +1226,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
         inputs: vec![value.clone()],
         outputs: vec![copied.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut refused = Batch::new(2, vec![admission], vec![consume]);
     refused.buffer_allocations.push(BufferAllocation {
@@ -1370,7 +1324,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
             ),
         )?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-        let mut args = rank_group_args(1 << 20, 8 << 20);
+        let mut args = rank_group_args();
         args.python = wrapper;
         let mut worker = WorkerGroup::spawn(args)?;
         let admission = text_admission(81, 1, 1)?;
@@ -1385,7 +1339,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
             UnitId(1),
             0,
         );
-        worker.submit_batch(batch, &CallReaders::new())?;
+        worker.submit_placed(batch)?;
 
         // A correlation or rank-ownership failure may fail the poll and must
         // deliver no result. A short extent still delivers the call's result,
@@ -1459,7 +1413,7 @@ fn multiprocess_topology_handles_rank_failure_and_capacity_limits() -> anyhow::R
 }
 
 #[test]
-fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result<()> {
+fn replacement_rejects_changed_capacity() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     // The `replacement_worker` fixture ranks report their normal worker info
@@ -1468,61 +1422,52 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
     // relaunch every rank, and `validate_replacement_info`, called from the
     // group's recovery, refuses a replacement whose info differs in anything
     // but its endpoint; a failed replacement closes the group.
-    for change in [
-        serde_json::json!({"model_dtype": "float64"}),
-        serde_json::json!({"attention_backend": "flashinfer"}),
-        serde_json::json!({"weight_formats": ["fp8"]}),
-        serde_json::json!({"activation_formats": ["nvfp4"]}),
-        serde_json::json!({"max_batch_tokens": 128}),
-    ] {
-        let directory = tempfile::tempdir()?;
-        let wrapper = directory.path().join("python");
-        let python = serde_json::to_string(&worker_python())?;
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let fixture =
-            serde_json::to_string(&root.join("tests/python/fixtures/replacement_worker.py"))?;
-        // The fixture is run by path, so its own directory leads the import
-        // path; the repository root named here resolves the worker packages
-        // from this checkout.
-        let import_root = serde_json::to_string(&root.canonicalize()?)?;
-        let state = serde_json::to_string(&directory.path())?;
-        // `WorkerGroup` runs `<python> -m uniserve_worker.main <args>`, so the
-        // wrapper drops its first two arguments and runs the fixture with the
-        // rest. The fixture serves a `Worker` whose `info` reads
-        // `replacement.json` from `directory`, where each rank also writes
-        // its pid.
-        std::fs::write(
-            &wrapper,
-            format!(
-                "#!/usr/bin/env python3\nimport os, sys\nenv = dict(os.environ, PYTHONPATH={import_root}, UNISERVE_TEST_REPLACEMENT_DIR={state})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
-            ),
-        )?;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-        let mut args = rank_group_args(1 << 20, 8 << 20);
-        args.python = wrapper;
-        let mut worker = WorkerGroup::spawn(args)?;
+    let change = serde_json::json!({"max_batch_tokens": 128});
+    let directory = tempfile::tempdir()?;
+    let wrapper = directory.path().join("python");
+    let python = serde_json::to_string(&worker_python())?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = serde_json::to_string(&root.join("tests/python/fixtures/replacement_worker.py"))?;
+    // The fixture is run by path, so its own directory leads the import
+    // path; the repository root named here resolves the worker packages
+    // from this checkout.
+    let import_root = serde_json::to_string(&root.canonicalize()?)?;
+    let state = serde_json::to_string(&directory.path())?;
+    // `WorkerGroup` runs `<python> -m uniserve_worker.main <args>`, so the
+    // wrapper drops its first two arguments and runs the fixture with the
+    // rest. The fixture serves a `Worker` whose `info` reads
+    // `replacement.json` from `directory`, where each rank also writes
+    // its pid.
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env python3\nimport os, sys\nenv = dict(os.environ, PYTHONPATH={import_root}, UNISERVE_TEST_REPLACEMENT_DIR={state})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    let mut args = rank_group_args();
+    args.python = wrapper;
+    let mut worker = WorkerGroup::spawn(args)?;
 
-        std::fs::write(
-            directory.path().join("replacement.json"),
-            serde_json::to_vec(&change)?,
-        )?;
-        let pid =
-            std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
-        anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
+    std::fs::write(
+        directory.path().join("replacement.json"),
+        serde_json::to_vec(&change)?,
+    )?;
+    let pid = std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
+    anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
 
-        let failure = worker
-            .poll_batch(Duration::from_secs(30))
-            .expect_err("rank loss must report replacement rejection");
-        assert!(
-            format!("{failure:#}").contains("worker info changed"),
-            "unexpected failure for {change}: {failure:#}",
-        );
-        assert!(
-            !worker.is_ready(),
-            "incompatible replacement accepted: {change}"
-        );
-        worker.close()?;
-    }
+    let failure = worker
+        .poll_batch(Duration::from_secs(30))
+        .expect_err("rank loss must report replacement rejection");
+    assert!(
+        format!("{failure:#}").contains("worker info changed"),
+        "unexpected failure for {change}: {failure:#}",
+    );
+    assert!(
+        !worker.is_ready(),
+        "incompatible replacement accepted: {change}"
+    );
+    worker.close()?;
     Ok(())
 }
 
@@ -1544,7 +1489,6 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
     let mut config = EngineConfig::sim("stub");
-    config.runtime_family = RuntimeFamily::Ar;
     config.generation_limits = uniserve_core::GenerationLimits {
         features: uniserve_core::GenerationFeatures::UNDERSTANDING,
         latent_downsample: 1,
@@ -1558,7 +1502,7 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
         2,
         WorkerConfig::single_component("model", WORLD_SIZE),
     )];
-    config.worker_process = rank_group_args(128 << 10, 128 << 10);
+    config.worker_process = rank_group_args();
     config.worker_process.python = wrapper.clone();
     let engine = EngineCore::new(config)?;
 
@@ -1620,7 +1564,6 @@ fn launched_workers_hold_a_request_row_per_running_request() -> anyhow::Result<(
     const RUNNING: usize = 200;
 
     let mut config = EngineConfig::sim("stub");
-    config.runtime_family = RuntimeFamily::Ar;
     config.generation_limits = uniserve_core::GenerationLimits {
         features: uniserve_core::GenerationFeatures::UNDERSTANDING,
         latent_downsample: 1,
@@ -1635,7 +1578,7 @@ fn launched_workers_hold_a_request_row_per_running_request() -> anyhow::Result<(
         2,
         WorkerConfig::single_component("model", WORLD_SIZE),
     )];
-    config.worker_process = rank_group_args(128 << 10, 128 << 10);
+    config.worker_process = rank_group_args();
     let engine = {
         let _launch_guard = CHILD_LAUNCH_ENV_LOCK
             .lock()
@@ -1681,7 +1624,7 @@ fn closing_a_group_lets_every_rank_finish_a_collective_teardown() -> anyhow::Res
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args();
     args.python = wrapper;
     let mut worker = WorkerGroup::spawn(args)?;
 
@@ -1703,7 +1646,6 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
         .with_max_level(tracing::Level::ERROR)
         .try_init();
     let mut config = EngineConfig::sim("stub");
-    config.runtime_family = RuntimeFamily::Diffusion;
     config.generation_limits = uniserve_core::GenerationLimits {
         latent_downsample: 1,
         max_cfg_branches: 1,
@@ -1717,7 +1659,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
         2,
         WorkerConfig::single_component("model", WORLD_SIZE),
     )];
-    config.worker_process = rank_group_args(128 << 10, 128 << 10);
+    config.worker_process = rank_group_args();
     let engine = {
         let _launch_guard = CHILD_LAUNCH_ENV_LOCK
             .lock()
@@ -1746,7 +1688,6 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
                 sampling: DiffusionSamplingParams {
                     num_frames: 22,
                     video_units: 3,
-                    num_inference_steps: 4,
                     seed: index as u64,
                     width: 1344,
                     height: 768,
@@ -1784,14 +1725,11 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
 fn check_rank_ipc() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
     let info = executor.info();
-    assert_eq!(info.endpoint.rank, 0);
-    assert_eq!(info.world_size, WORLD_SIZE as u32);
     assert_eq!(info.max_batch_calls, 256);
     assert_eq!(info.max_batch_tokens, 256);
-    assert_eq!(info.queue_depth as usize, QUEUE_DEPTH);
 
     let mut admission = text_admission(11, 1, 1)?;
-    let sampling = &mut admission.ar.as_mut().unwrap().sampling;
+    let sampling = &mut admission.generation.as_mut().unwrap().sampling;
     sampling.return_logprobs = true;
     sampling.n_logprobs = 1;
     sampling.return_prompt_logprobs = true;
@@ -1831,7 +1769,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
 
     // `WorkerGroup::submit_batch` refuses a batch id that does not exceed the
     // last one submitted, whether the batch repeats it or conflicts with it.
-    assert!(executor.submit_batch(initial, &CallReaders::new()).is_err());
+    assert!(executor.submit_placed(initial).is_err());
 
     let conflicting = token_batch(
         1,
@@ -1844,11 +1782,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         UnitId(1),
         0,
     );
-    assert!(
-        executor
-            .submit_batch(conflicting, &CallReaders::new())
-            .is_err()
-    );
+    assert!(executor.submit_placed(conflicting).is_err());
 
     // A Finish for another epoch of the same request id leaves the resident
     // epoch in place: the continuation below still runs.
@@ -1881,7 +1815,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     continuation.calls[0].bounds.max_completion_bytes = 4 + 2 * 12;
     let continued = execute(&mut executor, continuation)?;
     assert_eq!(continued.results[0].output.status, CallStatus::Ok);
-    assert_eq!(continued.results[0].output.position, 3);
+    assert_eq!(continued.results[0].output.kv_visible_len, 3);
     assert!(continued.results[0].output.sampled_logprob.is_some());
     assert_eq!(
         continued.results[0].output.top_logprobs[0].token_id,
@@ -1908,7 +1842,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         0,
     );
     close_batch.commands.push(close.clone());
-    executor.submit_batch(close_batch.clone(), &CallReaders::new())?;
+    executor.submit_placed(close_batch.clone())?;
     // A batch returns one result: the call's completion and the retirement
     // it carries arrive together.
     let result = executor
@@ -1918,7 +1852,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert_eq!(result.results[0].output.status, CallStatus::Ok);
     assert!(executor.poll_batch(Duration::from_millis(50))?.is_none());
     assert!(matches!(
-        executor.submit_batch(close_batch, &CallReaders::new()),
+        executor.submit_placed(close_batch),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
     let descendant = token_batch(
@@ -1935,7 +1869,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     let closed = execute(&mut executor, descendant)?;
     let closed_record = &closed.results[0].output;
     assert_eq!(closed_record.status, CallStatus::Error);
-    assert_eq!(closed_record.error_code, Some(ErrorCode::InvalidCall));
+    assert_eq!(closed_record.error_code, Some(ErrorCode::InvalidDescriptor));
 
     qualify_kv_rank_locations(&mut executor)?;
 
@@ -1945,16 +1879,13 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert!(!executor.is_ready());
     assert!(executor.poll_batch(Duration::ZERO)?.is_none());
     assert!(matches!(
-        executor.submit_batch(
-            command_batch(
-                100,
-                BatchCommand::Finish {
-                    request_key: admission.request_key,
-                    retained_buffers: Vec::new(),
-                }
-            ),
-            &CallReaders::new()
-        ),
+        executor.submit_placed(command_batch(
+            100,
+            BatchCommand::Finish {
+                request_key: admission.request_key,
+                retained_buffers: Vec::new(),
+            }
+        )),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
     executor.close()?;
@@ -2014,7 +1945,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         request_key,
         call_id: CallId::new(10, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::KvPublish),
+        kind: CallKind::Transfer(TransferMode::KvPublish),
         bounds: Bounds {
             max_transfer_bytes: 4096,
             ..Bounds::default()
@@ -2022,7 +1953,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut publish = Batch::new(10, Vec::new(), vec![call]);
     publish.collective_seq = 6;
@@ -2037,12 +1968,13 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         .context("KV publication has no physical locations")?;
     assert_eq!(publication.source, buffer);
     for tensor in publication.tensors() {
-        let ranks = tensor
+        // Each rank publishes its own location, from its own incarnation.
+        let sources = tensor
             .locations
             .iter()
-            .map(|location| location.source.rank)
+            .map(|location| location.source.incarnation.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(ranks, (0..WORLD_SIZE as u32).collect());
+        assert_eq!(sources.len(), WORLD_SIZE);
     }
     // A repeated batch id is refused.
     assert!(execute(executor, publish).is_err());
@@ -2128,20 +2060,17 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     let lost_admission = text_admission(22, 1, 2)?;
     // Keep this rank from completing the batch before the test terminates it.
     let paused = PausedProcess::new(victim.try_into()?)?;
-    executor.submit_batch(
-        token_batch(
-            3,
-            3,
-            lost_admission.request_key,
-            Some(lost_admission),
-            CallId::new(3, 0),
-            CallKind::Forward(ForwardMode::Prefill),
-            &[4],
-            UnitId(2),
-            0,
-        ),
-        &CallReaders::new(),
-    )?;
+    executor.submit_placed(token_batch(
+        3,
+        3,
+        lost_admission.request_key,
+        Some(lost_admission),
+        CallId::new(3, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[4],
+        UnitId(2),
+        0,
+    ))?;
     paused.terminate()?;
     let loss = executor
         .poll_batch(Duration::from_secs(30))
@@ -2149,7 +2078,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     let loss = loss
         .downcast_ref::<WorkerFailure>()
         .context("expected scoped WorkerGroup loss")?;
-    assert_eq!(loss.worker_id.0, initial_endpoint.worker_id);
+    assert_eq!(loss.worker_id.0, "worker");
     assert_eq!(loss.endpoints.len(), WORLD_SIZE);
     assert!(loss.endpoints.contains(&initial_endpoint));
     let requests = loss
@@ -2186,10 +2115,6 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         ),
     )?;
     assert_eq!(recovered.results[0].output.status, CallStatus::Ok);
-    assert_eq!(
-        executor.info().endpoint.worker_id,
-        initial_endpoint.worker_id
-    );
     assert_ne!(
         executor.info().endpoint.incarnation,
         initial_endpoint.incarnation
@@ -2212,7 +2137,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args();
     args.python = wrapper.clone();
     let startup = WorkerGroup::spawn(args);
     remove_file(wrapper)?;
@@ -2244,18 +2169,17 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         .ranks,
         components: WorkerConfig::single_component("model", WORLD_SIZE),
         queue_depth: QUEUE_DEPTH,
-        req_slot_cap: 1 << 20,
-        resp_slot_cap: 8 << 20,
-        kv_token_capacity: Some(4096),
+        max_total_tokens: Some(4096),
         block_size: Some(16),
         max_batch_calls: 256,
         max_batch_tokens: 256,
-        attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
-        // `publisher` is the worker id `SlowShmPublication` names as the
-        // source of its segment.
-        transfer: uniserve_engine::TransferConfig::parse("publisher->worker=shm")?,
+        attention_backend: "torch".into(),
+        // The segment stands in for a product that rank 0 of this worker
+        // published over shared storage.
+        transfer: uniserve_engine::TransferConfig::parse("worker->worker=posix_shm")?,
         ..config
     })?;
+    let publisher = executor.info().endpoint.clone();
 
     let slow_admission = text_admission(31, 1, 1)?;
     let mut slow = token_batch(
@@ -2283,7 +2207,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     slow.calls[0].predicate = Some(predicate.clone());
     slow.input_products.push(TensorPublication {
         product: predicate,
-        value: publication.descriptor()?,
+        value: publication.descriptor(&publisher)?,
     });
 
     let fast_admission = text_admission(32, 1, 2)?;
@@ -2301,12 +2225,12 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
 
     // Resubmitting batch 1 is refused because batch ids must increase; the
     // original submission stays in flight.
-    executor.submit_batch(slow.clone(), &CallReaders::new())?;
+    executor.submit_placed(slow.clone())?;
     assert!(matches!(
-        executor.submit_batch(slow, &CallReaders::new()),
+        executor.submit_placed(slow),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
-    executor.submit_batch(fast, &CallReaders::new())?;
+    executor.submit_placed(fast)?;
     // This worker's component spans both ranks, so its ranks stay inside the
     // same collective and hold one batch in flight. The blocked batch is at the
     // head of the channel, so nothing behind it runs until its dependency is
@@ -2372,7 +2296,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         request_key: admission.request_key,
         call_id: CallId::new(3, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: input.max_bytes(),
             ..Bounds::default()
@@ -2380,7 +2304,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         inputs: vec![input.clone()],
         outputs: vec![output.clone()],
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut batch = Batch::new(3, vec![admission], vec![call]);
     batch.buffer_allocations = [(&input, 0), (&output, 256)]
@@ -2393,9 +2317,9 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         .collect();
     batch.input_products.push(TensorPublication {
         product: input,
-        value: publication.descriptor()?,
+        value: publication.descriptor(&publisher)?,
     });
-    executor.submit_batch(batch, &CallReaders::new())?;
+    executor.submit_placed(batch)?;
     let transferred = executor
         .poll_batch(Duration::from_secs(30))?
         .context("tensor input did not reach its component")?;
@@ -2414,7 +2338,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Independent instances accepting the same computation must retain separate capacity.
+/// Independent instances accepting the same call must retain separate capacity.
 #[test]
 fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow::Result<()> {
     use uniserve_engine::{
@@ -2443,7 +2367,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     // its own queue depth; both route products to each other over shared
     // storage.
     let spawn = |worker_id: &str, depth| -> anyhow::Result<WorkerGroup> {
-        let mut args = rank_group_args(1 << 20, 8 << 20);
+        let mut args = rank_group_args();
         let binding = WorkerConfig::placed(
             &["localhost".to_owned()],
             "cpu",
@@ -2459,7 +2383,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             args.python = wrapper.clone();
         }
         args.transfer = uniserve_engine::TransferConfig::parse(
-            "encoder-0->encoder-1=shm,encoder-1->encoder-0=shm",
+            "encoder-0->encoder-1=posix_shm,encoder-1->encoder-0=posix_shm",
         )?;
         WorkerGroup::spawn(args)
     };
@@ -2469,7 +2393,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             (WorkerId("encoder-1".into()), spawn("encoder-1", 2)?),
         ],
         uniserve_engine::TransferConfig::parse(
-            "encoder-0->encoder-1=shm,encoder-1->encoder-0=shm",
+            "encoder-0->encoder-1=posix_shm,encoder-1->encoder-0=posix_shm",
         )?,
     )?;
     let pid = std::fs::read_to_string(&pid_file)?.parse::<i32>()?;
@@ -2489,7 +2413,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
                     forward: batch.forward,
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
-                    buffers: batch.buffer_allocations,
+                    buffers: on_every_rank(batch.buffer_allocations),
                     readers: Default::default(),
                 },
             )],
@@ -2599,7 +2523,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         call_id: CallId::new(6, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: source.max_bytes(),
             ..Bounds::default()
@@ -2607,7 +2531,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let publish = Batch::new(6, Vec::new(), vec![publish]);
 
@@ -2644,7 +2568,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         call_id: CallId::new(7, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: publication.max_bytes(),
             ..Bounds::default()
@@ -2652,7 +2576,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     executor.submit(bind(
         Batch::new(7, vec![admission.clone()], vec![transfer]),
@@ -2697,16 +2621,15 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         call_id: CallId::new(8, 0),
         component: "vision_encoder".into(),
-        code: CallKind::Media(MediaCall::VisionEncoding),
+        kind: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
-            max_latent_bytes: 8192,
             ..Bounds::default()
         },
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut encode = Batch::new(8, Vec::new(), vec![encode]);
     encode
@@ -2827,16 +2750,15 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: next.request_key,
         call_id: CallId::new(15, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::Tensor),
+        kind: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: feature.max_bytes(),
-            max_latent_bytes: feature.max_bytes(),
             ..Bounds::default()
         },
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let mut retained = Batch::new(15, vec![next], vec![retained]);
     // The source product lives at offset zero on encoder-1. Its destination
@@ -2943,9 +2865,9 @@ impl Drop for PausedProcess {
 
 /// An external shared-storage publisher the test controls.
 ///
-/// The segment carries what a consumer needs in its header: the digest of the
-/// locator that names it, and a readiness word the test writes after the
-/// payload. Until then a rank that reads it waits on that word.
+/// The segment carries what a consumer needs in its header: a readiness word
+/// the test writes after the payload. Until then a rank that reads it waits
+/// on that word.
 struct SlowShmPublication {
     name: String,
     endpoint: String,
@@ -2980,41 +2902,8 @@ impl SlowShmPublication {
         // which leaves the readiness word pending and every acknowledgment
         // word unclaimed.
         file.set_len(SEGMENT_HEADER_BYTES + 1)?;
-        // The header names the exact locator the rank will be handed, the way
-        // the worker's own publications do, so the rank accepts the segment.
-        file.write_all_at(&publication.digest()?, 0)?;
         file.write_all_at(&[0], SEGMENT_HEADER_BYTES)?;
         Ok(publication)
-    }
-
-    /// The digest the worker computes over a locator: SHA-256 of its
-    /// canonical JSON, keys sorted, no whitespace.
-    fn digest(&self) -> anyhow::Result<[u8; 32]> {
-        use sha2::Digest as _;
-
-        let canonical = format!(
-            concat!(
-                "{{\"device\":\"cpu\",\"dtype\":\"uint8\",\"endpoint\":\"{endpoint}\",",
-                "\"name\":\"{name}\",\"nbytes\":1,\"offset\":[0],\"shape\":[1],",
-                "\"source\":{{\"address_space\":\"{address_space}\",",
-                "\"incarnation\":\"{incarnation}\",\"node\":\"{node}\",\"rank\":0,",
-                "\"worker_id\":\"publisher\"}},\"transport\":\"posix_shm\"}}"
-            ),
-            endpoint = self.endpoint,
-            name = self.name,
-            address_space = self.address_space(),
-            incarnation = self.endpoint,
-            node = self.node()?,
-        );
-        Ok(sha2::Sha256::digest(canonical.as_bytes()).into())
-    }
-
-    fn address_space(&self) -> String {
-        format!("rust:{}", std::process::id())
-    }
-
-    fn node(&self) -> anyhow::Result<String> {
-        Ok(std::fs::read_to_string("/etc/hostname")?.trim().to_owned())
     }
 
     fn publish(&self) -> anyhow::Result<()> {
@@ -3027,7 +2916,12 @@ impl SlowShmPublication {
         Ok(())
     }
 
-    fn descriptor(&self) -> anyhow::Result<TransferHandle> {
+    /// Describes the segment as a product published by `source`, a rank the
+    /// engine launched.
+    fn descriptor(
+        &self,
+        source: &uniserve_worker_ipc::WorkerEndpoint,
+    ) -> anyhow::Result<TransferHandle> {
         Ok(TransferHandle::DeviceProduct {
             height: 0,
             width: 0,
@@ -3035,13 +2929,7 @@ impl SlowShmPublication {
             tensor: uniserve_worker_ipc::TensorTransfer {
                 shape: vec![1],
                 locations: vec![Locator {
-                    source: uniserve_worker_ipc::WorkerEndpoint {
-                        worker_id: "publisher".into(),
-                        rank: 0,
-                        node: self.node()?,
-                        address_space: self.address_space(),
-                        incarnation: self.endpoint.clone(),
-                    },
+                    source: source.clone(),
                     transport: TransferTransport::PosixShm {
                         endpoint: self.endpoint.clone(),
                         name: self.name.clone(),
@@ -3065,23 +2953,13 @@ impl Drop for SlowShmPublication {
 
 /// Spawns the default two-rank stub group from `rank_group_args`.
 fn spawn_rank_group() -> anyhow::Result<WorkerGroup> {
-    spawn_rank_group_with_capacities(1 << 20, 8 << 20)
-}
-
-fn spawn_rank_group_with_capacities(
-    request_slot_capacity: usize,
-    response_slot_capacity: usize,
-) -> anyhow::Result<WorkerGroup> {
-    WorkerGroup::spawn(rank_group_args(
-        request_slot_capacity,
-        response_slot_capacity,
-    ))
+    WorkerGroup::spawn(rank_group_args())
 }
 
 /// The components the stub model declares, over `rank_count` ranks.
 ///
 /// A placement names what a worker holds, and a worker that serves a model's
-/// whole computation holds every component it declares.
+/// whole call holds every component it declares.
 fn stub_components(
     rank_count: usize,
 ) -> std::collections::BTreeMap<String, uniserve_core::ComponentConfig> {
@@ -3107,13 +2985,9 @@ fn stub_components(
 /// Launch arguments for a two-rank stub group on the local host's CPU.
 ///
 /// Both ranks hold the single `model` component, with `QUEUE_DEPTH` batches
-/// in flight and the given channel slot capacities in bytes. Tests adjust the
-/// returned value (for example components, interpreter or transfer edges)
-/// before spawning.
-fn rank_group_args(
-    request_slot_capacity: usize,
-    response_slot_capacity: usize,
-) -> WorkerProcessArgs {
+/// in flight. Tests adjust the returned value (for example components,
+/// interpreter or transfer edges) before spawning.
+fn rank_group_args() -> WorkerProcessArgs {
     let worker = worker_python();
     let config = WorkerProcessArgs {
         stub: true,
@@ -3133,13 +3007,11 @@ fn rank_group_args(
         .ranks,
         components: WorkerConfig::single_component("model", WORLD_SIZE),
         queue_depth: QUEUE_DEPTH,
-        req_slot_cap: request_slot_capacity,
-        resp_slot_cap: response_slot_capacity,
-        kv_token_capacity: Some(4096),
+        max_total_tokens: Some(4096),
         block_size: Some(16),
         max_batch_calls: 256,
         max_batch_tokens: 256,
-        attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
+        attention_backend: "torch".into(),
         transfer: Default::default(),
         ..config
     }
@@ -3155,11 +3027,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "channel_transport": "iceoryx2",
     "acknowledgment_slot": 0,
     "host_slots": [0],
-    "product_consumers": [],
     "products_cross_hosts": false,
-    "worker_id": "worker",
-    "queue_depth": 2,
-    "ipc_payload_cap": 1048576,
     "queue_depth": 8,
     "model": "",
     "device": "cpu",
@@ -3174,26 +3042,26 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
         }
     },
     "deployment_components": ["model"],
-    "supported_calls": null,
     "transfer_backends": "local",
     "publish_backends": "local",
     "rendezvous_address": null,
     "rendezvous_listen_fd": null,
+    "role": "model",
+    "expert_parallel": null,
+    "expert_microbatches": 1,
     "distributed_backend": null,
     "mesh": null,
     "lane": [],
     "no_model": true,
-    "allow_stub": true,
     "load_format": "auto",
     "download_dir": null,
     "load_threads": null,
-    "checksum_manifest": null,
     "model_dtype": "bfloat16",
     "quantization_config": {},
     "kv_cache_dtype": null,
-    "kv_memory_fraction": 0.7,
-    "kv_token_capacity": 4096,
-    "attention_backend": "torch_sdpa",
+    "mem_fraction_static": 0.7,
+    "max_total_tokens": 4096,
+    "attention_backend": "torch",
     "block_size": 16,
     "max_batch_calls": 8,
     "max_batch_tokens": 256,
@@ -3205,12 +3073,16 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "graph_policy": "off",
     "decode_graph_batch_sizes": null,
     "prefill_cuda_graph": false,
+    "prefill_outputs": true,
     "prefill_graph_token_sizes": null,
+    "flow_cuda_graph": true,
     "flow_graph_batch_sizes": null,
     "flow_graph_shapes": null,
     "min_video_seconds": null,
     "video_text_capacities": null,
-    "video_frame_sizes": null,
+    "video_resolutions": null,
+    "video_aspect_ratios": null,
+    "canvas_sampling": null,
     "flashinfer_workspace_size": 536870912,
     "flashinfer_use_tensor_core": null,
     "flashinfer_decode_backend": "fa2",
@@ -3235,12 +3107,31 @@ fn worker_python() -> PathBuf {
         })
 }
 
+/// Places a batch's buffer spans at the same offsets on every rank of the
+/// groups these tests launch, which share one layout of their pools.
+fn on_every_rank(allocations: Vec<BufferAllocation>) -> Vec<RankBuffer> {
+    RankBuffer::on_every_rank(&allocations, WORLD_SIZE as u32)
+}
+
+/// Submission of a batch that carries its buffer spans, which a group takes
+/// beside the batch as a rank-by-rank placement.
+trait SubmitPlaced {
+    fn submit_placed(&mut self, batch: Batch) -> Result<(), uniserve_engine::BatchSubmitError>;
+}
+
+impl SubmitPlaced for WorkerGroup {
+    fn submit_placed(&mut self, mut batch: Batch) -> Result<(), uniserve_engine::BatchSubmitError> {
+        let spans = on_every_rank(std::mem::take(&mut batch.buffer_allocations));
+        self.submit_batch(batch, &CallReaders::new(), &spans)
+    }
+}
+
 /// Submits one batch and waits up to 30 seconds for its result.
 fn execute(
     executor: &mut WorkerGroup,
     batch: Batch,
 ) -> anyhow::Result<uniserve_engine::WorkerResult> {
-    executor.submit_batch(batch, &CallReaders::new())?;
+    executor.submit_placed(batch)?;
     executor
         .poll_batch(Duration::from_secs(30))?
         .ok_or_else(|| anyhow::anyhow!("submission did not complete"))
@@ -3268,7 +3159,7 @@ fn text_admission(
     Ok(NewRequest::new(
         RequestKey::new(1, RequestId(request_id), request_epoch),
         request_pool_idx,
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: SamplingParams {
                 temperature: 0.0,
                 ignore_eos: true,
@@ -3277,21 +3168,19 @@ fn text_admission(
             negative_token_ids: Vec::new(),
             finish_token_ids: Vec::new(),
             initial_position: 0,
-            canvas: None,
         }),
         None,
         0,
     )?)
 }
 
-/// The coordinates a call entering after `output` executes at, as the engine
-/// derives them from the completion it observed.
-fn coordinates_after(output: &uniserve_worker_ipc::RequestOutput) -> CallCoordinates {
+/// The coordinates a call entering after `output` executes at, for a request
+/// whose completions advance its logical position with its visible KV.
+fn coordinates_after(output: &uniserve_worker_ipc::CallOutput) -> CallCoordinates {
     CallCoordinates {
-        logical_position: output.position,
+        logical_position: output.kv_visible_len,
         kv_visible_len: output.kv_visible_len,
         kv_computed_len: output.kv_computed_len,
-        flow_step: output.num_completed_steps,
     }
 }
 
@@ -3336,7 +3225,6 @@ fn token_batch(
             logical_position: prefix_length,
             kv_visible_len: prefix_length,
             kv_computed_len: prefix_length,
-            flow_step: 0,
         },
         token_input: None,
         token_output: Some(token_output),
@@ -3359,7 +3247,7 @@ fn token_batch(
         request_key,
         call_id,
         component: "model".into(),
-        code: mode,
+        kind: mode,
         bounds: Bounds {
             max_tokens: tokens.len().max(1) as u32,
             max_kv_units: u32::from(prefix_length == 0),
@@ -3368,7 +3256,7 @@ fn token_batch(
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     };
     let input_length = tokens.len() as u32;
     let mut batch = Batch::new(batch_id, admission.into_iter().collect(), vec![call]);

@@ -5,7 +5,8 @@
 //! soft-token run ([`ControlTokens::expand_images`]), and the engine writes
 //! the image's vision features where that run stands ([`engine_images`]).
 //! The reply is generated in canvases of the checkpoint's `canvas_length`
-//! tokens under the server's block-diffusion sampling ([`canvas_sampling`]),
+//! tokens under the deployment's block-diffusion sampling
+//! ([`canvas_sampling`]), which the engine and its workers are launched with,
 //! and Gemma-4 parsers split its thought channel and tool calls
 //! ([`Gemma4ChatOutputProcessor`]). Token-sampling controls have no meaning
 //! for a denoised canvas, so a request that sets one is refused
@@ -17,16 +18,15 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use uniserve_core::{
-    CanvasSampling, GenerationRequest, ImageEncoderInput, ImageIngestStep, ImageInput,
-    MultimodalInputs,
+    CanvasSampling, GenerationRequest, ImageEncoderInput, ImageInput, MediaCall, MultimodalInputs,
 };
 
 use crate::profile::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
-use crate::serving::chat::{ChatOutputProcessor, Gemma4ChatOutputProcessor};
+use crate::serving::chat::{ChatOutputProcessor, ChatRequest, Gemma4ChatOutputProcessor};
 use crate::serving::text::TextDecodeOptions;
 use crate::serving::{
-    InputProcessor, OutputProcessorPolicy, PromptInput, SamplingConfig, ServeError, ServeRequestId,
-    StopConfig, TokenizeError, media,
+    InputProcessor, OutputProcessorPolicy, SamplingConfig, ServeError, ServeRequestId, StopConfig,
+    TokenizeError, media,
 };
 
 /// Splits a prompt whose images stand as soft-token runs into the engine's
@@ -56,7 +56,7 @@ pub(crate) fn engine_images(
             position: u32::try_from(prompt.len()).unwrap_or(u32::MAX),
             num_positions: placement.soft_tokens,
             encoders: vec![ImageEncoderInput {
-                encoder: ImageIngestStep::VitEncode,
+                encoder: MediaCall::VisionEncoding,
                 num_kv_tokens: Some(placement.soft_tokens),
                 max_kv_tokens: None,
             }],
@@ -66,9 +66,10 @@ pub(crate) fn engine_images(
     (prompt, inputs)
 }
 
-/// Returns the block-diffusion sampling of every canvas the server
+/// Returns the block-diffusion sampling of every canvas the deployment
 /// generates: the checkpoint's canvas length under its sampler defaults, as
-/// the server's configuration overrides them.
+/// the server's configuration overrides them. The engine and the workers are
+/// launched with it; requests do not carry it.
 pub(crate) fn canvas_sampling(profile: &DiffusionGemmaProfile) -> CanvasSampling {
     let denoising = &profile.denoising;
     CanvasSampling {
@@ -171,24 +172,19 @@ impl InputProcessor {
     ///
     /// # Errors
     ///
-    /// Returns `TokenizeError::Invalid` for a text prompt, an image with no
-    /// area, request text that encodes image tokens of its own, or a prompt
-    /// that leaves no room for one canvas; chat validation, rendering,
-    /// tokenizer, and parser construction errors propagate.
+    /// Returns `TokenizeError::Invalid` for an image with no area, request
+    /// text that encodes image tokens of its own, or a prompt that leaves no
+    /// room for one canvas; chat validation, rendering, tokenizer, and parser
+    /// construction errors propagate.
     pub(super) fn preprocess_diffusion_gemma_input(
         &self,
         profile: &DiffusionGemmaProfile,
-        prompt: PromptInput,
+        mut chat: ChatRequest,
         images: &[media::ImageInput],
         sampling: &SamplingConfig,
         generation: &mut GenerationRequest,
         decode: &mut TextDecodeOptions,
     ) -> Result<OutputProcessorPolicy, TokenizeError> {
-        let PromptInput::Chat(mut chat) = prompt else {
-            return Err(TokenizeError::Invalid(
-                "DiffusionGemma generates replies to chat prompts only".to_owned(),
-            ));
-        };
         chat.decode_options = decode.clone();
         chat.validate()?;
         let processor = Gemma4ChatOutputProcessor::new(
@@ -197,8 +193,7 @@ impl InputProcessor {
             self.parse_reasoning,
         )?;
         let rendered = self
-            .renderer
-            .as_ref()
+            .chat_renderer()
             .ok_or(crate::serving::chat::Error::MissingChatTemplate)?
             .render(&chat)?;
         let rendered = self.tokenizer.encode(&rendered, false)?;
@@ -217,7 +212,7 @@ impl InputProcessor {
         // Canvases occupy whole blocks of positions after the prompt, so the
         // reply may use only the whole canvases that fit the context.
         let prompt_len = u32::try_from(expanded.len()).unwrap_or(u32::MAX);
-        let max_model_len = self.config.max_model_tokens();
+        let max_model_len = self.config.max_model_len;
         let canvas = profile.canvas_length;
         let room = max_model_len.saturating_sub(prompt_len) / canvas * canvas;
         if room == 0 {
@@ -244,7 +239,6 @@ impl InputProcessor {
                 .seed
                 .unwrap_or_else(|| uuid::Uuid::new_v4().as_u64_pair().0),
         );
-        generation.canvas = Some(canvas_sampling(profile));
         decode.skip_special_tokens = chat.decode_options.skip_special_tokens;
         Ok(OutputProcessorPolicy::Chat(ChatOutputProcessor::Gemma4(
             processor,
@@ -276,7 +270,7 @@ mod tests {
     use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
     use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
     use crate::serving::{
-        FinishStatus, InputProcessor, RequestOutput, ServedSamplingControl, ServingRuntime,
+        FinishStatus, InputProcessor, RequestOutput, RequestRenderer, ServingRuntime,
     };
     use futures::StreamExt;
     use tokenizers::models::bpe::{BPE, Vocab};
@@ -345,19 +339,21 @@ mod tests {
             },
             quantized: false,
         };
+        let sampling = super::canvas_sampling(&profile);
         let model = ModelConfig {
             served_name: "sim-model".to_string(),
             parameters: ModelParameters::DiffusionGemma(profile),
             sampling_defaults: SamplingDefaults::default(),
-            max_model_tokens: Some(4096),
+            max_model_len: 4096,
             primary_eos_token_id: None,
             eos_token_ids: BTreeSet::new(),
         };
 
         let mut worker = SimEngine::new();
         worker.set_text_len(TEXT_LEN);
+        worker.set_canvas_sampling(sampling);
         let mut config = EngineConfig::sim("sim-model");
-        config.runtime_family = model.runtime_family();
+        config.worker_process.canvas_sampling = Some(sampling);
         config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
         let client = Arc::new(
             EngineClient::connect_with_executor(config, Box::new(SimExecutor::new(worker)))
@@ -366,7 +362,7 @@ mod tests {
         let processor = InputProcessor::new(
             model,
             Arc::clone(&tokenizer),
-            Some(
+            RequestRenderer::Chat(
                 HfChatRenderer::new(
                     Some("{{ messages[0].content }}".to_string()),
                     HashMap::new(),
@@ -376,10 +372,7 @@ mod tests {
             ),
             crate::serving::WorkerCapabilities {
                 limits: client.generation_limits(),
-                sampling_controls: ServedSamplingControl::ALL.to_vec(),
-                max_model_tokens: 4096,
             },
-            None,
             false,
         )
         .unwrap();

@@ -110,7 +110,7 @@ def _run(rank, port, grouped=False):
             HIDDEN,
             INTERMEDIATE,
             top_k=TOP_K,
-            activation="gelu_tanh",
+            activation="gelu_pytorch_tanh",
             device=device,
             dtype=torch.bfloat16,
         )
@@ -217,7 +217,7 @@ def _run_joined(rank, port):
                 HIDDEN,
                 INTERMEDIATE,
                 top_k=TOP_K,
-                activation="gelu_tanh",
+                activation="gelu_pytorch_tanh",
                 device=device,
                 dtype=torch.bfloat16,
             )
@@ -334,7 +334,7 @@ def _nvfp4_moe(codes, device, group=None):
         HIDDEN,
         INTERMEDIATE,
         top_k=TOP_K,
-        activation="gelu_tanh",
+        activation="gelu_pytorch_tanh",
         device=device,
         dtype=torch.bfloat16,
     )
@@ -726,7 +726,7 @@ def _run_megamoe(rank, port, activation):
                     )
 
 
-@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("activation", ["silu", "gelu_pytorch_tanh"])
 def test_megamoe_ranks_preserve_routed_results_across_local_sizes(activation):
     """Unequal, full and empty senders retain the declared routed equation.
 

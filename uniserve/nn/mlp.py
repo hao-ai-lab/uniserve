@@ -15,7 +15,9 @@ class GatedMLP(nn.Module):
     """Compose named gate/up projections, activation, and a reduced down
     projection.
 
-    ``rounding`` selects the SiLU gating recipe (see ``SiLUAndMul``).
+    A SiLU-gated MLP states the ``rounding`` recipe its model's reference
+    evaluates (see ``SiLUAndMul``); a GELU-gated one has a single recipe and
+    takes none.
     """  # noqa: D205
 
     activation: SiLUAndMul | GELUAndMul
@@ -26,15 +28,19 @@ class GatedMLP(nn.Module):
         intermediate_size: int,
         *,
         activation: str = "silu",
-        rounding: Rounding = Rounding.ONCE,
+        rounding: Rounding | None = None,
         bias: bool = False,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
-        if activation != "silu" and rounding is not Rounding.ONCE:
-            raise ValueError("gated rounding recipes apply to SiLU gating")
+        if (activation == "silu") != (rounding is not None):
+            raise ValueError(
+                "SiLU gating requires a rounding recipe, and no other "
+                "gating takes one"
+            )
         if activation == "silu":
+            assert rounding is not None
             self.activation = SiLUAndMul(rounding)
         elif activation in {"gelu", "gelu_pytorch_tanh"}:
             self.activation = GELUAndMul(

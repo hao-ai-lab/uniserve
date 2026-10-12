@@ -1,11 +1,9 @@
 """Semantic counter-based random coordinates for deterministic execution.
 
-The token sampler draws through the canonical Philox4x32-10 mapping defined
-here and mirrored bit-for-bit by the Rust simulator in
-``crates/foundation/core/src/philox.rs``. A draw is addressed only by its
-request lineage and semantic coordinates, so the same coordinate yields the
-same uniform in every language and is independent of batch order, execution
-depth, accepted proposal length, completion order, and replay.
+The token sampler draws through the Philox4x32-10 mapping defined here. A
+draw is addressed only by its request lineage and semantic coordinates, so
+the same coordinate yields the same uniform and is independent of batch order,
+execution depth, accepted proposal length, completion order, and replay.
 """
 
 from __future__ import annotations
@@ -21,11 +19,9 @@ _PHILOX_M1 = 0xCD9E8D57
 _PHILOX_KEY_BUMP_0 = 0x9E3779B9
 _PHILOX_KEY_BUMP_1 = 0xBB67AE85
 
-# Draw layout identifiers matching the IPC ``DrawLayout`` discriminants. They
-# separate the proposal and target draw spaces so rejected proposals cannot
-# shift target coordinates.
+# Draw layout identifiers. They separate the token-sampling and flow-noise
+# draw spaces so activity in one cannot shift the other's coordinates.
 DRAW_LAYOUT_TARGET = 0
-DRAW_LAYOUT_PROPOSAL = 1
 DRAW_LAYOUT_FLOW_NOISE = 2
 
 
@@ -148,7 +144,6 @@ def _splitmix_coordinate(seed: int, coordinate: int) -> int:
 
 __all__ = [
     "DRAW_LAYOUT_FLOW_NOISE",
-    "DRAW_LAYOUT_PROPOSAL",
     "DRAW_LAYOUT_TARGET",
     "flow_noise_seed",
     "normal_noise",

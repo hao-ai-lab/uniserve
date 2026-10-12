@@ -3,13 +3,13 @@
 A causal 3D convolution over ``[batch, channels, frames, height, width]``
 reads its input padded on both sides of height and width (reflected or
 replicated) and preceded by zero frames. :func:`pad` writes that padded input
-into contiguous storage in one pass, reading the source through its own
-strides, so channel-first, channels-last and permuted views all work. The
-output equals the two-step ``F.pad`` result bit for bit: every element is a
-copy of one source element or zero.
+in one pass into channel-first or channels-last storage, reading the source
+through its own strides, so channel-first, channels-last and permuted views
+all work. The output equals the two-step ``F.pad`` result bit for bit: every
+element is a copy of one source element or zero.
 
 The kernel backs ``uniserve.nn.functional.frame_pad``, which validates the
-padding, allocates the contiguous output and raises on CUDA whenever
+padding, allocates the output in its storage order and raises on CUDA whenever
 :func:`unsupported` reports a reason; the launcher does not revalidate.
 """
 
@@ -23,6 +23,13 @@ from uniserve_kernels.triton import tl, triton, unsupported_operands
 _PAD_PIXELS = 32
 _PAD_CHANNELS = 64
 
+# Channel-first sources and outputs store each channel's rows contiguously.
+# A program then copies a run of up to _ROW_PIXELS pixels from each of
+# _ROW_ELEMENTS // run channels, moving every channel's row in few large
+# transfers rather than the default tile's 32-pixel runs of 64 channels.
+_ROW_PIXELS = 512
+_ROW_ELEMENTS = 2048
+
 
 if triton is not None:  # pragma: no cover - depends on the accelerator stack.
 
@@ -35,6 +42,11 @@ if triton is not None:  # pragma: no cover - depends on the accelerator stack.
         stride_frame,
         stride_height,
         stride_width,
+        out_batch,
+        out_channel,
+        out_frame_stride,
+        out_height_stride,
+        out_width_stride,
         height,
         width,
         out_frames,
@@ -48,7 +60,7 @@ if triton is not None:  # pragma: no cover - depends on the accelerator stack.
         block_pixels: tl.constexpr,
         block_channels: tl.constexpr,
     ):
-        """Write one row segment of the padded contiguous output.
+        """Write one row segment of the padded output through its strides.
 
         Grid: (samples * out_frames * out_height, width blocks, channel
         blocks). Output frames before ``pad_front`` are zero; every other
@@ -64,14 +76,16 @@ if triton is not None:  # pragma: no cover - depends on the accelerator stack.
         )
         valid = (columns < out_width)[:, None] & (channel < channels)[None, :]
 
-        # Contiguous storage: [sample, channel, frame, row, column]; the
-        # columns of one row are adjacent, so the stores coalesce.
-        plane = out_frames.to(tl.int64) * out_height * out_width
+        # The block's columns are adjacent in channel-first storage and its
+        # channels in channels-last storage, so either layout's stores
+        # coalesce.
         destination = (
             out
-            + (sample.to(tl.int64) * channels + channel[None, :]) * plane
-            + (out_frame.to(tl.int64) * out_height + out_row) * out_width
-            + columns[:, None]
+            + sample.to(tl.int64) * out_batch
+            + out_frame.to(tl.int64) * out_frame_stride
+            + out_row.to(tl.int64) * out_height_stride
+            + columns[:, None].to(tl.int64) * out_width_stride
+            + channel[None, :].to(tl.int64) * out_channel
         )
 
         frame = out_frame - pad_front
@@ -121,9 +135,10 @@ if triton is not None:  # pragma: no cover - depends on the accelerator stack.
 def unsupported(values: torch.Tensor, out: torch.Tensor) -> str | None:
     """Return why the kernel cannot pad ``values`` into ``out``, or ``None``.
 
-    The input may use any strides. The output must be contiguous storage of
-    the input's dtype, batch and channels; the caller sizes its frames, rows
-    and columns from the padding. The launch records no autograd graph.
+    The input may use any strides. The output must be contiguous or
+    channels-last storage of the input's dtype, batch and channels; the
+    caller sizes its frames, rows and columns from the padding. The launch
+    records no autograd graph.
     """
     reason = unsupported_operands(values, out)
     if reason is not None:
@@ -132,8 +147,11 @@ def unsupported(values: torch.Tensor, out: torch.Tensor) -> str | None:
         return "values and output are not [batch, channels, frames, h, w]"
     if out.dtype != values.dtype:
         return f"output dtype {out.dtype} differs from {values.dtype}"
-    if not out.is_contiguous():
-        return "the output is not contiguous"
+    if not (
+        out.is_contiguous()
+        or out.is_contiguous(memory_format=torch.channels_last_3d)
+    ):
+        return "the output is neither contiguous nor channels-last"
     if out.shape[:2] != values.shape[:2]:
         return "the output's batch and channels differ from the input's"
     return None
@@ -154,16 +172,22 @@ def pad(
     """
     batch, channels, _, height, width = (int(size) for size in values.shape)
     _, _, out_frames, out_height, out_width = (int(size) for size in out.shape)
+    pixels, block_channels = _PAD_PIXELS, _PAD_CHANNELS
+    if values.stride(4) == 1 and out.is_contiguous():
+        # A run never exceeds the output row, which bounds a program.
+        pixels = min(_ROW_PIXELS, triton.next_power_of_2(out_width))
+        block_channels = _ROW_ELEMENTS // pixels
     _frame_pad_kernel[
         (
             batch * out_frames * out_height,
-            triton.cdiv(out_width, _PAD_PIXELS),
-            triton.cdiv(channels, _PAD_CHANNELS),
+            triton.cdiv(out_width, pixels),
+            triton.cdiv(channels, block_channels),
         )
     ](
         values,
         out,
         *(int(stride) for stride in values.stride()),
+        *(int(stride) for stride in out.stride()),
         height,
         width,
         out_frames,
@@ -172,7 +196,7 @@ def pad(
         channels,
         *padding,
         reflect,
-        _PAD_PIXELS,
-        _PAD_CHANNELS,
+        pixels,
+        block_channels,
         num_warps=4,
     )

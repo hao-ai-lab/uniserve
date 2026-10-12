@@ -28,7 +28,6 @@ def main() -> None:
     name = endpoint_name(config)
     with WorkerIpcEndpoint(
         name,
-        max_payload=config.ipc.max_payload_bytes,
         max_inflight=config.ipc.queue_depth,
         transport=config.ipc.channel_transport,
     ) as endpoint:

@@ -131,7 +131,7 @@ def _positive_bf16(
 
 
 @pytest.mark.parametrize("provider", BF16_PROVIDERS)
-@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("activation", ["silu", "gelu_pytorch_tanh"])
 @torch.inference_mode()
 def test_bf16_experts_match_the_routed_equation(activation, provider):
     generator = torch.Generator().manual_seed(41)
@@ -171,7 +171,7 @@ def test_bf16_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
     """
     top_k = EXPERTS
     generator = torch.Generator().manual_seed(43)
-    module, hidden = _positive_bf16("gelu_tanh", generator, top_k=top_k)
+    module, hidden = _positive_bf16("gelu_pytorch_tanh", generator, top_k=top_k)
     ids, weights = _routes(generator, top_k=top_k)
 
     stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
@@ -193,7 +193,7 @@ def test_bf16_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
 
 
 @pytest.mark.parametrize("tile_m,cluster_m", [(128, 1), (256, 2)])
-@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("activation", ["silu", "gelu_pytorch_tanh"])
 @torch.inference_mode()
 def test_bf16_wide_tiles_preserve_partial_output_columns(
     tile_m, cluster_m, activation
@@ -253,7 +253,7 @@ def test_an_expert_parallel_rank_sums_the_routes_to_its_resident_experts():
     nothing, so an exchange can sum the ranks' partial outputs.
     """
     generator = torch.Generator().manual_seed(73)
-    module, hidden = _positive_bf16("gelu_tanh", generator)
+    module, hidden = _positive_bf16("gelu_pytorch_tanh", generator)
     up_gate, down = module.up_gate.weight.clone(), module.down.weight.clone()
     resident = slice(EXPERTS // 2, EXPERTS)
     for linear, weight in ((module.up_gate, up_gate), (module.down, down)):
@@ -271,7 +271,7 @@ def test_an_expert_parallel_rank_sums_the_routes_to_its_resident_experts():
         down,
         ids.clamp(max=EXPERTS - 1),
         torch.where(kept, weights, 0.0),
-        "gelu_tanh",
+        "gelu_pytorch_tanh",
     )
     with ExecutionContext(module, moe="cutedsl") as context:
         context.prepare(TextSize(TOKENS, 1))
@@ -376,7 +376,7 @@ def _exact_nvfp4(activation, generator, top_k=TOP_K):
 
 
 @pytest.mark.parametrize("provider", NVFP4_PROVIDERS)
-@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("activation", ["silu", "gelu_pytorch_tanh"])
 @torch.inference_mode()
 def test_nvfp4_experts_apply_per_expert_scales_and_static_activations(
     activation, provider
@@ -413,7 +413,9 @@ def test_preparing_nvfp4_experts_keeps_one_copy_of_the_logical_weights(
     provider,
 ):
     """A kernel's physical placement changes neither values nor footprint."""
-    module, _ = _exact_nvfp4("gelu_tanh", torch.Generator().manual_seed(53))
+    module, _ = _exact_nvfp4(
+        "gelu_pytorch_tanh", torch.Generator().manual_seed(53)
+    )
     logical = {
         name: getattr(module, name).weight.dequantize()
         for name in ("up_gate", "down")
@@ -444,7 +446,7 @@ def test_preparing_nvfp4_experts_keeps_one_copy_of_the_logical_weights(
 
 
 @pytest.mark.parametrize("provider", NVFP4_PROVIDERS)
-@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("activation", ["silu", "gelu_pytorch_tanh"])
 @torch.inference_mode()
 def test_nvfp4_gating_applies_the_declared_nonlinearity(activation, provider):
     """Each probe channel is the only nonzero input of its FC2 block.
@@ -536,7 +538,7 @@ def test_nvfp4_experts_read_hidden_states_stored_in_their_input_encoding(
     encoding is rejected.
     """  # noqa: D205
     generator = torch.Generator().manual_seed(67)
-    module, hidden = _exact_nvfp4("gelu_tanh", generator)
+    module, hidden = _exact_nvfp4("gelu_pytorch_tanh", generator)
     hidden = hidden * (torch.rand(hidden.shape, generator=generator) + 0.5).to(
         DEVICE, torch.bfloat16
     )
@@ -578,7 +580,7 @@ def test_nvfp4_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
     """
     top_k = EXPERTS
     generator = torch.Generator().manual_seed(61)
-    module, hidden = _exact_nvfp4("gelu_tanh", generator, top_k=top_k)
+    module, hidden = _exact_nvfp4("gelu_pytorch_tanh", generator, top_k=top_k)
     ids, weights = _routes(generator, top_k=top_k)
     expected = _reference(
         hidden,
@@ -586,7 +588,7 @@ def test_nvfp4_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
         module.down.weight.dequantize(dtype=torch.float32),
         ids,
         weights,
-        "gelu_tanh",
+        "gelu_pytorch_tanh",
     )
 
     stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
@@ -669,7 +671,7 @@ def _unaligned_nvfp4():
         HIDDEN,
         intermediate,
         top_k=TOP_K,
-        activation="gelu_tanh",
+        activation="gelu_pytorch_tanh",
         device=DEVICE,
         dtype=torch.bfloat16,
     )

@@ -29,7 +29,7 @@
 //! single-tick driver for tests and examples.
 
 use super::*;
-use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
+use uniserve_worker_ipc::{CallCoordinates, ErrorCode, ForwardMode, MediaCall, TransferMode};
 
 /// The products a batch's calls publish.
 fn batch_products(batch: &ExecutionBatch) -> impl Iterator<Item = BufferId> + '_ {
@@ -86,7 +86,7 @@ impl Scheduler {
                 }
                 Err(ExecutorSubmitError::Failed(error)) => {
                     // Failure reconciliation owns the pending identities until
-                    // every affected computation has been retired.
+                    // every affected call has been retired.
                     self.on_executor_error(error);
                     return true;
                 }
@@ -98,7 +98,7 @@ impl Scheduler {
     /// Returns whether any rank queue can still accept a batch.
     ///
     /// `queue_depth` bounds the batches in flight on one rank, not across the
-    /// instance: a batch carries one computation to one component, so a media
+    /// instance: a batch carries one call to one component, so a media
     /// pass occupies a slot on each component it touches rather than a single
     /// shared slot. Assembling stops once every rank queue is full.
     fn a_rank_queue_admits(&self) -> bool {
@@ -122,12 +122,16 @@ impl Scheduler {
 
     /// Advances scheduler and executor work, blocking only for an outstanding result.
     ///
+    /// Serving drives `run`; `step` lets tests and examples advance the
+    /// scheduler deterministically from the calling thread.
+    ///
     /// Drains `commands` first; a shutdown command or a disconnected channel
     /// aborts every request, closes the executor and returns `false`. When the
     /// nonblocking tick makes no progress while batches are in flight, this
     /// waits a bounded time for one result.
     ///
     /// Returns whether the loop made progress or handled an executor outcome.
+    #[cfg(feature = "testing")]
     pub fn step(&mut self, commands: &Receiver<Command>) -> bool {
         if self.drain_commands(commands) {
             self.abort_all_requests();
@@ -319,7 +323,7 @@ impl Scheduler {
 fn rejection_cause(call: &Call, error: &generation::GenerationResultError) -> String {
     format!(
         "{error} (call {}.{}, {:?})",
-        call.call_id.batch_id, call.call_id.request_index, call.code
+        call.call_id.batch_id, call.call_id.request_index, call.kind
     )
 }
 
@@ -463,9 +467,14 @@ impl Scheduler {
     /// reading those host products wait until the read has completed, so a
     /// model worker's queue never holds a call blocked on a host task. Then
     /// the vision encoding precedes the text encoding that splices its
-    /// features in, on the same component, while the latent encoding covers
-    /// the visual condition units in rounds and then the audio tracks.
-    /// Latent preparation follows once every one of them is scheduled.
+    /// features in, on the same component; the text encoding waits until
+    /// those features are produced, because a worker dispatches its
+    /// submissions in order and one waiting for an input would hold back
+    /// every later one. Meanwhile the latent encoding covers the visual
+    /// condition units in rounds and then the audio tracks, each call on
+    /// the latent encoder's ranks that the prompt's encoding does not take
+    /// and that hold none of the request's calls (`latent_round`). Latent
+    /// preparation follows once every one of them is scheduled.
     ///
     /// Latent preparation, the denoising steps and the two decoders become
     /// ready once their predecessor is scheduled; they name their inputs by
@@ -503,16 +512,25 @@ impl Scheduler {
         let mut ready = Vec::new();
         if graph.encodes_vision() && !state.vision_encoding_scheduled {
             ready.push(MediaCall::VisionEncoding);
-        } else if !state.text_encoding_scheduled {
+        } else if !state.text_encoding_scheduled
+            && state.vision_features.as_ref().is_none_or(produced)
+        {
             ready.push(MediaCall::TextEncoding);
         }
+        // Latent encoding is offered while a rank of the latent encoder is
+        // free to take units (`latent_round`), from the first tick: the
+        // ranks that encode no prompt start on the condition units beside
+        // the vision encoding.
         let visual_units = graph.condition_units().len() as u32;
-        if state.scheduled_condition_units < visual_units
-            || (graph.encodes_condition_audio() && state.condition_audio_latents.is_none())
-        {
+        let encoding_remains = state.scheduled_condition_units < visual_units
+            || (graph.encodes_condition_audio() && state.condition_audio_latents.is_none());
+        if encoding_remains && self.latent_round(state).is_some() {
             ready.push(MediaCall::LatentEncoding);
         }
-        if !ready.is_empty() {
+        // Latent preparation reads the text features and every condition
+        // latent, so nothing later is offered while the text encoding waits
+        // for its vision features or a latent encoding call for a rank.
+        if !ready.is_empty() || encoding_remains || !state.text_encoding_scheduled {
             return ready;
         }
         if !state.latent_preparation_scheduled {
@@ -558,7 +576,7 @@ impl Scheduler {
     }
 
     /// Returns the steps of a request's trajectory covered once its submitted
-    /// calls complete, from their latent intervals.
+    /// calls complete.
     pub(super) fn scheduled_steps(&self, id: RequestId, progress: &Denoising) -> u32 {
         progress.scheduled(
             self.inflight
@@ -566,46 +584,11 @@ impl Scheduler {
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .filter_map(|pending| match pending.call.code {
-                    CallKind::Media(media_call) => Some((media_call, pending.input.latent())),
+                .filter_map(|pending| match pending.call.kind {
+                    CallKind::Media(media_call) => Some(media_call),
                     _ => None,
                 }),
         )
-    }
-
-    /// Returns where a video request's samples live on its denoiser worker.
-    ///
-    /// A standalone denoiser's latent pool gives every request slot the same
-    /// run of consecutive pages after its sentinel page, so the worker's
-    /// advertised pool and slot count name the pages of `slot`. The raster is
-    /// the video the samples decode to.
-    ///
-    /// Page zero is the sentinel and request slots are numbered from one
-    /// (`RequestPool::new`), so slot `s` owns the
-    /// `(latent_pages - 1) / request_slots` pages that start at
-    /// `1 + (s - 1) * pages`.
-    ///
-    /// Returns `None` when `worker` is not a loaded worker.
-    fn sample_placement(
-        &self,
-        worker: &crate::WorkerId,
-        slot: u32,
-        sampling: &uniserve_core::DiffusionSamplingParams,
-    ) -> Option<LatentPlacement> {
-        let (_, info) = self
-            .executor
-            .info()
-            .workers
-            .iter()
-            .find(|(id, _)| id == worker)?;
-        let pages = info.latent_pages.saturating_sub(1) / info.request_slots.max(1);
-        let first = 1 + slot.saturating_sub(1) * pages;
-        Some(LatentPlacement {
-            page_table: (first..first + pages).collect(),
-            latent_units: pages * info.latent_page_units,
-            height: sampling.height,
-            width: sampling.width,
-        })
     }
 
     /// Returns the component whose lanes one media call occupies.
@@ -613,35 +596,144 @@ impl Scheduler {
         self.info.media_components.get(&media_call).cloned()
     }
 
-    /// Returns how many media units one call of this kind covers at once.
+    /// Returns the worker serving `component` for one request, with the
+    /// component's placement there.
     ///
-    /// A distributed component reconstructs `units_per_rank` media units on
-    /// each of its ranks per round; any other component counts one unit per
-    /// rank. The worker is the request's owner of `component` when it has
-    /// one, otherwise the first candidate that can execute `work`.
-    ///
-    /// Returns `None` when no such worker is loaded, when its bound component
-    /// has no binding on that worker, or when the width does not fit in
-    /// `u32`.
-    fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> Option<u32> {
+    /// The worker is the request's owner of `component` when it has one,
+    /// otherwise the first candidate that can execute `work`. Returns `None`
+    /// when no such worker is loaded or its bound component has no binding
+    /// on that worker.
+    fn placed_component<'a>(
+        &'a self,
+        request: RequestKey,
+        work: CallKind,
+        component: &'a str,
+    ) -> Option<(&'a crate::WorkerId, &'a crate::ComponentConfig)> {
         let owner = self
             .placement
             .affinity
             .get(&(request, component.to_owned()));
-        let (_, bound, info) = self
+        let (worker, bound, _) = self
             .placement
             .component_candidates(self.executor.as_ref(), work, component)
             .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))?;
-        let component = info
-            .components
-            .iter()
-            .find(|component| component.name == bound)?;
-        let units_per_rank = if component.config.distribution.is_some() {
-            component.config.units_per_rank.max(1)
+        let config = self.executor.info().component_config(worker, bound)?;
+        Some((worker, config))
+    }
+
+    /// Returns how many media units one call of this kind covers at once.
+    ///
+    /// A distributed component reconstructs `units_per_rank` media units on
+    /// each of its ranks per round; any other component counts one unit per
+    /// rank, on the worker `placed_component` names.
+    ///
+    /// Returns `None` when the component has no placement or the width does
+    /// not fit in `u32`.
+    fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> Option<u32> {
+        let (_, config) = self.placed_component(request, work, component)?;
+        let units_per_rank = if config.distribution.is_some() {
+            config.units_per_rank.max(1)
         } else {
             1
         };
-        u32::try_from(component.config.ranks.len().saturating_mul(units_per_rank)).ok()
+        u32::try_from(config.ranks.len().saturating_mul(units_per_rank)).ok()
+    }
+
+    /// Returns the next latent encoding call of one request: the condition
+    /// units it covers and the ranks that hold them.
+    ///
+    /// The call is a visual round while condition units remain unscheduled
+    /// and otherwise the request's audio tracks, which are one unit.
+    /// Condition units are encoded independently of one another, so a
+    /// distributed latent encoder deals a call only to its free ranks, in
+    /// the component's rank order: those that hold none of the request's
+    /// calls in flight and that the prompt's encoding, until its text
+    /// encoding is placed, does not take. A rank still encoding the prompt
+    /// or an earlier round thus takes no unit that a free rank would
+    /// otherwise wait beside. Returns `None` while every rank is held; each
+    /// completing call frees its ranks.
+    ///
+    /// A latent encoder whose members encode together has no deal. Its call
+    /// covers the component's width and names no rank.
+    ///
+    /// Returns `None` as well when no component or worker serves latent
+    /// encoding.
+    fn latent_round(&self, state: &MediaFlowState) -> Option<(u32, Vec<u32>)> {
+        let request = state.admission.request_key;
+        let work = CallKind::Media(MediaCall::LatentEncoding);
+        let component = self.media_component(MediaCall::LatentEncoding)?;
+        let (worker, config) = self.placed_component(request, work, &component)?;
+        let remaining =
+            state.graph.condition_units().len() as u32 - state.scheduled_condition_units;
+        if config.distribution.is_none() {
+            let width = u32::try_from(config.ranks.len()).ok()?;
+            let units = if remaining > 0 {
+                width.min(remaining)
+            } else {
+                1
+            };
+            return Some((units, Vec::new()));
+        }
+
+        // A call in flight on this worker holds the ranks it was dealt to,
+        // or every rank of its component when it names none.
+        let mut held = HashSet::new();
+        // The vision and text encodings run one after the other on the text
+        // encoder's ranks, which are theirs from the start: between the two
+        // calls no call of the prompt is in flight there.
+        if !state.text_encoding_scheduled
+            && let Some(name) = self.media_component(MediaCall::TextEncoding)
+            && let Some((owner, prompt)) =
+                self.placed_component(request, CallKind::Media(MediaCall::TextEncoding), &name)
+            && owner == worker
+        {
+            held.extend(prompt.ranks.iter().copied());
+        }
+        for pending in self
+            .inflight
+            .pending_calls
+            .get(&state.request.request_id)
+            .into_iter()
+            .flatten()
+        {
+            let name = &pending.call.component;
+            if self.placement.affinity.get(&(request, name.clone())) != Some(worker) {
+                continue;
+            }
+            match &pending.input {
+                InflightInput::Media {
+                    decode: Some(range),
+                    ..
+                } if !range.ranks.is_empty() => {
+                    held.extend(range.ranks.iter().map(|rank| *rank as usize));
+                }
+                _ => held.extend(
+                    self.executor
+                        .info()
+                        .component_config(worker, name)
+                        .into_iter()
+                        .flat_map(|binding| binding.ranks.iter().copied()),
+                ),
+            }
+        }
+
+        let free = config
+            .ranks
+            .iter()
+            .filter(|rank| !held.contains(*rank))
+            .map(|rank| *rank as u32)
+            .collect::<Vec<_>>();
+        if free.is_empty() {
+            return None;
+        }
+        let per_rank = config.units_per_rank.max(1) as u32;
+        let units = if remaining > 0 {
+            remaining.min(free.len() as u32 * per_rank)
+        } else {
+            1
+        };
+        let holders = units.div_ceil(per_rank) as usize;
+        Some((units, free[..holders].to_vec()))
     }
 
     /// Returns a component's device lane capacity in media units.
@@ -653,21 +745,11 @@ impl Scheduler {
     /// Returns `None` for an exclusive lane, and when `worker` is not loaded
     /// or holds no binding named `component`.
     fn device_lane_units(&self, worker: &crate::WorkerId, component: &str) -> Option<u32> {
-        self.executor
-            .info()
-            .workers
-            .iter()
-            .find(|(id, _)| id == worker)
-            .and_then(|(_, info)| {
-                info.components
-                    .iter()
-                    .find(|binding| binding.name == component)
-            })
-            .and_then(|binding| {
-                binding.config.distribution.as_ref().map(|_| {
-                    (binding.config.ranks.len() * binding.config.units_per_rank.max(1)) as u32
-                })
-            })
+        let config = self.executor.info().component_config(worker, component)?;
+        config
+            .distribution
+            .as_ref()
+            .map(|_| (config.ranks.len() * config.units_per_rank.max(1)) as u32)
     }
 
     /// Returns the lanes one media call occupies and how much of each.
@@ -733,25 +815,18 @@ impl Scheduler {
             .placement
             .affinity
             .get(&(request, component.to_owned()));
-        let Some((worker, info)) = self.executor.info().workers.iter().find(|(id, info)| {
-            owner.is_none_or(|owner| id == owner)
-                && info
-                    .components
-                    .iter()
-                    .any(|binding| binding.name == component)
+        let info = self.executor.info();
+        let Some((worker, binding)) = info.workers.iter().find_map(|(id, _)| {
+            if owner.is_some_and(|owner| id != owner) {
+                return None;
+            }
+            Some((id, info.component_config(id, component)?))
         }) else {
             return Vec::new();
         };
-        let Some(binding) = info
-            .components
-            .iter()
-            .find(|binding| binding.name == component)
-        else {
-            return Vec::new();
-        };
-        let ranks = &binding.config.ranks;
-        let per_rank = binding.config.units_per_rank.max(1) as u32;
-        let (width, tasks): (usize, Box<dyn Fn(usize) -> u32>) = match binding.config.distribution {
+        let ranks = &binding.ranks;
+        let per_rank = binding.units_per_rank.max(1) as u32;
+        let (width, tasks): (usize, Box<dyn Fn(usize) -> u32>) = match binding.distribution {
             Some(_) => (
                 (units.max(1) as usize)
                     .div_ceil(per_rank as usize)
@@ -809,7 +884,7 @@ impl Scheduler {
         let mut ledger = LaneLedger::default();
         for (id, queue) in &self.inflight.pending_calls {
             for inflight in queue {
-                let CallKind::Media(media_call) = inflight.call.code else {
+                let CallKind::Media(media_call) = inflight.call.kind else {
                     continue;
                 };
                 if inflight.call.input_image.is_some() {
@@ -882,17 +957,9 @@ impl Scheduler {
             MediaCall::VideoDecoding => {
                 width().min(state.request.sampling.video_units - state.scheduled_decode_units)
             }
-            // A visual round covers the condition units its component's
-            // ranks encode together; the audio tracks are one call.
-            MediaCall::LatentEncoding => {
-                let remaining =
-                    state.graph.condition_units().len() as u32 - state.scheduled_condition_units;
-                if remaining > 0 {
-                    width().min(remaining)
-                } else {
-                    1
-                }
-            }
+            // A visual round covers the condition units its free ranks
+            // encode together; the audio tracks are one call.
+            MediaCall::LatentEncoding => self.latent_round(state).map_or(1, |(units, _)| units),
             MediaCall::AudioDecoding => width(),
             // An encode round covers the media units the decode round produced.
             MediaCall::VideoEncoding => state
@@ -918,8 +985,8 @@ impl Scheduler {
     /// latches engine-fatal on any error.
     ///
     /// A latent encoding call is a visual round while condition units remain
-    /// unscheduled, covering the next units its component's ranks encode
-    /// together, and otherwise the request's one audio call.
+    /// unscheduled, covering the next units its free ranks encode together,
+    /// and otherwise the request's one audio call (`latent_round`).
     fn plan_media_call(
         &mut self,
         id: RequestId,
@@ -933,12 +1000,20 @@ impl Scheduler {
         let request_key = state.admission.request_key;
         let stateful = work.advances_state();
 
-        // A video request advances its ladder one step per call.
+        // A video request advances one denoising step per call.
         let step = self.scheduled_steps(id, &state.denoising);
-        let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step, 1);
+        let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step);
         let units = state.graph.condition_units();
         let visual_round = media_call == MediaCall::LatentEncoding
             && state.scheduled_condition_units < units.len() as u32;
+        let latent_round = if media_call == MediaCall::LatentEncoding {
+            Some(
+                self.latent_round(state)
+                    .ok_or("a scheduled latent encoding call has a free rank")?,
+            )
+        } else {
+            None
+        };
         // Freeze the actual decode/write interval before advancing scheduled
         // counters. Completion consumes this same range from the submission.
         let decode = match media_call {
@@ -950,12 +1025,14 @@ impl Scheduler {
                     .component_width(request_key, work, &component)
                     .ok_or("a scheduled decoder has a loaded owner")?
                     .min(state.request.sampling.video_units - state.scheduled_decode_units),
+                ranks: Vec::new(),
             }),
             MediaCall::VideoEncoding => Some(DecodeRange {
                 request_key,
                 call_id,
                 cursor: state.scheduled_encode_units,
                 max_units: state.decoded_units[&state.scheduled_encode_units].0,
+                ranks: Vec::new(),
             }),
             MediaCall::AudioDecoding => Some(DecodeRange {
                 request_key,
@@ -964,30 +1041,32 @@ impl Scheduler {
                 max_units: self
                     .component_width(request_key, work, &component)
                     .ok_or("a scheduled decoder has a loaded owner")?,
+                ranks: Vec::new(),
             }),
             MediaCall::AudioEncoding => Some(DecodeRange {
                 request_key,
                 call_id,
                 cursor: 0,
                 max_units: 1,
+                ranks: Vec::new(),
             }),
-            // A visual round covers the next condition units the latent
-            // encoder's ranks encode together; the audio call is one unit.
-            MediaCall::LatentEncoding if visual_round => Some(DecodeRange {
-                request_key,
-                call_id,
-                cursor: state.scheduled_condition_units,
-                max_units: self
-                    .component_width(request_key, work, &component)
-                    .ok_or("a scheduled latent encoder has a loaded owner")?
-                    .min(units.len() as u32 - state.scheduled_condition_units),
-            }),
-            MediaCall::LatentEncoding => Some(DecodeRange {
-                request_key,
-                call_id,
-                cursor: 0,
-                max_units: 1,
-            }),
+            // A visual round covers the next condition units on the latent
+            // encoder's free ranks; the audio call is one unit on the first.
+            MediaCall::LatentEncoding => {
+                let (max_units, ranks) =
+                    latent_round.ok_or("a latent encoding call has its round")?;
+                Some(DecodeRange {
+                    request_key,
+                    call_id,
+                    cursor: if visual_round {
+                        state.scheduled_condition_units
+                    } else {
+                        0
+                    },
+                    max_units,
+                    ranks,
+                })
+            }
             _ => None,
         };
 
@@ -1138,13 +1217,6 @@ impl Scheduler {
             output_starts.push((reservation.clone(), start));
         }
 
-        // The step interval of a call that advances the trajectory; its
-        // pages follow from the worker the call is placed on.
-        let interval = stateful.then_some(if media_call == MediaCall::Denoising {
-            (step, 1)
-        } else {
-            (0, 0)
-        });
         let completion_output = if outputs.is_empty() && stateful {
             Some(self.media_completion_product(request_key, call_id)?)
         } else {
@@ -1158,7 +1230,6 @@ impl Scheduler {
                 logical_position: 0,
                 kv_visible_len: 0,
                 kv_computed_len: 0,
-                flow_step: step,
             },
 
             token_output: None,
@@ -1181,13 +1252,13 @@ impl Scheduler {
             request_key,
             call_id,
             component: component.to_owned(),
-            code: work,
+            kind: work,
             bounds: Bounds::default(),
             inputs,
             outputs,
             completion_output,
             predicate,
-            rng: None,
+            image_index: None,
         };
 
         // Record what this call schedules: the admission it carries, the
@@ -1236,7 +1307,7 @@ impl Scheduler {
                 }
             }
             MediaCall::LatentPreparation => state.latent_preparation_scheduled = true,
-            // Submitted steps are derived from the call's latent interval.
+            // Submitted steps are derived from the pending denoising calls.
             MediaCall::Denoising => {}
             MediaCall::VideoDecoding => {
                 let range = decode.as_ref().ok_or("a video decode has an input range")?;
@@ -1289,7 +1360,7 @@ impl Scheduler {
 
         // Place the call, recording the request's residency on the selected
         // worker, then bind each distinct input and output buffer to its
-        // reserved span in that worker's address space.
+        // reserved span in the buffer pool of each rank that backs it.
         let (worker, selected_component) = self
             .placement
             .select_worker(self.executor.as_ref(), &self.info, &call)
@@ -1303,32 +1374,16 @@ impl Scheduler {
             .buffer_inputs()
             .chain(call.buffer_outputs())
             .filter(|product| bound.insert(product.buffer_id()))
-            .map(|product| {
+            .flat_map(|product| {
                 let (component, index, start) = &state.buffer_bindings[&product.buffer_id()];
                 state.allocations.tensors[&(component.clone(), *index)]
                     .bind(product, *start, &worker)
             })
             .collect();
 
-        // Request slots are allocated per worker, so the slot and the latent
-        // pages it owns are those of the selected worker.
+        // Request slots are allocated per worker; the denoiser derives the
+        // latent pages of its slot from its own pool.
         let request_pool_idx = state.allocations.request_slot(&worker);
-        let sampling = state.request.sampling;
-        let latent = match interval {
-            Some((start_step, step_count)) => {
-                let samples = self
-                    .sample_placement(&worker, request_pool_idx, &sampling)
-                    .ok_or("a placed call's worker is loaded")?;
-                Some(Denoising::params(
-                    request_key,
-                    call_id,
-                    &samples,
-                    start_step,
-                    step_count,
-                ))
-            }
-            None => None,
-        };
 
         // Admission routed every component of the request, so the replicas
         // reading this call's products are known here: the producer names
@@ -1354,7 +1409,7 @@ impl Scheduler {
             block_tables: Vec::new(),
             new_cache_units: Vec::new(),
             forward: uniserve_worker_ipc::ForwardBatch::default(),
-            latent,
+            latent: None,
             decode,
             buffers,
             readers: Some(readers),
@@ -1362,7 +1417,6 @@ impl Scheduler {
         self.register_inflight(
             call.clone(),
             InflightInput::Media {
-                latent: placement.latent.clone(),
                 decode: placement.decode.clone(),
             },
             0,
@@ -1574,16 +1628,16 @@ impl Scheduler {
         }
     }
 
-    /// Returns whether a flow prefix can be scheduled now.
+    /// Returns whether a guidance prefix can be scheduled now.
     ///
-    /// Returns `false` only while the request holds a flow prefix that no
+    /// Returns `false` only while the request holds a guidance prefix that no
     /// successful denoising completion has finalized and a denoising call is
     /// in flight.
-    pub(super) fn flow_prefix_is_schedulable(&self, id: RequestId) -> bool {
+    pub(super) fn guidance_prefix_is_schedulable(&self, id: RequestId) -> bool {
         let prefix_is_pending = self
             .running
             .get(&id)
-            .and_then(|state| state.flow_prefix.as_ref())
+            .and_then(|state| state.guidance_prefix.as_ref())
             .is_some_and(|prefix| !prefix.diffusion_finalized);
         !prefix_is_pending
             || !self
@@ -1592,7 +1646,7 @@ impl Scheduler {
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .any(|call| call.call.code == CallKind::Media(MediaCall::Denoising))
+                .any(|call| call.call.kind == CallKind::Media(MediaCall::Denoising))
     }
 
     /// Counts prompt tokens accepted or present in pending forward inputs.
@@ -1637,7 +1691,7 @@ impl Scheduler {
         let mut feedback_index = state.feedback_encoder_index;
         for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
-            match call.code {
+            match call.kind {
                 // A context prefill adds its prompt tokens and vision blocks.
                 CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => {
                     let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
@@ -1648,7 +1702,7 @@ impl Scheduler {
                 }
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     physical = physical.saturating_add(call.bounds.max_tokens);
-                    if is_feedback_computation(call) {
+                    if is_feedback_call(call) {
                         feedback_index += 1;
                         if feedback_index == state.req.image_generation.feedback_encoders.len() {
                             logical = logical
@@ -1698,7 +1752,7 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .any(|pending| matches!(pending.call.code, CallKind::Forward(_)));
+            .any(|pending| matches!(pending.call.kind, CallKind::Forward(_)));
         Some(CallCoordinates {
             logical_position,
             kv_visible_len,
@@ -1707,7 +1761,6 @@ impl Scheduler {
             } else {
                 state.kv_computed_len.max(kv_visible_len)
             },
-            flow_step: self.num_scheduled_denoise_steps(id)?,
         })
     }
 
@@ -1746,9 +1799,9 @@ impl Scheduler {
         let mut images = 0;
         for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
-            if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+            if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                 index = 0;
-            } else if consumes_image_features(call) && is_feedback_computation(call) {
+            } else if consumes_image_features(call) && is_feedback_call(call) {
                 index += 1;
                 if index == state.req.image_generation.feedback_encoders.len() {
                     index = 0;
@@ -1792,8 +1845,8 @@ impl Scheduler {
             .find_map(|pending| select(&pending.call))
     }
 
-    /// Selects the next computation from the last pending input, or from accepted
-    /// request progress when no computation remains. No request state is replayed.
+    /// Selects the next call from the last pending input, or from accepted
+    /// request progress when no call remains. No request state is replayed.
     pub(super) fn next_generation_phase(&self, id: RequestId) -> Option<Phase> {
         let state = self.running.get(&id)?;
         let pending = self
@@ -1802,7 +1855,7 @@ impl Scheduler {
             .get(&id)
             .and_then(|queue| queue.back());
         let phase = match pending.map(|pending| &pending.call) {
-            Some(call) => match call.code {
+            Some(call) => match call.kind {
                 CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => Phase::Prefill,
                 CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     Phase::Prefill
@@ -1824,7 +1877,7 @@ impl Scheduler {
                 }
                 CallKind::Forward(ForwardMode::TokenDenoising) => Phase::Readout,
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
-                    if is_feedback_computation(call) {
+                    if is_feedback_call(call) {
                         if self.scheduled_feedback(id)?.0 == 0 {
                             Phase::DecodeUnd
                         } else {
@@ -1837,13 +1890,13 @@ impl Scheduler {
                     }
                 }
                 CallKind::Forward(ForwardMode::Prefill) => Phase::PublishKv,
-                CallKind::Transfer(TransferMode::KvPublish) => Phase::PrepareGen,
+                CallKind::Transfer(TransferMode::KvPublish) => Phase::LatentPreparation,
                 CallKind::Media(MediaCall::LatentPreparation)
-                | CallKind::Media(MediaCall::Denoising) => Phase::DenoiseGen,
+                | CallKind::Media(MediaCall::Denoising) => Phase::Denoising,
                 CallKind::Media(MediaCall::ImageDecoding) => Phase::FeedbackEncode,
                 CallKind::Media(MediaCall::VisionEncoding)
                 | CallKind::Media(MediaCall::LatentEncoding)
-                    if is_feedback_computation(call) =>
+                    if is_feedback_call(call) =>
                 {
                     Phase::FeedbackState
                 }
@@ -1864,16 +1917,16 @@ impl Scheduler {
             {
                 if state.req.is_readout() {
                     Phase::Readout
-                } else if state.req.is_canvas_generation() {
+                } else if self.config.canvas.is_some() {
                     Phase::Canvas
                 } else {
                     Phase::DecodeUnd
                 }
             }
-            Phase::DenoiseGen
+            Phase::Denoising
                 if self.num_scheduled_denoise_steps(id)? >= state.denoising.steps() =>
             {
-                Phase::CommitGen
+                Phase::ImageDecoding
             }
             phase => phase,
         })
@@ -1906,7 +1959,7 @@ impl Scheduler {
             return self.state_predecessor(id);
         };
         // Accepted lengths are published in device request state; the successor
-        // needs the producing computation identity while its host report is pending.
+        // needs the producing call identity while its host report is pending.
         Some(call.call_id)
     }
 
@@ -2023,7 +2076,7 @@ impl Scheduler {
         // prompt/decode pipelining, using each predecessor's actual inputs.
         if target == CallKind::Forward(ForwardMode::Decode) {
             let feedback_continuation = consumes_image_features(&predecessor.call)
-                && is_feedback_computation(&predecessor.call)
+                && is_feedback_call(&predecessor.call)
                 && self
                     .scheduled_feedback(id)
                     .is_some_and(|(index, _)| index == 0)
@@ -2040,7 +2093,7 @@ impl Scheduler {
                 || (state.phase == Phase::Prefill && state.starts_gen_after_context())
                 || queue.iter().any(|call| {
                     !matches!(
-                        call.call.code,
+                        call.call.kind,
                         CallKind::Forward(ForwardMode::Prefill)
                             | CallKind::Forward(ForwardMode::Decode)
                     )
@@ -2113,7 +2166,7 @@ impl Scheduler {
         }
     }
 
-    /// Determines the next pipelined computation from its submitted predecessor.
+    /// Determines the next pipelined call from its submitted predecessor.
     ///
     /// Returns `None`, among other cases, when the request is not running or
     /// has no call in flight, has not yet submitted its whole prompt or every
@@ -2133,12 +2186,12 @@ impl Scheduler {
             return None;
         }
         let last = &self.inflight.pending_calls.get(&id)?.back()?.call;
-        let chainable = if last.code == CallKind::Media(MediaCall::ImageDecoding) {
+        let chainable = if last.kind == CallKind::Media(MediaCall::ImageDecoding) {
             state.req.feeds_back_images()
                 && state.req.image_generation.feedback_source
                     == Some(uniserve_core::FeedbackSource::DeviceProduct)
         } else if consumes_image_features(last)
-            && is_feedback_computation(last)
+            && is_feedback_call(last)
             && self.scheduled_feedback(id)?.0 == 0
         {
             state.req.image_generation.sample_feedback_continuation
@@ -2152,22 +2205,20 @@ impl Scheduler {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::CloseKv | Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
             Phase::PublishKv => CallKind::Transfer(TransferMode::KvPublish),
-            Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
-            Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
-            Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),
+            Phase::LatentPreparation => CallKind::Media(MediaCall::LatentPreparation),
+            Phase::Denoising => CallKind::Media(MediaCall::Denoising),
+            Phase::ImageDecoding => CallKind::Media(MediaCall::ImageDecoding),
             Phase::Readout | Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
             Phase::FeedbackEncode => {
                 let feedback = &state.req.image_generation;
                 feedback.feedback_source.as_ref()?;
-                match feedback
-                    .feedback_encoders
-                    .get(self.scheduled_feedback(id)?.0)?
-                    .encoder
-                {
-                    ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
-                    ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
-                }
+                CallKind::Media(
+                    feedback
+                        .feedback_encoders
+                        .get(self.scheduled_feedback(id)?.0)?
+                        .encoder,
+                )
             }
             Phase::IngestState => return None,
         })
@@ -2237,9 +2288,9 @@ impl Scheduler {
     /// Returns whether output capacity can cover every unresolved token-producing call.
     ///
     /// The request's event journal must hold, besides `OUTPUT_TERMINAL_RESERVE`
-    /// events kept for its terminal output, the `call_output_bound` of every
-    /// in-flight call plus the `next_output_bound` of the next one. Returns
-    /// `false` for a request that is not running or whose journal is closed.
+    /// events kept for its terminal output, the `output_bound` of every
+    /// in-flight call plus that of the call it plans next. Returns `false`
+    /// for a request that is not running or whose journal is closed.
     pub(super) fn output_window_ready(&self, id: RequestId) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
@@ -2254,30 +2305,15 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .map(|pending| call_output_bound(pending.call.code, &pending.call.bounds))
+            .map(|pending| output_bound(pending.call.kind))
             .sum::<usize>();
+        let next = self
+            .peek_next_call_variant(id)
+            .map_or(DEFAULT_OUTPUT_EVENTS, output_bound);
         available
             .saturating_sub(reserved)
             .saturating_sub(OUTPUT_TERMINAL_RESERVE)
-            >= self.next_output_bound(id)
-    }
-
-    /// Returns the output-size bound, in events, for the next call.
-    ///
-    /// Mirrors the per-kind counts of `call_output_bound`, which charges a
-    /// call once it is in flight, for the kinds `peek_next_call_variant`
-    /// predicts; a denoising call is budgeted at `denoise_step_burst` steps.
-    pub(super) fn next_output_bound(&self, id: RequestId) -> usize {
-        match self.peek_next_call_variant(id) {
-            Some(
-                CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode),
-            ) => 4,
-            Some(CallKind::Media(MediaCall::Denoising)) => {
-                usize::from(self.denoise_step_burst).saturating_add(2)
-            }
-            Some(CallKind::Media(MediaCall::ImageDecoding)) => 3,
-            Some(_) | None => 2,
-        }
+            >= next
     }
 
     /// Retains a submitted call and its inputs as in flight for its request,
@@ -2290,7 +2326,7 @@ impl Scheduler {
     /// `reserve_generation_resources`.
     pub(super) fn register_inflight(&mut self, call: Call, input: InflightInput, queue_us: u64) {
         let request_id = call.request_key.request_id;
-        let domain = self.stats.domains.get(call.code);
+        let domain = self.stats.domains.get(call.kind);
         let active = domain.active_credits.fetch_add(1, Ordering::Relaxed) + 1;
         domain.peak_credits.fetch_max(active, Ordering::Relaxed);
         domain.launched_calls.fetch_add(1, Ordering::Relaxed);
@@ -2302,11 +2338,11 @@ impl Scheduler {
             .push_back(InflightCall { call, input });
     }
 
-    /// Counts one backpressure event against the metrics domain of `computation`.
-    pub(super) fn record_domain_backpressure(&self, computation: uniserve_worker_ipc::CallKind) {
+    /// Counts one backpressure event against the metrics domain of `call`.
+    pub(super) fn record_domain_backpressure(&self, call: uniserve_worker_ipc::CallKind) {
         self.stats
             .domains
-            .get(computation)
+            .get(call)
             .backpressure_events
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -2327,13 +2363,13 @@ impl Scheduler {
     }
 
     /// Counts one returned call, and a predicated or failed status, against
-    /// the metrics domain of `computation`.
+    /// the metrics domain of `call`.
     pub(super) fn record_domain_completion(
         &self,
-        computation: uniserve_worker_ipc::CallKind,
+        call: uniserve_worker_ipc::CallKind,
         status: CallStatus,
     ) {
-        let stats = self.stats.domains.get(computation);
+        let stats = self.stats.domains.get(call);
         stats.completed_calls.fetch_add(1, Ordering::Relaxed);
         match status {
             CallStatus::Ok => {}
@@ -2351,15 +2387,11 @@ impl Scheduler {
     ///
     /// A reclaim with no active credit is logged as an accounting defect and
     /// changes no counter.
-    pub(super) fn reclaim_domain_credit(
-        &self,
-        computation: uniserve_worker_ipc::CallKind,
-        failed: bool,
-    ) {
-        let stats = self.stats.domains.get(computation);
+    pub(super) fn reclaim_domain_credit(&self, call: uniserve_worker_ipc::CallKind, failed: bool) {
+        let stats = self.stats.domains.get(call);
         let active = stats.active_credits.load(Ordering::Relaxed);
         if active == 0 {
-            tracing::error!(?computation, "domain call credit accounting underflowed");
+            tracing::error!(?call, "domain call credit accounting underflowed");
             return;
         }
         stats.active_credits.fetch_sub(1, Ordering::Relaxed);
@@ -2375,7 +2407,7 @@ impl Scheduler {
     /// calls whose credits it returns.
     pub(super) fn fail_inflight_domain_credits(&self) {
         for inflight in self.inflight.pending_calls.values().flatten() {
-            self.reclaim_domain_credit(inflight.call.code, true);
+            self.reclaim_domain_credit(inflight.call.kind, true);
         }
     }
 
@@ -2388,7 +2420,7 @@ impl Scheduler {
     /// through `Inflight::take_ready_completions`.
     pub(super) fn stage_completion(
         &mut self,
-        mut record: uniserve_worker_ipc::RequestOutput,
+        mut record: uniserve_worker_ipc::CallOutput,
         media: Result<Option<Arc<SharedMedia>>, String>,
     ) {
         let id = record.request_key.request_id;
@@ -2426,7 +2458,7 @@ impl Scheduler {
                     self.emit(id, event);
                 }
                 record.status = CallStatus::Error;
-                record.error_code = Some(uniserve_worker_ipc::ErrorCode::ResourceExhausted);
+                record.error_code = Some(uniserve_worker_ipc::ErrorCode::ResourceError);
                 None
             }
         };
@@ -2461,9 +2493,8 @@ impl Scheduler {
     pub(super) fn process_diffusion_result(
         &mut self,
         call: Call,
-        latent: Option<LatentParams>,
         decode: Option<DecodeRange>,
-        record: uniserve_worker_ipc::RequestOutput,
+        record: uniserve_worker_ipc::CallOutput,
         media: Option<Arc<SharedMedia>>,
     ) {
         let id = record.request_key.request_id;
@@ -2471,19 +2502,23 @@ impl Scheduler {
             return;
         };
         let mut consumed_products = Vec::new();
-        let already_failed = matches!(state.terminal_intent, TerminalIntent::Failure(_));
+        let already_failed = matches!(
+            state.terminal_intent,
+            TerminalIntent::Failure(_) | TerminalIntent::Rejected(_)
+        );
 
         // Only the final muxing call, the one that carries no media units,
         // returns the artifact; every other call returns none.
-        let media_output_valid = if call.code == CallKind::Media(MediaCall::Muxing) {
+        let media_output_valid = if call.kind == CallKind::Media(MediaCall::Muxing) {
             media.is_some() == call.inputs.is_empty()
         } else {
             media.is_none()
         };
-        let step_valid = call.code != CallKind::Media(MediaCall::Denoising)
-            || latent
-                .as_ref()
-                .is_some_and(|interval| Denoising::completes(interval, record.num_completed_steps));
+        // The worker reports the steps it has completed; a denoising result
+        // that does not advance the trajectory would be scheduled again
+        // without end.
+        let step_valid = call.kind != CallKind::Media(MediaCall::Denoising)
+            || record.step_index > state.denoising.completed();
         let valid = record.status == CallStatus::Ok
             && record.request_key == call.request_key
             && record.call_id == call.call_id
@@ -2496,12 +2531,18 @@ impl Scheduler {
             state.admission_state = WorkerRegistration::Registered;
         }
 
-        // A request that already failed only drains its remaining calls.
+        // A request that already failed only drains its remaining calls. A
+        // worker that refuses the request states why, and the client is told.
         if !already_failed {
             if !valid {
+                let refusal = (record.error_code == Some(ErrorCode::InvalidRequest))
+                    .then(|| record.error_message.clone())
+                    .flatten();
                 if let Some(state) = self.media_state_mut(id) {
-                    state.terminal_intent =
-                        TerminalIntent::Failure("media worker call failed".to_string());
+                    state.terminal_intent = match refusal {
+                        Some(reason) => TerminalIntent::Rejected(reason),
+                        None => TerminalIntent::Failure("media worker call failed".to_string()),
+                    };
                 }
             } else if let Some(state) = self.media_state_mut(id) {
                 // A condition product retires once the calls reading it have
@@ -2509,7 +2550,7 @@ impl Scheduler {
                 // vision features with the text encoding, the pixels with the
                 // last visual latent round, the PCM with the audio latent
                 // encoding, and the condition rows with latent preparation.
-                match call.code {
+                match call.kind {
                     CallKind::Media(MediaCall::VisionEncoding) => {
                         consumed_products
                             .extend(state.condition_media.remove(product::VISION_PIXELS));
@@ -2544,22 +2585,16 @@ impl Scheduler {
                         consumed_products.extend(state.condition_video_latents.iter().cloned());
                         consumed_products.extend(state.condition_audio_latents.iter().cloned());
                     }
-                    // `valid` requires a denoising result to complete its interval.
+                    // `valid` requires a denoising result to advance the trajectory.
                     CallKind::Media(MediaCall::Denoising) => {
-                        if let Some(interval) = latent.as_ref() {
-                            let accepted =
-                                state
-                                    .denoising
-                                    .accept(interval, record.num_completed_steps, None);
-                            debug_assert!(accepted, "a valid step completes its interval");
-                        }
+                        let accepted = state.denoising.accept(record.step_index, None);
+                        debug_assert!(accepted, "a valid step advances the trajectory");
                     }
                     CallKind::Media(MediaCall::VideoEncoding) => {
                         let Some(range) = decode.as_ref() else {
                             self.invariant_broken("a submitted media write keeps its input range");
                             return;
                         };
-                        state.encoded_video_units += range.max_units;
                         state.encoded_ready.insert(range.cursor, range.max_units);
                         if let Some((_, product)) = state.decoded_units.remove(&range.cursor) {
                             consumed_products.push(product);
@@ -2584,7 +2619,7 @@ impl Scheduler {
                     _ => {}
                 }
 
-                let phase = match call.code {
+                let phase = match call.kind {
                     CallKind::Media(
                         MediaCall::MediaReading
                         | MediaCall::VisionEncoding
@@ -2606,7 +2641,7 @@ impl Scheduler {
                         | MediaCall::AudioEncoding,
                     ) => "decoding",
                     CallKind::Media(MediaCall::Muxing) => "finalizing",
-                    _ => unreachable!("media request completed a non-media computation"),
+                    _ => unreachable!("media request completed a non-media call"),
                 };
                 let _ = state.output.enqueue(EngineCoreOutput::MediaProgress {
                     phase: phase.to_owned(),
@@ -2639,6 +2674,8 @@ impl Scheduler {
             }
             if let TerminalIntent::Failure(message) = &state.terminal_intent {
                 Some(DiffusionTerminal::Failed(message.clone()))
+            } else if let TerminalIntent::Rejected(message) = &state.terminal_intent {
+                Some(DiffusionTerminal::Rejected(message.clone()))
             } else if let TerminalIntent::Finish(reason) = &state.terminal_intent {
                 Some(DiffusionTerminal::Finished(reason.clone()))
             } else if state.output.is_closed() {
@@ -2682,6 +2719,12 @@ impl Scheduler {
             }
             DiffusionTerminal::Failed(message) => {
                 let _ = state.output.enqueue(EngineCoreOutput::Error { message });
+            }
+            DiffusionTerminal::Rejected(message) => {
+                let _ = state.output.enqueue(EngineCoreOutput::Rejected {
+                    kind: RejectionKind::Invalid,
+                    message,
+                });
             }
             DiffusionTerminal::Finished(reason) => {
                 let _ = state.output.enqueue(EngineCoreOutput::Finished {
@@ -2734,7 +2777,7 @@ impl Scheduler {
         call_id: CallId,
     ) -> Option<(Call, InflightInput)> {
         let inflight = self.inflight.pop_pending_call(request_key, call_id)?;
-        self.reclaim_domain_credit(inflight.call.code, false);
+        self.reclaim_domain_credit(inflight.call.kind, false);
         Some((inflight.call, inflight.input))
     }
 
@@ -2771,20 +2814,29 @@ impl Scheduler {
     /// executor errors and control-plane invariant violations remain fatal.
     ///
     /// A `WorkerFailure` is reconciled by `fail_after_worker_failure`; the
-    /// worker codes `SchedulerBug` and `InvariantViolation` also latch
-    /// engine-fatal. Losing every execution-capable worker also stops the
+    /// worker code `InvariantViolation` also latches engine-fatal. Losing every execution-capable worker also stops the
     /// engine, so later admissions cannot wait for capacity that will never
     /// return. Any other error latches engine-fatal and fails every in-flight
     /// call.
     pub(super) fn on_executor_error(&mut self, error: anyhow::Error) {
         if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
-            let execution = failure.execution.as_ref();
-            let code = execution.and_then(|value| value.code.as_deref());
-            if matches!(code, Some("SchedulerBug" | "InvariantViolation")) {
+            let code = failure.execution.as_ref().map(|value| value.code);
+            if code == Some(uniserve_worker_ipc::ErrorCode::InvariantViolation) {
                 self.fatal = true;
                 tracing::error!(worker = %failure.worker_id, ?code, "control-plane invariant failed: {error}");
-            } else if code == Some("InputError") {
+            } else if code == Some(uniserve_worker_ipc::ErrorCode::InputError) {
                 tracing::info!(worker = %failure.worker_id, ?code, "Worker rejected request: {error}");
+            } else if !failure.refusals.is_empty()
+                && failure
+                    .requests
+                    .iter()
+                    .all(|request| failure.refusals.contains_key(request))
+            {
+                tracing::info!(
+                    worker = %failure.worker_id,
+                    refusals = ?failure.refusals,
+                    "Worker refused requests as invalid"
+                );
             } else {
                 tracing::warn!(worker = %failure.worker_id, ?code, "Worker failed affected work: {error}");
             }
@@ -2864,7 +2916,7 @@ impl Scheduler {
                 invalid_result = true;
                 continue;
             }
-            let Some(computation) = self
+            let Some(call) = self
                 .inflight
                 .pending_calls
                 .get(&record.request_key.request_id)
@@ -2873,13 +2925,13 @@ impl Scheduler {
                         .iter()
                         .find(|inflight| inflight.call.call_id == record.call_id)
                 })
-                .map(|inflight| inflight.call.code)
+                .map(|inflight| inflight.call.kind)
             else {
                 invalid_result = true;
                 continue;
             };
             // A group's batch timing is the maximum of each phase over its calls.
-            let component = returned_groups[super::stats::ExecutionDomainStats::index(computation)]
+            let component = returned_groups[super::stats::ExecutionDomainStats::index(call)]
                 .get_or_insert(TimingCounters::default());
             component.queued_us = component.queued_us.max(record.timing_counters.queued_us);
             component.device_us = component.device_us.max(record.timing_counters.device_us);
@@ -2907,7 +2959,7 @@ impl Scheduler {
         let forward_stats = report.forward_stats;
         for result in &report.results {
             let record = &result.output;
-            if let Some(computation) = self
+            if let Some(call) = self
                 .inflight
                 .pending_calls
                 .get(&record.request_key.request_id)
@@ -2916,9 +2968,9 @@ impl Scheduler {
                         .iter()
                         .find(|inflight| inflight.call.call_id == record.call_id)
                 })
-                .map(|inflight| inflight.call.code)
+                .map(|inflight| inflight.call.kind)
             {
-                self.record_domain_completion(computation, record.status);
+                self.record_domain_completion(call, record.status);
             }
         }
         for (index, returned) in returned_groups.into_iter().enumerate() {
@@ -3029,16 +3081,16 @@ impl Scheduler {
                     continue;
                 };
 
-                let call_variant = call.code;
+                let call_variant = call.kind;
 
                 // Media calls update their independent call progress immediately;
                 // generation calls continue through semantic validation.
-                let (image_kv, latent) = match input {
-                    InflightInput::Media { latent, decode } => {
-                        self.process_diffusion_result(call, latent, decode, record, media);
+                let image_kv = match input {
+                    InflightInput::Media { decode } => {
+                        self.process_diffusion_result(call, decode, record, media);
                         continue;
                     }
-                    InflightInput::Generation { image_kv, latent } => (image_kv, latent),
+                    InflightInput::Generation { image_kv } => image_kv,
                 };
 
                 // A request already finishing with an error discards the
@@ -3088,10 +3140,9 @@ impl Scheduler {
                 if let Err(error) = generation::validate_generation_result(
                     &call,
                     image_kv,
-                    latent.as_ref(),
                     state,
                     &record,
-                    media.as_deref(),
+                    self.config.canvas.as_ref(),
                 ) {
                     self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;
@@ -3137,7 +3188,7 @@ impl Scheduler {
                     .is_some_and(|state| state.terminal_intent.is_terminal())
                     || self.inflight.pending_finishes.contains_key(&id);
                 if semantic_blocked {
-                    if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+                    if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                         self.free_request_latent(id);
                     }
                     self.finish_pending_if_idle(id);
@@ -3145,9 +3196,9 @@ impl Scheduler {
                 }
 
                 let progress_result = if record.status == CallStatus::Ok {
-                    self.running.get_mut(&id).map(|state| {
-                        state.process_generation_result(&call, latent.as_ref(), &record)
-                    })
+                    self.running
+                        .get_mut(&id)
+                        .map(|state| state.process_generation_result(&call, &record))
                 } else {
                     None
                 };
@@ -3158,7 +3209,7 @@ impl Scheduler {
                 // An accepted forward extends the request's KV: publish the
                 // prompt pages it completed, then retire sliding-window pages
                 // no later reader needs.
-                if progress_result.is_some() && matches!(call.code, CallKind::Forward(_)) {
+                if progress_result.is_some() && matches!(call.kind, CallKind::Forward(_)) {
                     self.advance_request_kv(id);
                 }
 
@@ -3187,26 +3238,26 @@ impl Scheduler {
 
                 // Reclaim resources whose lifetime ends at this transition before
                 // making its public output eligible for resolution.
-                let free_flow_prefix = call_variant == CallKind::Media(MediaCall::Denoising)
+                let free_guidance_prefix = call_variant == CallKind::Media(MediaCall::Denoising)
                     && record.status == CallStatus::Ok
                     && self
                         .running
                         .get(&id)
-                        .is_some_and(|state| record.num_completed_steps >= state.denoising.steps());
+                        .is_some_and(|state| record.step_index >= state.denoising.steps());
                 if call_variant == CallKind::Media(MediaCall::Denoising)
                     && record.status == CallStatus::Ok
                     && let Some(prefix) = self
                         .running
                         .get_mut(&id)
-                        .and_then(|state| state.flow_prefix.as_mut())
+                        .and_then(|state| state.guidance_prefix.as_mut())
                 {
                     prefix.diffusion_finalized = true;
                 }
-                if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+                if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                     self.free_request_latent(id);
                 }
-                if free_flow_prefix {
-                    self.free_flow_prefix(id);
+                if free_guidance_prefix {
+                    self.free_guidance_prefix(id);
                 }
                 if matches!(
                     call_variant,
@@ -3271,7 +3322,7 @@ impl Scheduler {
             for (_priority, _seq_index, id, call, record, media, public_tokens_before) in to_resolve
             {
                 let token_call = matches!(
-                    call.code,
+                    call.kind,
                     CallKind::Forward(ForwardMode::Prefill)
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)
@@ -3464,8 +3515,10 @@ impl Scheduler {
     ///
     /// Only the request epochs `loss` names fail, together with requests whose
     /// queued work targets an invalidated worker incarnation or reads an
-    /// invalidated buffer; every other request continues. A retired call that
-    /// has no pending record latches engine-fatal and stops reconciliation.
+    /// invalidated buffer; every other request continues. A media request
+    /// `loss` names as refused is rejected with the reason the worker stated
+    /// rather than failed. A retired call that has no pending record latches
+    /// engine-fatal and stops reconciliation.
     fn fail_after_worker_failure(&mut self, loss: &WorkerFailure) {
         // Blocks published from an invalidated worker incarnation leave
         // prefix-cache lookup; pages still referenced keep their owners.
@@ -3540,7 +3593,7 @@ impl Scheduler {
                 );
                 return;
             };
-            self.reclaim_domain_credit(inflight.call.code, true);
+            self.reclaim_domain_credit(inflight.call.kind, true);
         }
         for batch in pending {
             if batch.requests.is_empty() && batch.commands.is_empty() {
@@ -3560,12 +3613,14 @@ impl Scheduler {
         });
 
         // Fail each affected request that is still on the named epoch: a media
-        // request records a failure intent; a token request emits an error
+        // request records a failure intent, or a rejection with the worker's
+        // reason when the worker refused it; a token request emits an error
         // unless an error finish is already pending, and defers an error
         // finish until its in-flight calls drain.
         let engine_id = self.engine_id;
         for request in requests {
             let id = request.request_id;
+            let refusal = loss.refusals.get(&request);
             let error_emitted = self
                 .inflight
                 .pending_finishes
@@ -3573,7 +3628,10 @@ impl Scheduler {
                 .is_some_and(|finish| finish.reason == FinishReason::Error);
             if let Some(state) = self.media_state_mut(id) {
                 if state.admission.request_key == request {
-                    state.terminal_intent = TerminalIntent::Failure(loss.message.clone());
+                    state.terminal_intent = match refusal {
+                        Some(reason) => TerminalIntent::Rejected(reason.clone()),
+                        None => TerminalIntent::Failure(loss.message.clone()),
+                    };
                 }
             } else if let Some(state) = self.running.get_mut(&id) {
                 if request != RequestKey::new(engine_id, id, state.request_epoch) {
@@ -3641,7 +3699,11 @@ impl Scheduler {
                 .is_some_and(|state| state.admission.request_key == request)
             {
                 if !self.inflight.has_pending_calls(id) {
-                    self.finish_media(id, DiffusionTerminal::Failed(loss.message.clone()));
+                    let terminal = match refusal {
+                        Some(reason) => DiffusionTerminal::Rejected(reason.clone()),
+                        None => DiffusionTerminal::Failed(loss.message.clone()),
+                    };
+                    self.finish_media(id, terminal);
                 }
             } else if self.running.contains_key(&id) {
                 self.finish_after_inflight(id, FinishReason::Error, None);

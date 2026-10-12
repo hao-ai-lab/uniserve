@@ -174,6 +174,12 @@ class RoutedTensor:
             }
         )
 
+    def to(self, dtype: torch.dtype) -> RoutedTensor:
+        """Cast every route's tensor to ``dtype``."""
+        return RoutedTensor(
+            {route: value.to(dtype) for route, value in self.values.items()}
+        )
+
     def add(self, other: RoutedTensor) -> RoutedTensor:
         """Add another routed tensor route by route."""
         if set(other.values) != set(self.values) or any(

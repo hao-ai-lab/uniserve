@@ -20,61 +20,15 @@ from pathlib import Path
 
 from uniserve_worker.config.deployment import WorkerProcessArgs
 
-# Keys ``read_launch_descriptor`` requires the descriptor to carry. A launch
-# that omits one is a contract violation rather than something to paper over
-# with a local default. Optional keys such as ``checkpoint_identity`` and
-# ``base_model`` are absent when the launcher has no value for them.
-REQUIRED_FIELDS = (
-    "registration_address",
-    "channel_transport",
-    "acknowledgment_slot",
-    "host_slots",
-    "products_cross_hosts",
-    "worker_id",
-    "queue_depth",
-    "ipc_payload_cap",
-    "model",
-    "device",
-    "rank",
-    "local_rank",
-    "world_size",
-    "components",
-    "deployment_components",
-    "supported_calls",
-    "transfer_backends",
-    "publish_backends",
-    "rendezvous_address",
-    "rendezvous_listen_fd",
-    "attention_backend",
-    "block_size",
-    "max_batch_calls",
-    "max_batch_tokens",
-    "max_request_pool_size",
-    "max_model_len",
-    "max_video_seconds",
-    "max_condition_rows",
-    "ffmpeg",
-    "model_dtype",
-    "quantization_config",
-    "kv_memory_fraction",
-    "graph_policy",
-    "prefill_cuda_graph",
-    "flashinfer_workspace_size",
-    "flashinfer_decode_backend",
-    "flashinfer_prefill_backend",
-    "flashinfer_disable_split_kv",
-    "load_format",
-    "no_model",
-    "allow_stub",
-)
-
 
 def create_worker_cli_parser() -> argparse.ArgumentParser:
     """Build the worker launch parser over identity and the descriptor."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--launch-descriptor", required=True, type=Path)
-    # Identity is repeated on argv so `ps` identifies a worker without reading
-    # its descriptor; the descriptor remains the authority.
+    # The rank's logical position is repeated on argv so `ps` identifies a
+    # worker without reading its descriptor. The rank and world size also
+    # come from the descriptor, which is the authority; the worker id exists
+    # only here, because the engine alone holds which worker a rank serves.
     parser.add_argument("--worker-id", default="worker")
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world-size", type=int, default=1)
@@ -85,11 +39,13 @@ def read_launch_descriptor(path: Path) -> Namespace:
     """Load one launch descriptor into the namespace the config consumes.
 
     The descriptor's keys become the namespace's attributes unchanged; value
-    validation belongs to ``WorkerProcessArgs.from_namespace``.
+    validation belongs to ``WorkerProcessArgs.from_namespace``, which reads
+    every key it needs directly: the engine writes every launch value, so a
+    descriptor that omits one is a launch contract violation.
 
     Raises:
-        ValueError: The file cannot be read, is not valid JSON, is not a JSON
-            object, or omits a key in ``REQUIRED_FIELDS``.
+        ValueError: The file cannot be read, is not valid JSON, or is not a
+            JSON object.
     """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -104,9 +60,6 @@ def read_launch_descriptor(path: Path) -> Namespace:
     if not isinstance(payload, dict):
         raise ValueError("launch descriptor must be a JSON object")
 
-    missing = [name for name in REQUIRED_FIELDS if name not in payload]
-    if missing:
-        raise ValueError(f"launch descriptor omits {sorted(missing)}")
     return Namespace(**payload)
 
 

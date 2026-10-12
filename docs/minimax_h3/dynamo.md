@@ -83,7 +83,7 @@ curl --fail-with-body --max-time 600 \
     "size": "1344x768",
     "response_format": "b64_json",
     "output_format": "mp4",
-    "nvext": {"seed": 1000, "num_inference_steps": 8}
+    "nvext": {"seed": 1000}
   }' -o artifacts/dynamo/response.json
 
 .venv/bin/python - <<'PY'
@@ -103,6 +103,6 @@ Open `artifacts/dynamo/video.mp4` to play the generated video and soundtrack. Fa
 
 `size` selects one of the canvases the worker serves: those its `--video-resolutions` and `--video-aspect-ratios` prepare, as for `uniserve serve` (1344x768 and 768x1344 by default). Without `size` the worker generates the first of them. A client may instead name the canvas with top-level `resolution` (`768p` or `480p`) and `aspect_ratio` fields, which the frontend forwards to the worker; a `size` that disagrees with them is refused.
 
-The checkpoint determines the denoising schedule. `nvext.num_inference_steps` is optional; if supplied, it must match the checkpoint's eight steps. This integration supports text-to-video requests with completed responses; image input, streaming and guidance overrides are unsupported. Use `b64_json` to retrieve the MP4 directly, as above.
+The checkpoint determines the denoising schedule and the frame rate, and `seconds` the frame count, so `nvext.num_inference_steps`, `nvext.fps` and `nvext.num_frames` are refused. This integration supports text-to-video requests with completed responses; image input, streaming and guidance overrides are unsupported. Use `b64_json` to retrieve the MP4 directly, as above.
 
 Stop the worker and frontend with Ctrl-C in their respective terminals.

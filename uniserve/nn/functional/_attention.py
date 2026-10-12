@@ -10,7 +10,7 @@ def attention(
 ):
     """Apply local attention without implicit cache allocation or collectives.
 
-    Paged read-only calls pass physical K/V tensors and write_indices=None.
+    Paged read-only calls pass physical K/V tensors and slot_mapping=None.
     Persistent cache writes use Attention bound through ExecutionContext.
     ``window`` bounds the visible history as documented on ``Attention``.
     """

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 from uniserve.model import PatchEncoder, VisionInput
-from uniserve.nn.vae import PatchAutoencoder
+from uniserve.nn.vae import PatchAutoencoder, TiledEncoder
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.device import fill_cpu_ints
 from uniserve.runtime.resources import close_resources
@@ -17,21 +19,16 @@ from .cuda_graph import CUDAGraphRunner
 from .model_runner import ModelRunner
 from .output import ExecutionOutput
 
-# Most images one packed vision graph encodes. The largest graph's
-# activations bound the graph pool the vision graphs share (for
-# DiffusionGemma, 16 slots of 2520 patch rows), and a call with more images
-# replays it once per such group.
-MAX_PACKED_IMAGES = 16
 
-
-def packed_capacities(max_images: int) -> tuple[int, ...]:
+def packed_capacities(max_images: int, max_slots: int) -> tuple[int, ...]:
     """Slot counts of the packed vision graphs for calls of ``max_images``.
 
-    Every count from one to ``max_images``, capped at ``MAX_PACKED_IMAGES``,
-    so a call pads no empty slots below the cap. The graphs share one pixel
-    buffer and one pool, so each further count adds only its output.
+    Every count from one to ``max_images``, capped at the encoder's
+    ``max_slots``, so a call pads no empty slots below the cap and a larger
+    batch replays the largest graph once per group. The graphs share one
+    pixel buffer and one pool, so each further count adds only its output.
     """
-    return tuple(range(1, min(max_images, MAX_PACKED_IMAGES) + 1))
+    return tuple(range(1, min(max_images, max_slots) + 1))
 
 
 class EncoderRunner(ModelRunner):
@@ -42,6 +39,10 @@ class EncoderRunner(ModelRunner):
     count of ``packed_capacities``, captured at startup (``capture_packed``).
     A call takes the graph of its image count, or the largest once per full
     group, and every packing of a capacity replays its graph.
+
+    A video encoder's runner with graph pools captures the tile encoding of
+    a ``TiledEncoder`` at startup (``capture_tile``), whose replay the
+    entry's later contexts bind.
     """
 
     def __init__(self, *args, **kwargs):
@@ -52,6 +53,8 @@ class EncoderRunner(ModelRunner):
         # static ``(pixels, grids)`` input, the pixels a leading view of one
         # buffer every count shares.
         self._packed: dict[int, CUDAGraphRunner] = {}
+        # Captured spatial tile encodings, retained for their operators.
+        self._tiles: list[CUDAGraphRunner] = []
 
     @property
     def packs_images(self) -> bool:
@@ -129,8 +132,9 @@ class EncoderRunner(ModelRunner):
         encoder = self.model
         assert isinstance(encoder, PatchEncoder)
         assert encoder.max_patches is not None
+        assert encoder.max_slots is not None
         row = 3 * encoder.patch_size**2
-        capacities = packed_capacities(max_images)
+        capacities = packed_capacities(max_images, encoder.max_slots)
 
         # Only one packed call runs at a time on the runner's stream, so
         # every capacity reads the leading slots of one pixel buffer.
@@ -164,6 +168,66 @@ class EncoderRunner(ModelRunner):
                 graph.close()
                 raise
             self._packed[slots] = graph
+
+    @torch.inference_mode()
+    def capture_tile(
+        self, encoder: TiledEncoder, pixels: torch.Tensor
+    ) -> Callable[[torch.Tensor], torch.Tensor] | None:
+        """Capture ``encoder``'s encoding of one tile and return its operator.
+
+        ``pixels`` is the tile's native input; a copy becomes the graph's
+        fixed input, charged with the graph to the runner's graph storage.
+        The operator returns a new tensor equal to ``encoder.encode_tile`` of
+        any tile: a tile of ``pixels``'s shape, dtype and device replays the
+        graph and any other is encoded eagerly. A caller runs it on this
+        runner's stream, which every context of the runner's entry shares,
+        and the replay reads its tile there. Returns None for a runner
+        without graph pools.
+
+        Raises:
+            CUDAGraphError: After startup is sealed, or when graph residency
+                exceeds its byte budget.
+        """
+        if not self.pools:
+            return None
+        if self._startup_complete:
+            raise CUDAGraphError("tile capture is outside startup")
+
+        with self.graph_storage.allocate(self):
+            static = pixels.clone()
+        stream = self.context.stream
+        if stream is not None:
+            stream.wait(torch.cuda.current_stream(self.device))
+        try:
+            graph = CUDAGraphRunner.capture(
+                self.context,
+                (static,),
+                lambda inputs: encoder.encode_tile(*inputs),
+                pools=self.pools,
+            )
+        finally:
+            if stream is not None:
+                torch.cuda.current_stream(self.device).wait_stream(
+                    stream.stream
+                )
+        try:
+            self.graph_storage.check()
+        except BaseException:
+            graph.close()
+            raise
+        self._tiles.append(graph)
+
+        def encode_tile(tile: torch.Tensor) -> torch.Tensor:
+            if (
+                tile.shape != static.shape
+                or tile.dtype != static.dtype
+                or tile.device != static.device
+            ):
+                return encoder.encode_tile(tile)
+            # The next replay overwrites the graph's output.
+            return graph.replay((tile,)).clone()
+
+        return encode_tile
 
     @torch.inference_mode()
     def run_batch(self, batch, forward, *, eligible, borrow_output=False):
@@ -259,7 +323,9 @@ class EncoderRunner(ModelRunner):
         close_resources(
             super().close,
             *(graph.close for graph in self._packed.values()),
+            *(graph.close for graph in self._tiles),
             *(() if self._host is None else (self._host.close,)),
         )
         self._packed.clear()
+        self._tiles.clear()
         self._tokens = self._host = None

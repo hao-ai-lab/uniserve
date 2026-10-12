@@ -27,6 +27,15 @@ def test_component_media_assignment_uses_worker_local_ranks(rank):
     assert binding.owns
     assert tuple(binding.media_units(7, 3)) == ((9,) if rank == 0 else (7, 8))
 
+    # A round that names its ranks deals the units in that order, and a
+    # member it leaves out holds none.
+    assert tuple(binding.media_units(7, 3, (0, 1))) == (
+        (7, 8) if rank == 0 else (9,)
+    )
+    assert tuple(binding.media_units(7, 2, (0,))) == (
+        (7, 8) if rank == 0 else ()
+    )
+
     nonmember = ComponentBinding(
         "decoder",
         ComponentConfig((1 - rank,), distribution="temporal_units"),

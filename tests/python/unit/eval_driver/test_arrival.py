@@ -108,7 +108,9 @@ def test_finite_rate_duration_ends_at_the_last_completion(monkeypatch):
     assert result.duration_s == 0.5
 
 
-@pytest.mark.parametrize("concurrency", [None, 0, 2])
+# A trace's sessions are its concurrency: a smaller limit does not hold a
+# session back, so both first requests are in flight together.
+@pytest.mark.parametrize("concurrency", [None, 0, 1, 2])
 def test_closed_loop_sessions_wait_for_their_own_previous_response(concurrency):
     async def run():
         first_arrivals = set()
@@ -146,10 +148,11 @@ def test_closed_loop_sessions_wait_for_their_own_previous_response(concurrency):
                 request_rate=float("inf"),
                 max_concurrency=concurrency,
                 submit=submit,
-                warmup_requests=0,
             ),
             timeout=5,
         )
+        # Each session's first request is measured, not repeated as warmup.
+        assert result.warmup_outputs == ()
         assert [record.request_id for record in result.outputs] == [
             row.id for row in rows
         ]
@@ -158,24 +161,10 @@ def test_closed_loop_sessions_wait_for_their_own_previous_response(concurrency):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize(
-    "settings",
-    [
-        {"request_rate": 1.0},
-        {"max_concurrency": 1},
-        {"warmup_requests": 1},
-    ],
-)
-def test_closed_loop_sessions_reject_incompatible_arrival_settings(settings):
+def test_closed_loop_sessions_reject_a_finite_request_rate():
     async def submit(row, scheduled):
         return SimpleNamespace(success=True)
 
-    arguments = {
-        "request_rate": float("inf"),
-        "max_concurrency": 2,
-        "warmup_requests": 0,
-        **settings,
-    }
     with pytest.raises(ValueError, match="session"):
         asyncio.run(
             run_load(
@@ -183,7 +172,8 @@ def test_closed_loop_sessions_reject_incompatible_arrival_settings(settings):
                     Example(id="a0", prompt="", session_id="a"),
                     Example(id="b0", prompt="", session_id="b"),
                 ],
+                request_rate=1.0,
+                max_concurrency=2,
                 submit=submit,
-                **arguments,
             )
         )

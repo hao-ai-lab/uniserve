@@ -2,7 +2,7 @@
 
 ``MediaBuilder`` wraps a standalone ``VideoDenoiser`` for serving: it bounds
 admitted sizes, maps each size to the capacity layout whose prepared
-constants and captured ladder it shares, describes a request slot's storage,
+constants and captured steps it shares, describes a request slot's storage,
 and places a request's solver samples in latent pool pages (``SamplePages``).
 """
 
@@ -29,11 +29,9 @@ REQUEST_PAGES = 8
 SAMPLE_ALIGNMENT = 256
 
 #: Default text capacities, in prompt tokens: a first rung, then steps of
-#: ``TEXT_CAPACITY_STEP`` up to the prompt capacity. A request's layout holds
-#: at most one step of padding rows beyond its prompt's tiles. Padding rows
-#: cost GEMM work, about 2% of a 4-5 second step per 1024 rows on 4 x GB200
-#: under Ulysses-4, so the first rung spares prompts of up to 1024 tokens
-#: that padding.
+#: ``TEXT_CAPACITY_STEP`` below the prompt capacity, which is always the last
+#: capacity. A request's layout holds at most one step of padding rows beyond
+#: its prompt's tiles, and a short prompt pads to the first rung only.
 TEXT_CAPACITY_FIRST = 1024
 TEXT_CAPACITY_STEP = 2048
 
@@ -121,7 +119,7 @@ class MediaBuilder:
     canvas the deployment prepares, each with every frame count the worker
     admits and every text capacity. A request evaluates in the smallest
     capacity layout that holds it (``layout``), so every request of one
-    layout binds the same shapes and replays the same captured ladder, and no
+    layout binds the same shapes and replays the same captured steps, and no
     admitted size needs a layout of its own. What distinguishes the request
     within its layout is state the builder stages with its samples.
 
@@ -129,7 +127,9 @@ class MediaBuilder:
     smallest text capacity with the request's own condition region, which
     its runner prepares on first use and steps without a graph.
     ``maximum_layout`` bounds every such layout: the largest text-only
-    layout widened to the worker's condition capacity.
+    layout widened to the worker's condition capacity. A denoiser that is
+    not ``text_only`` receives only such requests, so ``layouts`` is empty
+    for it and startup prepares the maximum alone.
 
     The samples a solver step rewrites live in the worker's latent pool (see
     ``sample_pages``); the request's slot holds only state written once: the
@@ -151,18 +151,20 @@ class MediaBuilder:
 
         Admitted frame counts are the legal counts from ``min_frames`` up to
         ``max_frames`` rounded up to complete native windows. Text
-        capacities are prompt token counts; the largest must hold
-        ``max_text_tokens``, and without any they are ``TEXT_CAPACITY_FIRST``
-        and then steps of ``TEXT_CAPACITY_STEP`` up to it.
+        capacities are prompt token counts below ``max_text_tokens``, which
+        is always the largest capacity; without any they are
+        ``TEXT_CAPACITY_FIRST`` and then steps of ``TEXT_CAPACITY_STEP``.
+        A listed capacity equal to ``max_text_tokens`` repeats the largest.
         ``condition_rows`` is the packed condition rows a request may bring,
         zero for a worker that serves no conditions. ``canvases`` are the
         canvases the deployment prepares and admits, distinct members of
         ``VideoDenoiser.canvases``; without any they are all of those.
+        (``VideoDenoiser.select_canvases`` resolves a deployment's names.)
 
         Raises:
             ValueError: No frame count or canvas is admitted, a canvas
                 repeats or is not one the denoiser offers, a text
-                capacity is not positive or none holds ``max_text_tokens``,
+                capacity is not positive or exceeds ``max_text_tokens``,
                 or the condition capacity is negative or exceeds what the
                 denoiser takes (``VideoDenoiser.condition_layout``).
         """
@@ -174,13 +176,13 @@ class MediaBuilder:
         frames = denoiser.legal_frame_count(max_frames)
         self.denoiser = denoiser
         self.num_steps = denoiser.num_steps
-        self.canvases = tuple(canvases) or denoiser.canvases
+        offered = tuple(denoiser.canvases.values())
+        self.canvases = tuple(canvases) or offered
         self.max_text_tokens = max_text_tokens
         if not self.canvases:
             raise ValueError("media input admits no canvas")
         if len(set(self.canvases)) != len(self.canvases):
             raise ValueError("media input canvases must be distinct")
-        offered = denoiser.canvases
         if not set(self.canvases) <= set(offered):
             raise ValueError(
                 f"the denoiser offers only the canvases {offered}, not every "
@@ -211,15 +213,19 @@ class MediaBuilder:
         reference = max(self.canvases, key=storage)
         self.maximum = self._size(frames, max_text_tokens, reference)
 
-        requested = tuple(int(value) for value in text_capacities) or (
+        listed = tuple(int(value) for value in text_capacities)
+        if (
+            min(listed, default=1) < 1
+            or max(listed, default=0) > max_text_tokens
+        ):
+            raise ValueError(
+                "text capacities must be positive and not exceed the prompt "
+                "capacity"
+            )
+        below = listed or (
             TEXT_CAPACITY_FIRST,
             *range(TEXT_CAPACITY_STEP, max_text_tokens, TEXT_CAPACITY_STEP),
-            max_text_tokens,
         )
-        if min(requested) < 1 or max(requested) < max_text_tokens:
-            raise ValueError(
-                "text capacities must be positive and hold the prompt capacity"
-            )
         # Each capacity is the text region of the layout that holds it,
         # capped at the one that holds the prompt capacity.
         largest = denoiser.layout_size(self.maximum).num_text_tokens
@@ -232,7 +238,7 @@ class MediaBuilder:
                             self._size(frames, value, reference)
                         ).num_text_tokens,
                     )
-                    for value in requested
+                    for value in (*below, max_text_tokens)
                 }
             )
         )
@@ -282,8 +288,9 @@ class MediaBuilder:
 
         Raises:
             ValueError: The frame count or canvas is not one the worker
-                admits, the prompt exceeds its conditioning capacity, or the
-                denoiser refuses the conditions.
+                admits, the prompt exceeds its conditioning capacity, the
+                conditions take more rows than the condition capacity, naming
+                both, or the denoiser refuses the conditions.
         """
         size = self._size(
             num_frames,
@@ -296,11 +303,16 @@ class MediaBuilder:
             size.num_frames not in self.frame_counts
             or size.canvas not in self.canvases
             or size.num_text_tokens > self.max_text_tokens
-            or size.condition_rows > self.condition_rows
         ):
             raise ValueError(
-                "media input exceeds the worker frame, canvas, conditioning "
-                "or condition capacity"
+                "media input exceeds the worker frame, canvas or conditioning "
+                "capacity"
+            )
+        if size.condition_rows > self.condition_rows:
+            raise ValueError(
+                f"conditions: the conditions take {size.condition_rows} "
+                f"denoiser rows, more than the {self.condition_rows} this "
+                "deployment serves; serve with a larger --max-condition-rows"
             )
         return size
 
@@ -356,8 +368,12 @@ class MediaBuilder:
         row-shaped workspace dimension by dimension. Layouts start at the
         maximum's canvas and follow the other canvases in decreasing
         generated rows, then frame counts and text capacities in decreasing
-        order.
+        order. There are none when the denoiser is not ``text_only``: no
+        request it admits evaluates in one.
         """
+        if not self.denoiser.text_only:
+            return ()
+
         canvases = sorted(
             self.canvases,
             key=lambda canvas: (

@@ -32,7 +32,7 @@ class TransportKind(StrEnum):
     """Selects in-process, shared storage, device, or rank-channel transport."""
 
     LOCAL = "local"
-    SHM = "shm"
+    POSIX_SHM = "posix_shm"
     CUDA_VMM = "cuda_vmm"
     CHANNEL = "channel"
 

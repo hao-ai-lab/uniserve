@@ -19,8 +19,9 @@ class Rounding(StrEnum):
     the activation dtype: each operation computes in FP32 and stores a rounded
     result that the next operation reads. A reduction inside one operation,
     such as an RMS normalization's statistics, still accumulates in FP32 and
-    rounds once. A checkpoint's numerical contract selects the recipe its
-    reference implementation evaluates.
+    rounds once. Every caller states the recipe its model's reference
+    implementation evaluates; the functions that take a ``Rounding`` have no
+    default.
     """
 
     ONCE = "once"

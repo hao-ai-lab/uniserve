@@ -6,14 +6,15 @@ DiffusionGemma model with the released checkpoints' attention shapes, whose
 sliding tables start after retired pages, replays of causal text chunks,
 non-causal image-block rows and 256-token commit rows return the outputs and
 write the KV of eager execution of the same calls, and a replayed call copies
-no device value to the host. After startup, a prefill or decode call no
-captured graph holds fails instead of running eagerly, and the worker
-reports the most rows its prefill and decode graphs hold, at most the rows
-its KV unit pool holds a page of each cache group for. On pools of few
-units, whose cache groups have pages of different sizes, startup captures
-every prefill bucket a batch the pool holds selects, and each replays. A
-worker whose prefills select no output replays graphs that only write the
-K/V cache, and leaves the cache of the eager pass that evaluates outputs.
+no device value to the host. A worker captures prefill buckets and decode
+sizes up to the calls it admits, so every call it admits replays a graph; a
+call no captured graph holds, such as a decode call beyond the sizes a launch
+names, runs eagerly and returns the outputs a graph run of its rows returns.
+On pools of few units, whose cache groups have pages of different sizes, startup
+captures every prefill bucket a batch the pool holds selects, and each
+replays. A worker whose prefills select no output replays graphs that only
+write the K/V cache, and leaves the cache of the eager pass that evaluates
+outputs.
 """
 
 from __future__ import annotations
@@ -26,19 +27,17 @@ import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
+from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.distributed import Communicator
 from uniserve.loading import weights
 from uniserve.math import ceil_div
-from uniserve.runtime import PrefixCache
+from uniserve.runtime import KVCache
 from uniserve_models import loading as models
-from uniserve_worker.bootstrap.cache import cache_info
+from uniserve_worker.bootstrap.cache import cache_info, plan_cache
 from uniserve_worker.bootstrap.capacity import (
     graph_table_widths,
     input_buffer_config,
 )
-from uniserve_worker.bootstrap.components import supported_calls
-from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.errors import ResourceError
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.graph_inputs import (
     prefill_captures,
@@ -104,29 +103,30 @@ def _diffusion_gemma_worker(
         device="cuda:0",
         weights=weights.Config(dtype=torch.bfloat16),
     ).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         model_dtype="bfloat16",
         block_size=16,
         max_batch_calls=slots,
         max_request_pool_size=slots,
         max_batch_tokens=768,
-        max_sequence_tokens=SEQUENCE,
+        max_model_len=SEQUENCE,
         prefill_cuda_graph=graphs,
         prefill_outputs=outputs,
         prefill_graph_token_sizes=(64, 256),
         decode_graph_batch_sizes=(1,),
     )
     processor = source.image_processor
-    cache = PrefixCache(
+    planes = plan_cache(model.text, config)
+    cache = KVCache(
         model.text.cache_config,
+        planes,
         num_units=units,
-        block_size=16,
         device="cuda:0",
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model.text, config, num_units=units),
+        info=cache_info(model.text, planes, num_units=units),
         request_pool_size=slots,
         table_width=64,
     )
@@ -134,7 +134,7 @@ def _diffusion_gemma_worker(
     try:
         runner.configure_inputs(
             input_config=input_buffer_config(
-                model, config, processor=processor
+                model, config, planes=planes, processor=processor
             ),
             kv_cache=manager,
             latent_pool=None,
@@ -164,7 +164,7 @@ def _install(manager, slots, *, retired):
     entries, unit = [], 1
     for slot in slots:
         for group, shape in enumerate(manager.shapes):
-            pages = ceil_div(SEQUENCE, shape.page_tokens)
+            pages = ceil_div(SEQUENCE, shape.block_size)
             units = tuple(range(unit, unit + pages * shape.units_per_page))
             unit += len(units)
             start = retired if shape.window is not None else 0
@@ -174,7 +174,7 @@ def _install(manager, slots, *, retired):
                     group,
                     start,
                     units[start * shape.units_per_page :],
-                    pages * shape.page_tokens,
+                    pages * shape.block_size,
                 )
             )
     manager.block_tables.install(tuple(entries))
@@ -409,23 +409,23 @@ def _qwen_checkpoint(root):
 
 
 @torch.inference_mode()
-def test_sealed_prefill_rejects_calls_no_captured_graph_holds(tmp_path):
-    """After startup, a prefill no captured graph holds fails, writing no KV.
+def test_prefill_graphs_hold_every_admitted_row_count(tmp_path):
+    """Every prefill the worker admits replays a graph, one no graph holds not.
 
-    Forty admitted calls exceed the 31 rows the widest prefill bucket holds;
-    the worker reports that bound, replays a graph for 31 rows, and rejects
-    35 rows, and non-causal rows its text-only model captured no graph for,
-    without running them.
+    Forty admitted calls exceed the 31 rows of the fixed row buckets, so the
+    worker also captures a bucket for 40 rows. Calls of 31, 35 and 40 rows
+    replay graphs and return the same rows alike; the text-only model
+    captured no graph for non-causal rows, which run eagerly.
     """
     _qwen_checkpoint(tmp_path)
     model = models.load_model(
         models.read_config(tmp_path), device="cuda:0"
     ).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         block_size=16,
-        kv_token_capacity=4096,
-        max_sequence_tokens=32,
+        max_total_tokens=4096,
+        max_model_len=32,
         max_batch_calls=40,
         max_batch_tokens=64,
         max_request_pool_size=40,
@@ -437,16 +437,13 @@ def test_sealed_prefill_rejects_calls_no_captured_graph_holds(tmp_path):
         worker_config=config,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_calls=supported_calls(model),
         queue_depth=2,
-        completion_payload_bytes=1 << 16,
     ) as worker:
         worker.warmup()
-        assert worker.info.max_prefill_calls == 31
 
         manager = worker.kv_cache
         manager.block_tables.install(
-            tuple((slot, 0, 0, (slot,), 16) for slot in range(1, 36))
+            tuple((slot, 0, 0, (slot,), 16) for slot in range(1, 41))
         )
 
         def rows(count, *, causal=True):
@@ -457,19 +454,23 @@ def test_sealed_prefill_rejects_calls_no_captured_graph_holds(tmp_path):
                 causal=causal,
             )
 
-        output = _call(worker.runner, manager, rows(31))
-        assert output.stats.cuda_graph_replays == 1
-        assert len(output.materialize().values) == 31
+        replayed = _call(worker.runner, manager, rows(31))
+        assert replayed.stats.cuda_graph_replays == 1
+        assert len(replayed.materialize().values) == 31
 
-        before = _cache_values(manager)
-        for rejected in (rows(35), rows(2, causal=False)):
-            with pytest.raises(ResourceError, match="no prefill graph"):
-                _call(worker.runner, manager, rejected)
-        torch.cuda.synchronize()
-        for actual, expected in zip(
-            _cache_values(manager), before, strict=True
-        ):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for count in (35, 40):
+            wide = _call(worker.runner, manager, rows(count))
+            assert wide.stats.cuda_graph_replays == 1
+            assert len(wide.materialize().values) == count
+            for actual, expected in zip(_outputs(wide), _outputs(replayed)):
+                torch.testing.assert_close(
+                    actual, expected, rtol=2e-2, atol=2e-2
+                )
+
+        non_causal = _call(worker.runner, manager, rows(2, causal=False))
+        assert non_causal.stats.cuda_graph_replays == 0
+        assert non_causal.stats.cuda_graph_runtime_mode_counts == {"eager": 1}
+        assert len(non_causal.materialize().values) == 2
 
 
 @torch.inference_mode()
@@ -479,18 +480,18 @@ def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
     Every row of a prefill call holds a page of the model's one cache
     group, so a 96-token unit pool holds fewer rows than the configured
     prefill buckets would. Startup captures every prefill graph within the
-    pool, the worker reports the rows its allocatable units hold, and a
-    prefill of that many rows replays a graph.
+    pool, and a prefill of as many rows as the allocatable units hold replays
+    a graph.
     """
     _qwen_checkpoint(tmp_path)
     model = models.load_model(
         models.read_config(tmp_path), device="cuda:0"
     ).model
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         block_size=16,
-        kv_token_capacity=96,
-        max_sequence_tokens=32,
+        max_total_tokens=96,
+        max_model_len=32,
         max_batch_calls=16,
         max_batch_tokens=64,
         max_request_pool_size=16,
@@ -502,16 +503,13 @@ def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
         worker_config=config,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_calls=supported_calls(model),
         queue_depth=2,
-        completion_payload_bytes=1 << 16,
     ) as worker:
         worker.warmup()
         # Unit zero is the pool's sentinel; each row holds one unit, and the
         # pool holds fewer rows than the 31 the widest bucket would.
         allocatable = worker.info.kv_cache.num_units - 1
         assert allocatable < 31
-        assert worker.info.max_prefill_calls == allocatable
 
         manager = worker.kv_cache
         manager.block_tables.install(
@@ -535,25 +533,25 @@ def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
 
 
 @torch.inference_mode()
-def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
-    """Decode capacity follows the unit pool; wider decode calls fail.
+def test_decode_calls_no_captured_graph_holds_run_eagerly(tmp_path):
+    """Captured decode sizes follow the unit pool; wider calls run eagerly.
 
     Decode graphs of up to 16 rows are configured, and capturing one stages
     a page of the model's one cache group per row on the unit pool, whose
-    96 tokens hold fewer. The worker reports the largest configured size its
-    allocatable units hold, replays a graph for a decode call of that many
-    rows, and rejects one more row without running it.
+    96 tokens hold fewer. A decode call of the largest size its allocatable
+    units hold replays a graph; one more row runs eagerly, and the shared
+    rows' outputs equal the replay's.
     """
     _qwen_checkpoint(tmp_path)
     model = models.load_model(
         models.read_config(tmp_path), device="cuda:0"
     ).model
     sizes = (1, 2, 4, 8, 16)
-    config = WorkerConfig(
+    config = cpu_worker_config(
         device="cuda:0",
         block_size=16,
-        kv_token_capacity=96,
-        max_sequence_tokens=32,
+        max_total_tokens=96,
+        max_model_len=32,
         max_batch_calls=16,
         max_batch_tokens=64,
         max_request_pool_size=16,
@@ -565,25 +563,19 @@ def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
         worker_config=config,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_calls=supported_calls(model),
         queue_depth=2,
-        completion_payload_bytes=1 << 16,
     ) as worker:
         worker.warmup()
         # Unit zero is the pool's sentinel; each row stages one unit.
         allocatable = worker.info.kv_cache.num_units - 1
-        capacity = worker.info.max_decode_calls
-        assert capacity == max(size for size in sizes if size <= allocatable)
+        capacity = max(size for size in sizes if size <= allocatable)
         assert capacity < max(sizes)
+        assert capacity + 1 <= allocatable
 
-        # Each row owns one unit; the row beyond the capacity shares one,
-        # which its rejected call never reaches.
+        # Each row owns one unit.
         manager = worker.kv_cache
         manager.block_tables.install(
-            tuple(
-                (slot, 0, 0, ((slot - 1) % allocatable + 1,), 16)
-                for slot in range(1, capacity + 2)
-            )
+            tuple((slot, 0, 0, (slot,), 16) for slot in range(1, capacity + 2))
         )
 
         def rows(count):
@@ -594,18 +586,61 @@ def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
                 mode=ForwardMode.DECODE,
             )
 
-        output = _call(worker.runner, manager, rows(capacity))
-        assert output.stats.cuda_graph_replays == 1
-        assert len(output.materialize().values) == capacity
+        replayed = _call(worker.runner, manager, rows(capacity))
+        assert replayed.stats.cuda_graph_replays == 1
+        assert len(replayed.materialize().values) == capacity
 
-        before = _cache_values(manager)
-        with pytest.raises(ResourceError, match="no decode graph"):
-            _call(worker.runner, manager, rows(capacity + 1))
-        torch.cuda.synchronize()
-        for actual, expected in zip(
-            _cache_values(manager), before, strict=True
-        ):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        wide = _call(worker.runner, manager, rows(capacity + 1))
+        assert wide.stats.cuda_graph_replays == 0
+        assert wide.stats.cuda_graph_runtime_mode_counts == {"eager": 1}
+        assert len(wide.materialize().values) == capacity + 1
+        for actual, expected in zip(_outputs(wide), _outputs(replayed)):
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@torch.inference_mode()
+def test_default_decode_graphs_hold_the_most_rows_admitted(tmp_path):
+    """A launch naming no decode sizes captures one for its largest call.
+
+    A hundred admitted calls fall between the default sizes' steps of eight,
+    so the largest decode call of a hundred rows still replays a graph.
+    """
+    _qwen_checkpoint(tmp_path)
+    model = models.load_model(
+        models.read_config(tmp_path), device="cuda:0"
+    ).model
+    config = cpu_worker_config(
+        device="cuda:0",
+        block_size=16,
+        max_total_tokens=4096,
+        max_model_len=32,
+        max_batch_calls=100,
+        max_batch_tokens=128,
+        max_request_pool_size=100,
+        prefill_graph_token_sizes=(16,),
+    )
+    with Worker(
+        model,
+        worker_config=config,
+        sampling_group=Communicator(device=torch.device("cuda:0")),
+        tokenizer=None,
+        queue_depth=2,
+    ) as worker:
+        worker.warmup()
+
+        manager = worker.kv_cache
+        manager.block_tables.install(
+            tuple((slot, 0, 0, (slot,), 16) for slot in range(1, 101))
+        )
+        rows = _rows(
+            tuple(torch.tensor([slot % 30 + 1]) for slot in range(100)),
+            prefix=0,
+            selections=(TokenSelection.LAST_LOGITS,) * 100,
+            mode=ForwardMode.DECODE,
+        )
+        output = _call(worker.runner, manager, rows)
+        assert output.stats.cuda_graph_replays == 1
+        assert len(output.materialize().values) == 100
 
 
 @SM100
@@ -628,8 +663,7 @@ def test_a_small_pool_replays_every_prefill_bucket(tmp_path, units):
         tmp_path, graphs=True, units=units, slots=12
     ) as (runner, manager, config):
         pages = tuple(
-            (shape.page_tokens, shape.units_per_page)
-            for shape in manager.shapes
+            (shape.block_size, shape.units_per_page) for shape in manager.shapes
         )
         shapes = prefill_captures(
             config,
@@ -660,7 +694,7 @@ def test_a_small_pool_replays_every_prefill_bucket(tmp_path, units):
             entries, unit = [], 1
             for slot, length in enumerate(lengths, start=1):
                 for group, page in enumerate(manager.shapes):
-                    count = ceil_div(length, page.page_tokens)
+                    count = ceil_div(length, page.block_size)
                     held = count * page.units_per_page
                     entries.append(
                         (
@@ -668,7 +702,7 @@ def test_a_small_pool_replays_every_prefill_bucket(tmp_path, units):
                             group,
                             0,
                             tuple(range(unit, unit + held)),
-                            count * page.page_tokens,
+                            count * page.block_size,
                         )
                     )
                     unit += held

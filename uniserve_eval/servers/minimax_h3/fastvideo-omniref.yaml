@@ -8,12 +8,11 @@
 # Engine: Ulysses sequence parallelism over the four GPUs with every component
 # resident: the DiT replicated rather than FSDP-sharded, no text encoder, image
 # encoder or VAE offload, and the VAE decode split across the ranks and
-# gathered. This is the fastest lossless configuration measured on 4xGB200:
-# FastVideo's documented four-GPU OmniRef run
+# gathered. FastVideo's documented four-GPU OmniRef run
 # (examples/inference/basic/basic_fasth3_omniref_pdd.py,
-# docs/inference/fasth3-distilled.md: FSDP, the text encoder and VAEs
-# offloaded) took 27.1 s for W4 and 44.1 s for W5, this one 17.5 s and 35.8 s
-# (exploratory, two requests each). Attention is the checkpoint's trained
+# docs/inference/fasth3-distilled.md) instead shards the DiT with FSDP and
+# offloads the text encoder and VAEs, which this lossless configuration
+# avoids, so it is faster on 4xGB200. Attention is the checkpoint's trained
 # policy, which the pipeline requires: VSA-H3 with sparsity 0.9 and 128-token
 # tiles, eager (tile 128 is not compiled).
 generator:

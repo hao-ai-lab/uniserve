@@ -68,15 +68,14 @@ impl crate::serving::InputProcessor {
     /// `image_url` part, whose URL is not read again. Pass no images for a
     /// model without image input, which rejects image parts.
     ///
-    /// The returned request carries a placeholder engine identifier that the
-    /// caller must replace before submission (see
-    /// `InputProcessor::preprocess_generation`).
+    /// The served model name and `prompt_logprobs` are checked before
+    /// preprocessing, by `ServingRuntime::generate_chat`
+    /// (`validate_request_compat`).
     ///
     /// # Errors
     ///
-    /// Returns an `ApiError` when route validation (served model name,
-    /// `prompt_logprobs` bounds and streaming compatibility) or message and
-    /// control conversion fails, and the mapped serving error when
+    /// Returns an `ApiError` when message and control conversion fails, and
+    /// the mapped serving error when
     /// preprocessing fails, including when `images` does not hold exactly one
     /// image per `image_url` part.
     pub fn preprocess_chat_request(
@@ -91,11 +90,6 @@ impl crate::serving::InputProcessor {
         ),
         ApiError,
     > {
-        crate::openai::chat_completions::validate_request_compat(
-            &request,
-            self.served_model_name(),
-        )?;
-
         let requested_logprobs = request.logprobs;
         // Stream chunks have no `prompt_logprobs` field. Validation accepts a
         // streamed `prompt_logprobs: 0` for vLLM compatibility, but lowering
@@ -173,15 +167,11 @@ impl crate::serving::InputProcessor {
                 logit_bias: convert_logit_bias(request.logit_bias)?,
                 logprobs: requested_logprobs.then_some(request.top_logprobs.unwrap_or(0)),
                 prompt_logprobs,
-                logprob_token_ids: None,
             },
             None,
             image_gen,
             CachePolicy {
-                isolation_key: crate::serving::cache_isolation_key(
-                    None,
-                    request.cache_salt.as_deref(),
-                ),
+                isolation_key: crate::serving::cache_isolation_key(request.cache_salt.as_deref()),
                 ..CachePolicy::default()
             },
             request.priority.unwrap_or(0),
@@ -214,8 +204,7 @@ fn convert_modalities(modalities: &[ChatModality]) -> ModalitySelection {
 ///
 /// Wire names differ from the serving names: `guidance_scale` and
 /// `image_guidance_scale` are the text and image CFG scales, `cfg_norm` is the
-/// renormalization type, and `num_images` is `max_images`. Per-image prompts
-/// and image retention have no chat wire field and keep their defaults.
+/// renormalization type, and `num_images` is `max_images`.
 fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
     ImageGenControls {
         resolution: config.resolution,
@@ -230,8 +219,6 @@ fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
         timestep_shift: config.timestep_shift,
         seed: config.seed,
         max_images: config.num_images,
-        prompts: Vec::new(),
-        retain_images: None,
     }
 }
 
@@ -396,15 +383,14 @@ impl crate::serving::InputProcessor {
     /// Validates and tokenizes an image API request into its final engine input.
     ///
     /// The request is served as an image-only generation of exactly one image
-    /// with the default shared cache policy and default text sampling. As with
-    /// [`Self::preprocess_chat_request`], the returned engine identifier is a
-    /// placeholder.
+    /// with the default shared cache policy and default text sampling.
     ///
     /// # Errors
     ///
     /// Rejects an empty or whitespace-only prompt, `n != 1`, a model name
-    /// other than the served one, `steps == 0`, and a malformed `size`;
-    /// preprocessing failures are mapped from the serving error.
+    /// other than the served one, and a malformed `size`; preprocessing
+    /// failures, including image controls `ImageParams::validate` refuses,
+    /// are mapped from the serving error.
     pub fn preprocess_image_request(
         &self,
         request_id: ServeRequestId,
@@ -422,20 +408,8 @@ impl crate::serving::InputProcessor {
                 Some("prompt"),
             ));
         }
-        if request.n != 1 {
-            return Err(ApiError::invalid_request(
-                "n must be 1 for the configured image-generation route".to_string(),
-                Some("n"),
-            ));
-        }
         if let Some(model) = request.model.as_deref() {
             crate::openai::utils::check_model_served(model, self.served_model_name())?;
-        }
-        if request.steps == Some(0) {
-            return Err(ApiError::invalid_request(
-                "steps must be positive".to_string(),
-                Some("steps"),
-            ));
         }
         // An absent size leaves both dimensions to the profile's resolution
         // policy.
