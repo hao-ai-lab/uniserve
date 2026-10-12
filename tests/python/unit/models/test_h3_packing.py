@@ -1,10 +1,10 @@
-"""Conditioned dense layouts reproduce the released H3 packed sequences.
+"""Conditioned layouts reproduce the released H3 packed sequences.
 
 The released diffusers pipeline packs ``[text | conditions | target audio |
-target video]``; the dense layout holds the same rows in another physical
-order. Every row's rotary coordinates and modulation tag must equal the
-reference's bit for bit, and the condition rows must read the timesteps the
-reference holds them at.
+target video]``; the dense and segment layouts hold the same rows in other
+physical orders. Every row's rotary coordinates and modulation tag must equal
+the reference's bit for bit, and the condition rows must read the timesteps
+the reference holds them at.
 """
 
 from types import SimpleNamespace
@@ -19,6 +19,7 @@ from diffusers.modular_pipelines.minimax_h3.before_denoise import (
 
 from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
+from uniserve.nn.attention import vsa
 from uniserve_models.minimax_h3.packing import (
     AUDIO_CONDITION_GROUP,
     AUDIO_GROUP,
@@ -31,6 +32,9 @@ from uniserve_models.minimax_h3.packing import (
     dense_packing,
     dense_tables,
     latent_raster,
+    segment_packing,
+    segment_tables,
+    segment_tiles,
     video_latent_frames,
 )
 
@@ -118,27 +122,47 @@ def _assert_condition_groups(
     assert torch.equal(groups, by_time[index])
 
 
-@pytest.mark.parametrize("canvas", [WIDE, TALL])
-@pytest.mark.parametrize(
-    "anchors",
-    [("first",), ("last",), ("first", "last")],
-)
-def test_keyframes_follow_the_released_fl2va_layout(canvas, anchors):
-    # 8 s is 192 frames, 57 latent frames: past 16, so the last keyframe's
-    # pairwise-summed anchor differs from a sequential sum in the last place.
-    frames, text_rows = 192, 1935
-    spans = ((11, 1027), (1040, 1100))
+# 8 s is 192 frames, 57 latent frames: past 16, so the last keyframe's
+# pairwise-summed anchor differs from a sequential sum in the last place.
+KEYFRAME_FRAMES, KEYFRAME_TEXT = 192, 1935
+KEYFRAME_SPANS = ((11, 1027), (1040, 1100))
+ANCHORS = [("first",), ("last",), ("first", "last")]
+
+
+def _keyframes(canvas, anchors) -> tuple[Condition, ...]:
     roles = {
         "first": ConditionRole.FIRST_FRAME,
         "last": ConditionRole.LAST_FRAME,
     }
-    conditions = tuple(
+    return tuple(
         Condition(roles[anchor], video.Config(1, canvas)) for anchor in anchors
     )
-    packing, tables, condition_rows = _tables(
-        frames, canvas, text_rows, spans, conditions
-    )
+
+
+def _released_fl2va(canvas, anchors):
+    """The released fl2va packed sequence of the keyframe cases."""
     height, width = latent_raster(canvas)
+    return MiniMaxH3PrepareLayoutStep.build_packed_sequence(
+        _text_tags(KEYFRAME_TEXT, KEYFRAME_SPANS),
+        video_latent_frames(KEYFRAME_FRAMES),
+        height,
+        width,
+        audio_latent_frames(KEYFRAME_FRAMES),
+        (1, 2, 2),
+        2,
+        AUDIO_TAG,
+        VIDEO_TAG,
+        anchors,
+    )
+
+
+@pytest.mark.parametrize("canvas", [WIDE, TALL])
+@pytest.mark.parametrize("anchors", ANCHORS)
+def test_keyframes_follow_the_released_fl2va_layout(canvas, anchors):
+    frames, text_rows, spans = KEYFRAME_FRAMES, KEYFRAME_TEXT, KEYFRAME_SPANS
+    packing, tables, condition_rows = _tables(
+        frames, canvas, text_rows, spans, _keyframes(canvas, anchors)
+    )
     (
         positions,
         tags,
@@ -147,18 +171,7 @@ def test_keyframes_follow_the_released_fl2va_layout(canvas, anchors):
         _,
         visual,
         audio,
-    ) = MiniMaxH3PrepareLayoutStep.build_packed_sequence(
-        _text_tags(text_rows, spans),
-        video_latent_frames(frames),
-        height,
-        width,
-        audio_latent_frames(frames),
-        (1, 2, 2),
-        2,
-        AUDIO_TAG,
-        VIDEO_TAG,
-        anchors,
-    )
+    ) = _released_fl2va(canvas, anchors)
     ours, our_tags, our_groups = _reference_order(
         tables, packing, text_rows, condition_rows
     )
@@ -170,6 +183,85 @@ def test_keyframes_follow_the_released_fl2va_layout(canvas, anchors):
     )
     # Attention sees the generated rows, the prompt and the conditions.
     assert tables.used == packing.prefix_start + text_rows + condition_rows
+
+
+@pytest.mark.parametrize("tile", [64, 128])
+@pytest.mark.parametrize("canvas", [WIDE, TALL])
+@pytest.mark.parametrize("anchors", ANCHORS)
+def test_keyframes_follow_the_released_fl2va_layout_in_tiles(
+    tile, canvas, anchors
+):
+    """Sparse students hold the released keyframe rows in dense tiles."""
+    frames, text_rows, spans = KEYFRAME_FRAMES, KEYFRAME_TEXT, KEYFRAME_SPANS
+    segments = condition_segments(_keyframes(canvas, anchors), canvas)
+    packing = segment_packing(
+        num_frames=frames,
+        canvas=canvas,
+        text_rows=-(-text_rows // tile) * tile,
+        condition_rows=sum(segment_tiles(s, tile) for s in segments) * tile,
+        tile=tile,
+        token_multiple=4 * tile,
+    )
+    tables = segment_tables(
+        packing,
+        num_frames=frames,
+        canvas=canvas,
+        num_text_tokens=text_rows,
+        segments=segments,
+        vision_spans=spans,
+        sparsity=0.9,
+        reference_keep=None,
+    )
+    (
+        positions,
+        tags,
+        video_indices,
+        audio_indices,
+        _,
+        visual,
+        audio,
+    ) = _released_fl2va(canvas, anchors)
+
+    # Our packed row of every row of the reference's packed order: the
+    # prompt and the keyframes by the prefix source rows they gather, then
+    # the generated audio and the generated video in raster order.
+    taken = tables.prefix_index != packing.zero_row
+    source = torch.full((packing.zero_row,), -1, dtype=torch.int64)
+    source[tables.prefix_index[taken]] = torch.nonzero(taken).flatten()
+    order = torch.cat(
+        (
+            source[:text_rows],
+            source[packing.text_rows : packing.text_rows + visual],
+            packing.audio_indices,
+            packing.video_indices[packing.video_raster_indices.argsort()],
+        )
+    )
+    assert bool((order >= 0).all())
+    assert torch.equal(tables.position_ids.index_select(0, order), positions)
+    assert torch.equal(tables.token_tags.index_select(0, order), tags)
+    assert audio == 0
+    _assert_condition_groups(
+        tables.groups.index_select(0, order),
+        video_indices,
+        audio_indices,
+        (visual, audio),
+        text_rows,
+    )
+
+    # Every keyframe starts a tile of its own after the prompt's tiles, and
+    # every query attends its tiles densely.
+    keyframe_rows = order[text_rows : text_rows + visual]
+    per_keyframe = visual // len(anchors)
+    tiles_per_keyframe = segment_tiles(segments[0], tile)
+    assert torch.equal(
+        keyframe_rows[::per_keyframe],
+        packing.text_rows
+        + torch.arange(len(anchors)) * tiles_per_keyframe * tile,
+    )
+    used = torch.unique(keyframe_rows // tile)
+    assert used.numel() == len(anchors) * tiles_per_keyframe
+    assert bool((tables.tile_segments[used] == vsa.DENSE_TILE).all())
+    assert int(tables.variable_block_sizes[used].sum()) == visual
 
 
 def _reference_latents(condition: Condition):

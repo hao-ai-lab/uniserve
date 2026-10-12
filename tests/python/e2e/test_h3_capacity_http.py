@@ -105,7 +105,7 @@ def test_every_admitted_duration_and_prompt_length_replays(
         Path(__file__).resolve().parents[3]
         / "configs"
         / "minimax_h3"
-        / "fasth3-ulysses4.json"
+        / "ulysses4.json"
     )
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"

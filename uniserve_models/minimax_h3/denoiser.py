@@ -240,7 +240,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         the largest reference raster, the checkpoint's 2048-pixel short edge
         at 4:1, and three videos of the generated length with their
         soundtracks, on the canvas of the canvas rule where a video packs
-        the most rows. A network that packs keyframes also holds the two
+        the most rows. Every conditioned network also holds the two
         keyframes of ``canvas``, which are all an ``fl2va`` request carries.
         A text-to-video network takes no conditions.
         """
@@ -248,13 +248,11 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         if not tasks & {"fl2va", "ref2va"}:
             return ()
 
-        keyframes: tuple[Condition, ...] = ()
-        if self.dense:
-            frame = video.Config(1, canvas)
-            keyframes = (
-                Condition(ConditionRole.FIRST_FRAME, frame),
-                Condition(ConditionRole.LAST_FRAME, frame),
-            )
+        frame = video.Config(1, canvas)
+        keyframes = (
+            Condition(ConditionRole.FIRST_FRAME, frame),
+            Condition(ConditionRole.LAST_FRAME, frame),
+        )
         if "ref2va" not in tasks:
             return keyframes
 
@@ -341,9 +339,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             ValueError: A canvas the checkpoint does not generate, an invalid
                 frame count, prompt length or vision span, or conditions this
                 network does not take: keyframes without an ``fl2va`` or
-                ``ref2va`` task, references without ``ref2va``, or a keyframe
-                under sparse attention, whose segment packing has no keyframe
-                rows.
+                ``ref2va`` task, or references without ``ref2va``.
         """
         canvases = self.config.canvases
         if canvases is not None and canvas not in canvases.values():

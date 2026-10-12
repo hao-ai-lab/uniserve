@@ -6,9 +6,9 @@ exist, one per attention kind:
 
 * ``SegmentPacking`` (sparse attention): whole tiles ``[text | conditions |
   stereo audio | tiled video | padding]``. Text, conditions and audio are
-  dense, except that every reference video forms a video segment of its
-  own; the generated video is the last segment, grouped into
-  spatiotemporal tiles.
+  dense, keyframes and images each in tiles of their own, except that every
+  reference video forms a video segment of its own; the generated video is
+  the last segment, grouped into spatiotemporal tiles.
 * ``DensePacking`` (dense attention): ``[target video | target audio | text
   and conditions | padding]``. Attention is permutation-equivariant given
   the rotary coordinates, so the generated rows lead at fixed offsets and the
@@ -483,6 +483,28 @@ def _video_span(frames: int) -> float:
     )
 
 
+def _place_keyframe(
+    positions: torch.Tensor,
+    rows: slice | torch.Tensor,
+    anchor: ConditionRole,
+    origin: float,
+    frames: int,
+    spatial: torch.Tensor,
+) -> None:
+    """Place a keyframe on the generated timeline of ``frames`` latent frames.
+
+    The generated video starts at ``origin``; a first keyframe shares its
+    first latent frame's time and a last keyframe its last one's, both at
+    the target's spatial grid ``spatial``.
+    """
+    positions[rows, 0] = (
+        origin
+        if anchor == ConditionRole.FIRST_FRAME
+        else origin + _keyframe_span(frames) - ROPE_FRAME_RESCALE
+    )
+    positions[rows, 1:] = spatial
+
+
 def _keyframe_span(frames: int) -> float:
     """Rotary time ``frames`` latent frames occupy, summed pairwise.
 
@@ -608,12 +630,9 @@ def dense_tables(
                 float(segment.audio_frames), _video_span(segment.latent_frames)
             )
     for segment, visual in keyframes:
-        positions[visual, 0] = (
-            clock
-            if segment.anchor == ConditionRole.FIRST_FRAME
-            else clock + _keyframe_span(frames) - ROPE_FRAME_RESCALE
+        _place_keyframe(
+            positions, visual, segment.anchor, clock, frames, spatial
         )
-        positions[visual, 1:] = spatial
 
     _place_frames(
         positions, slice(0, packing.video_rows), frames, clock, spatial
@@ -675,16 +694,11 @@ def _video_grid(
 def segment_tiles(segment: Segment, tile: int) -> int:
     """Tiles one condition occupies in a segment packing of ``tile`` rows.
 
-    Its audio rows fill whole tiles, then an image's rows fill whole tiles
-    and a video's rows fill the tiles of its token grid.
-
-    Raises:
-        ValueError: A keyframe, which segment packing does not hold.
+    Its audio rows fill whole tiles, then a keyframe's or an image's rows
+    fill whole tiles and a video's rows fill the tiles of its token grid.
     """
-    if segment.kind == SegmentKind.KEYFRAME:
-        raise ValueError("H3 segment packing holds no keyframes")
     tiles = math.ceil(segment.audio_rows / tile)
-    if segment.kind == SegmentKind.IMAGE:
+    if segment.kind in (SegmentKind.KEYFRAME, SegmentKind.IMAGE):
         tiles += math.ceil(segment.video_rows / tile)
     elif segment.kind == SegmentKind.VIDEO:
         grid = _video_grid(
@@ -899,23 +913,25 @@ def segment_tables(
 ) -> SegmentTables:
     """Build one request's tables in its multi-segment layout.
 
-    The rows and their coordinates are the released ``ref2va`` packed
-    sequence ``[text | references | target audio | target video]`` of
+    The rows and their coordinates are the released packed sequence
+    ``[text | keyframes | references | target audio | target video]`` of
     ``dense_tables``, held in tiles.
-    The prompt fills the text tiles from the first. The references follow in
+    The prompt fills the text tiles from the first. The conditions follow in
     packed order from the first condition tile, each segment in its own
-    tiles: a reference's audio rows, then an image's rows fill whole dense
-    tiles, and a reference video forms its own segment of video tiles over its
-    token grid. The generated audio fills dense tiles and the generated
-    video forms the last segment. A video query keeps
+    tiles: a keyframe's rows fill whole dense tiles, as an image's do after a
+    reference's audio rows, and a reference video forms its own segment of
+    video tiles over its token grid. Dense tiles attend and are attended
+    densely, as the segment-pure prefix tiles of the FastVideo VSA-H3 layout
+    are. The generated audio fills dense tiles and the generated video forms
+    the last segment. A video query keeps
     ``kept_tiles(1 - reference_keep, n)`` tiles of a reference segment of
     ``n`` tiles and ``kept_tiles(sparsity, n)`` of the generated video.
     ``reference_keep`` is None for a network without reference videos.
 
     Raises:
-        ValueError: A keyframe, conditions or a prompt that do not fit the
-            layout's capacities, a vision span outside the prompt, or a
-            reference video without a keep rate.
+        ValueError: Conditions or a prompt that do not fit the layout's
+            capacities, a vision span outside the prompt, or a reference
+            video without a keep rate.
     """
     tile = packing.tile
     if (
@@ -977,10 +993,13 @@ def segment_tables(
     prefix_index[text] = torch.arange(num_text_tokens)
 
     # References advance the media clock in packed order, as in
-    # ``dense_tables``; their prefix source rows follow the text capacity.
+    # ``dense_tables``; the conditions' prefix source rows follow the text
+    # capacity. Keyframes lead and are placed on the generated timeline once
+    # the references have left the clock at its origin.
     clock = float(num_text_tokens)
     next_tile = packing.text_rows // tile
     source = packing.text_rows
+    keyframes = []
     for segment in segments:
         if segment.audio_rows:
             audio = dense_rows(next_tile, segment.audio_rows)
@@ -990,7 +1009,16 @@ def segment_tables(
             )
             source += segment.audio_rows
             tags[audio], groups[audio] = AUDIO_TAG, AUDIO_CONDITION_GROUP
-        if segment.kind == SegmentKind.IMAGE:
+        if segment.kind == SegmentKind.KEYFRAME:
+            visual = dense_rows(next_tile, segment.video_rows)
+            next_tile += math.ceil(segment.video_rows / tile)
+            prefix_index[visual] = torch.arange(
+                source, source + segment.video_rows
+            )
+            source += segment.video_rows
+            tags[visual], groups[visual] = VIDEO_TAG, VISUAL_CONDITION_GROUP
+            keyframes.append((segment, visual))
+        elif segment.kind == SegmentKind.IMAGE:
             visual = dense_rows(next_tile, segment.video_rows)
             next_tile += math.ceil(segment.video_rows / tile)
             prefix_index[visual] = torch.arange(
@@ -1041,6 +1069,11 @@ def segment_tables(
             clock += max(
                 float(segment.audio_frames), _video_span(segment.latent_frames)
             )
+
+    for segment, visual in keyframes:
+        _place_keyframe(
+            positions, visual, segment.anchor, clock, frames, spatial
+        )
 
     # The generated audio and video start where the references leave the
     # clock; their rows are the layout's.

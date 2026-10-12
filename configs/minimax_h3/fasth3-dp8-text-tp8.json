@@ -39,6 +39,11 @@
         "ranks": [0],
         "parallel_config": {},
         "distribution": "temporal_units"
+      },
+      "latent_encoder": {
+        "ranks": [0],
+        "parallel_config": {},
+        "distribution": "temporal_units"
       }
     },
     "queue_depth": 6
@@ -59,6 +64,11 @@
         "parallel_config": {}
       },
       "audio_decoder": {
+        "ranks": [0],
+        "parallel_config": {},
+        "distribution": "temporal_units"
+      },
+      "latent_encoder": {
         "ranks": [0],
         "parallel_config": {},
         "distribution": "temporal_units"
@@ -85,6 +95,11 @@
         "ranks": [0],
         "parallel_config": {},
         "distribution": "temporal_units"
+      },
+      "latent_encoder": {
+        "ranks": [0],
+        "parallel_config": {},
+        "distribution": "temporal_units"
       }
     },
     "queue_depth": 6
@@ -105,6 +120,11 @@
         "parallel_config": {}
       },
       "audio_decoder": {
+        "ranks": [0],
+        "parallel_config": {},
+        "distribution": "temporal_units"
+      },
+      "latent_encoder": {
         "ranks": [0],
         "parallel_config": {},
         "distribution": "temporal_units"
@@ -131,6 +151,11 @@
         "ranks": [0],
         "parallel_config": {},
         "distribution": "temporal_units"
+      },
+      "latent_encoder": {
+        "ranks": [0],
+        "parallel_config": {},
+        "distribution": "temporal_units"
       }
     },
     "queue_depth": 6
@@ -151,6 +176,11 @@
         "parallel_config": {}
       },
       "audio_decoder": {
+        "ranks": [0],
+        "parallel_config": {},
+        "distribution": "temporal_units"
+      },
+      "latent_encoder": {
         "ranks": [0],
         "parallel_config": {},
         "distribution": "temporal_units"
@@ -177,6 +207,11 @@
         "ranks": [0],
         "parallel_config": {},
         "distribution": "temporal_units"
+      },
+      "latent_encoder": {
+        "ranks": [0],
+        "parallel_config": {},
+        "distribution": "temporal_units"
       }
     },
     "queue_depth": 6
@@ -197,6 +232,11 @@
         "parallel_config": {}
       },
       "audio_decoder": {
+        "ranks": [0],
+        "parallel_config": {},
+        "distribution": "temporal_units"
+      },
+      "latent_encoder": {
         "ranks": [0],
         "parallel_config": {},
         "distribution": "temporal_units"
@@ -307,6 +347,19 @@
       }
     },
     "queue_depth": 6
+  },
+  {
+    "id": "reader",
+    "ranks": [
+      { "node": "localhost", "device": "cpu" }
+    ],
+    "components": {
+      "media_reader": {
+        "ranks": [0],
+        "parallel_config": {}
+      }
+    },
+    "queue_depth": 24
   },
   {
     "id": "muxer",
