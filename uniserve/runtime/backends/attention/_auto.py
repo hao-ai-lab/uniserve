@@ -134,15 +134,15 @@ def _input_class(batch):
     return path, mask
 
 
-def _paged_calls(page_tokens):
+def _paged_calls(block_size):
     """Return one-row samples of every paged call a cache layer receives.
 
     They are a causal and a non-causal paged row and a segmented prefix read
-    whose queries see every current key, over ``page_tokens``-token pages.
-    Routing depends only on their kind, causality and page size.
+    whose queries see every current key, over ``block_size``-token pages.
+    Routing depends only on their kind, causality and block size.
     """
     lengths = SequenceLengths.from_lengths((1,), device="cpu")
-    table = BlockTable(torch.ones((1, 1), dtype=torch.int32), page_tokens)
+    table = BlockTable(torch.ones((1, 1), dtype=torch.int32), block_size)
     return (
         PagedInput(lengths, lengths, table, None, (True,)),
         PagedInput(lengths, lengths, table, None, (False,)),
@@ -389,9 +389,9 @@ class _Automatic(_Operator):
             )
         # A later run may read rows an earlier run of the same sequence
         # writes, so the batch's complete write commits before any run; the
-        # runs carry no write addresses.
-        if batch.write_indices is not None:
-            self.update_cache(k, v, indices=batch.write_indices)
+        # runs carry no slot mapping.
+        if batch.slot_mapping is not None:
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
         for rows, _, run in causal_runs(batch):
             if rows.start == rows.stop:
                 continue
@@ -559,7 +559,7 @@ class Backend(_Backend):
                     architecture=self._architecture,
                 )
             )
-            for call in _paged_calls(pages.page_tokens)
+            for call in _paged_calls(pages.block_size)
         )
 
     def _requirements(self, arguments):

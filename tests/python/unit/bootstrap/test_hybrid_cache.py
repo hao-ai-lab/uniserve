@@ -37,11 +37,11 @@ def test_hybrid_layers_form_one_group_per_window_and_page_shape():
     # layers give two columns: five units per windowed page.
     assert windowed.kind is KvGroupKind.SLIDING_WINDOW
     assert windowed.window == 8
-    assert (windowed.page_tokens, windowed.units_per_page) == (16, 5)
+    assert (windowed.block_size, windowed.units_per_page) == (16, 5)
     assert windowed.layer_ids == WINDOWED
     assert (windowed.num_kv_heads, windowed.head_dim) == (4, 4)
     assert full.kind is KvGroupKind.FULL
-    assert (full.page_tokens, full.units_per_page) == (32, 1)
+    assert (full.block_size, full.units_per_page) == (32, 1)
     assert full.layer_ids == FULL
     assert (full.num_kv_heads, full.head_dim) == (1, 8)
     assert (info.num_units, info.dtype) == (20, "float32")
@@ -68,7 +68,7 @@ def test_hybrid_capacity_counts_units_of_every_group():
     planes = plan_cache(hybrid_model(), _config())
     capacity = derive_runtime_kv_capacity(
         pages=tuple(
-            (group.page_tokens, group.units_per_page) for group in planes.groups
+            (group.block_size, group.units_per_page) for group in planes.groups
         ),
         max_total_tokens=256,
         unit_bytes=planes.unit_bytes,

@@ -40,7 +40,7 @@ fn readout_worker() -> SimEngine {
         CallKind::Forward(ForwardMode::TokenDenoising),
         CallKind::Media(MediaCall::VisionEncoding),
     ];
-    sim.set_page_tokens(16);
+    sim.set_block_size(16);
     sim
 }
 

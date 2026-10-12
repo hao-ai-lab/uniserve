@@ -12,7 +12,7 @@ import torch
 from uniserve.diffusion import Branch, Guidance, Schedule
 from uniserve.model import ImageDenoiser
 from uniserve.processing import BranchSource
-from uniserve_worker.model_executor.diffusion_runner import Ladder
+from uniserve_worker.model_executor.diffusion_runner import DenoisingSteps
 
 
 @dataclass(slots=True)
@@ -41,11 +41,11 @@ class KVConditioning:
 
 
 @dataclass(slots=True)
-class SlotLadder:
-    """A standalone request's views of its slot and its bound ladder.
+class SlotState:
+    """A standalone request's views of its slot and its bound steps.
 
     The views borrow request storage whose execution owners retain the
-    backing. The ladder views the samples of its layout's runner and is bound
+    backing. The steps view the samples of their layout's runner and are bound
     again when that runner is replaced. ``staging`` is the host staging
     started at admission (the seeded draw and the request's own state
     tables); latent preparation reads what it filled, and retirement waits
@@ -53,7 +53,7 @@ class SlotLadder:
     """
 
     tensors: dict[str, Mapping[str, torch.Tensor]] = field(default_factory=dict)
-    ladder: Ladder | None = None
+    steps: DenoisingSteps | None = None
     staging: Future[None] | None = None
 
 
@@ -74,7 +74,7 @@ class DiffusionState:
     schedules: Mapping[str, Schedule]
     guidance: Guidance | None = None
     kv: KVConditioning | None = None
-    slot: SlotLadder | None = None
+    slot: SlotState | None = None
 
     @classmethod
     def open(
@@ -88,7 +88,7 @@ class DiffusionState:
         """Build a request's state on its ``schedules``.
 
         An ``ImageDenoiser`` attends to the request's KV prefixes; any other
-        denoiser advances a ladder over its request slot.
+        denoiser advances denoising steps over its request slot.
         """
         attends = isinstance(denoiser, ImageDenoiser)
         return cls(
@@ -96,5 +96,5 @@ class DiffusionState:
             dict(schedules),
             guidance,
             kv=KVConditioning() if attends else None,
-            slot=None if attends else SlotLadder(),
+            slot=None if attends else SlotState(),
         )

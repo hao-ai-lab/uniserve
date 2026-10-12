@@ -160,7 +160,7 @@ class ExecutionContext(Generic[SizeT]):
     opens a step around every forward that reaches them (see
     ``uniserve.runtime.expert_exchange``) and retires it after this context.
 
-    ``tiles`` maps ``SpatialEncoder`` modules to borrowed operators, each
+    ``tiles`` maps ``TiledEncoder`` modules to borrowed operators, each
     returning exactly that encoder's ``encode_tile`` of any tile, such as the
     replay of a graph captured at the tile shape; the encoders' calls within
     this context encode their tiles through them. Their owner keeps them
@@ -783,7 +783,7 @@ class ExecutionContext(Generic[SizeT]):
             _install(scope, _binding.moe, self._moe)
             _install(scope, _binding.attention_storage, self._exchange)
             _install(scope, _binding.linear_chunks, self._chunks)
-            _install(scope, _binding.spatial_tiles, self._tiles)
+            _install(scope, _binding.tile_operators, self._tiles)
             if self.weights is not None:
                 scope.enter_context(self.weights.activate())
             yield

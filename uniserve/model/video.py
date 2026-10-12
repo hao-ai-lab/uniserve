@@ -1,4 +1,4 @@
-"""Windowed media encoding and reconstruction over borrowed tensors."""
+"""Clip-wise media encoding and reconstruction over borrowed tensors."""
 
 from __future__ import annotations
 
@@ -9,24 +9,24 @@ from torch import nn
 
 from uniserve.distributed import Communicator
 from uniserve.media import image, video
-from uniserve.nn.vae import LatentDecoder, LatentEncoder, SpatialEncoder
+from uniserve.nn.vae import LatentDecoder, LatentEncoder, TiledEncoder
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
 
 class VideoEncoder(nn.Module):
-    """Encode units of RGB24 frames into latent rows.
+    """Encode clips of RGB24 frames into latent rows.
 
-    A unit is a contiguous run of a video's frames whose latents depend on no
-    frame outside it. ``frame_slices`` lists a video's units in order and
+    A clip is a contiguous run of a video's frames whose latents depend on no
+    frame outside it. ``clips`` lists a video's clips in order and
     ``latent_slices`` the contiguous latent frames each one produces, so the
-    units of one video may be encoded by different ranks, in any order, and
+    clips of one video may be encoded by different ranks, in any order, and
     their rows assemble the whole-video encoding exactly. A still frame (a
     one-frame video) may further be encoded in bands of its latent rows:
     ``row_bands`` partitions its latent raster into bands of whole row
     groups, each band's rows are a contiguous run of the frame's rows, and
     the bands' rows assemble the frame's encoding exactly. Banding needs a
     latent encoder that encodes a band on its own, such as one over a
-    ``SpatialEncoder``.
+    ``TiledEncoder``.
 
     Subclasses define both temporal partitions; ``output_layout``, which
     describes a video's complete latent as frame-major rows along its leading
@@ -34,11 +34,11 @@ class VideoEncoder(nn.Module):
     ``latent_size``, a frame's native latent raster; ``row_group``, the
     latent rows of one row group, a frame's rows being row-major over its
     row groups, each group owning the same number of consecutive rows;
-    ``unpack_pixels``, the conversion of one unit's frames into the native
-    encoder input; and ``pack_latents``, the conversion of that unit's native
+    ``unpack_pixels``, the conversion of one clip's frames into the native
+    encoder input; and ``pack_latents``, the conversion of that clip's native
     NCTHW latents into its output rows. An encoder whose posterior is sampled
     defines ``posterior_noise``: the draw spans the video's complete latent
-    and each unit takes the share of its own latent frames and rows, which
+    and each clip takes the share of its own latent frames and rows, which
     reproduces the draw of a whole-video encoding. Inputs remain borrowed;
     results are new tensors.
     """
@@ -50,12 +50,12 @@ class VideoEncoder(nn.Module):
         super().__init__()
         self.encoder = encoder
 
-    def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
-        """Partition a video of ``num_frames`` frames into its units."""
+    def clips(self, num_frames: int) -> tuple[slice, ...]:
+        """Partition a video of ``num_frames`` frames into its clips."""
         raise NotImplementedError
 
     def latent_slices(self, num_frames: int) -> tuple[slice, ...]:
-        """Return the latent frames each unit produces, in unit order."""
+        """Return the latent frames each clip produces, in clip order."""
         raise NotImplementedError
 
     def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
@@ -97,10 +97,10 @@ class VideoEncoder(nn.Module):
 
     def still_tile(
         self, device: torch.device
-    ) -> tuple[SpatialEncoder, torch.Tensor] | None:
+    ) -> tuple[TiledEncoder, torch.Tensor] | None:
         """Return the tiled encoder of still frames and one tile's input.
 
-        A latent encoder over a ``SpatialEncoder`` encodes every still frame
+        A latent encoder over a ``TiledEncoder`` encodes every still frame
         at least a tile high and wide in tiles of one shape: the native input
         of a tile-sized frame, which ``unpack_pixels`` returns with the
         frame's raster as its trailing axes. Returns that encoder and a zero
@@ -108,7 +108,7 @@ class VideoEncoder(nn.Module):
         encoder does not tile.
         """
         spatial = self.encoder.encoder
-        if not isinstance(spatial, SpatialEncoder):
+        if not isinstance(spatial, TiledEncoder):
             return None
         frame = torch.zeros(
             (1, spatial.tile_height, spatial.tile_width, 3),
@@ -126,17 +126,17 @@ class VideoEncoder(nn.Module):
         return None
 
     def unpack_pixels(
-        self, pixels: torch.Tensor, frames: slice, num_frames: int
+        self, pixels: torch.Tensor, clip: slice, num_frames: int
     ) -> torch.Tensor:
-        """Return the native encoder input of one unit's frames.
+        """Return the native encoder input of one clip's frames.
 
-        ``pixels`` holds exactly the frames ``frames`` selects, as
+        ``pixels`` holds exactly the frames ``clip`` selects, as
         ``[frames, height, width, 3]`` uint8 RGB.
         """
         raise NotImplementedError
 
     def pack_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Return the output rows of one unit's native NCTHW latents."""
+        """Return the output rows of one clip's native NCTHW latents."""
         raise NotImplementedError
 
     @torch.inference_mode()
@@ -144,43 +144,43 @@ class VideoEncoder(nn.Module):
         self,
         pixels: tuple[torch.Tensor, ...],
         *,
-        frames: tuple[slice, ...],
+        clips: tuple[slice, ...],
         num_frames: tuple[int, ...],
         rows: tuple[slice | None, ...] | None = None,
     ) -> tuple[TensorOutput, ...]:
-        """Encode units of RGB24 videos into their latent rows.
+        """Encode clips of RGB24 videos into their latent rows.
 
-        ``pixels[i]`` holds exactly the frames that ``frames[i]`` selects from
+        ``pixels[i]`` holds exactly the frames that ``clips[i]`` selects from
         a video of ``num_frames[i]`` frames, as ``[frames, height, width, 3]``
-        uint8, and ``frames[i]`` must be one of that video's units. ``rows[i]``
-        is None for the unit's whole raster, or, for a still frame, a band of
+        uint8, and ``clips[i]`` must be one of that video's clips. ``rows[i]``
+        is None for the clip's whole raster, or, for a still frame, a band of
         whole latent row groups, such as one of ``row_bands``. Each result
-        holds its unit's rows at their place in the video's complete latent.
+        holds its clip's rows at their place in the video's complete latent.
 
         Raises:
-            ValueError: The inputs break the unit contract above, or the
+            ValueError: The inputs break the clip contract above, or the
                 encoded rows disagree with the declared layout.
         """
         if rows is None:
             rows = (None,) * len(pixels)
         if (
             not pixels
-            or len(pixels) != len(frames)
+            or len(pixels) != len(clips)
             or len(pixels) != len(num_frames)
             or len(pixels) != len(rows)
         ):
             raise ValueError(
-                "video frames, unit slices, durations and bands must align"
+                "video frames, clips, durations and bands must align"
             )
 
-        units = []
+        positions = []
         for value, interval, count, band in zip(
-            pixels, frames, num_frames, rows, strict=True
+            pixels, clips, num_frames, rows, strict=True
         ):
-            legal = self.frame_slices(count)
+            legal = self.clips(count)
             if interval not in legal:
                 raise ValueError(
-                    "video frame slice must select one complete encoding unit"
+                    "video clip must be one of the video's complete clips"
                 )
             if (
                 value.ndim != 4
@@ -189,8 +189,8 @@ class VideoEncoder(nn.Module):
                 or value.shape[0] != interval.stop - interval.start
             ):
                 raise ValueError(
-                    "video units must be uint8 RGB frames "
-                    "[frames, height, width, 3] covering their frame slice"
+                    "video clips must be uint8 RGB frames "
+                    "[frames, height, width, 3] covering their clip"
                 )
             if band is not None:
                 height, _ = self.latent_size(
@@ -210,33 +210,33 @@ class VideoEncoder(nn.Module):
                         "a band must be whole latent row groups of a still "
                         "frame"
                     )
-            units.append(legal.index(interval))
+            positions.append(legal.index(interval))
 
-        # One posterior draw per video size serves every unit of this call
+        # One posterior draw per video size serves every clip of this call
         # that belongs to a video of that size.
         draws: dict[video.Config, torch.Tensor | None] = {}
         outputs = []
-        for value, interval, count, unit, band in zip(
-            pixels, frames, num_frames, units, rows, strict=True
+        for value, interval, count, position, band in zip(
+            pixels, clips, num_frames, positions, rows, strict=True
         ):
             size = video.Config(
                 count, image.Config(int(value.shape[1]), int(value.shape[2]))
             )
             layout = self.output_layout(size)["video"]
-            windows = self.latent_slices(count)
-            window = windows[unit]
-            extent = window.stop - window.start
-            if layout.shape[0] % windows[-1].stop:
+            spans = self.latent_slices(count)
+            span = spans[position]
+            extent = span.stop - span.start
+            if layout.shape[0] % spans[-1].stop:
                 raise ValueError(
                     "video latent rows must divide evenly among latent frames"
                 )
-            rows_per_frame = layout.shape[0] // windows[-1].stop
+            rows_per_frame = layout.shape[0] // spans[-1].stop
 
             # A band keeps a run of its frame's row groups, whose rows follow
             # each other within the frame.
             first, stop = (
-                window.start * rows_per_frame,
-                window.stop * rows_per_frame,
+                span.start * rows_per_frame,
+                span.stop * rows_per_frame,
             )
             if band is not None:
                 groups = self.latent_size(size.frame)[0] // self.row_group
@@ -253,14 +253,15 @@ class VideoEncoder(nn.Module):
                 draws[size] = self.posterior_noise(size)
             noise = draws[size]
             if noise is not None:
-                noise = noise[:, :, window]
+                noise = noise[:, :, span]
                 if band is not None:
                     noise = noise[..., band, :]
                 noise = noise.to(value.device)
 
-            # A unit whose input was padded to the encoder's temporal extent
-            # yields trailing latent frames beyond its own; the window keeps
-            # the leading ones, so the posterior never samples the others.
+            # A clip whose input was padded to the encoder's temporal extent
+            # yields trailing latent frames beyond its own; the encoder's
+            # output window keeps the leading ones, so the posterior never
+            # samples the others.
             latents = self.encoder(
                 self.unpack_pixels(value, interval, count),
                 rows=band,
@@ -294,7 +295,7 @@ class AudioEncoder(nn.Module):
     """Encode sample-major PCM tracks into latent rows.
 
     Tracks are encoded whole rather than by media unit. Subclasses define
-    ``latent_frames`` and ``latent_rate`` from their codec's compression;
+    ``latent_frames`` and ``latent_rate`` from their VAE's compression;
     ``output_layout``; ``unpack_samples``, the conversion of one track's
     ``[samples, channels]`` PCM into the native encoder input; and
     ``pack_latents``, the conversion of the track's native latents into its
@@ -363,134 +364,131 @@ class AudioEncoder(nn.Module):
 
 
 class VideoDecoder(nn.Module):
-    """Decode a video's packed latent one reconstruction window at a time.
+    """Decode a video's packed latent one clip at a time.
 
     A video's size is its frame count and raster
-    (``uniserve.media.video.Config``). Its native output is cut at the legal
-    output frame slices of ``frame_slices``, and each slice is reconstructed
-    from one window of the packed latent into one native segment. Subclasses
-    define the slices, the native output layout, each slice's ``segment``,
-    the decoder input of a segment's window (``window_input``) and
-    ``unpack_latents``: the mathematical conversion from a complete packed
-    latent to one window's decoder input.
+    (``uniserve.media.video.Config``). Its native output is cut into the
+    clips of ``clips``, and each clip is reconstructed from its decoder input,
+    a run of the packed latent's frames, into one native clip output.
+    Subclasses define the clips, the native output layout, each clip's native
+    output (``clip_output``), the decoder input of a clip decoding to such an
+    output (``clip_input``) and ``unpack_latents``: the mathematical
+    conversion from a complete packed latent to one clip's decoder input.
 
     Only unpacking depends on the video's frame count. ``decode`` evaluates
-    unpacked windows, whose computation depends on their segment alone, so a
-    caller prepares decoding resources and graphs per segment rather than per
-    video size, and unpacks each window outside them. Decoder inputs and
-    scratch remain borrowed.
+    unpacked clip inputs, whose computation depends on their clip output
+    alone, so a caller prepares decoding resources and graphs per clip output
+    rather than per video size, and unpacks each clip outside them. Decoder
+    inputs and scratch remain borrowed.
     """
 
     def __init__(self, decoder: LatentDecoder):
         super().__init__()
         self.decoder = decoder
 
-    def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
+    def clips(self, num_frames: int) -> tuple[slice, ...]:
         raise NotImplementedError
 
     def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
-        """Describe a video's native output: one segment per frame slice."""
+        """Describe a video's native output: one clip output per clip."""
         raise NotImplementedError
 
-    def segment(self, size: video.Config, frames: slice) -> video.Config:
-        """Return the native frames and raster one frame slice decodes to.
+    def clip_output(self, size: video.Config, clip: slice) -> video.Config:
+        """Return the native frames and raster one clip decodes to.
 
         Raises:
-            ValueError: ``frames`` is not a legal output frame slice of
-                ``size``.
+            ValueError: ``clip`` is not one of the clips of ``size``.
         """
         raise NotImplementedError
 
-    def window_input(self, segment: video.Config) -> BufferConfig:
-        """Describe the decoder input of a window decoding to ``segment``."""
+    def clip_input(self, output: video.Config) -> BufferConfig:
+        """Describe the decoder input of a clip decoding to ``output``."""
         raise NotImplementedError
 
     def unpack_latents(
         self,
         latent: torch.Tensor,
-        frames: slice,
+        clip: slice,
         size: video.Config,
         *,
         out: torch.Tensor,
     ) -> None:
-        """Write the decoder input of one legal output frame slice.
+        """Write the decoder input of one clip.
 
         ``latent`` is the complete packed latent of a video of ``size`` and
-        ``out`` the window's input, laid out as ``window_input`` describes
-        for ``segment(size, frames)``. The conversion is ordered on the
+        ``out`` the clip's input, laid out as ``clip_input`` describes for
+        ``clip_output(size, clip)``. The conversion is ordered on the
         caller's current stream.
 
         Raises:
             ValueError: ``latent`` is not a complete packed latent of
-                ``size``, or ``frames`` is not one of its legal slices.
+                ``size``, or ``clip`` is not one of its clips.
         """
         raise NotImplementedError
 
     @torch.inference_mode()
     def decode(
         self,
-        windows: tuple[torch.Tensor, ...],
+        inputs: tuple[torch.Tensor, ...],
         *,
-        segments: tuple[video.Config, ...],
+        clip_outputs: tuple[video.Config, ...],
     ) -> tuple[torch.Tensor, ...]:
-        """Reconstruct unpacked windows into their native segments.
+        """Reconstruct unpacked clip inputs into their native clip outputs.
 
-        Each window is laid out as ``window_input`` describes for its
-        segment. Each result leads with the segment's unit axis of one,
+        Each input is laid out as ``clip_input`` describes for its clip
+        output. Each result leads with the clip output's unit axis of one,
         which is one row of ``output_layout`` (``place`` describes where).
 
         Raises:
-            ValueError: The windows and segments do not align, or a window
-                is not laid out for its segment.
+            ValueError: The inputs and clip outputs do not align, or an input
+                is not laid out for its clip output.
         """
-        if not windows or len(windows) != len(segments):
-            raise ValueError("video windows and segments must align")
-        for window, segment in zip(windows, segments, strict=True):
-            config = self.window_input(segment)
+        if not inputs or len(inputs) != len(clip_outputs):
+            raise ValueError("video clip inputs and outputs must align")
+        for value, output in zip(inputs, clip_outputs, strict=True):
+            config = self.clip_input(output)
             if (
-                tuple(window.shape) != tuple(config.shape)
-                or window.dtype != config.dtype
+                tuple(value.shape) != tuple(config.shape)
+                or value.dtype != config.dtype
             ):
                 raise ValueError(
-                    "a video window must be laid out for its segment"
+                    "a video clip input must be laid out for its clip output"
                 )
 
-        outputs = []
-        for window in windows:
-            decoded = self.decoder(window).unsqueeze(0)
+        decoded_clips = []
+        for value in inputs:
+            decoded = self.decoder(value).unsqueeze(0)
             # A decoder may return borrowed workspace. Preserve earlier results
             # across later numerical calls within this batch.
-            if len(windows) > 1:
+            if len(inputs) > 1:
                 decoded = decoded.clone()
-            outputs.append(decoded)
-        return tuple(outputs)
+            decoded_clips.append(decoded)
+        return tuple(decoded_clips)
 
     def place(
-        self, decoded: torch.Tensor, frames: slice, size: video.Config
+        self, decoded: torch.Tensor, clip: slice, size: video.Config
     ) -> TensorOutput:
-        """Describe one decoded segment's place in the output of ``size``.
+        """Describe one decoded clip output's place in the output of ``size``.
 
-        ``decoded`` is ``decode``'s result for the window of ``frames``; the
+        ``decoded`` is ``decode``'s result for the clip ``clip``; the
         returned output names its row of ``output_layout(size)``.
 
         Raises:
-            ValueError: ``frames`` is not a legal output frame slice of
-                ``size``.
+            ValueError: ``clip`` is not one of the clips of ``size``.
         """
-        legal = self.frame_slices(size.num_frames)
-        if frames not in legal:
+        legal = self.clips(size.num_frames)
+        if clip not in legal:
             raise ValueError(
-                "video frame slice must select one complete reconstruction "
-                "window"
+                "video clip must be one of the video's complete clips"
             )
-        unit = legal.index(frames)
+        position = legal.index(clip)
         layout = self.output_layout(size)["video"]
         return TensorOutput(
             decoded,
             OutputLayout(
                 layout.shape,
                 layout.dtype,
-                (slice(unit, unit + 1), *layout.local_slice[1:]),
+                (slice(position, position + 1), *layout.local_slice[1:]),
                 variable_axes=layout.variable_axes,
                 value_range=layout.value_range,
             ),
@@ -501,7 +499,7 @@ class AudioDecoder(nn.Module):
     """Decode media units of a packed latent timeline into sample-major PCM.
 
     Subclasses define ``latent_frames``, ``latent_rate``, ``latent_halo`` and
-    ``unpack_latents`` from their codec's compression and channel layout. A
+    ``unpack_latents`` from their VAE's compression and channel layout. A
     media unit is a contiguous span of latent frames; because the decoder is
     convolutional, decoding a unit together with ``latent_halo`` frames of
     context on each side and discarding that context reproduces the whole-track
@@ -542,7 +540,7 @@ class AudioDecoder(nn.Module):
         raise NotImplementedError
 
     def unpack_latents(self, latent, num_samples, *, window, workspace):
-        """Return the codec's native channel and time representation.
+        """Return the VAE's native channel and time representation.
 
         ``window`` selects the contiguous latent frames to unpack, including
         the halo the caller added around the media unit.
@@ -636,10 +634,10 @@ class AudioDecoder(nn.Module):
 class VideoPostprocessor(nn.Module):
     """Blend temporal overlaps, crop decoder padding and produce RGB24 frames.
 
-    ``overlap_weights`` weights the current window, in the decoded precision.
+    ``overlap_weights`` weights the current clip, in the decoded precision.
     A subclass supplies ``reconstruction_slices`` for the body and successor
-    overlap within each native NCTHW segment. A frame slice starting at zero
-    resets the overlap; later slices consume the preceding window's state.
+    overlap within each native NCTHW clip output. A clip starting at frame
+    zero resets the overlap; later clips consume the preceding clip's state.
     Returned tensors borrow disjoint slices of ``workspace['rgb_frames']``.
 
     Media units of one round are reconstructed by different ranks, and a unit's
@@ -675,11 +673,11 @@ class VideoPostprocessor(nn.Module):
         self.units = Communicator()
 
     def reconstruction_slices(
-        self, frames: slice, num_frames: int
+        self, clip: slice, num_frames: int
     ) -> tuple[slice, slice]:
         """Locate the body and successor overlap.
 
-        Within a native decoded segment.
+        Within the native decoded output of ``clip``.
         """
         raise NotImplementedError
 
@@ -693,9 +691,9 @@ class VideoPostprocessor(nn.Module):
     @torch.inference_mode()
     def forward(
         self,
-        segments: tuple[TensorOutput, ...],
+        decoded: tuple[TensorOutput, ...],
         *,
-        frames: tuple[slice, ...],
+        clips: tuple[slice, ...],
         sizes: tuple[video.Config, ...],
         state: Mapping[str, torch.Tensor],
         constants: Mapping[str, torch.Tensor],
@@ -709,14 +707,13 @@ class VideoPostprocessor(nn.Module):
         units left than the component has ranks.
         """
         if (
-            not segments
-            or len(segments) != len(frames)
-            or len(segments) != len(sizes)
+            not decoded
+            or len(decoded) != len(clips)
+            or len(decoded) != len(sizes)
             or len({size.frame for size in sizes}) != 1
         ):
             raise ValueError(
-                "video segments, frame slices and sizes of one raster must "
-                "align"
+                "decoded video clips, clips and sizes of one raster must align"
             )
         num_frames = tuple(size.num_frames for size in sizes)
         if (
@@ -734,8 +731,8 @@ class VideoPostprocessor(nn.Module):
         extent = self.overlap_weights.numel()
         values, slices = [], []
         total_frames = 0
-        for index, (segment, interval, count) in enumerate(
-            zip(segments, frames, num_frames, strict=True)
+        for index, (clip_output, interval, count) in enumerate(
+            zip(decoded, clips, num_frames, strict=True)
         ):
             if (
                 type(count) is not int
@@ -746,10 +743,10 @@ class VideoPostprocessor(nn.Module):
                 or not 0 <= interval.start < interval.stop <= count
             ):
                 raise ValueError(
-                    "video frame slices must lie within their output duration"
+                    "video clips must lie within their output duration"
                 )
             body_slice, next_slice = self.reconstruction_slices(interval, count)
-            value = segment.tensor
+            value = clip_output.tensor
             if value.ndim == 6 and value.shape[0] == 1:
                 value = value[0]
             if (
@@ -758,7 +755,7 @@ class VideoPostprocessor(nn.Module):
                 or value.shape[-2:] != (height, width)
             ):
                 raise ValueError(
-                    "video segments must have native NCTHW shape and the "
+                    "decoded video clips must have native NCTHW shape and the "
                     "requested raster"
                 )
             body, successor = value[:, :, body_slice], value[:, :, next_slice]
@@ -781,11 +778,11 @@ class VideoPostprocessor(nn.Module):
                 and interval.start != 0
                 and (
                     num_frames[index - 1] != count
-                    or frames[index - 1].stop != interval.start
+                    or clips[index - 1].stop != interval.start
                 )
             ):
                 raise ValueError(
-                    "successive video windows must describe a contiguous "
+                    "successive video clips must describe a contiguous "
                     "ordered range"
                 )
             values.append(value)
@@ -843,14 +840,14 @@ class VideoPostprocessor(nn.Module):
         ):
             raise ValueError("video views must share the decoded input device")
 
-        # Weights broadcast over the temporal axis of each NCTHW window.
+        # Weights broadcast over the temporal axis of each NCTHW clip.
         weights = self.overlap_weights.to(overlap.dtype).view(
             1, 1, extent, 1, 1
         )
         cursor = 0
         outputs = []
         for value, (body_slice, next_slice), interval, count in zip(
-            values, slices, frames, num_frames, strict=True
+            values, slices, clips, num_frames, strict=True
         ):
             body = value[:, :, body_slice]
             if interval.start:

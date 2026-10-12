@@ -593,10 +593,10 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
         audio_shift: table.audio_shift(),
         frame_rate: table.frame_rate(),
         audio_sample_rate: table.audio_sample_rate(),
-        frames: crate::FrameChunks {
+        frames: crate::FrameClips {
             min_frames: table.frames().min_frames(),
-            chunk_frames: table.frames().chunk_frames(),
-            chunk_latent_frames: table.frames().chunk_latent_frames(),
+            clip_frames: table.frames().clip_frames(),
+            clip_latent_frames: table.frames().clip_latent_frames(),
             tail_latent_frames: table.frames().tail_latent_frames(),
         },
         canvases: table
@@ -1393,7 +1393,7 @@ fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
     };
     Ok(KvCacheGroup {
         kind,
-        page_tokens: group.page_tokens(),
+        block_size: group.block_size(),
         units_per_page: group.units_per_page(),
         layer_ids: group
             .layer_ids()
@@ -1955,7 +1955,7 @@ fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransf
 fn kv_group_transfer_from_table(group: fbs::KvGroupTransfer<'_>) -> CodecResult<KvGroupTransfer> {
     Ok(KvGroupTransfer {
         start: group.start(),
-        page_tokens: group.page_tokens(),
+        block_size: group.block_size(),
         tensors: group
             .tensors()
             .map(|items| {

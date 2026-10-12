@@ -63,7 +63,7 @@ fn worker(text_len: usize) -> SimEngine {
         CallKind::Forward(ForwardMode::Prefill),
         CallKind::Forward(ForwardMode::TokenDenoising),
     ];
-    sim.set_page_tokens(16);
+    sim.set_block_size(16);
     sim.set_text_len(text_len);
     sim.set_canvas_sampling(SAMPLING);
     sim

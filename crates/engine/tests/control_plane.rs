@@ -18,8 +18,8 @@
 //! - `SimEngine::set_queue_depth` bounds the batches the scheduler may keep
 //!   unresolved. Depth 1 is the serial oracle that the depth-invariance tests
 //!   compare depth 2 against.
-//! - The KV page size is 64 tokens, one unit per page (`WorkerInfo::default`),
-//!   unless a test calls `SimEngine::set_page_tokens` or `set_groups`, and
+//! - The KV block size is 64 tokens, one unit per page (`WorkerInfo::default`),
+//!   unless a test calls `SimEngine::set_block_size` or `set_groups`, and
 //!   generated images default to 512x512 (`ImageParams::default`).
 //! - The `general` request gauges and the `kv_cache` and `encoder` counters in
 //!   `SchedulerStats` are snapshots that `Scheduler::publish_cache_stats`
@@ -1157,7 +1157,7 @@ fn hybrid_groups_share_one_unit_pool() {
         },
         KvCacheGroup {
             kind: KvGroupKind::SlidingWindow { window: 96 },
-            page_tokens: 32,
+            block_size: 32,
             units_per_page: 3,
             layer_ids: (4..16).collect(),
             ..base
@@ -1245,7 +1245,7 @@ fn hybrid_groups_share_one_unit_pool() {
         };
         for (_, placement) in &batch.requests {
             for table in &placement.block_tables {
-                let (page_tokens, units_per_page) = if table.group_id == 0 {
+                let (block_size, units_per_page) = if table.group_id == 0 {
                     (64, 1)
                 } else {
                     (32, 3)
@@ -1254,7 +1254,7 @@ fn hybrid_groups_share_one_unit_pool() {
                 let pages = (table.unit_ids.len() / units_per_page) as u32;
                 assert_eq!(
                     table.allocated_tokens,
-                    (table.start_page + pages) * page_tokens
+                    (table.start_page + pages) * block_size
                 );
                 if table.group_id == 1 {
                     assert!(pages <= (96 + 2 * 64) / 32 + 1, "{table:?}");
@@ -2528,7 +2528,7 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
     let mut sim = SimEngine::new();
     sim.set_text_len(8);
     sim.set_num_units(129);
-    sim.set_page_tokens(256);
+    sim.set_block_size(256);
     let executor = Box::new(SimExecutor::new(sim));
     let sched = support::scheduler(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();

@@ -538,7 +538,7 @@ class Executor:
                 publication_transports=self.worker.publication_transports,
                 request_tables=self.worker.block_tables,
                 request_pool=self.worker.requests,
-                model_runner=self.worker.runner,
+                model_executor=self.worker.runner,
                 decode_state=self.worker.decode_state,
                 sampling_group=self.worker.sampling_group,
                 tokenizer=self.worker.tokenizer,
@@ -624,7 +624,7 @@ class Executor:
         state.predecessors = self.worker.requests.predecessors(batch.calls)
         validate_batch(
             batch,
-            model_runner=self.worker.runner,
+            model_executor=self.worker.runner,
             config=self.worker.worker_config,
             predecessors=state.predecessors,
         )
@@ -672,7 +672,7 @@ class Executor:
             state,
             host_tasks=self.worker.host_tasks,
             request_pool=self.worker.requests,
-            model_runner=self.worker.runner,
+            model_executor=self.worker.runner,
         )
         self.advance_inputs(state)
 
@@ -710,7 +710,7 @@ class Executor:
                 output_pool=self.worker.output_pool,
                 request_tables=self.worker.block_tables,
                 request_pool=self.worker.requests,
-                model_runner=self.worker.runner,
+                model_executor=self.worker.runner,
                 transfer_backends=self.worker.transports,
                 config=self.worker.worker_config,
             )

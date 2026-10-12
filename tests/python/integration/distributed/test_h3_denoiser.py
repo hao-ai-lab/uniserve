@@ -456,8 +456,8 @@ def _stage(factory, latents, size, slot, views, context, *, seed, features):
     factory.store_conditioning(size, views, features)
 
 
-def _ladder(factory, runner, size, views, schedules, slot):
-    """Bind a slot's ladder over the runner's samples and the slot's pages."""
+def _bind_steps(factory, runner, size, views, schedules, slot):
+    """Bind a slot's steps over the runner's samples and the slot's pages."""
     samples = factory.sample_views(size, runner.samples)
     return runner.bind(
         factory.layout(size),
@@ -520,7 +520,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         )
         stream = CUDAStream.external(torch.cuda.Stream(device=device))
         # Slot storage is the request pool's bank, whose rows the captured
-        # ladder reaches through the device slot index; the samples live in
+        # graph reaches through the device slot index; the samples live in
         # the slot's pages of the latent pool.
         pool = RequestPool(
             2, state_buffers=factory.capacity_buffers(), device=device
@@ -554,16 +554,18 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                     initial = _committed(factory, latents, size, 1, 1)
                     for name in model.modalities:
                         samples[name].copy_(initial[name])
-                    ladder = _ladder(factory, runner, size, views, schedules, 1)
-                    runner.warmup(ladder)
+                    steps = _bind_steps(
+                        factory, runner, size, views, schedules, 1
+                    )
+                    runner.warmup(steps)
                     for name in model.modalities:
                         torch.testing.assert_close(
                             samples[name], initial[name], rtol=0, atol=0
                         )
-                    # Startup captures the first request's ladder; the second
+                    # Startup captures the first request's steps; the second
                     # request, with its own schedules, replays it.
                     if seed == 31:
-                        runner.capture(ladder)
+                        runner.capture(steps)
                     bank = 1
                     for index in range(4):
                         state = _committed(factory, latents, size, 1, bank)
@@ -584,7 +586,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                                 ratio.double() * value.double()
                                 + (1.0 - ratio).double() * clean
                             ).float()
-                        result, path = runner.step(ladder, index, bank)
+                        result, path = runner.step(steps, index, bank)
                         assert path == "graph_replay"
                         bank = 1 - bank
                         successor = _committed(factory, latents, size, 1, bank)
@@ -603,7 +605,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                             )
                     torch.cuda.synchronize(device)
                     # Retired request schedules may be overwritten immediately.
-                    # A later ladder supplies its own endpoints to replay.
+                    # Later steps supply their own endpoints to replay.
                     for schedule in schedules.values():
                         schedule.timesteps.fill_(float("nan"))
                         schedule.sigmas.fill_(float("nan"))
@@ -615,10 +617,10 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
 
 
 @torch.inference_mode()
-def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
-    """One captured ladder serves every prompt length within its layout.
+def test_prompt_lengths_of_one_layout_replay_its_steps_exactly(tmp_path):
+    """One captured step graph serves every prompt length of its layout.
 
-    Startup captures the ladder with a placeholder prompt on one slot. Two
+    Startup captures the graph with a placeholder prompt on one slot. Two
     requests whose prompts fill the same text tile to different lengths then
     replay it from both slots, reading their own tile valid counts and rotary
     tables from their slots, and each final sample equals its eager
@@ -676,10 +678,12 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                     features=features[slot],
                 )
                 schedules = model.make_schedules(device=device)
-                ladder = _ladder(factory, runner, size, views, schedules, slot)
+                steps = _bind_steps(
+                    factory, runner, size, views, schedules, slot
+                )
                 bank = 1
                 for index in range(4):
-                    result, path = runner.step(ladder, index, bank)
+                    result, path = runner.step(steps, index, bank)
                     paths.append(path)
                     bank = 1 - bank
                 samples[slot] = {
@@ -732,11 +736,11 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                     ),
                 )
                 schedules = model.make_schedules(device=device)
-                ladder = _ladder(
+                steps = _bind_steps(
                     factory, runner, placeholder, views, schedules, 1
                 )
-                runner.warmup(ladder)
-                runner.capture(ladder)
+                runner.warmup(steps)
+                runner.capture(steps)
 
                 actual, paths = denoise(runner, pool, context)
                 assert paths == ["graph_replay"] * 8
@@ -828,10 +832,12 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
                     features=features[slot],
                 )
                 schedules = model.make_schedules(device=device)
-                ladder = _ladder(factory, runner, size, views, schedules, slot)
+                steps = _bind_steps(
+                    factory, runner, size, views, schedules, slot
+                )
                 bank = 1
                 for index in range(factory.num_steps):
-                    result, path = runner.step(ladder, index, bank)
+                    result, path = runner.step(steps, index, bank)
                     paths.append(path)
                     bank = 1 - bank
                 samples[slot] = {
@@ -885,11 +891,11 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
                     ),
                 )
                 schedules = model.make_schedules(device=device)
-                ladder = _ladder(
+                steps = _bind_steps(
                     padded, runner, placeholder, views, schedules, 1
                 )
-                runner.warmup(ladder)
-                runner.capture(ladder)
+                runner.warmup(steps)
+                runner.capture(steps)
                 actual, paths = denoise(padded, runner, pool)
                 assert set(paths) == {"graph_replay"}
             finally:

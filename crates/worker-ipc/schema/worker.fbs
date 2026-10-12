@@ -126,7 +126,7 @@ table KvGroup {
   kind:KvGroupKind;
   /// Read only when `kind` is `SlidingWindow`.
   window:uint;
-  page_tokens:uint;
+  block_size:uint;
   units_per_page:uint;
   /// Global cache-layer ids of this rank's layers, in column order.
   layer_ids:[uint];
@@ -200,11 +200,11 @@ table ReferenceLimits {
   total:uint;
 }
 
-/// How the video VAE divides a video's frames into chunks (`FrameChunks`).
-table FrameChunks {
+/// How the video VAE divides a video's frames into clips (`FrameClips`).
+table FrameClips {
   min_frames:uint;
-  chunk_frames:uint;
-  chunk_latent_frames:uint;
+  clip_frames:uint;
+  clip_latent_frames:uint;
   tail_latent_frames:uint;
 }
 
@@ -212,9 +212,9 @@ table FrameChunks {
 /// (sigma points including the clean endpoint, and the per-modality shifts),
 /// the frame rate of every video it generates, in frames per second, the
 /// sample rate of the audio it generates with a video (zero when it generates
-/// none), how the VAE chunks a video's frames, the canvases it prepares and
-/// accepts, in the order the deployment selected them, and the references a
-/// request may carry.
+/// none), how the VAE divides a video's frames into clips, the canvases it
+/// prepares and accepts, in the order the deployment selected them, and the
+/// references a request may carry.
 table VideoDenoiserInfo {
   tasks:[string];
   schedule_points:uint;
@@ -222,7 +222,7 @@ table VideoDenoiserInfo {
   audio_shift:double;
   frame_rate:uint;
   audio_sample_rate:uint;
-  frames:FrameChunks (required);
+  frames:FrameClips (required);
   canvases:[ServedCanvas];
   references:ReferenceLimits;
 }
@@ -729,7 +729,7 @@ table DeviceProductTransfer {
 /// keys, values, and, for quantized storage, scales.
 table KvGroupTransfer {
   start:uint;
-  page_tokens:uint;
+  block_size:uint;
   tensors:[TensorTransfer];
 }
 

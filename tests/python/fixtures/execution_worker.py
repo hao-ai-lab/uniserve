@@ -121,7 +121,7 @@ def execution_worker(
         request_pool_size=worker.info.request_slots,
         block_size=block_size
         if kv_cache is None
-        else kv_cache.groups[0].page_tokens,
+        else kv_cache.groups[0].block_size,
         commit_marker_tokens=0 if flow is None else flow.framing,
         max_cfg_branches=1 if flow is None else 3,
         latent_page_units=worker.info.latent_page_units,

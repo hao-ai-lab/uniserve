@@ -130,7 +130,7 @@ def test_native_attention_matches_declared_visibility(
             # Compare the already committed cache so the reference invocation
             # does not perform a second write for the same numerical call.
             reference_batch = (
-                replace(batch, write_indices=None)
+                replace(batch, slot_mapping=None)
                 if representation == "paged"
                 else batch
             )
@@ -192,7 +192,7 @@ def test_paged_replay_reads_changed_causal_flags(provider):
                     v,
                     replace(
                         batch,
-                        write_indices=None,
+                        slot_mapping=None,
                         causal=causal,
                         causal_values=None,
                     ),
@@ -319,7 +319,7 @@ def test_native_paged_replay_reads_changed_block_table_and_writes_slot_zero(
             with torch.cuda.graph(graph, stream=stream):
                 native(q, k, v, batch, scale=0.125, out=out)
             batch.block_table.indices[0, 0] = 2
-            batch.write_indices[0] = 32
+            batch.slot_mapping[0] = 32
             v.mul_(3)
             native.bind(batch)
             graph.replay()
@@ -328,7 +328,7 @@ def test_native_paged_replay_reads_changed_block_table_and_writes_slot_zero(
                 q,
                 k,
                 v,
-                replace(batch, write_indices=None),
+                replace(batch, slot_mapping=None),
                 scale=0.125,
                 out=expected,
             )
@@ -423,7 +423,7 @@ def test_native_paged_output_views_preserve_values_on_replay(
                 query,
                 k,
                 v,
-                replace(batch, write_indices=None),
+                replace(batch, slot_mapping=None),
                 scale=0.125,
                 out=expected,
             )
@@ -477,7 +477,7 @@ def test_paged_replay_preserves_masked_writes_and_live_sequence_boundaries(
             queries=replace(batch.queries, host=None),
             prefixes=replace(batch.prefixes, host=None),
         )
-        batch.write_indices[0] = -1
+        batch.slot_mapping[0] = -1
         with (
             _prepare(resolve("trtllm", device=device), state) as native,
             _prepare(TorchBackend(), state) as reference,
@@ -501,21 +501,21 @@ def test_paged_replay_preserves_masked_writes_and_live_sequence_boundaries(
                 causal=True,
                 device=device,
             )
-            changed.write_indices[1] = -1
+            changed.slot_mapping[1] = -1
             for name in ("queries", "prefixes"):
                 getattr(batch, name).values.copy_(getattr(changed, name).values)
                 getattr(batch, name).offsets.copy_(
                     getattr(changed, name).offsets
                 )
             batch.block_table.indices.copy_(changed.block_table.indices)
-            batch.write_indices.copy_(changed.write_indices)
+            batch.slot_mapping.copy_(changed.slot_mapping)
             k.mul_(2)
             v.mul_(3)
             before = tuple(tensor.clone() for tensor in (q, k, v))
             expected_state = tuple(
                 tensor.clone() for tensor in (state.key, state.value)
             )
-            slots = changed.write_indices.cpu().tolist()
+            slots = changed.slot_mapping.cpu().tolist()
             for target, source in zip(expected_state, (k, v), strict=True):
                 for row, slot in enumerate(slots):
                     if slot != -1:
@@ -526,7 +526,7 @@ def test_paged_replay_preserves_masked_writes_and_live_sequence_boundaries(
                 q,
                 k,
                 v,
-                replace(changed, write_indices=None),
+                replace(changed, slot_mapping=None),
                 scale=0.125,
                 out=expected,
             )
@@ -888,7 +888,7 @@ def test_native_history_window_matches_portable_reference(
                 actual.zero_()
                 graph.replay()
             reference_batch = (
-                replace(batch, write_indices=None)
+                replace(batch, slot_mapping=None)
                 if isinstance(batch, PagedInput)
                 else batch
             )

@@ -189,7 +189,7 @@ def execute(
     state: BatchState,
     tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> PendingOutput:
     """Schedule one request's media reading on the rank's host lane.
 
@@ -210,17 +210,17 @@ def execute(
     reservations = request.host.tasks
     if len(reservations) != 1:
         raise RuntimeError("media reading has no reserved lane slot")
-    vision = capability(model_runner.model, TubeletEncoder)
-    audio = capability(model_runner.model, AudioEncoder)
+    vision = capability(model_executor.model, TubeletEncoder)
+    audio = capability(model_executor.model, AudioEncoder)
     if vision is None or audio is None:
         raise RuntimeError("media reading requires the condition encoders")
-    postprocessor = model_runner.video_postprocessor
+    postprocessor = model_executor.video_postprocessor
     if postprocessor is None:
         raise RuntimeError("media reading requires the output frame rate")
 
     # Each product's storage is reserved now and filled by the host task;
     # the products are published only once it completes.
-    declared = model_runner.outputs.get(call.component, ())
+    declared = model_executor.outputs.get(call.component, ())
     products = {}
     for output in call.outputs:
         if output.output_index >= len(declared):
@@ -245,7 +245,7 @@ def execute(
             vision=vision,
             sample_rate=audio.sample_rate,
             frame_rate=postprocessor.frame_rate,
-            ffmpeg=model_runner.worker_config.ffmpeg,
+            ffmpeg=model_executor.worker_config.ffmpeg,
         ),
         profile_name=(
             "uniserve.host.read "

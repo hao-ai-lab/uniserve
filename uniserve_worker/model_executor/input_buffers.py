@@ -139,7 +139,7 @@ class AttentionBufferConfig(RowBufferConfig):
             "cumulative_query_lengths": BufferConfig((rows + 1,), torch.int32),
             "cumulative_prefix_lengths": BufferConfig((rows + 1,), torch.int32),
             # [table, token]: each table addresses its own units.
-            "write_indices": BufferConfig((tables, tokens), torch.int64),
+            "slot_mapping": BufferConfig((tables, tokens), torch.int64),
             # Host columns of a call's rows for their device staging
             # (``AttentionBuffers.stage_rows``).
             "row_columns": BufferConfig(
@@ -353,7 +353,7 @@ class AttentionBuffers(InputBuffers):
     causal_values: torch.Tensor
     cumulative_query_lengths: torch.Tensor
     cumulative_prefix_lengths: torch.Tensor
-    write_indices: torch.Tensor
+    slot_mapping: torch.Tensor
     row_columns: torch.Tensor
 
     def __init__(self, *, config: AttentionBufferConfig, **options):
@@ -362,7 +362,7 @@ class AttentionBuffers(InputBuffers):
         self.table_widths = config.table_widths
         # -1 is the attention write-index sentinel for a token that writes no
         # cache slot; unstaged capacity starts inert.
-        self.write_indices.fill_(-1)
+        self.slot_mapping.fill_(-1)
         # Pinned sources of the host columns ``stage_rows`` copies.
         self._row_host = HostBuffers(
             self.row_columns.shape,
@@ -390,7 +390,7 @@ class AttentionBuffers(InputBuffers):
         first one the row's first query reaches back to, through the row's
         last query. The host supplies per-row lengths, each table's staged
         page count per row and each token's row with one copy; the units,
-        first staged pages and write addresses are gathered on the device
+        first staged pages and slot mapping are gathered on the device
         from the request slots' resident tables (``gather_request_rows``).
 
         Returns an ``AttentionBatch`` over this owner's columns: paged
@@ -418,7 +418,7 @@ class AttentionBuffers(InputBuffers):
                 "sequences"
             )
         total = sum(queries)
-        if count > self.max_rows or total > self.write_indices.shape[1]:
+        if count > self.max_rows or total > self.slot_mapping.shape[1]:
             raise ValueError("attention rows exceed input-buffer capacity")
 
         # Host columns, each section ``stride`` long (``_row_inputs``), in a
@@ -458,7 +458,7 @@ class AttentionBuffers(InputBuffers):
                     first = first_page(table, prefix)
                     end = min(
                         table.end_page,
-                        ceil_div(prefix + query, shape.page_tokens),
+                        ceil_div(prefix + query, shape.block_size),
                     )
                 pages.append(max(0, end - first))
                 first_pages.append(first)
@@ -467,7 +467,7 @@ class AttentionBuffers(InputBuffers):
                 start = (ROW_SECTIONS + table_number) * stride
                 host[start : start + count] = pages
                 widths.append(max(1, *pages))
-                block_sizes.append(shape.page_tokens)
+                block_sizes.append(shape.block_size)
                 firsts.append(
                     None if shape.window is None else tuple(first_pages)
                 )
@@ -495,7 +495,7 @@ class AttentionBuffers(InputBuffers):
             query_lengths=self.query_lengths,
             query_offsets=self.cumulative_query_lengths,
             prefix_offsets=self.cumulative_prefix_lengths,
-            write_indices=self.write_indices,
+            slot_mapping=self.slot_mapping,
         )
 
         shared = SequenceLengths(
@@ -525,7 +525,7 @@ class AttentionBuffers(InputBuffers):
                     shared,
                     prefix_lengths,
                     blocks,
-                    self.write_indices[table_number, :total],
+                    self.slot_mapping[table_number, :total],
                     causal,
                     flags,
                 )
@@ -592,7 +592,7 @@ class AttentionBuffers(InputBuffers):
 
         Rows ``live_rows..rows`` of every table's units and start pages
         become zero (unit zero is valid storage, page zero the first), and
-        tokens ``live_tokens..tokens`` of every table's write addresses
+        tokens ``live_tokens..tokens`` of every table's slot mapping
         become -1, no cache write. Each column is one ``[table, ...]``
         tensor whose tables are the staged views (``_stage_table``), so one
         launch covers every table; columns past a table's graph width are
@@ -602,7 +602,7 @@ class AttentionBuffers(InputBuffers):
             self.block_tables[:, live_rows:rows].zero_()
             self.start_pages[:, live_rows:rows].zero_()
         if tokens > live_tokens:
-            self.write_indices[:, live_tokens:tokens].fill_(-1)
+            self.slot_mapping[:, live_tokens:tokens].fill_(-1)
 
     def _vector(self, target, source):
         if source.numel() > target.numel():
@@ -887,7 +887,7 @@ class TokenBuffers(AttentionBuffers):
             query_lengths=self.query_lengths,
             query_offsets=self.cumulative_query_lengths,
             prefix_offsets=self.cumulative_prefix_lengths,
-            write_indices=self.write_indices,
+            slot_mapping=self.slot_mapping,
             rows=count,
             columns=max(widths),
         )
@@ -918,7 +918,7 @@ class TokenBuffers(AttentionBuffers):
                     self.start_pages[number, :count] if windowed else None,
                     table.start_pages if windowed else None,
                 ),
-                self.write_indices[number, :count],
+                self.slot_mapping[number, :count],
                 causal,
             )
         attention = AttentionBatch(entries, queries)
@@ -1241,7 +1241,7 @@ class DiffusionBuffers(AttentionBuffers):
 
 
 class VisionBuffers(InputBuffers):
-    """Borrow prepared image views; codecs need no token or KV backing."""
+    """Borrow prepared image views; VAEs need no token or KV backing."""
 
     row_type = VisionRow
 

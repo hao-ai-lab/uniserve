@@ -27,7 +27,7 @@ def mha_pool(
     total_layers,
     total_kv_heads,
     num_pages,
-    page_size,
+    block_size,
     device,
     request_pool_size=1,
     table_width=None,
@@ -54,7 +54,7 @@ def mha_pool(
         config,
         plan_units(
             config,
-            block_size=page_size,
+            block_size=block_size,
             dtype=dtype if encoded else store_dtype or dtype,
             quantization=quantization,
         ),
@@ -68,7 +68,7 @@ def mha_pool(
             KvGroup(
                 kind=KvGroupKind.FULL,
                 window=0,
-                page_tokens=page_size,
+                block_size=block_size,
                 units_per_page=1,
                 layer_ids=tuple(range(layer_offset, layer_offset + num_layers)),
                 num_kv_heads=num_kv_heads,

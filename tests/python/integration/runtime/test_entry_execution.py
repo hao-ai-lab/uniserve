@@ -68,7 +68,7 @@ from uniserve_worker.transport.fetch import fetch_tensor
 
 pytestmark = pytest.mark.integration
 
-# A four-frame single-pixel clip: one window of the fixture decoder.
+# A four-frame single-pixel video: one clip of the fixture decoder.
 PIXEL = video.Config(4, image.Config(1, 1))
 
 
@@ -116,7 +116,7 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
         group.device,
     )
     runner = ModelExecutor(
-        DecodedModel(DecoderConfig(window=25)),
+        DecodedModel(DecoderConfig(clip_length=25)),
         cpu_worker_config(rank=rank, world_size=4),
         bindings={"reconstruction": binding},
     )
@@ -259,7 +259,7 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(
             return normalized.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
         def decode(runner):
-            return media.decode_video_unit(
+            return media.decode_video_clip(
                 runner, "reconstruction", source, slice(0, 4), PIXEL
             ).values[0]
 
@@ -299,7 +299,7 @@ def test_module_call_statistics_count_the_call_without_tokens():
         bindings=_encoder_bindings(model, components),
     )
     try:
-        output = media.decode_video_unit(
+        output = media.decode_video_clip(
             runner, "reconstruction", torch.zeros(4, 3), slice(0, 4), PIXEL
         )
     finally:
@@ -762,9 +762,9 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
 
 @pytest.mark.gpu
 def test_decoder_graphs_share_backing_and_match_eager_decoding():
-    """Every captured decoder segment views one input and one output.
+    """Every captured decoder clip output views one input and one output.
 
-    A window decodes at its segment, so each raster captures one graph.
+    A clip decodes at its clip output, so each raster captures one graph.
     Graphs captured largest first replay in any order and reproduce the
     eager reconstruction exactly, so sharing their backing loses nothing.
     """
@@ -789,16 +789,16 @@ def test_decoder_graphs_share_backing_and_match_eager_decoding():
         for height, width in ((2, 3), (2, 2), (1, 1))
     )
 
-    def decode(runner, size, window, latent):
-        return media.decode_video_unit(
+    def decode(runner, size, clip, latent):
+        return media.decode_video_clip(
             runner,
             "reconstruction",
             latent,
-            slice(4 * window, 4 * window + 4),
+            slice(4 * clip, 4 * clip + 4),
             size,
         ).values[0]
 
-    calls = [(size, window) for size in sizes for window in range(2)]
+    calls = [(size, clip) for size in sizes for clip in range(2)]
     try:
         generator = torch.Generator(device=device).manual_seed(0)
 
@@ -807,9 +807,9 @@ def test_decoder_graphs_share_backing_and_match_eager_decoding():
             rows = size.num_frames * size.frame.height * size.frame.width
             return torch.randn(rows, 3, generator=generator, device=device)
 
-        # Startup captures every segment, largest first.
-        for size, window in calls:
-            decode(graphs, size, window, source(size))
+        # Startup captures every clip output, largest first.
+        for size, clip in calls:
+            decode(graphs, size, clip, source(size))
         entries = list(graphs._module_entries.values())
         assert len(entries) == len(sizes)
         captured = [
@@ -824,10 +824,10 @@ def test_decoder_graphs_share_backing_and_match_eager_decoding():
         )
 
         # Replays in a different order match eager decoding bit for bit.
-        for size, window in reversed(calls[1:] + calls[:1]):
+        for size, clip in reversed(calls[1:] + calls[:1]):
             value = source(size)
-            replayed = decode(graphs, size, window, value)
-            reference = decode(eager, size, window, value)
+            replayed = decode(graphs, size, clip, value)
+            reference = decode(eager, size, clip, value)
             torch.testing.assert_close(replayed, reference, rtol=0, atol=0)
         outputs = set()
         for graph in captured:

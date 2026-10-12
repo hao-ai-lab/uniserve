@@ -52,7 +52,7 @@ pub struct KvCacheStats {
 #[derive(Default)]
 pub struct PrefixStats {
     /// Cumulative prompt tokens eligible for prefix reuse: per request, the
-    /// longest multiple of the largest page size that leaves one prompt token
+    /// longest multiple of the largest block size that leaves one prompt token
     /// to compute.
     pub query_tokens: AtomicU64,
     /// Cumulative prompt tokens reused from the prefix cache.

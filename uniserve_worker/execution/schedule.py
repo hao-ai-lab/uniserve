@@ -65,7 +65,7 @@ def dispatch_batch(
     transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
@@ -96,7 +96,7 @@ def dispatch_batch(
         for device in dict.fromkeys(
             device
             for call in active
-            for device in model_runner.call_devices(call)
+            for device in model_executor.call_devices(call)
         ):
             state.output_buffer.begin_device(device)
 
@@ -127,7 +127,7 @@ def dispatch_batch(
         transports=transports,
         request_tables=request_tables,
         request_pool=request_pool,
-        model_runner=model_runner,
+        model_executor=model_executor,
         decode_state=decode_state,
         sampling_group=sampling_group,
         tokenizer=tokenizer,
@@ -177,7 +177,7 @@ def _execute_ready_actions(
     transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     config: WorkerConfig,
 ) -> None:
     """Execute a frontier that contains no model-forward rows.
@@ -219,14 +219,14 @@ def _execute_ready_actions(
                     latent_pool=latent_pool,
                     publication_transports=publication_transports,
                     request_tables=request_tables,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             # Latent preparation belongs to diffusion only on image workers;
             # a video worker's latent preparation falls through to media.
             elif (
                 call.kind is MediaCall.LATENT_PREPARATION
-                and model_runner.image_builder is not None
+                and model_executor.image_builder is not None
             ):
                 assert latent_pool is not None
                 result = diffusion.prepare_latent(
@@ -235,7 +235,7 @@ def _execute_ready_actions(
                     latent_pool=latent_pool,
                     publication_transports=publication_transports,
                     request_tables=request_tables,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     config=config,
                     state=state,
                 )
@@ -244,29 +244,29 @@ def _execute_ready_actions(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             elif (
                 call.kind is MediaCall.VISION_ENCODING
-                and model_runner.video_postprocessor is not None
+                and model_executor.video_postprocessor is not None
             ):
                 result = conditions.encode_vision(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             elif (
                 call.kind is MediaCall.LATENT_ENCODING
-                and model_runner.video_postprocessor is not None
+                and model_executor.video_postprocessor is not None
             ):
                 result = conditions.encode_latents(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             elif call.kind is MediaCall.TEXT_ENCODING:
@@ -274,7 +274,7 @@ def _execute_ready_actions(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             elif call.kind in HOST_MEDIA_CALLS:
@@ -284,16 +284,16 @@ def _execute_ready_actions(
                     media_mux=media_mux,
                     publication_transports=publication_transports,
                     transports=transports,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
-            elif model_runner.video_postprocessor is not None:
+            elif model_executor.video_postprocessor is not None:
                 result = media.execute(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
                     request_pool=request_pool,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
             else:
@@ -313,7 +313,7 @@ def _execute_calls(
     transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
@@ -379,8 +379,8 @@ def _execute_calls(
         # request's condition encodings included, are media actions. When
         # the frontier holds forward work, only those calls run in this
         # round; the other ready calls stay live and run in a later round.
-        images = model_runner.image_builder is not None
-        videos = model_runner.video_postprocessor is not None
+        images = model_executor.image_builder is not None
+        videos = model_executor.video_postprocessor is not None
         numerical = tuple(
             index
             for index in frontier
@@ -414,7 +414,7 @@ def _execute_calls(
                 transports=transports,
                 request_tables=request_tables,
                 request_pool=request_pool,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 config=config,
             )
             continue
@@ -430,7 +430,7 @@ def _execute_calls(
                 kv_cache=kv_cache,
                 latent_pool=latent_pool,
                 request_tables=request_tables,
-                model_runner=model_runner,
+                model_executor=model_executor,
             )
         else:
             trajectories = {}
@@ -447,7 +447,7 @@ def _execute_calls(
                 kv_cache=kv_cache,
                 latent_pool=latent_pool,
                 request_tables=request_tables,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 decode_state=decode_state,
                 sampling_group=sampling_group,
                 tokenizer=tokenizer,
@@ -465,13 +465,13 @@ def _execute_calls(
             tensor_store=tensor_store,
             latent_pool=latent_pool,
             request_tables=request_tables,
-            model_runner=model_runner,
+            model_executor=model_executor,
             decode_state=decode_state,
         )
 
         values = (
             forward_values(
-                model_runner,
+                model_executor,
                 tuple((task, scheduled[index]) for index, task in forward),
                 cache=kv_cache,
                 tables=request_tables,
@@ -493,7 +493,7 @@ def _execute_calls(
             state=state,
             tensor_store=tensor_store,
             publication_transports=publication_transports,
-            model_runner=model_runner,
+            model_executor=model_executor,
             request_tables=request_tables,
             decode_state=decode_state,
             sampling_group=sampling_group,
@@ -512,7 +512,7 @@ def _execute_calls(
                 latent_pool=latent_pool,
                 publication_transports=publication_transports,
                 request_tables=request_tables,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 config=config,
             )
     return outcomes

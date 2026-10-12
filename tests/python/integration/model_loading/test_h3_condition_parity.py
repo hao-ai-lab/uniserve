@@ -281,7 +281,7 @@ def test_conditioned_request_computes_the_model_first_step(workers, root, case):
         request_pool_idx=1,
         diffusion=DiffusionSamplingParams(
             request.num_frames,
-            len(runner.video_decoder.frame_slices(request.num_frames)),
+            len(runner.video_decoder.clips(request.num_frames)),
             SEED,
             width=request.canvas.width,
             height=request.canvas.height,
@@ -345,7 +345,7 @@ def test_conditioned_request_computes_the_model_first_step(workers, root, case):
     assert diffusion.captures
     schedules = media.open_state(runner, size).schedules
     samples = builder.sample_views(size, diffusion.samples)
-    ladder = diffusion.bind(
+    steps = diffusion.bind(
         layout,
         tuple(
             builder.bind(size, views, samples, schedules, index)
@@ -357,7 +357,7 @@ def test_conditioned_request_computes_the_model_first_step(workers, root, case):
         pages=builder.slot_pages(1),
     )
     first = {name: value.clone() for name, value in initial.items()}
-    result = runner.run_denoising(ladder, 0, 1)
+    result = runner.run_denoising(steps, 0, 1)
     assert result.stats.cuda_graph_runtime_mode_counts == {"eager": 1}
     successor = builder.sample_views(
         size, worker.pool.bank_view(0, builder.slot_pages(1))
@@ -424,17 +424,17 @@ def test_conditioned_request_computes_the_model_first_step(workers, root, case):
         TensorBuffers.allocate(requirements, device="cpu") as host,
         TensorBuffers.allocate(requirements, device=DEVICE) as backing,
     ):
-        model_runner = DenoisingRunner(denoiser, context=context)
-        model_runner.warmup(model_layout)
+        model_executor = DenoisingRunner(denoiser, context=context)
+        model_executor.warmup(model_layout)
         request, staged = backing.view(requirements), host.view(requirements)
-        model_runner.prepare_latents(
+        model_executor.prepare_latents(
             (model_layout,),
             noise=noise,
             state={
                 name: staged[name].unsqueeze(0) for name in denoiser.modalities
             },
         )
-        model_runner.prepare_state(
+        model_executor.prepare_state(
             (model_size,),
             layouts=(model_layout,),
             out={
@@ -464,7 +464,7 @@ def test_conditioned_request_computes_the_model_first_step(workers, root, case):
             model_schedules["video"].step(0),
             (conditioning,),
         )
-        model_runner.step(inputs, model_schedules, state=request)
+        model_executor.step(inputs, model_schedules, state=request)
         for name in denoiser.modalities:
             assert _equal(successor[name], request[name]), name
 

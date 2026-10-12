@@ -27,7 +27,7 @@ def test_paged_replay_retains_each_length_and_page_generation(
     generator = torch.Generator(device="cuda:0").manual_seed(618)
     device = torch.device("cuda", 0)
     dtype = torch.bfloat16
-    page_size, query_heads, kv_heads, width = 64, 4, 2, 128
+    block_size, query_heads, kv_heads, width = 64, 4, 2, 128
     num_tokens = 3 if decode else 259
     query = torch.randn(
         (num_tokens, query_heads, width),
@@ -36,7 +36,7 @@ def test_paged_replay_retains_each_length_and_page_generation(
         generator=generator,
     )
     keys = torch.randn(
-        (16, page_size, kv_heads, width),
+        (16, block_size, kv_heads, width),
         dtype=dtype,
         device=device,
         generator=generator,
@@ -78,7 +78,7 @@ def test_paged_replay_retains_each_length_and_page_generation(
         )
     table = BlockTable(
         torch.empty((3, 4096), device=device, dtype=torch.int32)[:, :6],
-        page_size,
+        block_size,
     )
     queries = SequenceLengths.from_lengths(layouts[0][0], device=device)
     prefixes = SequenceLengths.from_lengths(

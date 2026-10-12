@@ -357,22 +357,22 @@ class AttentionBinding:
             else plan.restore(result, storage=storage, out=out)
         )
 
-    def update_cache(self, k, v, *, indices):
-        """Write current K/V into the bound K/V cache at physical indices."""
+    def update_cache(self, k, v, *, slot_mapping):
+        """Write current K/V into the bound K/V cache at ``slot_mapping``."""
         if self.cache is None:
             raise RuntimeError("this attention layer has no bound prefix state")
 
         if self.module.context_parallel is not None:
             from uniserve.nn.attention import SequenceLengths, VarlenInput
 
-            count = indices.numel()
+            count = slot_mapping.numel()
             if count not in self.cache_batches:
-                if capturing(indices.device):
+                if capturing(slot_mapping.device):
                     raise RuntimeError(
                         "prepare context cache writes before capture"
                     )
                 lengths = SequenceLengths.from_lengths(
-                    (count,), device=indices.device
+                    (count,), device=slot_mapping.device
                 )
                 self.cache_batches[count] = VarlenInput(
                     lengths, lengths, (False,)
@@ -382,7 +382,7 @@ class AttentionBinding:
             storage = _binding.attention_storage.get().get(id(self.module))
             k, v = plan.exchange(k, v, storage=storage)
 
-        self.cache.update(k, v, indices=indices)
+        self.cache.update(k, v, slot_mapping=slot_mapping)
 
     def close(self):
         for operator in self.operators.values():

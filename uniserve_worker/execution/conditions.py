@@ -15,8 +15,8 @@ admission with the request's exact leading extents:
   ``condition_video_latents`` in rounds of encoding units, each round
   covering the next units its component's ranks encode together, and the
   PCM into ``condition_audio_latents`` in one call. A video's units are its
-  encoder windows; a still frame is one unit or, as planned, several bands
-  of its latent rows (``VideoEncoder.row_bands``).
+  clips; a still frame is one unit or, as planned, several bands of its
+  latent rows (``VideoEncoder.row_bands``).
 
 Every product concatenates its conditions in request order. The server
 presents the vision blocks in request order too, so the vision features are
@@ -271,7 +271,7 @@ def _consume_whole(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> torch.Tensor:
     """Read one of a call's inputs whole on the call's compute device.
 
@@ -285,7 +285,7 @@ def _consume_whole(
     read = tensor_store.consume(
         call.inputs[index],
         consumer_call_id=call.call_id,
-        device=model_runner.call_devices(call)[0],
+        device=model_executor.call_devices(call)[0],
     )
     request.device_reads.append(read)
     if read.region is not None or read.tensor is None:
@@ -317,7 +317,7 @@ def encode_vision(
     state: BatchState,
     tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> PendingOutput:
     """Encode a request's vision blocks into one row per placeholder.
 
@@ -340,9 +340,9 @@ def encode_vision(
         0,
         state=state,
         tensor_store=tensor_store,
-        model_runner=model_runner,
+        model_executor=model_executor,
     )
-    features, result = vision_features(video, patches, model_runner)
+    features, result = vision_features(video, patches, model_executor)
     products = transfer.publish_tensors(
         call,
         (features,),
@@ -354,7 +354,7 @@ def encode_vision(
 
 
 def vision_features(
-    video: VideoAdmission, patches: torch.Tensor, model_runner: ModelExecutor
+    video: VideoAdmission, patches: torch.Tensor, model_executor: ModelExecutor
 ) -> tuple[torch.Tensor, ExecutionOutput]:
     """Encode a request's vision blocks into one row per placeholder.
 
@@ -385,7 +385,7 @@ def vision_features(
         torch.tensor([view.grid], dtype=torch.int64, device=patches.device)
         for view in views
     )
-    result = model_runner.encode_vision(
+    result = model_executor.encode_vision(
         VisionInput(samples, grids, tuple(view.grid for view in views))
     )
     features = torch.cat(result.values)
@@ -437,7 +437,7 @@ def vision_inputs(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> VisionInputs:
     """Return text encoding's vision inputs for a conditioned prompt.
 
@@ -462,7 +462,7 @@ def vision_inputs(
         0,
         state=state,
         tensor_store=tensor_store,
-        model_runner=model_runner,
+        model_executor=model_executor,
     )
     return {"visual": visual, **vision_grids(video)}
 
@@ -480,7 +480,7 @@ def encode_units(
     video: VideoAdmission,
     run: range,
     pixels: torch.Tensor,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> tuple[torch.Tensor, ExecutionOutput]:
     """Encode a run of a request's visual units into their rows.
 
@@ -498,11 +498,11 @@ def encode_units(
             "condition pixels disagree with the request's conditions"
         )
 
-    encoder = model_runner.component(
+    encoder = model_executor.component(
         MediaCall.LATENT_ENCODING, capability_type=VideoEncoder
     )
     units = condition_units(video)
-    values, frames, counts, bands, planned = [], [], [], [], []
+    values, spans, counts, bands, planned = [], [], [], [], []
     for index, unit in (units[position] for position in run):
         condition = video.conditions[index]
         size = condition.pixels
@@ -510,38 +510,37 @@ def encode_units(
             raise invalid_descriptor("a visual unit belongs to no pixels")
         # A still frame planned as several units is encoded in bands of its
         # latent rows, one band per unit, each reading the whole frame; any
-        # other condition's units are its encoder windows. A unit's frames
-        # are whole [height, width, 3] rasters of its condition's pixels,
-        # frame-major.
+        # other condition's units are its clips. A unit's frames are whole
+        # [height, width, 3] rasters of its condition's pixels, frame-major.
         if size.num_frames == 1 and len(condition.latent_units) > 1:
-            window = slice(0, 1)
+            clip = slice(0, 1)
             band = encoder.row_bands(size.frame, len(condition.latent_units))[
                 unit
             ]
         else:
-            window = encoder.frame_slices(size.num_frames)[unit]
+            clip = encoder.clips(size.num_frames)[unit]
             band = None
         area = size.frame.height * size.frame.width
         values.append(
             pixels[
-                offsets[index] + window.start * area : offsets[index]
-                + window.stop * area
+                offsets[index] + clip.start * area : offsets[index]
+                + clip.stop * area
             ].view(
-                window.stop - window.start,
+                clip.stop - clip.start,
                 size.frame.height,
                 size.frame.width,
                 3,
             )
         )
-        frames.append(window)
+        spans.append(clip)
         counts.append(size.num_frames)
         bands.append(band)
         planned.append(condition.latent_units[unit])
 
-    result = model_runner.run_encoder(
+    result = model_executor.run_encoder(
         "video_condition",
         *values,
-        frames=tuple(frames),
+        clips=tuple(spans),
         num_frames=tuple(counts),
         rows=tuple(bands),
     )
@@ -555,7 +554,7 @@ def encode_units(
 def encode_tracks(
     video: VideoAdmission,
     samples: torch.Tensor,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> tuple[torch.Tensor, ExecutionOutput]:
     """Encode every audio track of a request into its rows.
 
@@ -581,7 +580,7 @@ def encode_tracks(
         raise invalid_descriptor(
             "condition samples disagree with the request's audio tracks"
         )
-    result = model_runner.run_encoder(
+    result = model_executor.run_encoder(
         "audio_condition", *samples.split(lengths)
     )
     if [value.shape[0] for value in result.values] != [
@@ -599,7 +598,7 @@ def encode_latents(
     state: BatchState,
     tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> PendingOutput:
     """Encode one round of a request's condition latents.
 
@@ -617,7 +616,7 @@ def encode_latents(
 
     request = state.pending_output(call.request_key.request_id)
     video = video_admission(request)
-    encoder = condition_encoder(call, model_runner.outputs)
+    encoder = condition_encoder(call, model_executor.outputs)
     if encoder is None or len(call.outputs) != 1:
         raise invalid_descriptor(
             "latent encoding publishes one condition latent product"
@@ -627,23 +626,23 @@ def encode_latents(
         0,
         state=state,
         tensor_store=tensor_store,
-        model_runner=model_runner,
+        model_executor=model_executor,
     )
     if encoder is VideoEncoder:
         # This rank encodes its share of the round's units, which follow
         # the earlier rounds' units.
         decode = decode_range(call, state=state)
         covered = _round_units(video, decode)
-        run = model_runner.bindings[call.component].media_units(
+        run = model_executor.bindings[call.component].media_units(
             covered.start, len(covered), decode.ranks
         )
         if not run:
             raise invalid_descriptor(
                 "a latent encoding round assigns this rank no unit"
             )
-        rows, result = encode_units(video, run, source, model_runner)
+        rows, result = encode_units(video, run, source, model_executor)
     else:
-        rows, result = encode_tracks(video, source, model_runner)
+        rows, result = encode_tracks(video, source, model_executor)
     products = transfer.publish_tensors(
         call,
         (rows,),

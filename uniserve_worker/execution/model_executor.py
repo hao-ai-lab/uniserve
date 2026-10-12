@@ -306,7 +306,7 @@ class ModelExecutor:
         # method) borrow on that entry's stream; see ``prepare_module``.
         self._module_scratch: dict[tuple[str, str, str], Scratch] = {}
         # Replays of the still-frame tile encodings startup captured, by
-        # ``SpatialEncoder``; every context prepared afterwards binds them
+        # ``TiledEncoder``; every context prepared afterwards binds them
         # (see ``capture_tiles``).
         self._tile_operators: dict[
             nn.Module, Callable[[torch.Tensor], torch.Tensor]
@@ -344,7 +344,7 @@ class ModelExecutor:
         # An expert-only rank's executions, one per microbatch exchange.
         self._expert_executions: tuple[Execution, ...] = ()
         # A standalone denoiser's component, binding and call, the request
-        # bank and latent pool its ladders gather through, and the one
+        # bank and latent pool its bound steps gather through, and the one
         # runner that serves every layout the media builder admits.
         self._denoiser = None
         self.diffusion_bank: Mapping[str, torch.Tensor] = {}
@@ -442,7 +442,7 @@ class ModelExecutor:
         executor is closed and ``InputError`` unless exactly one call matches.
         """
         if self._closed:
-            raise RuntimeError("model runner is closed")
+            raise RuntimeError("model executor is closed")
         entries = [
             (binding, call)
             for (entry, entry_path, entry_method), (
@@ -996,13 +996,13 @@ class ModelExecutor:
 
     @property
     def denoises(self) -> bool:
-        """Whether this rank advances a standalone denoiser's ladders."""
+        """Whether this rank advances a standalone denoiser's bound steps."""
         return self._denoiser is not None
 
     def bind_diffusion_storage(
         self, bank: Mapping[str, torch.Tensor], pool: LatentPool
     ) -> None:
-        """Borrow the storage the standalone denoiser's ladders gather.
+        """Borrow the storage the standalone denoiser's bound steps gather.
 
         The request bank holds each request's state and the latent pool its
         samples. The runner borrows both when it is built, so they are bound
@@ -1122,8 +1122,8 @@ class ModelExecutor:
         serving[layout] = None
         return entry
 
-    def run_denoising(self, ladder, index, bank):
-        """Run one denoising step of a bound ladder and time it.
+    def run_denoising(self, steps, index, bank):
+        """Run one denoising step of bound steps and time it.
 
         ``bank`` holds the request's committed samples; see
         ``DiffusionRunner.step``.
@@ -1134,7 +1134,7 @@ class ModelExecutor:
             f"uniserve.model.denoise rank={self.worker_config.rank} "
             "work=denoiser"
         ):
-            values, path = runner.step(ladder, index, bank)
+            values, path = runner.step(steps, index, bank)
         return replace(
             ModelRunner.result(values),
             stats=_observations("denoiser", started, path),
@@ -1433,7 +1433,7 @@ class ModelExecutor:
                         device_causality=self.attention.device_causality,
                         pool=(
                             tuple(
-                                (group.page_tokens, group.units_per_page)
+                                (group.block_size, group.units_per_page)
                                 for group in kv_cache.shapes
                             ),
                             kv_cache.num_units - 1,
@@ -1508,7 +1508,7 @@ class ModelExecutor:
                             else None,
                             weights=self.expert_weights,
                         )
-                        # Text staging counts canonical tokens. Spatial codecs
+                        # Text staging counts canonical tokens. VAEs
                         # and vision towers expand those into different query
                         # domains, so their layer plans use the actual numerical
                         # shapes encountered during preparation/eager execution.
@@ -2454,10 +2454,10 @@ class ModelExecutor:
         ``_execution_failure`` classifies when execution or validation fails.
         """
         if self._closed:
-            raise RuntimeError("model runner is closed")
+            raise RuntimeError("model executor is closed")
         tasks = rows
         if not tasks:
-            raise ValueError("model runner received an empty call")
+            raise ValueError("model executor received an empty call")
 
         # Only token forward modes and denoising are eligible for CUDA graphs;
         # other staged kinds run eagerly.
@@ -2486,7 +2486,7 @@ class ModelExecutor:
         entry = self._forward_calls.get((calls[0].component, forward_mode))
         if entry is None:
             raise InputError(
-                f"model runner has no {calls[0].kind.value!r} binding "
+                f"model executor has no {calls[0].kind.value!r} binding "
                 f"for {calls[0].component!r}",
                 phase="input_staging",
                 route=forward_mode.value,

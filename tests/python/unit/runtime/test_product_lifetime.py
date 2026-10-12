@@ -122,7 +122,7 @@ def test_buffer_pool_binds_each_buffer_at_its_engine_offset() -> None:
 def _table(pool, units):
     """Return a slot table of whole pages of ``units`` in the one group."""
     shape = pool.shapes[0]
-    return GroupTable(shape, 0, tuple(units), len(units) * shape.page_tokens)
+    return GroupTable(shape, 0, tuple(units), len(units) * shape.block_size)
 
 
 @pytest.mark.parametrize(
@@ -140,7 +140,7 @@ def test_kv_call_retains_pages_through_output_completion_and_reuse(
         total_layers=1,
         total_kv_heads=1,
         num_pages=3,
-        page_size=4,
+        block_size=4,
         device=device,
     )
     events = EventPool()
@@ -257,7 +257,7 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         total_layers=1,
         total_kv_heads=1,
         num_pages=5,
-        page_size=4,
+        block_size=4,
         device="cpu",
     )
     buffer = BufferId(
@@ -1138,7 +1138,7 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
         total_layers=1,
         total_kv_heads=1,
         num_pages=2,
-        page_size=4,
+        block_size=4,
         device="cpu",
         table_width=1,
     )

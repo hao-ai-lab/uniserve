@@ -245,7 +245,7 @@ def _attention(cache, *, build):
     entries = {}
     for table in range(len(cache.tables)):
         units = tuple(range(table * PAGES, (table + 1) * PAGES))
-        page = cache.groups[cache.tables[table].group].page_tokens
+        page = cache.groups[cache.tables[table].group].block_size
         entry = build(units, page)
         if entries:
             entry = replace(

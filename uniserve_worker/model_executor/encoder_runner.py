@@ -7,7 +7,7 @@ from collections.abc import Callable
 import torch
 
 from uniserve.model import PatchEncoder, VisionInput
-from uniserve.nn.vae import PatchAutoencoder, SpatialEncoder
+from uniserve.nn.vae import PatchAutoencoder, TiledEncoder
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.device import fill_cpu_ints
 from uniserve.runtime.resources import close_resources
@@ -41,7 +41,7 @@ class EncoderRunner(ModelRunner):
     group, and every packing of a capacity replays its graph.
 
     A video encoder's runner with graph pools captures the tile encoding of
-    a ``SpatialEncoder`` at startup (``capture_tile``), whose replay the
+    a ``TiledEncoder`` at startup (``capture_tile``), whose replay the
     entry's later contexts bind.
     """
 
@@ -171,7 +171,7 @@ class EncoderRunner(ModelRunner):
 
     @torch.inference_mode()
     def capture_tile(
-        self, encoder: SpatialEncoder, pixels: torch.Tensor
+        self, encoder: TiledEncoder, pixels: torch.Tensor
     ) -> Callable[[torch.Tensor], torch.Tensor] | None:
         """Capture ``encoder``'s encoding of one tile and return its operator.
 

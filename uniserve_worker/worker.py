@@ -1,7 +1,7 @@
 """Resource scope and public entry point for one model-backed worker.
 
 `Worker` owns the execution resources of one worker rank, including the
-model runner (`ModelExecutor`), the paged KV cache and block tables of a
+model executor (`ModelExecutor`), the paged KV cache and block tables of a
 worker with a ``CausalLM``, the latent pool of a denoising worker, the
 request slots (`RequestPool`), the product, buffer and output stores, the
 transports, the host lane, the muxer rank's `MediaMux`, and the process
@@ -611,7 +611,7 @@ class Worker:
                 )
                 startup.callback(self.latent_pool.close)
             if runner.denoises:
-                # Ladders gather a request's tables from its slot and its
+                # Bound steps gather a request's tables from its slot and its
                 # samples from its pages, so runners borrow both owners.
                 assert self.latent_pool is not None
                 runner.bind_diffusion_storage(

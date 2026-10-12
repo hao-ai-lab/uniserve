@@ -1227,12 +1227,12 @@ fn acquire_cached_prefix(
         .ok_or("an admitted request's block tables cover every KV group")?;
 
     // Queries count the tokens eligible for reuse under the same rule as the
-    // prefix selection: a multiple of the largest page size that leaves at
+    // prefix selection: a multiple of the largest block size that leaves at
     // least one prompt token to compute, so prefill produces logits.
     let step = coordinator
         .groups()
         .iter()
-        .map(|group| group.page_tokens)
+        .map(|group| group.block_size)
         .max()
         .unwrap_or(1);
     let query_tokens = prompt.len().saturating_sub(1) / step * step;
@@ -1250,7 +1250,7 @@ fn acquire_cached_prefix(
     state.prefix_published = coordinator
         .groups()
         .iter()
-        .map(|group| hit.cached_tokens / group.page_tokens)
+        .map(|group| hit.cached_tokens / group.block_size)
         .collect();
     state.prefix_page_hashes = hit.page_hashes;
     state.num_computed_prompt_tokens = hit.cached_tokens as u32;

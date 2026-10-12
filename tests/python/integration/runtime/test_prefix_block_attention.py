@@ -84,7 +84,7 @@ def _batch(
     lengths,
     prefixes,
     *,
-    page_tokens,
+    block_size,
     heads=_SLIDING,
     start_pages=None,
     prefix_starts=None,
@@ -96,7 +96,7 @@ def _batch(
 
     Physical page 0 is a NaN sentinel that fills unused block table
     entries. Sequence ``b`` owns logical pages ``[start_pages[b],
-    ceil(P_b / page_tokens))`` on distinct random physical pages; only its
+    ceil(P_b / block_size))`` on distinct random physical pages; only its
     prefix tokens are written, so unwritten page tails and unowned pages
     stay NaN.
     """
@@ -115,11 +115,11 @@ def _batch(
         tensor[tokens:] = float("nan")
 
     owned = [
-        max(0, math.ceil(prefix / page_tokens) - start)
+        max(0, math.ceil(prefix / block_size) - start)
         for prefix, start in zip(prefixes, starts, strict=True)
     ]
     pages = pages or 1 + sum(owned) + 3
-    shape = (pages, page_tokens, kv_heads, head_dim)
+    shape = (pages, block_size, kv_heads, head_dim)
     key_cache = torch.full(shape, float("nan"), device="cuda")
     value_cache = torch.full(shape, float("nan"), device="cuda")
     key_cache = key_cache.to(torch.bfloat16)
@@ -140,7 +140,7 @@ def _batch(
             page = int(physical[used])
             used += 1
             table[row, column] = page
-            written = min(page_tokens, prefix - (start + column) * page_tokens)
+            written = min(block_size, prefix - (start + column) * block_size)
             rows = (written, kv_heads, head_dim)
             key_cache[page, :written] = _normalized(rows, generator)
             value_cache[page, :written] = torch.randn(
@@ -168,7 +168,7 @@ def _reference(batch, *, window, query_window, scale, causal=False):
     ``[tokens, Hq]`` of every packed row inside a block.
     """
     offsets = batch.query_offsets.tolist()
-    page_tokens = batch.key_cache.shape[1]
+    block_size = batch.key_cache.shape[1]
     _tokens, query_heads, head_dim = batch.query.shape
     group = query_heads // batch.key.shape[1]
     kv_of_head = torch.arange(query_heads, device="cuda") // group
@@ -191,8 +191,8 @@ def _reference(batch, *, window, query_window, scale, causal=False):
         # can see.
         tokens = torch.arange(first, prefix, device="cuda")
         start = 0 if batch.start_page is None else int(batch.start_page[row])
-        pages = batch.block_table[row, tokens // page_tokens - start].long()
-        slots = tokens % page_tokens
+        pages = batch.block_table[row, tokens // block_size - start].long()
+        slots = tokens % block_size
         keys = torch.cat(
             (batch.key_cache[pages, slots], batch.key[begin:end])
         ).float()
@@ -289,10 +289,10 @@ def _assert_matches(
     assert bool((lse[tokens:] == _UNWRITTEN).all())
 
 
-def _history_start_pages(prefixes, page_tokens):
+def _history_start_pages(prefixes, block_size):
     # Pages entirely before the 1023-token window are retired, so the
     # table's first column is a later logical page.
-    return tuple(max(0, prefix - 1023) // page_tokens for prefix in prefixes)
+    return tuple(max(0, prefix - 1023) // block_size for prefix in prefixes)
 
 
 @pytest.mark.parametrize(
@@ -311,7 +311,7 @@ def test_paged_graph_reads_changed_row_causality(heads, window):
     batch = _batch(
         lengths,
         prefixes,
-        page_tokens=32,
+        block_size=32,
         heads=heads,
         start_pages=starts,
         seed=97,
@@ -349,9 +349,9 @@ def test_paged_graph_reads_changed_row_causality(heads, window):
         _assert_matches(batch, out, lse, base2=False, causal=causal, **options)
 
 
-@pytest.mark.parametrize("page_tokens", [16, 32])
+@pytest.mark.parametrize("block_size", [16, 32])
 @torch.inference_mode()
-def test_canvas_reads_fixed_history_window(page_tokens):
+def test_canvas_reads_fixed_history_window(block_size):
     # Empty prefix, prefixes shorter than, at and around the window, one
     # that is not a page multiple, and a block shorter than a key tile.
     lengths = (256, 256, 256, 256, 256, 256, 17)
@@ -359,9 +359,9 @@ def test_canvas_reads_fixed_history_window(page_tokens):
     batch = _batch(
         lengths,
         prefixes,
-        page_tokens=page_tokens,
-        start_pages=_history_start_pages(prefixes, page_tokens),
-        seed=page_tokens,
+        block_size=block_size,
+        start_pages=_history_start_pages(prefixes, block_size),
+        seed=block_size,
     )
     out, lse = _outputs(batch)
 
@@ -380,17 +380,17 @@ def test_canvas_reads_fixed_history_window(page_tokens):
     )
 
 
-@pytest.mark.parametrize("page_tokens", [16, 32])
+@pytest.mark.parametrize("block_size", [16, 32])
 @torch.inference_mode()
-def test_image_block_window_follows_each_query(page_tokens):
+def test_image_block_window_follows_each_query(block_size):
     lengths = (280, 280, 280, 280, 3)
     prefixes = (0, 300, 1023, 1500, 2000)
     batch = _batch(
         lengths,
         prefixes,
-        page_tokens=page_tokens,
-        start_pages=_history_start_pages(prefixes, page_tokens),
-        seed=7 + page_tokens,
+        block_size=block_size,
+        start_pages=_history_start_pages(prefixes, block_size),
+        seed=7 + block_size,
     )
     out, lse = _outputs(batch)
 
@@ -409,10 +409,10 @@ def test_image_block_window_follows_each_query(page_tokens):
     )
 
 
-@pytest.mark.parametrize("page_tokens", [16, 32])
+@pytest.mark.parametrize("block_size", [16, 32])
 @pytest.mark.parametrize("query_window", [False, True])
 @torch.inference_mode()
-def test_small_batch_reads_history_window(page_tokens, query_window):
+def test_small_batch_reads_history_window(block_size, query_window):
     # A batch too small to occupy the GPU with the widest work tiles (two
     # sequences of at most 256 queries): a full block over a prefix just past
     # the window and a short block over a prefix that is not a page multiple.
@@ -421,9 +421,9 @@ def test_small_batch_reads_history_window(page_tokens, query_window):
     batch = _batch(
         lengths,
         prefixes,
-        page_tokens=page_tokens,
-        start_pages=_history_start_pages(prefixes, page_tokens),
-        seed=41 + page_tokens,
+        block_size=block_size,
+        start_pages=_history_start_pages(prefixes, block_size),
+        seed=41 + block_size,
     )
     out, lse = _outputs(batch)
 
@@ -457,7 +457,7 @@ def test_short_window_bounds_are_exact(heads, query_window):
     # the output well past the tolerance. Windows cut pages mid-way.
     lengths = (5, 3, 9)
     prefixes = (20, 37, 3)
-    batch = _batch(lengths, prefixes, page_tokens=16, heads=heads, seed=23)
+    batch = _batch(lengths, prefixes, block_size=16, heads=heads, seed=23)
     out, lse = _outputs(batch)
 
     _launch(
@@ -480,16 +480,16 @@ def test_short_window_bounds_are_exact(heads, query_window):
     )
 
 
-@pytest.mark.parametrize("page_tokens", [32, 64])
+@pytest.mark.parametrize("block_size", [32, 64])
 @torch.inference_mode()
-def test_full_layer_reads_whole_prefix(page_tokens):
+def test_full_layer_reads_whole_prefix(block_size):
     # Head dim 512 with 8 query heads per KV head: canvas blocks and image
     # blocks read the whole prefix; lengths and prefixes are not tile or page
     # multiples.
     lengths = (256, 256, 280, 17)
     prefixes = (0, 1025, 300, 4097)
     batch = _batch(
-        lengths, prefixes, page_tokens=page_tokens, heads=_FULL, seed=31
+        lengths, prefixes, block_size=block_size, heads=_FULL, seed=31
     )
     out, lse = _outputs(batch)
 
@@ -513,9 +513,9 @@ def test_full_layer_reads_whole_prefix(page_tokens):
     )
 
 
-@pytest.mark.parametrize("page_tokens", [32, 64])
+@pytest.mark.parametrize("block_size", [32, 64])
 @torch.inference_mode()
-def test_causal_chunks_continue_their_history(page_tokens):
+def test_causal_chunks_continue_their_history(block_size):
     # Head dimension 512 prefill chunks: a prompt without history, chunks
     # after long prefixes that are not page multiples, and a short final
     # chunk. Block lengths are not key-tile multiples, so the diagonal cuts
@@ -523,7 +523,7 @@ def test_causal_chunks_continue_their_history(page_tokens):
     lengths = (2048, 1023, 300, 17, 130)
     prefixes = (0, 300, 14336, 4097, 64)
     batch = _batch(
-        lengths, prefixes, page_tokens=page_tokens, heads=_FULL, seed=61
+        lengths, prefixes, block_size=block_size, heads=_FULL, seed=61
     )
     out, lse = _outputs(batch)
 
@@ -558,7 +558,7 @@ def test_causal_diagonal_is_exact(lse_base2):
     # well past the tolerance. Short chunks after prefixes that cut pages.
     lengths = (5, 3, 9, 200)
     prefixes = (20, 37, 3, 0)
-    batch = _batch(lengths, prefixes, page_tokens=16, heads=_FULL, seed=67)
+    batch = _batch(lengths, prefixes, block_size=16, heads=_FULL, seed=67)
     out, lse = _outputs(batch)
 
     _launch(
@@ -595,7 +595,7 @@ def test_causal_graph_replay_reads_updated_lengths():
         _batch(
             (1024, 17, 600, 1, 300),
             (4097, 0, 1500, 64, 12000),
-            page_tokens=64,
+            block_size=64,
             heads=_FULL,
             seed=83,
             pages=pages,
@@ -604,7 +604,7 @@ def test_causal_graph_replay_reads_updated_lengths():
         _batch(
             (5, 1024, 130, 700, 1024),
             (300, 9000, 0, 2049, 64),
-            page_tokens=64,
+            block_size=64,
             heads=_FULL,
             seed=89,
             pages=pages,
@@ -671,7 +671,7 @@ def test_whole_prefix_from_explicit_start(lse_base2):
     lengths = (256, 280, 64)
     prefixes = (300, 1000, 64)
     batch = _batch(
-        lengths, prefixes, page_tokens=16, prefix_starts=(100, 0, 63), seed=11
+        lengths, prefixes, block_size=16, prefix_starts=(100, 0, 63), seed=11
     )
     out, lse = _outputs(batch)
 
@@ -705,7 +705,7 @@ def test_graph_replay_reads_updated_lengths_and_tables():
         _batch(
             (280, 256),
             (1500, 700),
-            page_tokens=16,
+            block_size=16,
             start_pages=(29, 0),
             seed=3,
             pages=pages,
@@ -714,7 +714,7 @@ def test_graph_replay_reads_updated_lengths_and_tables():
         _batch(
             (17, 280),
             (2000, 0),
-            page_tokens=16,
+            block_size=16,
             start_pages=(61, 0),
             seed=4,
             pages=pages,
@@ -795,14 +795,14 @@ def test_capture_at_another_batch_size_after_one_call():
     large = _batch(
         (256,) * 8,
         prefixes,
-        page_tokens=64,
+        block_size=64,
         start_pages=_history_start_pages(prefixes, 64),
         seed=51,
     )
     small = _batch(
         (256, 17),
         (1025, 3001),
-        page_tokens=64,
+        block_size=64,
         start_pages=_history_start_pages((1025, 3001), 64),
         seed=52,
     )
@@ -821,8 +821,8 @@ def test_capture_at_another_batch_size_after_one_call():
     _assert_matches(small, out, lse, base2=False, **options)
 
 
-def test_eligibility_reports_unsupported_page_size():
-    batch = _batch((256,), (100,), page_tokens=16)
+def test_eligibility_reports_unsupported_block_size():
+    batch = _batch((256,), (100,), block_size=16)
     arguments = [
         batch.query,
         batch.key,
@@ -838,15 +838,15 @@ def test_eligibility_reports_unsupported_page_size():
     wide = batch.key_cache.new_zeros((4, 128, *batch.key_cache.shape[2:]))
     arguments[3:5] = [wide, wide]
     assert not prefix_block.can_run(*arguments, window=1023)
-    with pytest.raises(ValueError, match="page_tokens"):
+    with pytest.raises(ValueError, match="block_size"):
         prefix_block.prefix_block_attention(*arguments, max_query_len=256)
 
 
 def test_eligibility_reports_unsupported_causal_configuration():
     # Causal ordering serves full-attention layers only: head dimension 512
     # without a history window.
-    sliding = _batch((256,), (100,), page_tokens=16)
-    full = _batch((256,), (100,), page_tokens=16, heads=_FULL)
+    sliding = _batch((256,), (100,), block_size=16)
+    full = _batch((256,), (100,), block_size=16, heads=_FULL)
 
     def arguments(batch):
         return (

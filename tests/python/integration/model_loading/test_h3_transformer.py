@@ -24,7 +24,7 @@ from uniserve_models.minimax_h3 import (
     Transformer,
 )
 from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
-from uniserve_models.minimax_h3.denoiser import modulation_timesteps
+from uniserve_models.minimax_h3.denoiser import adaln_timesteps
 from uniserve_models.minimax_h3.weights import transformer_component
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
@@ -193,7 +193,7 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
     # The Preview export's four DMD rungs; each step reads its video and
     # audio timestep entries.
     denoiser = dmd_denoiser(config)
-    _, entries, _ = modulation_timesteps(denoiser)
+    _, entries, _ = adaln_timesteps(denoiser)
     model = loading.load_model(
         lambda config: Transformer(
             config,

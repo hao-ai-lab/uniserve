@@ -28,7 +28,7 @@ def unsupported(
         return "requires a head dimension that is a multiple of 8, at most 256"
     if window is not None:
         return "does not take history windows"
-    if pages is not None and (pages.quantized or pages.page_tokens % 256):
+    if pages is not None and (pages.quantized or pages.block_size % 256):
         return "requires dense 256-token cache blocks"
     return None
 
@@ -85,8 +85,8 @@ class _FlashOperator(_Operator):
             )
         self._validate(q, k, v, batch, out)
 
-        if isinstance(batch, PagedInput) and batch.write_indices is not None:
-            self.update_cache(k, v, indices=batch.write_indices)
+        if isinstance(batch, PagedInput) and batch.slot_mapping is not None:
+            self.update_cache(k, v, slot_mapping=batch.slot_mapping)
 
         if q.numel() == 0:
             return out

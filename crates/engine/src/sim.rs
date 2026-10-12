@@ -1388,12 +1388,12 @@ impl SimEngine {
             .num_units = count;
     }
 
-    /// Sets every KV group's page size in tokens.
+    /// Sets every KV group's block size in tokens.
     ///
     /// # Panics
     ///
     /// Panics when the simulated worker does not expose a KV cache.
-    pub fn set_page_tokens(&mut self, tokens: u32) {
+    pub fn set_block_size(&mut self, tokens: u32) {
         for group in &mut self
             .info
             .kv_cache
@@ -1401,7 +1401,7 @@ impl SimEngine {
             .expect("sim AR worker has a KV cache")
             .groups
         {
-            group.page_tokens = tokens;
+            group.block_size = tokens;
         }
     }
 

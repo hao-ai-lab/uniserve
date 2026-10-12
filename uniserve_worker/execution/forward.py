@@ -75,7 +75,7 @@ SampleCandidate = tuple[
 
 
 def forward_values(
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     inputs: tuple[tuple[InputRow, Call], ...],
     *,
     state: BatchState,
@@ -103,9 +103,11 @@ def forward_values(
     # A call's staged CUDA device must be one the batch's output buffer
     # declares; ``register_device`` also fails once the buffer is sealed.
     for row, _call in inputs:
-        state.output_buffer.register_device(model_runner.call_devices(_call)[1])
+        state.output_buffer.register_device(
+            model_executor.call_devices(_call)[1]
+        )
 
-    outputs = model_runner.forward(
+    outputs = model_executor.forward(
         inputs,
         cache=cache,
         tables=tables,
@@ -163,7 +165,7 @@ def _publish_samples(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
@@ -234,7 +236,7 @@ def _publish_samples(
             logits,
             work,
             selected,
-            image_builder=model_runner.image_builder,
+            image_builder=model_executor.image_builder,
             request_tables=request_tables,
             decode_state=decode_state,
             state=state,
@@ -255,7 +257,7 @@ def initialize_trajectories(
     kv_cache: KVCacheManager | None,
     latent_pool: LatentPool,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
 ) -> dict[int, DiffusionState]:
     """Open diffusion trajectories for the live denoising calls.
 
@@ -275,7 +277,7 @@ def initialize_trajectories(
             kv_cache=kv_cache,
             latent_pool=latent_pool,
             request_tables=request_tables,
-            model_runner=model_runner,
+            model_executor=model_executor,
             state=state,
         )
 
@@ -291,7 +293,7 @@ def prepare_diffusion_step(
     kv_cache: KVCacheManager | None,
     latent_pool: LatentPool,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
@@ -327,7 +329,7 @@ def prepare_diffusion_step(
             trajectory,
             latent_pool.committed_step_index(row.request.request_pool_idx),
             request_tables=request_tables,
-            model_runner=model_runner,
+            model_executor=model_executor,
             latent_pool=latent_pool,
             tokenizer=tokenizer,
             state=state,
@@ -342,7 +344,7 @@ def prepare_diffusion_step(
         return step_inputs
 
     values = forward_values(
-        model_runner,
+        model_executor,
         tuple(
             (task, scheduled[index]) for index, _branch, task in active_prefixes
         ),
@@ -395,7 +397,7 @@ def prepare_forward_rows(
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     decode_state: DecodeState | None,
 ) -> tuple[list[tuple[int, InputRow]], dict[int, PreparedImage]]:
     """Build homogeneous numerical rows for the current dependency frontier.
@@ -433,7 +435,7 @@ def prepare_forward_rows(
             # The model sees only the first ``latent_units`` rows of the
             # page-sized staging.
             rows = diffusion.flow_rows(
-                diffusion.require_inputs(model_runner),
+                diffusion.require_inputs(model_executor),
                 trajectories[index],
                 staging.value[: int(params.latent_units)],
                 guide,
@@ -441,7 +443,7 @@ def prepare_forward_rows(
                 conditioning_position=int(
                     calls.require_progress(row).logical_position
                 ),
-                device=model_runner.call_devices(call)[1],
+                device=model_executor.call_devices(call)[1],
             )
             forward.extend((index, task) for task in rows)
         elif (
@@ -454,7 +456,7 @@ def prepare_forward_rows(
                         call,
                         state=state,
                         request_tables=request_tables,
-                        canvas_slots=model_runner.canvas_slots,
+                        canvas_slots=model_executor.canvas_slots,
                     ),
                 )
             )
@@ -472,7 +474,7 @@ def prepare_forward_rows(
                     call,
                     tensor_store=tensor_store,
                     request_tables=request_tables,
-                    model_runner=model_runner,
+                    model_executor=model_executor,
                     state=state,
                 )
                 if token.writes_context(call)
@@ -481,7 +483,7 @@ def prepare_forward_rows(
                         call,
                         tensor_store=tensor_store,
                         request_tables=request_tables,
-                        model_runner=model_runner,
+                        model_executor=model_executor,
                         decode_state=decode_state,
                         state=state,
                     ),
@@ -500,7 +502,7 @@ def prepare_forward_rows(
             prepared = image.prepare_features(
                 call,
                 tensor_store=tensor_store,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
             images[index] = prepared
@@ -516,7 +518,7 @@ def prepare_forward_rows(
             outcomes[index] = image.diffusion_finalize_frames(
                 call,
                 tensor_store=tensor_store,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
         else:
@@ -525,7 +527,7 @@ def prepare_forward_rows(
             latent = image.materialization_latent(
                 call,
                 latent_pool=latent_pool,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 state=state,
             )
             row = state.pending_output(call.request_key.request_id)
@@ -566,7 +568,7 @@ def publish_forward_values(
     tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     config: WorkerConfig,
@@ -642,7 +644,7 @@ def publish_forward_values(
                     value,
                     request_pool_index=sampling_index,
                     tensor_store=tensor_store,
-                    image_builder=model_runner.image_builder,
+                    image_builder=model_executor.image_builder,
                     request_tables=request_tables,
                     decode_state=decode_state,
                     state=state,
@@ -657,7 +659,7 @@ def publish_forward_values(
                 images[index],
                 value,
                 tensor_store=tensor_store,
-                model_runner=model_runner,
+                model_executor=model_executor,
                 publication_transports=publication_transports,
                 config=config,
                 state=state,
@@ -712,7 +714,7 @@ def publish_forward_values(
         outcomes,
         state=state,
         tensor_store=tensor_store,
-        model_runner=model_runner,
+        model_executor=model_executor,
         request_tables=request_tables,
         decode_state=decode_state,
         sampling_group=sampling_group,
@@ -731,7 +733,7 @@ def integrate_predictions(
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
-    model_runner: ModelExecutor,
+    model_executor: ModelExecutor,
     config: WorkerConfig,
 ) -> None:
     """Advance diffusion solvers and publish trajectories at their final step.
@@ -759,7 +761,7 @@ def integrate_predictions(
 
         # The solver updates only the model-visible portion of this
         # call's staging, preserving page padding.
-        model_runner.diffusion_entry(call).integrate(
+        model_executor.diffusion_entry(call).integrate(
             trajectories[index],
             staging.value[: int(params.latent_units)],
             timestep,
@@ -770,7 +772,7 @@ def integrate_predictions(
             call,
             trajectories[index],
             latent_pool=latent_pool,
-            model_runner=model_runner,
+            model_executor=model_executor,
             publication_transports=publication_transports,
             request_tables=request_tables,
             config=config,

@@ -26,11 +26,11 @@ from .vision import Encoder
 
 
 class Model(nn.Module):
-    """Compose text, denoising, vision, and latent codec over one backbone.
+    """Compose text, denoising, vision, and VAE over one backbone.
 
     The text LM and the image denoiser share the same MoT transformer; the
-    vision encoder feeds SigLIP features into it, and the latent codec maps
-    between pixels and the VAE latents the denoiser predicts. ``text.backbone``
+    vision encoder feeds SigLIP features into it, and the VAE maps
+    between pixels and the latents the denoiser predicts. ``text.backbone``
     and ``denoiser.backbone`` are one module instance, as are
     ``latent_encoder`` and ``image_decoder.decoder``, so each shared part
     holds one set of weights.

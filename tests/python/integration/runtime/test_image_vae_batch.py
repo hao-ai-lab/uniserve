@@ -1,4 +1,4 @@
-"""Worker image batches preserve the codec's spatial numerical domain."""
+"""Worker image batches preserve the VAE's spatial numerical domain."""
 
 import pytest
 import torch
@@ -26,7 +26,7 @@ pytestmark = pytest.mark.integration
 
 
 @torch.inference_mode()
-def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
+def test_batched_vae_queries_are_independent_of_text_token_capacity(tmp_path):
     _, _, architecture = bagel_checkpoint(tmp_path)
     model = bagel.Model(architecture).eval()
     config = cpu_worker_config(

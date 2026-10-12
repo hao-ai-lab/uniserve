@@ -58,14 +58,14 @@ class KvGroupKind(StrEnum):
 class KvGroup:
     """Describe one cache group of a worker's KV unit pool.
 
-    A logical page of the group holds ``page_tokens`` tokens of every layer
+    A logical page of the group holds ``block_size`` tokens of every layer
     in the group and occupies ``units_per_page`` units of the pool.
 
     Attributes:
         kind: History retention policy of the group.
         window: With `KvGroupKind.SLIDING_WINDOW`, the history tokens any
             reader of the group needs. Encoded only for a sliding window.
-        page_tokens: Tokens per logical page; a power of two.
+        block_size: Tokens per logical page; a power of two.
         units_per_page: Units one logical page occupies.
         layer_ids: Global cache-layer ids of this rank's layers in the
             group, in column order.
@@ -77,7 +77,7 @@ class KvGroup:
 
     kind: KvGroupKind
     window: int
-    page_tokens: int
+    block_size: int
     units_per_page: int
     layer_ids: tuple[int, ...]
     num_kv_heads: int
@@ -92,7 +92,7 @@ class KvGroup:
             kind.update(window=self.window)
         return {
             "kind": kind,
-            "page_tokens": self.page_tokens,
+            "block_size": self.block_size,
             "units_per_page": self.units_per_page,
             "layer_ids": list(self.layer_ids),
             "num_kv_heads": self.num_kv_heads,
@@ -164,25 +164,25 @@ class ServedCanvas:
 
 
 @dataclass(frozen=True, slots=True)
-class FrameChunks:
-    """How the video VAE divides a video's frames into chunks.
+class FrameClips:
+    """How the video VAE divides a video's frames into clips.
 
-    Mirrors the Rust ``FrameChunks``. A video has ``min_frames + n *
-    chunk_frames`` frames, one decode unit per chunk, so ``n + 1`` units. The
-    VAE encodes each chunk to ``chunk_latent_frames`` latent frames and the
-    final window past the whole chunks to ``tail_latent_frames``.
+    Mirrors the Rust ``FrameClips``. A video has ``min_frames + n *
+    clip_frames`` frames, one decode unit per clip, so ``n + 1`` units. The
+    VAE encodes each clip to ``clip_latent_frames`` latent frames and the
+    tail past the whole clips to ``tail_latent_frames``.
     """
 
     min_frames: int
-    chunk_frames: int
-    chunk_latent_frames: int
+    clip_frames: int
+    clip_latent_frames: int
     tail_latent_frames: int
 
     def to_mapping(self) -> dict[str, object]:
         return {
             "min_frames": self.min_frames,
-            "chunk_frames": self.chunk_frames,
-            "chunk_latent_frames": self.chunk_latent_frames,
+            "clip_frames": self.clip_frames,
+            "clip_latent_frames": self.clip_latent_frames,
             "tail_latent_frames": self.tail_latent_frames,
         }
 
@@ -196,9 +196,9 @@ class VideoDenoiserInfo:
     ``frame_rate`` is the frame rate of every video, the clock durations and
     reference videos are counted on; ``audio_sample_rate`` is the rate of the
     audio generated with each video, zero when the model generates none;
-    ``frames`` states how the VAE chunks a video's frames; ``canvases`` lists
-    the only canvases the deployment serves, those it prepares;
-    ``references`` states the references one request may carry.
+    ``frames`` states how the VAE divides a video's frames into clips;
+    ``canvases`` lists the only canvases the deployment serves, those it
+    prepares; ``references`` states the references one request may carry.
     """
 
     tasks: tuple[str, ...]
@@ -207,7 +207,7 @@ class VideoDenoiserInfo:
     audio_shift: float
     frame_rate: int
     audio_sample_rate: int
-    frames: FrameChunks
+    frames: FrameClips
     canvases: tuple[ServedCanvas, ...] = ()
     references: ReferenceLimits = ReferenceLimits()
 

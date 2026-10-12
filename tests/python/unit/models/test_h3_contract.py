@@ -157,7 +157,7 @@ def test_parallel_decoding_blocks_must_cover_the_heads(checkpoint):
         read_config(export, IOConfig(), sources={})
 
 
-def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
+def test_eight_step_checkpoint_owns_its_rungs_and_shifts(checkpoint):
     inference_path = checkpoint / "fastvideo_inference.json"
     inference = json.loads(inference_path.read_text())
     inference.update(

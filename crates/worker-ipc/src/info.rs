@@ -33,14 +33,14 @@ impl KvCacheInfo {
         self.num_units.saturating_sub(1)
     }
 
-    /// Returns the largest page size of any group, in tokens.
+    /// Returns the largest block size of any group, in tokens.
     ///
-    /// Every page size divides it (`validate`), so a length aligned to it is
+    /// Every block size divides it (`validate`), so a length aligned to it is
     /// a whole number of pages in every group.
-    pub fn max_page_tokens(&self) -> u32 {
+    pub fn max_block_size(&self) -> u32 {
         self.groups
             .iter()
-            .map(|group| group.page_tokens)
+            .map(|group| group.block_size)
             .max()
             .unwrap_or(0)
     }
@@ -89,7 +89,7 @@ impl KvCacheInfo {
     /// Validates the pool size, page shapes and each group's layer and head
     /// placement.
     ///
-    /// Every page size must be a power of two that divides the largest one,
+    /// Every block size must be a power of two that divides the largest one,
     /// so page-aligned prefix lengths agree across groups. A layer belongs to
     /// at most one group.
     pub fn validate(&self) -> ValidationResult<()> {
@@ -98,12 +98,12 @@ impl KvCacheInfo {
             "worker info declare an incomplete KV unit pool"
         );
 
-        let largest = self.max_page_tokens();
+        let largest = self.max_block_size();
         let mut layers = HashSet::new();
         for group in &self.groups {
             ensure_valid!(
-                group.page_tokens.is_power_of_two()
-                    && largest.is_multiple_of(group.page_tokens)
+                group.block_size.is_power_of_two()
+                    && largest.is_multiple_of(group.block_size)
                     && group.units_per_page > 0
                     && group.units_per_page < self.num_units,
                 "worker KV group page shape is invalid"
@@ -331,57 +331,57 @@ pub struct ReferenceLimits {
     pub total: u32,
 }
 
-/// How the video VAE divides a video's frames into chunks.
+/// How the video VAE divides a video's frames into clips.
 ///
-/// A video has `min_frames + n * chunk_frames` frames: one decode unit per
-/// chunk, so `n + 1` units. The VAE encodes each such chunk of a video to
-/// `chunk_latent_frames` latent frames and the final window past the whole
-/// chunks to `tail_latent_frames`. The model states the rule; every count a
+/// A video has `min_frames + n * clip_frames` frames: one decode unit per
+/// clip, so `n + 1` units. The VAE encodes each such clip of a video to
+/// `clip_latent_frames` latent frames and the tail past the whole clips to
+/// `tail_latent_frames`. The model states the rule; every count a
 /// request derives from it, the generated frames, the decode units and a
 /// reference video's encoded frames, follows from these four values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FrameChunks {
-    /// Fewest frames of a video: one chunk and the final window.
+pub struct FrameClips {
+    /// Fewest frames of a video: one clip and the tail.
     pub min_frames: u32,
-    /// Frames each further chunk adds.
-    pub chunk_frames: u32,
-    /// Latent frames one chunk encodes to.
-    pub chunk_latent_frames: u32,
-    /// Latent frames of the final window past the chunks.
+    /// Frames each further clip adds.
+    pub clip_frames: u32,
+    /// Latent frames one clip encodes to.
+    pub clip_latent_frames: u32,
+    /// Latent frames of the tail past the clips.
     pub tail_latent_frames: u32,
 }
 
-impl FrameChunks {
+impl FrameClips {
     /// Returns the decode units of a video of `frames` legal frames.
     pub fn units(&self, frames: u32) -> u32 {
-        frames.saturating_sub(self.min_frames) / self.chunk_frames + 1
+        frames.saturating_sub(self.min_frames) / self.clip_frames + 1
     }
 
     /// Returns the fewest legal frame count that is at least `requested`.
     pub fn align_up(&self, requested: u32) -> u32 {
         let beyond = requested.saturating_sub(self.min_frames);
-        self.min_frames + beyond.div_ceil(self.chunk_frames) * self.chunk_frames
+        self.min_frames + beyond.div_ceil(self.clip_frames) * self.clip_frames
     }
 
     /// Returns the most legal frames of at most `available`, or `None` below
     /// the fewest.
     pub fn align_down(&self, available: u32) -> Option<u32> {
         let beyond = available.checked_sub(self.min_frames)?;
-        Some(self.min_frames + beyond / self.chunk_frames * self.chunk_frames)
+        Some(self.min_frames + beyond / self.clip_frames * self.clip_frames)
     }
 
     /// Returns the latent frames the VAE encodes `frames` legal frames to.
     pub fn latent_frames(&self, frames: u32) -> u32 {
-        self.units(frames) * self.chunk_latent_frames + self.tail_latent_frames
+        self.units(frames) * self.clip_latent_frames + self.tail_latent_frames
     }
 
-    /// Checks that the rule is positive and leaves a final window past the
-    /// first chunk.
+    /// Checks that the rule is positive and leaves a tail past the first
+    /// clip.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            self.chunk_frames > 0
-                && self.min_frames > self.chunk_frames
-                && self.chunk_latent_frames > 0
+            self.clip_frames > 0
+                && self.min_frames > self.clip_frames
+                && self.clip_latent_frames > 0
                 && self.tail_latent_frames > 0,
             "a video denoiser declares an empty frame rule"
         );
@@ -411,9 +411,9 @@ pub struct VideoDenoiserInfo {
     /// Sample rate, in Hz, of the audio track generated with each video; zero
     /// for a deployment that generates none.
     pub audio_sample_rate: u32,
-    /// How the VAE chunks a video's frames, which counts frames and decode
-    /// units.
-    pub frames: FrameChunks,
+    /// How the VAE divides a video's frames into clips, which counts frames
+    /// and decode units.
+    pub frames: FrameClips,
     /// The only canvases the deployment serves: those it prepares, in the
     /// order its operator selected them.
     #[serde(default)]
@@ -682,7 +682,7 @@ impl Default for WorkerInfo {
                 dtype: KvCacheDtype::BFloat16,
                 groups: vec![KvCacheGroup {
                     kind: Default::default(),
-                    page_tokens: 64,
+                    block_size: 64,
                     units_per_page: 1,
                     layer_ids: (0..28).collect(),
                     num_kv_heads: 8,

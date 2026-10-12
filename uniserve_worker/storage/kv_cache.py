@@ -186,11 +186,11 @@ class KVCacheManager:
             for group in groups
         )
         self.shapes = tuple(
-            GroupShape(group.page_tokens, group.units_per_page, group.window)
+            GroupShape(group.block_size, group.units_per_page, group.window)
             for group in groups
         )
         # The most tokens a unit holds in any group bounds a whole-unit span.
-        self._unit_tokens = max(group.page_tokens for group in groups)
+        self._unit_tokens = max(group.block_size for group in groups)
 
         # Transport locations of committed exports, updated by the batch
         # commit; publication intervals retained under their buffers.
@@ -244,14 +244,14 @@ class KVCacheManager:
     def token_capacity(self) -> int:
         """Return the most tokens one request's tables can cover at once.
 
-        Every group holds whole pages of the same tokens. Page sizes are
+        Every group holds whole pages of the same tokens. Block sizes are
         powers of two, so whole pages of the largest size fill every group
         exactly; the allocatable units (all but the sentinel) bound how many
         such spans fit.
         """
-        largest = max(shape.page_tokens for shape in self.shapes)
+        largest = max(shape.block_size for shape in self.shapes)
         span_units = sum(
-            largest // shape.page_tokens * shape.units_per_page
+            largest // shape.block_size * shape.units_per_page
             for shape in self.shapes
         )
         return (self.num_units - 1) // span_units * largest
@@ -262,7 +262,7 @@ class KVCacheManager:
         At least one page per group, even for zero tokens.
         """
         return sum(
-            ceil_div(max(1, tokens), shape.page_tokens) * shape.units_per_page
+            ceil_div(max(1, tokens), shape.block_size) * shape.units_per_page
             for shape in self.shapes
         )
 
@@ -324,7 +324,7 @@ class KVCacheManager:
             WorkerError: ``invalid_descriptor`` when ``length`` exceeds the
                 table's pages.
         """
-        start = table.start_page * table.shape.page_tokens
+        start = table.start_page * table.shape.block_size
         if length <= start:
             return
         ranges = table.spans(start, length - start)
@@ -767,7 +767,7 @@ class KVCacheManager:
                     groups.append(
                         KvGroupTransfer(
                             start=start,
-                            page_tokens=table.shape.page_tokens,
+                            block_size=table.shape.block_size,
                             tensors=tensors,
                         )
                     )
@@ -812,14 +812,14 @@ class KVCacheManager:
         advertised = self.info.groups[group]
         axis = self.axes[group]
         columns = self.cache.planes.columns
-        page_tokens = table.shape.page_tokens
+        block_size = table.shape.block_size
         encoded = self.info.dtype == "float8_e4m3fn"
         # Pages the carried tokens touch, as (absolute page, offset, count).
         pages = []
         position = start
         while position < visible:
-            page, offset = divmod(position, page_tokens)
-            length = min(visible - position, page_tokens - offset)
+            page, offset = divmod(position, block_size)
+            length = min(visible - position, block_size - offset)
             pages.append((page, offset, length))
             position += length
 
@@ -834,7 +834,7 @@ class KVCacheManager:
             # depth, which keeps it within its byte bound.
             for row in range(table.shape.units_per_page):
                 units = table.row(row)
-                # Planes are [columns, units, page tokens, heads, dim]; each
+                # Planes are [columns, units, block size, heads, dim]; each
                 # page view is [tokens, columns, heads, dim]. Unencoded views
                 # alias the live units: ``require_writable`` rejects writes
                 # into the reserved interval until it is released and
@@ -1073,7 +1073,7 @@ class KVCacheManager:
         for table in tables:
             if (
                 table.allocated_tokens < publication.published_extent
-                or table.start_page * table.shape.page_tokens
+                or table.start_page * table.shape.block_size
                 > publication.published_extent
             ):
                 raise invalid_descriptor(
@@ -1085,10 +1085,10 @@ class KVCacheManager:
             # identical and must not be reset by this import.
             for group, table in enumerate(tables):
                 installed = self.block_tables.table(request_pool_idx, group)
-                page_tokens = table.shape.page_tokens
+                block_size = table.shape.block_size
                 first = max(table.start_page, installed.start_page)
                 last = min(
-                    -(-publication.base_extent // page_tokens),
+                    -(-publication.base_extent // block_size),
                     table.end_page,
                     installed.end_page,
                 )
