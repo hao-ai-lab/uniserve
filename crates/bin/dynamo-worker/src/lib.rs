@@ -79,7 +79,7 @@ struct Args {
 
     /// JSON deployment configuration: the Worker instances, their node/device
     /// ranks, and the FastH3 components placed on them, for example
-    /// `configs/minimax_h3/fasth3-ulysses4.json`.
+    /// `configs/minimax_h3/ulysses4.json`.
     #[arg(long, value_name = "FILE", value_parser = read_workers)]
     workers: Box<[WorkerConfig]>,
 
@@ -289,7 +289,7 @@ impl DynamoFastH3Engine {
             let _ = state.engine().shutdown().await;
             return Err(invalid_argument("checkpoint is not MiniMax H3"));
         }
-        let outputs = match check_fasth3(&capabilities) {
+        let outputs = match check_text_to_video(&capabilities) {
             Ok(outputs) => outputs,
             Err(message) => {
                 let _ = state.engine().shutdown().await;
@@ -626,13 +626,16 @@ fn prepare_request(
     })
 }
 
-/// Checks that a deployment's video capabilities are FastH3's, `t2va` alone,
-/// the requests `prepare_request` builds, and returns the rasters it serves.
-fn check_fasth3(capabilities: &Value) -> Result<Outputs, String> {
+/// Checks that a deployment's video capabilities include `t2va`, the
+/// requests `prepare_request` builds, and returns the rasters it serves.
+fn check_text_to_video(capabilities: &Value) -> Result<Outputs, String> {
     let tasks = &capabilities["tasks"];
-    if *tasks != json!(["t2va"]) {
+    let serves_t2va = tasks
+        .as_array()
+        .is_some_and(|tasks| tasks.iter().any(|task| task == "t2va"));
+    if !serves_t2va {
         return Err(format!(
-            "the Dynamo worker serves FastH3 text-to-video only; this deployment serves \
+            "the Dynamo worker sends text-to-video requests; this deployment serves \
              tasks {tasks}"
         ));
     }
@@ -972,21 +975,20 @@ mod tests {
             "16:9": {"width": 1344, "height": 768},
             "9:16": {"width": 768, "height": 1344},
         }});
-        check_fasth3(&capabilities(json!(["t2va"]), sizes))
+        check_text_to_video(&capabilities(json!(["t2va", "fl2va"]), sizes))
             .unwrap_or_else(|error| panic!("the default deployment was refused: {error}"))
     }
 
     #[test]
-    fn only_fasth3_deployments_are_served() {
+    fn only_text_to_video_deployments_are_served() {
         let sizes = json!({"768": {"16:9": {"width": 1344, "height": 768}}});
-        let outputs = check_fasth3(&capabilities(json!(["t2va"]), sizes.clone()))
+        let outputs = check_text_to_video(&capabilities(json!(["t2va", "fl2va"]), sizes.clone()))
             .unwrap_or_else(|error| panic!("a FastH3 deployment was refused: {error}"));
         assert_eq!(outputs.sizes(), ["1344x768"]);
-        // A base checkpoint serves more tasks.
-        assert!(check_fasth3(&capabilities(json!(["t2va", "fl2va"]), sizes.clone())).is_err());
-        assert!(check_fasth3(&capabilities(json!(["ref2va"]), sizes)).is_err());
+        // A reference denoiser generates no video from text alone.
+        assert!(check_text_to_video(&capabilities(json!(["ref2va"]), sizes)).is_err());
         // A deployment that serves no canvas has nothing to generate.
-        assert!(check_fasth3(&capabilities(json!(["t2va"]), json!({}))).is_err());
+        assert!(check_text_to_video(&capabilities(json!(["t2va", "fl2va"]), json!({}))).is_err());
     }
 
     #[test]
@@ -1016,7 +1018,7 @@ mod tests {
                 "21:9": {"width": 992, "height": 416},
             },
         });
-        let outputs = check_fasth3(&capabilities(json!(["t2va"]), sizes))
+        let outputs = check_text_to_video(&capabilities(json!(["t2va", "fl2va"]), sizes))
             .unwrap_or_else(|error| panic!("trained canvases were refused: {error}"));
         let prepare = |request: Value| prepare_request(request, "FastH3", 15.0, &outputs);
         for (size, short_edge, aspect_ratio) in

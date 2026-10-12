@@ -750,12 +750,11 @@ def begin_noise(
 
     A rank holding the denoiser first admits the request's exact size into
     the capacities it provisioned (``MediaBuilder.size``). A size it does not
-    serve, such as conditions beyond the condition capacity or keyframes a
-    reference-only denoiser packs no rows for, refuses the request: its
-    reason is recorded on the request, whose calls on this rank then report
-    it (``schedule.refused_output``). Every rank holding the denoiser
-    decides the same refusal from the same admission, so the ranks of a
-    collective call skip it together.
+    serve, such as conditions beyond the condition capacity, refuses the
+    request: its reason is recorded on the request, whose calls on this rank
+    then report it (``schedule.refused_output``). Every rank holding the
+    denoiser decides the same refusal from the same admission, so the ranks
+    of a collective call skip it together.
 
     The seeded draw and the request's state tables depend only on the seed
     and the admitted size, so they are prepared on the rank's noise thread

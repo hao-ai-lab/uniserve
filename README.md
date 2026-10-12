@@ -1,6 +1,6 @@
 # UniServe
 
-UniServe serves FastH3 8-Step text-to-video-with-audio generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 and MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers every deployment, precision and option. The same guide covers the base MiniMax-H3 checkpoint's text-to-video, keyframe and reference requests and FastH3 OmniRef reference requests.
+UniServe serves FastH3 8-Step text-to-video-with-audio and keyframe-conditioned generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 and MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers every deployment, precision and option. The same guide covers the base MiniMax-H3 checkpoint's text-to-video, keyframe and reference requests and FastH3 OmniRef reference requests.
 
 UniServe is a Python computation library and a Rust server. `uniserve` supplies numerical layers, loading and resource binding; `uniserve_models` composes the models; `uniserve_worker` executes serving requests with those same numerical implementations. Rust owns HTTP admission, scheduling, request state and response assembly.
 
@@ -40,7 +40,7 @@ export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
 
 uniserve serve "$H3_MODEL" \
-  --workers configs/minimax_h3/fasth3-ulysses4.json \
+  --workers configs/minimax_h3/ulysses4.json \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 2
@@ -62,13 +62,13 @@ A deployment file passed to `--workers` places FastH3's components on devices an
 
 | File | GPUs | Layout |
 | --- | --- | --- |
-| `fasth3-ulysses4.json` | Four on one host | Ulysses4 denoiser, TP4 text encoder |
-| `fasth3-ulysses8.json` | Eight on one host | Ulysses8 denoiser, TP8 text encoder |
-| `fasth3-ulysses8-two-node.json` | Four on each of two hosts | Ulysses8 denoiser, TP8 text encoder |
+| `ulysses4.json` | Four on one host | Ulysses4 denoiser, TP4 text encoder |
+| `ulysses8.json` | Eight on one host | Ulysses8 denoiser, TP8 text encoder |
+| `ulysses8-two-node.json` | Four on each of two hosts | Ulysses8 denoiser, TP8 text encoder |
 | `fasth3-ulysses4x2.json` | Eight on one host | Two Ulysses4 replicas |
 | `fasth3-ulysses4x2-two-node.json` | Four on each of two hosts | One Ulysses4 replica per host |
 | `fasth3-dp8-text-tp8.json` | Eight on one host | Eight one-GPU replicas, shared TP8 text encoder |
-| `fasth3-gather8.json` | Eight on one host | All-gather sequence-parallel denoiser, TP8 text encoder |
+| `gather8.json` | Eight on one host | All-gather sequence-parallel denoiser, TP8 text encoder |
 
 One replica spanning every GPU gives the lowest latency; replicas serve more requests at once. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#deployments) lists the recommended deployment and options for each GPU type and goal, and describes two-host startup.
 

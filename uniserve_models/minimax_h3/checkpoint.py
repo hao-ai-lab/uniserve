@@ -6,7 +6,9 @@ which its ``model_index.json`` lists: ``transformer`` serves t2va and
 fl2va, and ``transformer_ref`` serves ref2va. FastH3 is its fast variant:
 a FastVideo student of one partition, whose ``fastvideo_inference.json``
 states the student's task, schedule and sparse attention. The task selects
-the partition the student replaces. A FastH3 export that omits a component
+the partition the student replaces, and the student serves every task of
+that partition: a ``t2va`` student also takes ``fl2va`` keyframes, as the
+partition's network does. A FastH3 export that omits a component
 directory reads it from the base revision its contract pins in
 ``base_model_revision``.
 """
@@ -58,6 +60,13 @@ def _contract(root: Path) -> dict[str, Any] | None:
     return _json(path) if path.is_file() else None
 
 
+def _partition_tasks(partition: str) -> tuple[str, ...]:
+    """The tasks ``partition`` serves, in canonical order."""
+    return tuple(
+        task for task, owner in TASK_PARTITIONS.items() if owner == partition
+    )
+
+
 def detect(root: Path) -> Layout:
     """Classify ``root`` and list the DiT partitions it holds.
 
@@ -77,7 +86,9 @@ def detect(root: Path) -> Layout:
                 f"{sorted(_FASTVIDEO_TASKS)}, got {stated!r}"
             )
         return Layout(
-            MappingProxyType({TASK_PARTITIONS[task]: (task,)}),
+            MappingProxyType(
+                {TASK_PARTITIONS[task]: _partition_tasks(TASK_PARTITIONS[task])}
+            ),
             MappingProxyType(contract),
         )
 
@@ -89,11 +100,7 @@ def detect(root: Path) -> Layout:
         )
     index = _json(index_path)
     partitions = {
-        partition: tuple(
-            task
-            for task, owner in TASK_PARTITIONS.items()
-            if owner == partition
-        )
+        partition: _partition_tasks(partition)
         for partition in dict.fromkeys(TASK_PARTITIONS.values())
         if partition in index and (root / partition / "config.json").is_file()
     }

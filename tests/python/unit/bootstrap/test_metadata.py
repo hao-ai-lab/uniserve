@@ -103,7 +103,7 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
 
 
 def test_h3_worker_advertises_bounded_media_products():
-    from tests.python.fixtures.h3 import fasth3_config
+    from tests.python.fixtures.h3 import text_only_config
     from uniserve_models.minimax_h3 import Model
     from uniserve_worker.bootstrap.components import (
         media_components,
@@ -113,7 +113,7 @@ def test_h3_worker_advertises_bounded_media_products():
     from uniserve_worker.protocol.call import MediaCall, TransferMode
 
     with torch.device("meta"):
-        model = Model(fasth3_config())
+        model = Model(text_only_config())
     # The deployment serves 768p 16:9 and 9:16.
     config = cpu_worker_config(
         device="cpu",
@@ -538,14 +538,14 @@ def test_a_deployment_without_condition_capacity_serves_the_largest_set():
     """
     from dataclasses import replace
 
-    from tests.python.fixtures.h3 import WIDE, base_config, fasth3_config
+    from tests.python.fixtures.h3 import WIDE, base_config, text_only_config
     from uniserve_models.minimax_h3 import Model
     from uniserve_worker.bootstrap.inputs import media_builder
     from uniserve_worker.bootstrap.model_loader import loaded_worker_config
 
     with torch.device("meta"):
         model = Model(base_config())
-        text_only = Model(fasth3_config())
+        text_only = Model(text_only_config())
     config = cpu_worker_config(
         device="cpu",
         max_model_len=4096,

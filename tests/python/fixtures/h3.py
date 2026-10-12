@@ -64,9 +64,10 @@ def dmd_denoiser(
     video_shift: float = 12.0,
     sparsity: float = 0.9,
 ) -> DenoiserConfig:
-    """A FastH3 DMD student: sparse tile-64 attention, text-only.
+    """A FastH3 DMD student: sparse tile-64 attention, t2va and fl2va.
 
-    It generates the export's training buckets (``DMD_CANVASES``).
+    It serves the tasks of the ``transformer`` partition it replaces and
+    generates the export's training buckets (``DMD_CANVASES``).
     """
     return DenoiserConfig(
         transformer=transformer or transformer_config(),
@@ -79,7 +80,7 @@ def dmd_denoiser(
             ),
         },
         attention=SparseAttention(tile=64, sparsity=sparsity),
-        tasks=("t2va",),
+        tasks=("t2va", "fl2va"),
         canvases=DMD_CANVASES,
     )
 
@@ -124,7 +125,7 @@ def omniref_denoiser(
 
 
 def fasth3_config() -> Config:
-    """A FastH3 t2va export: one DMD denoiser."""
+    """A FastH3 DMD export: one denoiser serving t2va and fl2va."""
     return Config(
         text_encoder=text_encoder_config(),
         denoisers={"transformer": dmd_denoiser()},
@@ -141,6 +142,16 @@ def base_config() -> Config:
             "transformer": base_denoiser(),
             "transformer_ref": base_denoiser(tasks=("ref2va",)),
         },
+        video_vae=video_vae_config(),
+        audio_vae=audio_vae_config(),
+    )
+
+
+def text_only_config() -> Config:
+    """A FastH3 DMD denoiser restricted to ``t2va``: no conditioned task."""
+    return Config(
+        text_encoder=text_encoder_config(),
+        denoisers={"transformer": replace(dmd_denoiser(), tasks=("t2va",))},
         video_vae=video_vae_config(),
         audio_vae=audio_vae_config(),
     )
