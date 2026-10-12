@@ -486,20 +486,20 @@ def _video_span(frames: int) -> float:
 def _place_keyframe(
     positions: torch.Tensor,
     rows: slice | torch.Tensor,
-    anchor: ConditionRole,
+    keyframe: Segment,
     origin: float,
     frames: int,
     spatial: torch.Tensor,
 ) -> None:
     """Place a keyframe on the generated timeline of ``frames`` latent frames.
 
-    The generated video starts at ``origin``; a first keyframe shares its
-    first latent frame's time and a last keyframe its last one's, both at
-    the target's spatial grid ``spatial``.
+    The generated video starts at ``origin``; a keyframe anchoring the first
+    frame shares its first latent frame's time and one anchoring the last
+    frame its last one's, both at the target's spatial grid ``spatial``.
     """
     positions[rows, 0] = (
         origin
-        if anchor == ConditionRole.FIRST_FRAME
+        if keyframe.anchor == ConditionRole.FIRST_FRAME
         else origin + _keyframe_span(frames) - ROPE_FRAME_RESCALE
     )
     positions[rows, 1:] = spatial
@@ -630,9 +630,7 @@ def dense_tables(
                 float(segment.audio_frames), _video_span(segment.latent_frames)
             )
     for segment, visual in keyframes:
-        _place_keyframe(
-            positions, visual, segment.anchor, clock, frames, spatial
-        )
+        _place_keyframe(positions, visual, segment, clock, frames, spatial)
 
     _place_frames(
         positions, slice(0, packing.video_rows), frames, clock, spatial
@@ -1071,9 +1069,7 @@ def segment_tables(
             )
 
     for segment, visual in keyframes:
-        _place_keyframe(
-            positions, visual, segment.anchor, clock, frames, spatial
-        )
+        _place_keyframe(positions, visual, segment, clock, frames, spatial)
 
     # The generated audio and video start where the references leave the
     # clock; their rows are the layout's.
