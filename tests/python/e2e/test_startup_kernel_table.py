@@ -93,8 +93,8 @@ def test_bagel_startup_table_names_every_image_kernel(tmp_path):
     vision = sites("vision_encoding")
     assert vision and all(site["provider"] is not None for site in vision)
     for kind, half in (
-        ("latent_encoding", "encoder.middle"),
-        ("image_decoding", "decoder.decoder.middle"),
+        ("latent_encoding", "encoder.encoder.middle"),
+        ("image_decoding", "decoder.decoder.decoder.middle"),
     ):
         called = [
             site
