@@ -12,29 +12,37 @@ endpoint its locators already carry, so a consumer holding a locator can reach
 the grant without any additional field. Every rank of a deployment whose
 devices export descriptors runs on one host and is started by one engine, so
 they agree on the directory below.
+
+The producer side, `DescriptorGrants`, serves from a native thread of the
+`_uniserve_ipc` extension that never takes the GIL. A producer's device work
+can wait on the consumers that ask it for descriptors, as a collective waits
+for ranks that are still importing their inputs, and its main thread may
+meanwhile hold the GIL in a CUDA launch that waits for queue space; a grant
+that needed the interpreter would then deadlock the ranks. `fetch` runs on a
+consumer's read thread, whose blocking socket calls release the GIL.
 """
 
 from __future__ import annotations
 
-import array
 import os
 import socket
 import sys
 import tempfile
-import threading
 from pathlib import Path
 
+from uniserve_worker._uniserve_ipc import (
+    GRANT_GRANTED,
+    GRANT_REQUEST_BYTES,
+    DescriptorGrants,
+)
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import DESCRIPTOR_HANDLE_BYTES
 
-#: A request names one publication; a reply is either one descriptor or the
-#: refusal byte below. `SOCK_SEQPACKET` delivers each as a single record.
-#:
-#: A publication id is `uuid.uuid4().hex` (`CudaVmmTransport.publish`), whose
-#: 32 characters fill a request exactly.
-_REQUEST_BYTES = 32
-_REFUSED = b"\x00"
-_GRANTED = b"\x01"
+#: A request names one publication, `uuid.uuid4().hex`
+#: (`CudaVmmTransport.publish`), whose 32 characters fill it exactly; a reply
+#: is the granted byte with one descriptor or the refusal byte.
+#: `SOCK_SEQPACKET` delivers each as a single record.
+_GRANTED = bytes([GRANT_GRANTED])
 _TIMEOUT_SECONDS = 30.0
 
 
@@ -47,95 +55,20 @@ def address_of(endpoint: str) -> Path:
     return _directory() / f"{endpoint}.sock"
 
 
-class DescriptorGrants:
-    """Serve one address space's publication descriptors to local consumers.
+def serve(endpoint: str) -> DescriptorGrants:
+    """Serve this address space's publication descriptors to local consumers.
 
     Descriptors are registered as the producer publishes and withdrawn as the
-    publications retire. The registered descriptor stays owned by whoever
-    opened it: a direct export belongs to its publication, a pool handle to
-    the pool, and this table only lends them out.
+    publications retire. A registered descriptor stays owned by whoever opened
+    it: a direct export belongs to its publication, a pool handle to the pool,
+    and the grants only lend them out. `register`, `release` and `close` may
+    be called from any thread; once `release` returns, no grant of that
+    publication is still being sent, so its owner may close the descriptor.
 
-    Requests are served one connection at a time on a daemon thread;
-    `register` and `release` may be called from any thread.
+    Raises:
+        OSError: The socket cannot be bound at `address_of(endpoint)`.
     """
-
-    def __init__(self, endpoint: str) -> None:
-        self._descriptors: dict[str, int] = {}
-        self._lock = threading.Lock()
-        self._closed = False
-        self.address = address_of(endpoint)
-        self.address.parent.mkdir(parents=True, exist_ok=True)
-        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        self._listener.bind(str(self.address))
-        self._listener.listen(64)
-        self._thread = threading.Thread(
-            target=self._serve,
-            name="uniserve-descriptor-grants",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def register(self, publication_id: str, descriptor: int) -> None:
-        """Make one publication's descriptor grantable."""
-        with self._lock:
-            self._descriptors[publication_id] = descriptor
-
-    def release(self, publication_id: str) -> None:
-        """Withdraw a publication; later requests for it are refused."""
-        with self._lock:
-            self._descriptors.pop(publication_id, None)
-
-    def close(self) -> None:
-        """Stop serving and remove the socket."""
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._descriptors.clear()
-        self._listener.close()
-        self.address.unlink(missing_ok=True)
-
-    def _serve(self) -> None:
-        while True:
-            try:
-                connection, _ = self._listener.accept()
-            except OSError:
-                return  # the listener closed
-            with connection:
-                try:
-                    self._reply(connection)
-                except OSError:
-                    # A consumer that disconnects or times out costs only its
-                    # own request; the listener keeps serving.
-                    continue
-
-    def _reply(self, connection: socket.socket) -> None:
-        connection.settimeout(_TIMEOUT_SECONDS)
-        request = connection.recv(_REQUEST_BYTES)
-        if len(request) != _REQUEST_BYTES:
-            connection.sendall(_REFUSED)
-            return
-        with self._lock:
-            descriptor = self._descriptors.get(
-                request.decode("ascii", "ignore")
-            )
-        if descriptor is None:
-            connection.sendall(_REFUSED)
-            return
-        connection.sendmsg(
-            [_GRANTED],
-            [
-                (
-                    socket.SOL_SOCKET,
-                    socket.SCM_RIGHTS,
-                    bytes(_fd_array(descriptor)),
-                )
-            ],
-        )
-
-
-def _fd_array(descriptor: int) -> bytes:
-    return array.array("i", [descriptor]).tobytes()
+    return DescriptorGrants(str(address_of(endpoint)))
 
 
 def fetch(endpoint: str, publication_id: str) -> int:
@@ -160,7 +93,9 @@ def fetch(endpoint: str, publication_id: str) -> int:
             raise invalid_descriptor(
                 "CUDA publication endpoint serves no descriptor grants"
             ) from error
-        connection.sendall(publication_id.encode("ascii").ljust(_REQUEST_BYTES))
+        connection.sendall(
+            publication_id.encode("ascii").ljust(GRANT_REQUEST_BYTES)
+        )
         payload, descriptors, _flags, _address = socket.recv_fds(
             connection, 1, 1
         )

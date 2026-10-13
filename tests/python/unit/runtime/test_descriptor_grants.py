@@ -5,21 +5,24 @@ bytes of one carry no meaning anywhere else. A device that exports descriptors
 rather than fabric handles therefore has to hand the descriptor itself to its
 readers, which is what these cover: a registered publication is granted, an
 unregistered or withdrawn one is refused, an endpoint that serves nothing is
-refused rather than hung on, and a rank's readers are served when they all ask
-at once, which is what a batch of products actually produces.
+refused rather than hung on, a rank's readers are served when they all ask
+at once, which is what a batch of products actually produces, and they are
+served while the producer's interpreter is blocked.
 """
 
 from __future__ import annotations
 
+import ctypes
 import multiprocessing as mp
 import os
 import tempfile
+import time
 import uuid
 
 import pytest
 
 from uniserve_worker.errors import WorkerError
-from uniserve_worker.transport.descriptor_grants import DescriptorGrants, fetch
+from uniserve_worker.transport.descriptor_grants import fetch, serve
 
 pytestmark = [pytest.mark.unit]
 
@@ -61,7 +64,7 @@ def _in_child(endpoint: str, publication: str) -> tuple[str, object]:
 
 def test_a_registered_descriptor_opens_the_same_file_in_a_consumer() -> None:
     endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
-    grants = DescriptorGrants(endpoint)
+    grants = serve(endpoint)
     publication = uuid.uuid4().hex
     with tempfile.TemporaryFile() as source:
         grants.register(publication, source.fileno())
@@ -76,7 +79,7 @@ def test_a_registered_descriptor_opens_the_same_file_in_a_consumer() -> None:
 
 def test_a_withdrawn_publication_is_refused() -> None:
     endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
-    grants = DescriptorGrants(endpoint)
+    grants = serve(endpoint)
     publication = uuid.uuid4().hex
     with tempfile.TemporaryFile() as source:
         grants.register(publication, source.fileno())
@@ -113,7 +116,7 @@ def _fetch_many(endpoint: str, publications: list[str], channel) -> None:
 
 def test_concurrent_consumers_are_all_served() -> None:
     endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
-    grants = DescriptorGrants(endpoint)
+    grants = serve(endpoint)
     context = mp.get_context("spawn")
     readers = 8
     sources = [tempfile.TemporaryFile() for _ in range(4)]
@@ -151,3 +154,56 @@ def test_concurrent_consumers_are_all_served() -> None:
         grants.close()
         for source in sources:
             source.close()
+
+
+def _fetch_on_signal(endpoint: str, publication: str, channel) -> None:
+    """Ask for a publication once told to, and report when it arrived."""
+    channel.send("ready")
+    channel.recv()
+    descriptor = fetch(endpoint, publication)
+    try:
+        channel.send((_identity(descriptor), time.monotonic()))
+    finally:
+        os.close(descriptor)
+
+
+def test_grants_are_served_while_the_producer_holds_the_gil() -> None:
+    """A producer whose interpreter is blocked still grants its descriptors.
+
+    A producing rank's main thread can hold the GIL in a CUDA launch that
+    waits for queue space while its device waits on a collective of ranks
+    that are still importing this rank's products. Those ranks must receive
+    their descriptors meanwhile, or none of them proceeds. Here the producer
+    holds the GIL in one native sleep while a consumer process asks.
+    """
+    endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
+    grants = serve(endpoint)
+    publication = uuid.uuid4().hex
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(
+        target=_fetch_on_signal, args=(endpoint, publication, child)
+    )
+    hold_seconds = 3
+    with tempfile.TemporaryFile() as source:
+        grants.register(publication, source.fileno())
+        process.start()
+        try:
+            assert parent.poll(60), "the consumer process never started"
+            assert parent.recv() == "ready"
+            parent.send("go")
+            # `PyDLL` calls keep the GIL, so no Python thread of this process
+            # runs until the sleep returns.
+            held = time.monotonic()
+            ctypes.PyDLL(None).sleep(hold_seconds)
+            assert parent.poll(60), "the consumer process never answered"
+            identity, granted = parent.recv()
+        finally:
+            process.join(30)
+            if process.is_alive():
+                process.terminate()
+                process.join(10)
+            grants.close()
+        assert identity == _identity(source.fileno())
+        # The grant arrived during the hold, not once the GIL was free again.
+        assert granted - held < hold_seconds - 1

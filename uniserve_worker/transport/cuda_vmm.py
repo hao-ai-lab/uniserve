@@ -271,7 +271,7 @@ class CudaVmmTransport(Transport):
     def _descriptor_grants(self) -> DescriptorGrants:
         """Bind this address space's grant socket on first use."""
         if self._grants is None:
-            self._grants = DescriptorGrants(self.endpoint())
+            self._grants = descriptor_grants.serve(self.endpoint())
         return self._grants
 
     def publication_retirement(

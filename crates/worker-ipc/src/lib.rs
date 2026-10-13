@@ -80,6 +80,8 @@ macro_rules! ensure_valid {
 pub mod channel;
 /// FlatBuffers encoding and decoding for protocol messages.
 pub mod codec;
+/// Grants of a producer's shareable descriptors to consumers on its host.
+pub mod descriptor_grants;
 /// Shared-storage rank transport for ranks on the head's host.
 pub mod iceoryx;
 /// Stream-socket rank transport for ranks on other hosts.
