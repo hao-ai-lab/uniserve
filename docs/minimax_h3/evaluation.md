@@ -107,3 +107,40 @@ export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastVideo-FastH3-Omni-8-Ste
 Start `uniserve-host` on `rank-1` for the two-host server, as in [Two hosts](minimax_h3.md#two-hosts). The `sglang-gb200-8-reference` suite measures SGLang's base Ref2VA on the same cells and hosts with the base schedule (50 sigma points), one measured request per cell after its warmup; start SGLang's node rank 1 on `rank-1` beside the head, as for `sglang-gb200-8`. SGLang enlarges every reference image, so its results compare with the enlarged suite.
 
 Cross-engine results are not equal-work ratios: the engines differ in reference-image resizing, noise generators, media codecs and distributed attention. vLLM-Omni's W4 image processing keeps a smaller condition layout than the others, and its diffusion worker does not implement the two-host placement.
+
+## OmniRef on H200
+
+FastH3 OmniRef runs on H200 with the SM90 kernel of its 128-row sparse-attention tiles. The `h200-8-omniref-refs` and `h200-8-omniref-refs-enlarged` suites of `uniserve_eval/minimax_h3.toml` run the reference matrix on one eight-H200 host as one Ulysses8 replica (`ulysses8-reference.json`), with the capacities, reference sizings, warmups and seeds of the `gb200-8-omniref-refs` suites and `--mem-fraction-static 0.92`. Each cell is the mean ± SD of its three measured requests.
+
+Default reference sizing (`h200-8-omniref-refs`):
+
+| Composition | 5 s | 10 s | 15 s |
+| --- | ---: | ---: | ---: |
+| `image` | 10.17 ± 0.10 s | 17.55 ± 0.16 s | 26.16 ± 0.39 s |
+| `image-voice` | 10.56 ± 0.46 s | 17.74 ± 0.26 s | 26.41 ± 0.10 s |
+| `images3` | 13.80 ± 0.26 s | 23.13 ± 0.85 s | 33.94 ± 0.06 s |
+| `images9` | 18.71 ± 0.81 s | 30.91 ± 0.36 s | 43.71 ± 0.98 s |
+| `clip` | 11.48 ± 0.55 s | 18.14 ± 0.22 s | 26.46 ± 0.34 s |
+| `video` | 18.03 ± 0.29 s | 29.47 ± 0.18 s | 39.44 ± 0.28 s |
+| `clips3` | 20.98 ± 0.54 s | 29.85 ± 0.33 s | 40.09 ± 0.20 s |
+| `mixed` | 23.70 ± 0.95 s | 36.58 ± 1.11 s | 48.48 ± 0.98 s |
+| `full` | 38.93 ± 1.11 s | 53.34 ± 1.05 s | 70.09 ± 1.04 s |
+
+Every reference enlarged to its encoding size (`h200-8-omniref-refs-enlarged`):
+
+| Composition | 5 s | 10 s | 15 s |
+| --- | ---: | ---: | ---: |
+| `image` | 13.33 ± 0.78 s | 22.43 ± 0.89 s | 33.64 ± 0.10 s |
+| `image-voice` | 13.77 ± 0.73 s | 22.94 ± 0.88 s | 33.06 ± 1.31 s |
+| `images3` | 27.93 ± 0.24 s | 41.07 ± 0.38 s | 57.98 ± 0.54 s |
+| `images9` | 48.56 ± 0.89 s | 68.99 ± 1.07 s | 94.15 ± 0.58 s |
+| `clip` | 12.15 ± 0.36 s | 18.30 ± 0.33 s | 27.33 ± 0.53 s |
+| `video` | 19.14 ± 1.01 s | 28.88 ± 0.30 s | 39.90 ± 1.87 s |
+| `clips3` | 21.38 ± 0.59 s | 29.06 ± 0.06 s | 40.40 ± 0.86 s |
+| `mixed` | 30.04 ± 0.18 s | 44.48 ± 0.25 s | 58.34 ± 0.84 s |
+| `full` | 89.32 ± 0.84 s | 125.78 ± 9.24 s | 148.41 ± 0.97 s |
+
+```bash
+.venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run h200-8-omniref-refs --reuse-deployment
+.venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run h200-8-omniref-refs-enlarged --reuse-deployment
+```
