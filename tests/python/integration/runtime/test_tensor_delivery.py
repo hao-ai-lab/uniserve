@@ -423,6 +423,152 @@ def test_cuda_vmm_rereads_rewritten_storage_with_its_current_values() -> None:
         parent.close()
 
 
+def test_cuda_vmm_reads_reallocated_storage_as_a_new_allocation() -> None:
+    """Storage allocated after a read one is freed arrives with its own values.
+
+    The consumer keeps its mapping of every producer allocation it has read.
+    The producer frees the first storage once its publication has retired and
+    allocates the second in its place, which can reuse the first's address and
+    descriptor number; the consumer must still read the second allocation.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("cross-device VMM reads need two CUDA devices")
+    from uniserve_kernels.peer_storage import empty
+
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    events = EventPool()
+    producer = make_transport(
+        "cuda_vmm",
+        byte_capacity=16384,
+        ticket_capacity=2,
+        event_pool=events,
+        source=WorkerEndpoint.local(),
+    )
+    process = context.Process(target=_receive_cuda_products, args=(child, 2))
+    try:
+        process.start()
+        child.close()
+        for scale in (1.0, -3.0):
+            storage = empty(
+                (6, 8), dtype=torch.float32, device=torch.device("cuda:0")
+            )
+            values = scale * torch.arange(48, device="cuda:0").view(6, 8)
+            storage.copy_(values)
+            location = producer.publish(storage)
+            parent.send(TensorTransfer(shape=(6, 8), locations=(location,)))
+            assert parent.poll(45), "CUDA VMM product did not arrive"
+            assert parent.recv() == values.cpu().tolist()
+
+            # Retire the publication so nothing but this frame holds the
+            # storage, then free it before the next allocation.
+            retirement = producer.release(location)
+            torch.cuda.synchronize(0)
+            events.reap()
+            if retirement is not None:
+                retirement.result(timeout=5)
+            del storage, location
+        process.join(30)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(30)
+        producer.close()
+        events.close()
+        parent.close()
+
+
+def _publish_cached_allocator_product(channel) -> None:
+    """Publish a caching-allocator product placed inside a segment."""
+    events = EventPool()
+    producer = make_transport(
+        "cuda_vmm",
+        byte_capacity=8 << 20,
+        ticket_capacity=2,
+        event_pool=events,
+        source=WorkerEndpoint.local(),
+    )
+    try:
+        # The padding puts the product's block past the start of its
+        # segment's first page.
+        padding = torch.empty(
+            (3 << 20) + 4096, dtype=torch.uint8, device="cuda:0"
+        )
+        product = torch.arange(1 << 19, dtype=torch.float32, device="cuda:0")
+        location = producer.publish(product)
+        channel.send(
+            (
+                TensorTransfer(
+                    shape=tuple(product.shape), locations=(location,)
+                ),
+                product.cpu(),
+            )
+        )
+        assert channel.recv() == "read"
+        producer.release(location)
+        del padding
+    finally:
+        producer.close()
+        events.close()
+        channel.close()
+
+
+def test_cuda_vmm_delivers_a_product_from_expandable_segments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A product inside an expandable allocator segment arrives intact.
+
+    The engine enables PyTorch's expandable segments on every rank. Their
+    driver allocations request descriptor handles, so on a device that
+    exports descriptors they look exportable, yet a block inside a segment
+    has no handle and extent of its own.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("cross-device VMM reads need two CUDA devices")
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    events = EventPool()
+    consumer = make_transport(
+        "cuda_vmm",
+        byte_capacity=8 << 20,
+        ticket_capacity=2,
+        event_pool=events,
+        source=WorkerEndpoint.local(),
+    )
+    process = context.Process(
+        target=_publish_cached_allocator_product, args=(child,)
+    )
+    try:
+        # Only the producer starts with expandable segments; this process's
+        # allocator keeps the configuration it was started with.
+        with monkeypatch.context() as scoped:
+            scoped.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+            process.start()
+        child.close()
+        assert parent.poll(60), "caching-allocator product was not published"
+        tensor, expected = parent.recv()
+        destination = torch.empty(tensor.shape, device="cuda:1")
+        _consume(
+            fetch_tensor(
+                tensor,
+                destination,
+                bindings={(tensor.locations[0].source, "cuda_vmm"): consumer},
+            )
+        )
+        assert torch.equal(destination.cpu(), expected)
+        parent.send("read")
+        process.join(30)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(30)
+        consumer.close()
+        events.close()
+        parent.close()
+
+
 def test_cuda_vmm_stages_between_devices_without_peer_access() -> None:
     """A same-host VMM product remains deliverable across PCIe islands."""
     devices = range(torch.cuda.device_count())

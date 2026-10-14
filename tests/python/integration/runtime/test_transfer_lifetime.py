@@ -484,7 +484,7 @@ def _serve_unusable_cuda_handle(channel) -> None:
     source.copy_(torch.arange(1024, dtype=torch.float32, device="cuda:0"))
     event = torch.cuda.Event(interprocess=True)
     event.record()
-    exported, capacity, offset = export_handle(source)
+    exported, capacity, offset, allocation_id = export_handle(source)
     # A handle of the right length that names no allocation: the consumer
     # imports from the publication, so this is what an unusable handle is.
     locator = Locator(
@@ -499,6 +499,7 @@ def _serve_unusable_cuda_handle(channel) -> None:
             tensor_stride=tuple(source.stride()),
             ready_event_handle=event.ipc_handle(),
             allocation_handle=bytes(len(exported)),
+            allocation_id=allocation_id,
             acknowledgment_offset=-1,
         ),
         nbytes=source.numel() * source.element_size(),

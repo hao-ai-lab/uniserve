@@ -256,6 +256,12 @@ pub enum TransferTransport {
         /// over the producer's grant socket, keyed by `publication_id`.
         #[serde(with = "serde_bytes")]
         allocation_handle: Vec<u8>,
+        /// The producing process's nonzero identity of the exported
+        /// allocation, never reused within that process. Publications with
+        /// equal `endpoint` and `allocation_id` name the same physical
+        /// allocation, so a consumer imports it once and keeps the mapping for
+        /// every later read, whichever handle type it was exported as.
+        allocation_id: u64,
         /// Byte offset of this publication's acknowledgment header inside the
         /// exported allocation. A consumer writes its own slot's word there
         /// once its reads retire, which is how a product retires across hosts.
@@ -893,6 +899,7 @@ impl Locator {
                 tensor_stride,
                 ready_event_handle,
                 allocation_handle,
+                allocation_id,
                 ..
             } => {
                 ensure_valid!(
@@ -927,6 +934,7 @@ impl Locator {
                             || ready_event_handle.is_empty())
                         // A process descriptor is 4 bytes, a fabric handle 64.
                         && matches!(allocation_handle.len(), 4 | 64)
+                        && *allocation_id > 0
                         && tensor_stride.iter().all(|stride| *stride >= 0),
                     "CUDA VMM transfer handle is incomplete"
                 );

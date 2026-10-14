@@ -59,11 +59,12 @@ def serve(endpoint: str) -> DescriptorGrants:
     """Serve this address space's publication descriptors to local consumers.
 
     Descriptors are registered as the producer publishes and withdrawn as the
-    publications retire. A registered descriptor stays owned by whoever opened
-    it: a direct export belongs to its publication, a pool handle to the pool,
-    and the grants only lend them out. `register`, `release` and `close` may
-    be called from any thread; once `release` returns, no grant of that
-    publication is still being sent, so its owner may close the descriptor.
+    publications retire. A registered descriptor stays owned by the mapping
+    of the storage it was exported from (``peer_storage.export_handle``),
+    which closes it when the storage is freed, and the grants only lend it
+    out. `register`, `release` and `close` may be called from any thread;
+    once `release` returns, no grant of that publication is still being sent,
+    so its storage may be freed.
 
     Raises:
         OSError: The socket cannot be bound at `address_of(endpoint)`.

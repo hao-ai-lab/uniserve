@@ -1179,6 +1179,7 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
             tensor_stride,
             ready_event_handle,
             allocation_handle,
+            allocation_id,
             acknowledgment_offset,
         } => {
             handle.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
@@ -1202,6 +1203,7 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
                 intern!(py, "allocation_handle"),
                 PyBytes::new(py, allocation_handle),
             )?;
+            handle.set_item(intern!(py, "allocation_id"), allocation_id)?;
             handle.set_item(intern!(py, "acknowledgment_offset"), acknowledgment_offset)?;
             "CudaVmmTransfer"
         }
@@ -1698,6 +1700,7 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
             tensor_stride: i64_vec(&get(dict, intern!(py, "tensor_stride"))?)?,
             ready_event_handle: bytes_of(&get(dict, intern!(py, "ready_event_handle"))?)?,
             allocation_handle: bytes_of(&get(dict, intern!(py, "allocation_handle"))?)?,
+            allocation_id: u64_of(&get(dict, intern!(py, "allocation_id"))?)?,
             acknowledgment_offset: i64_of(&get(dict, intern!(py, "acknowledgment_offset"))?)?,
         },
         "channel" => TransferTransport::Channel {

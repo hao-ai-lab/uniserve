@@ -1668,6 +1668,7 @@ fn transfer_locator_from_table(value: fbs::Locator<'_>) -> CodecResult<Locator> 
                 .allocation_handle()
                 .map(|bytes| bytes.bytes().to_vec())
                 .unwrap_or_default(),
+            allocation_id: value.allocation_id(),
             acknowledgment_offset: value.acknowledgment_offset(),
         }
     } else if value.transport() == fbs::TransferTransportKind::Channel {
