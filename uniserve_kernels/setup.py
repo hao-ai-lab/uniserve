@@ -77,6 +77,32 @@ def _cuda_extensions():
         )
         for block, configuration in ((64, []), (128, ["-DVSA_BLK128=true"]))
     ]
+    # SM90a block-sparse attention over 128-row tiles, built on the vendored
+    # CUTLASS headers. Its GMMA and register reconfiguration instructions are
+    # architecture-conditional, so the target is exactly sm_90a.
+    sparse_attention.append(
+        CUDAExtension(
+            "uniserve_kernels.attention.vsa_sm90._C",
+            [_source("attention", "vsa_sm90", "csrc", "attention.cu")],
+            include_dirs=[
+                _include(
+                    "deepgemm", "csrc", "third-party", "cutlass", "include"
+                )
+            ],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++20"],
+                "nvcc": [
+                    "-O3",
+                    "-std=c++20",
+                    "--use_fast_math",
+                    "--expt-extended-lambda",
+                    "--expt-relaxed-constexpr",
+                    "-Xcompiler=-fno-strict-aliasing",
+                    "-gencode=arch=compute_90a,code=sm_90a",
+                ],
+            },
+        )
+    )
     return [
         # CUDA virtual memory management, peer handle export and import,
         # and strided host/device DMA.

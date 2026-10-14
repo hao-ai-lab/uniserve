@@ -263,3 +263,155 @@ def test_empty_dense_tiles_leave_live_rows_unchanged(provider, stream):
             rtol=2e-2,
             atol=2e-2,
         )
+
+
+# Providers of 128-row tiles. The window covers sequence tiles 2-6, whose
+# valid rows are 128, 100, 64, 30 and 0; the key blocks add whole blocks,
+# blocks with more and with at most 64 valid rows, an empty block, and a
+# block of 7 rows.
+WIDE_PROVIDERS = ["sm100", "sm90"]
+WIDE_TILE = 128
+WIDE_VALID = (64, 128, 128, 100, 64, 30, 0, 7)
+WIDE_WINDOW = range(2, 7)
+
+
+def _wide_selection(heads, generator):
+    """Per-head key blocks of each window tile, in no particular order.
+
+    The first tile selects every block; the others select several partial
+    blocks together, an odd number of them on some heads; the empty tile
+    selects none.
+    """
+    choices = (
+        tuple(range(len(WIDE_VALID))),
+        (0, 2, 4, 5, 7),
+        (1, 5, 6),
+        (3, 7),
+        (),
+    )
+    indices = torch.zeros(
+        heads, len(WIDE_WINDOW), len(WIDE_VALID), dtype=torch.int32
+    )
+    counts = torch.zeros(heads, len(WIDE_WINDOW), dtype=torch.int32)
+    for head in range(heads):
+        for tile, chosen in enumerate(choices):
+            chosen = list(chosen)
+            if head % 2 and len(chosen) > 1:
+                chosen = chosen[1:]
+            order = torch.randperm(len(chosen), generator=generator).tolist()
+            for slot, position in enumerate(order):
+                indices[head, tile, slot] = chosen[position]
+            counts[head, tile] = len(chosen)
+    return indices, counts
+
+
+def _wide_reference(q, k, v, indices, counts, valid):
+    """FP64 attention of each window row over its selected valid keys."""
+    tiles, heads = len(valid), q.shape[1]
+    keys = torch.arange(tiles * WIDE_TILE, device=q.device)
+    live_keys = keys % WIDE_TILE < torch.tensor(
+        valid, device=q.device
+    ).repeat_interleave(WIDE_TILE)
+    selected = torch.zeros(
+        heads, len(WIDE_WINDOW), tiles, dtype=torch.bool, device=q.device
+    )
+    for head in range(heads):
+        for tile in range(len(WIDE_WINDOW)):
+            count = int(counts[head, tile])
+            selected[head, tile, indices[head, tile, :count].long()] = True
+    mask = selected.repeat_interleave(WIDE_TILE, 1).repeat_interleave(
+        WIDE_TILE, 2
+    ) & live_keys.view(1, 1, -1)
+    # A row attends when its tile is valid there and selects a valid key.
+    rows = torch.arange(len(WIDE_WINDOW) * WIDE_TILE, device=q.device)
+    window_valid = torch.tensor(
+        [valid[tile] for tile in WIDE_WINDOW], device=q.device
+    ).repeat_interleave(WIDE_TILE)
+    attending = (rows % WIDE_TILE < window_valid).view(1, -1) & mask.any(-1)
+    expected = torch.zeros(
+        heads, rows.numel(), q.shape[2], dtype=torch.float64, device=q.device
+    )
+    for head in range(heads):
+        live = attending[head]
+        expected[head, live] = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1).double()[head, live],
+            k.transpose(0, 1).double()[head],
+            v.transpose(0, 1).double()[head],
+            attn_mask=mask[head, live],
+            scale=WIDE_TILE**-0.5,
+        )
+    return expected, attending
+
+
+@pytest.mark.parametrize("provider", WIDE_PROVIDERS, indirect=True)
+@torch.inference_mode()
+def test_wide_tiles_attend_their_selected_valid_keys(provider, stream):
+    """128-row tiles attend exactly the valid keys of their selected blocks.
+
+    The query tiles are a window of the sequence, as a context partition
+    holds, and read row-major views of merged projections. Keys and values
+    past every valid size carry large finite payloads that must not
+    contribute. A captured call replays the dense equations after the
+    projections, a valid size and the selection change.
+    """
+    generator = torch.Generator().manual_seed(1287)
+    device = torch.device("cuda")
+    heads = 3
+    tiles = len(WIDE_VALID)
+    valid = list(WIDE_VALID)
+    projections = torch.randn(
+        tiles * WIDE_TILE,
+        heads,
+        3,
+        128,
+        generator=generator,
+        dtype=torch.bfloat16,
+    ).to(device)
+    window = slice(WIDE_WINDOW.start * WIDE_TILE, WIDE_WINDOW.stop * WIDE_TILE)
+    q = projections[window, :, 0]
+    k, v = projections[:, :, 1], projections[:, :, 2]
+    sizes = torch.tensor(valid, dtype=torch.int32, device=device)
+    indices, counts = (
+        value.to(device) for value in _wide_selection(heads, generator)
+    )
+
+    def pad():
+        live = torch.arange(tiles * WIDE_TILE, device=device) % WIDE_TILE < (
+            sizes.repeat_interleave(WIDE_TILE)
+        )
+        k[~live], v[~live] = 300.0, -300.0
+
+    pad()
+    batch = vsa.BlockInput(
+        vsa.Pattern(((tiles,) * len(WIDE_WINDOW),), 0, 0, WIDE_TILE),
+        indices,
+        counts,
+        sizes,
+        WIDE_WINDOW.start,
+    )
+    module = vsa.BlockAttention(WIDE_TILE**-0.5)
+
+    def check(actual):
+        expected, attending = _wide_reference(q, k, v, indices, counts, valid)
+        actual = actual.transpose(0, 1).double()
+        torch.testing.assert_close(
+            actual[attending], expected[attending], rtol=2e-2, atol=2e-2
+        )
+
+    stream.wait(torch.cuda.current_stream())
+    with ExecutionContext(module, stream=stream, vsa=provider) as context:
+        context.prepare(None)
+        check(module(q, k, v, batch).clone())
+
+        replayed = torch.empty_like(q)
+        with CUDAGraph(context=context) as graph:
+            graph.capture(lambda: replayed.copy_(module(q, k, v, batch)))
+            # The 100-row block drops to 60 rows, below half a block, and the
+            # third tile selects the first block in place of the sixth.
+            projections.mul_(0.5)
+            valid[3] = 60
+            sizes[3] = 60
+            pad()
+            indices[:, 2][indices[:, 2] == 5] = 0
+            graph.replay()
+            check(replayed)

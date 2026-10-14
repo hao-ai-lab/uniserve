@@ -179,6 +179,50 @@ class Server:
         """
         ...
 
+#: Bytes of one descriptor-grant request: a publication id.
+GRANT_REQUEST_BYTES: int
+#: Reply byte of a granted request; the record carries the descriptor.
+GRANT_GRANTED: int
+#: Reply byte of a request for an unregistered or withdrawn publication.
+GRANT_REFUSED: int
+
+@final
+class DescriptorGrants:
+    """Serves this process's publication descriptors to consumer processes.
+
+    Requests are answered on a native thread that never takes the GIL, so a
+    producer whose Python threads are all blocked still grants its
+    descriptors. A consumer sends a `GRANT_REQUEST_BYTES`-byte publication id
+    on the `SOCK_SEQPACKET` socket and receives `GRANT_GRANTED` with the
+    descriptor as `SCM_RIGHTS`, or `GRANT_REFUSED`.
+    """
+
+    def __new__(cls, address: str) -> Self:
+        """Bind the grant socket at `address` and start serving it.
+
+        The parent directory is created when missing.
+
+        Raises:
+            OSError: The socket cannot be created or bound, as when one
+                already exists at `address`.
+        """
+
+    def register(self, publication_id: str, descriptor: int) -> None:
+        """Make one publication's descriptor grantable.
+
+        The descriptor stays owned by the caller, who keeps it open until
+        `release` returns.
+
+        Raises:
+            OSError: `publication_id` is not `GRANT_REQUEST_BYTES` bytes.
+        """
+
+    def release(self, publication_id: str) -> None:
+        """Withdraw a publication; no grant of it is in flight on return."""
+
+    def close(self) -> None:
+        """Stop serving and remove the socket; closing again does nothing."""
+
 @final
 class StreamSignal:
     """Bridges CUDA stream completion into an asyncio-readable signal.

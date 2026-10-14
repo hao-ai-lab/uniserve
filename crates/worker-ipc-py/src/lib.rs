@@ -3,7 +3,9 @@
 //! The `_uniserve_ipc` extension module exposes `Server`, which owns the
 //! rank's `RankServer` (iceoryx2 shared storage for a rank on the head's
 //! host, a TCP socket for a rank elsewhere); `StreamSignal`, which turns CUDA
-//! stream completion into a readable eventfd; `ErrorCode`, the schema's
+//! stream completion into a readable eventfd; `DescriptorGrants`, which serves
+//! a producer's shareable descriptors from a native thread and the
+//! `GRANT_*` constants of its protocol; `ErrorCode`, the schema's
 //! failure classes; `service_name`; and the `atomic_store_u32` /
 //! `atomic_load_u32` accessors for shared-storage segment header words. The hand-written stub `uniserve_worker/_uniserve_ipc.pyi`
 //! describes the same Python surface and must stay consistent with it.
@@ -28,6 +30,7 @@ mod convert;
 mod error_code;
 
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -38,6 +41,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
 use pyo3::wrap_pyfunction;
 use pythonize::{depythonize, pythonize};
+use uniserve_worker_ipc::descriptor_grants::{self, DescriptorGrants};
 use uniserve_worker_ipc::{RankServer, SHARED_STORAGE_CHANNEL, Wake};
 use uniserve_worker_ipc::{RequestKind, WorkerRequest, WorkerResponse};
 
@@ -626,11 +630,53 @@ fn atomic_load_u32(buffer: PyBuffer<u8>, offset: usize) -> PyResult<u32> {
     Ok(unsafe { AtomicU32::from_ptr(word) }.load(Ordering::Acquire))
 }
 
+/// Serves this process's publication descriptors to consumer processes.
+///
+/// Grants run on a native thread, so they are served while every Python
+/// thread of the producer is blocked; see
+/// `uniserve_worker_ipc::descriptor_grants`.
+#[pyclass(name = "DescriptorGrants", frozen)]
+struct PyDescriptorGrants {
+    grants: DescriptorGrants,
+}
+
+#[pymethods]
+impl PyDescriptorGrants {
+    #[new]
+    /// Binds the grant socket at `address` and starts serving it.
+    fn new(address: PathBuf) -> PyResult<Self> {
+        Ok(Self {
+            grants: DescriptorGrants::bind(&address)?,
+        })
+    }
+
+    /// Makes one publication's descriptor grantable.
+    fn register(&self, py: Python<'_>, publication_id: &str, descriptor: i32) -> PyResult<()> {
+        // The table lock is held while a grant is sent, which needs no GIL.
+        py.detach(|| self.grants.register(publication_id, descriptor))?;
+        Ok(())
+    }
+
+    /// Withdraws a publication; no grant of it is in flight on return.
+    fn release(&self, py: Python<'_>, publication_id: &str) {
+        py.detach(|| self.grants.release(publication_id));
+    }
+
+    /// Stops serving and removes the socket; closing again does nothing.
+    fn close(&self, py: Python<'_>) {
+        py.detach(|| self.grants.close());
+    }
+}
+
 #[pymodule]
 /// Registers the worker IPC Python extension module.
 fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServer>()?;
     m.add_class::<PyStreamSignal>()?;
+    m.add_class::<PyDescriptorGrants>()?;
+    m.add("GRANT_REQUEST_BYTES", descriptor_grants::REQUEST_BYTES)?;
+    m.add("GRANT_GRANTED", descriptor_grants::GRANTED)?;
+    m.add("GRANT_REFUSED", descriptor_grants::REFUSED)?;
     m.add_class::<PyErrorCode>()?;
     m.add("SOCKET_CHANNEL", uniserve_worker_ipc::SOCKET_CHANNEL)?;
     m.add_function(wrap_pyfunction!(service_name, m)?)?;
