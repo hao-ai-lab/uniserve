@@ -28,7 +28,7 @@ from .packing import (
     latent_raster,
     unpatchify_video_into,
     video_latent_frames,
-    video_order,
+    video_positions,
 )
 
 
@@ -105,14 +105,12 @@ class VideoDecoder(BaseVideoDecoder):
             tokens = latent[start:stop]
         else:
             # Tile and segment packing order the rows tile-major, which
-            # depends on the frame count; the argsort maps each raster row to
-            # its position among the packed rows.
-            positions = torch.argsort(
-                video_order(
-                    self.attention,
-                    num_frames=size.num_frames,
-                    canvas=size.frame,
-                )
+            # depends on the frame count; `video_positions` maps each raster
+            # row to its position among the packed rows.
+            positions = video_positions(
+                self.attention,
+                num_frames=size.num_frames,
+                canvas=size.frame,
             )[start:stop]
             if latent.device.type == "cuda":
                 # A pinned source keeps the transfer asynchronous; a pageable

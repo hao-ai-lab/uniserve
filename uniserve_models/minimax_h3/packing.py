@@ -20,6 +20,7 @@ All tables are CPU tensors built on the host.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from enum import StrEnum
@@ -56,6 +57,7 @@ __all__ = [
     "unpatchify_video_into",
     "video_latent_frames",
     "video_order",
+    "video_positions",
 ]
 
 # Token tags. A tag is also the token's group among each timestep's three
@@ -1147,6 +1149,31 @@ def video_order(
         _video_grid(frames, height, width), VIDEO_TILE_SHAPES[attention.tile]
     )
     return torch.from_numpy(raster)
+
+
+@functools.lru_cache(maxsize=16)
+def video_positions(
+    attention, *, num_frames: int, canvas: image.Config
+) -> torch.Tensor:
+    """Return the packed row of each raster video row.
+
+    The inverse permutation of ``video_order``: packed row
+    ``video_positions[r]`` holds raster row ``r``. It is a function of the
+    attention configuration, frame count and canvas alone, so every clip and
+    request of a size shares one host int64 tensor. The shared tensor is
+    read-only; callers copy the slices they use. Sixteen sizes bound the
+    cache at about 14 MB for fifteen-second 16:9 videos.
+
+    The inverse is one O(n) scatter on the host rather than a sort. A CPU
+    sort runs on each process's intra-op thread pool, and decoder ranks that
+    unpack at the same moment contend for the host's cores: the seven
+    decoder ranks of an eight-H200 deployment each took 0.29 to 0.87 s to
+    sort 37,296 rows.
+    """
+    order = video_order(attention, num_frames=num_frames, canvas=canvas).numpy()
+    positions = np.empty_like(order)
+    positions[order] = np.arange(order.size, dtype=order.dtype)
+    return torch.from_numpy(positions)
 
 
 def patchify_video(
