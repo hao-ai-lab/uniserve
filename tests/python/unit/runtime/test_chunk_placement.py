@@ -36,8 +36,12 @@ class _HostAllocation:
     def map_local(self) -> torch.Tensor:
         return self._storage
 
-    def export_handle(self) -> bytes:
-        return bytes(64)
+
+def _export_host_storage(
+    storage: torch.Tensor,
+) -> tuple[bytes, int, int, int]:
+    """Export a host fake's storage as a fabric-sized handle of one identity."""
+    return bytes(64), storage.nbytes, 0, 1
 
 
 @pytest.fixture
@@ -53,6 +57,7 @@ def make_pool(monkeypatch: pytest.MonkeyPatch) -> Callable[[int], VmmPool]:
         peer_storage, "allocation_granularity", lambda device: CHUNK_ALIGNMENT
     )
     monkeypatch.setattr(peer_storage, "allocate", _HostAllocation)
+    monkeypatch.setattr(peer_storage, "export_handle", _export_host_storage)
     return lambda units: VmmPool(
         torch.device("cpu"), capacity_bytes=units * CHUNK_ALIGNMENT
     )

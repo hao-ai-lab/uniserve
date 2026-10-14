@@ -114,8 +114,10 @@ def map_segments(parts: list[torch.Tensor]) -> torch.Tensor:
     return _extension().map_segments(parts)
 
 
-def export_handle(tensor: torch.Tensor) -> tuple[bytes, int, int] | None:
-    """Export shared storage as a shareable handle, byte capacity and offset.
+def export_handle(
+    tensor: torch.Tensor,
+) -> tuple[bytes, int, int, int] | None:
+    """Export storage from :func:`empty` as a handle, capacity, offset and id.
 
     The handle is the device's probed type: a fabric handle where the driver
     exports one, which another host inside the fabric domain can import, and a
@@ -123,13 +125,22 @@ def export_handle(tensor: torch.Tensor) -> tuple[bytes, int, int] | None:
     shape carries either.
 
     The capacity is the byte size of the tensor's whole storage and the
-    offset is the byte offset of the tensor's first element within it.
+    offset is the byte offset of the tensor's first element within it. The
+    id is a positive integer naming the storage's physical allocation among
+    every allocation this process exports, and is never reused: two exports
+    with the same id from one process name the same physical memory.
 
-    Return None when the driver rejects the storage base as a virtual memory
-    mapping (``CUDA_ERROR_INVALID_VALUE``) or when its allocation was not
-    created with this device's probed handle type. Raise for an empty or
-    non-CUDA tensor and for other CUDA failures. The caller retains the
-    source through every reader grant.
+    The handle is exported once per storage and belongs to it. Every call for
+    one storage returns the same bytes, and a process descriptor stays open
+    until the storage is freed, so the caller must not close it and must
+    withdraw every grant of it while it still holds the tensor.
+
+    Return None unless the tensor's storage is the whole of one allocation
+    this package created and mapped locally (:func:`empty` or
+    ``PeerAllocation.map_local``). Storage of any other allocator is refused
+    even when its driver allocation is exportable, as PyTorch's expandable
+    segments are: one handle and extent cannot describe a block inside such
+    a segment. Raise for an empty or non-CUDA tensor and for CUDA failures.
     """
     return _extension().export_handle(tensor)
 

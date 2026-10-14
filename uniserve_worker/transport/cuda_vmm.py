@@ -4,8 +4,10 @@ A device product is published in one of two forms. Storage that already has
 exportable physical backing is exported where it lies, which copies nothing.
 Anything else is copied into a chunk of the device's `VmmPool`, whose single
 handle covers every chunk published from that device. Either way the locator
-carries a shareable allocation handle, the byte offsets of the spans inside
-that allocation, and a readiness fence when one can reach the consumer.
+carries a shareable allocation handle, the producer's identity of that
+allocation, the byte offsets of the spans inside it, and a readiness fence
+when one can reach the consumer. A consumer imports each producer allocation
+once and keeps the mapping for later reads of it.
 
 Readiness: a rank whose products cross hosts drains its stream on every
 publication and publishes no fence; otherwise the locator carries an
@@ -96,6 +98,8 @@ class _CudaSource:
     event: torch.cuda.Event
     nbytes: int
     capacity: TransferCapacity
+    #: Owned by the exported storage's mapping, which `tensor` (or the pool)
+    #: keeps alive; a descriptor is only lent to the grant table.
     handle: bytes
     copied_source: torch.Tensor | tuple[torch.Tensor, ...] | None = None
     retirement: concurrent.futures.Future[None] | None = None
@@ -110,24 +114,22 @@ class _CudaSource:
     publication_id: str = ""
 
     def events_released(self) -> None:
-        # A fabric handle is bytes the publication carried and this rank owns
-        # nothing. A descriptor is an open file of this process, and a direct
-        # export's belongs to the publication: the engine retires a
+        # A descriptor is an open file of this process, owned by the mapping
+        # of the storage it was exported from and closed with it. A direct
+        # export's grant belongs to the publication: the engine retires a
         # publication only once no named reader is still reading it, so the
-        # grant and the descriptor end here together.
+        # grant ends here, while `tensor` still holds that mapping.
         #
-        # A chunk's descriptor belongs to its pool, and a chunk outlives its
-        # source by design -- the source was copied into it and is released
-        # while consumers are still reading. Withdrawing that grant here would
-        # refuse a reader that has not imported yet, so it is withdrawn where
-        # the chunk returns to the pool instead.
+        # A chunk outlives its source by design -- the source was copied into
+        # it and is released while consumers are still reading. Withdrawing
+        # the chunk's grant here would refuse a reader that has not imported
+        # yet, so it is withdrawn where the chunk returns to the pool instead.
         if (
             self.grants is not None
             and self.publication_id
             and self.pool is None
         ):
             self.grants.release(self.publication_id)
-            os.close(int.from_bytes(self.handle, sys.byteorder))
 
         # This ends the source's lifetime, not the chunk's. A pool publication
         # was copied into its chunk, so the source is the producer's to reuse
@@ -152,6 +154,10 @@ class CudaVmmTransport(Transport):
     consumer asks this rank for it over the grant socket in
     `descriptor_grants`. Such a device cannot place an edge across hosts in
     any case, so that connection has none of the costs of the fabric case.
+
+    Either way a consumer imports a producer allocation on its first read
+    only, and later publications of the same allocation reuse that mapping
+    (`_import`).
     """
 
     name = "cuda_vmm"
@@ -215,12 +221,11 @@ class CudaVmmTransport(Transport):
             name="uniserve-cuda-read",
             event_pool=event_pool,
         )
-        # Byte mappings of fabric-exported allocations this rank has read
-        # (`_fabric_import`), kept until the transport closes.
-        self._fabric_imports: dict[
-            tuple[str, str, bytes, int], torch.Tensor
-        ] = {}
-        self._fabric_import_lock = threading.Lock()
+        # Byte mappings of producer allocations this rank has read, keyed by
+        # producing endpoint, importing device and allocation identity
+        # (`_import`), kept until the transport closes.
+        self._imports: dict[tuple[str, str, int], torch.Tensor] = {}
+        self._import_lock = threading.Lock()
 
         with _endpoint_lock:
             _endpoints[self.endpoint()] = self
@@ -228,45 +233,65 @@ class CudaVmmTransport(Transport):
     def endpoint(self) -> str:
         return self._publications.name
 
-    def _fabric_import(
+    def _import(
         self, handle: CudaVmmTransfer, device: torch.device
     ) -> torch.Tensor:
-        """Return a byte mapping on ``device`` of a fabric-exported allocation.
+        """Return a byte mapping on ``device`` of a producer's allocation.
 
         Importing and mapping an allocation costs a fixed tens of
-        milliseconds whatever its size, and the driver serializes these
-        operations across processes, while producers publish from long-lived
-        storage: their product arenas and device pools. A mapping is
-        therefore kept for later reads of the same allocation. A fabric
-        handle names one physical allocation for as long as any import holds
-        it, so a kept mapping never aliases another allocation; it does keep
-        an allocation its producer has released alive until the transport
-        closes. Producers publish from their fixed arenas and pools, so the
-        set of mappings is bounded by those allocations.
+        milliseconds whatever its size, and unmapping and releasing it as
+        much again, and the driver serializes these operations across
+        processes, so ranks that read each other's products wait on one
+        another's imports. Producers publish from long-lived storage -- their
+        product arenas and device pools -- so a mapping is kept for every
+        later read of the same allocation, which the producer's
+        `allocation_id` names.
+        Only the first read of an allocation imports it, and only that read
+        asks the producer for a descriptor grant where the device exports
+        descriptors.
+
+        An identity is never reused within the producing process, so a kept
+        mapping never aliases another allocation. It does keep an allocation
+        the producer has released alive until this transport closes;
+        producers publish from their fixed arenas and pools, so the set of
+        mappings is bounded by those allocations.
         """
         import torch
         from uniserve_kernels.peer_storage import import_handle
 
-        key = (
-            handle.endpoint,
-            str(device),
-            handle.allocation_handle,
-            handle.storage_size_bytes,
-        )
-        with self._fabric_import_lock:
-            mapped = self._fabric_imports.get(key)
+        key = (handle.endpoint, str(device), handle.allocation_id)
+        with self._import_lock:
+            mapped = self._imports.get(key)
             if mapped is not None:
                 return mapped
-        imported = import_handle(
-            torch.empty(0, dtype=torch.uint8, device=device),
-            handle.allocation_handle,
-            handle.storage_size_bytes,
-        )
-        with self._fabric_import_lock:
+
+        prototype = torch.empty(0, dtype=torch.uint8, device=device)
+        if len(handle.allocation_handle) == DESCRIPTOR_HANDLE_BYTES:
+            # A descriptor names an open file of the producing process, so
+            # the usable one is received from that rank over its grant socket
+            # and closed once the allocation, which holds its own reference,
+            # has been imported.
+            granted = descriptor_grants.fetch(
+                handle.endpoint, handle.publication_id
+            )
+            try:
+                imported = import_handle(
+                    prototype,
+                    descriptor_grants.descriptor_bytes(granted),
+                    handle.storage_size_bytes,
+                )
+            finally:
+                os.close(granted)
+        else:
+            # A fabric handle is importable as published.
+            imported = import_handle(
+                prototype, handle.allocation_handle, handle.storage_size_bytes
+            )
+
+        with self._import_lock:
             # Another read thread may have imported the same allocation
             # meanwhile; the first mapping kept serves both.
-            mapped = self._fabric_imports.setdefault(key, imported)
-        return mapped
+            return self._imports.setdefault(key, imported)
 
     def _descriptor_grants(self) -> DescriptorGrants:
         """Bind this address space's grant socket on first use."""
@@ -285,9 +310,9 @@ class CudaVmmTransport(Transport):
     def _release_chunk(self, source: _CudaSource) -> None:
         """Return one chunk to its pool and withdraw the grant that named it.
 
-        The grant lends the pool's descriptor, which the pool keeps; what ends
-        here is a consumer's right to ask for this chunk, which ends when the
-        chunk can be handed out again.
+        The grant lends the pool's descriptor, which the pool's mapping owns;
+        what ends here is a consumer's right to ask for this chunk, which ends
+        when the chunk can be handed out again.
         """
         assert source.pool is not None and source.chunk is not None
         if source.grants is not None and source.publication_id:
@@ -445,7 +470,9 @@ class CudaVmmTransport(Transport):
                 pool = self._pool(first.device)
                 chunk = pool.reserve(tensor_nbytes(tensor))
             if exported is not None:
-                descriptor, storage_size, storage_offset = exported
+                descriptor, storage_size, storage_offset, allocation_id = (
+                    exported
+                )
             else:
                 assert pool is not None and chunk is not None
                 shared = chunk.storage.view(first.dtype).view(shape)
@@ -461,6 +488,7 @@ class CudaVmmTransport(Transport):
                 spans = (shared,)
                 first = shared
                 descriptor = pool.handle
+                allocation_id = pool.allocation_id
                 storage_size = pool.capacity
                 # A consumer reads the payload, which follows the chunk's
                 # acknowledgment words, so the offset names the payload.
@@ -539,6 +567,7 @@ class CudaVmmTransport(Transport):
                     # domain. A descriptor travels only so a consumer can tell
                     # which kind it is; the usable one comes from the grant.
                     allocation_handle=descriptor,
+                    allocation_id=allocation_id,
                     # A consumer writes its own slot's word here once its reads
                     # retire. A publication outside the pool carries no header.
                     acknowledgment_offset=(
@@ -577,11 +606,6 @@ class CudaVmmTransport(Transport):
                 if chunk is not None:
                     assert pool is not None
                     pool.release(chunk)
-                elif (
-                    descriptor is not None
-                    and len(descriptor) == DESCRIPTOR_HANDLE_BYTES
-                ):
-                    os.close(int.from_bytes(descriptor, sys.byteorder))
                 self.capacity.release(nbytes)
             raise
 
@@ -627,13 +651,13 @@ class CudaVmmTransport(Transport):
         region: tuple[slice, ...] | None,
     ) -> None:
         import torch
-        from uniserve_kernels.peer_storage import import_handle
 
         handle = locator.transport
         assert isinstance(handle, CudaVmmTransfer)
-        # A consumer in another process cannot fully check that a locator
-        # still names a publication the producer holds: a descriptor grant is
-        # refused once withdrawn, but a fabric handle is imported unchecked.
+        # A consumer in another process cannot check that a locator still
+        # names a publication the producer holds: an allocation it has mapped
+        # before is read through the kept mapping, and a fabric handle is
+        # imported unchecked; only a first descriptor grant can be refused.
         # The locator is the engine's word. The engine binds only locators the
         # producing rank reported to it, and frees a product's buffer only
         # once the batch consuming it has completed.
@@ -695,37 +719,11 @@ class CudaVmmTransport(Transport):
                         )
                     ):
                         import_device = source_device
-                    prototype = (
-                        destination_prototype
-                        if import_device == device
-                        else torch.empty(
-                            0,
-                            dtype=destination_prototype.dtype,
-                            device=import_device,
-                        )
+                    # The producer's allocation, mapped on its first read and
+                    # kept for later ones.
+                    allocation = self._import(handle, import_device).view(
+                        destination_prototype.dtype
                     )
-                    # A fabric handle is importable as published, and its
-                    # mapping is kept for later reads (`_fabric_import`). A
-                    # descriptor names an open file of the producing process,
-                    # so the usable one is received from that rank over its
-                    # grant socket and closed once the allocation, which holds
-                    # its own reference, has been imported.
-                    if len(handle.allocation_handle) == DESCRIPTOR_HANDLE_BYTES:
-                        granted = descriptor_grants.fetch(
-                            handle.endpoint, handle.publication_id
-                        )
-                        try:
-                            allocation = import_handle(
-                                prototype,
-                                descriptor_grants.descriptor_bytes(granted),
-                                handle.storage_size_bytes,
-                            )
-                        finally:
-                            os.close(granted)
-                    else:
-                        allocation = self._fabric_import(
-                            handle, import_device
-                        ).view(prototype.dtype)
 
                     # One mapping owns every span; tensor views share its
                     # deleter.
@@ -827,16 +825,19 @@ class CudaVmmTransport(Transport):
             self._reads.close()
         finally:
             self._publications.close()
+            # The grant thread stops before the pools go: a pool's descriptor
+            # is closed with its mapping, and grants of unacknowledged chunks
+            # still lend it.
+            if self._grants is not None:
+                self._grants.close()
+                self._grants = None
             # Consumers of this rank's remaining chunks are gone with it, so
             # their acknowledgments will never arrive. The pools are released
             # whole, which is what closing the transport means for them.
             self._unacknowledged.clear()
             self._pools.clear()
-            with self._fabric_import_lock:
-                self._fabric_imports.clear()
-            if self._grants is not None:
-                self._grants.close()
-                self._grants = None
+            with self._import_lock:
+                self._imports.clear()
             with _endpoint_lock:
                 _endpoints.pop(self.endpoint(), None)
         if self._failed_publication is not None:

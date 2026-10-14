@@ -41,3 +41,34 @@ def test_mapping_keeps_exported_allocation_importable(mapping):
     # Retirement is reader first, then the owner of the published storage.
     del imported
     del source
+
+
+def test_export_names_each_allocation_by_one_identity():
+    """Every view of one storage exports the same handle and identity.
+
+    Distinct allocations never share an identity, and storage from another
+    allocator is not exported where it lies.
+    """
+    device = torch.device("cuda:0")
+    page = peer_storage.allocation_granularity(device)
+    first = peer_storage.empty((page,), dtype=torch.uint8, device=device)
+    second = peer_storage.empty((page,), dtype=torch.uint8, device=device)
+
+    exported = peer_storage.export_handle(first)
+    assert exported is not None
+    handle, capacity, offset, identity = exported
+    assert (capacity, offset) == (page, 0)
+    assert identity > 0
+    assert peer_storage.export_handle(first[64:]) == (
+        handle,
+        page,
+        64,
+        identity,
+    )
+
+    other = peer_storage.export_handle(second)
+    assert other is not None
+    assert other[3] != identity
+
+    cached = torch.empty((page,), dtype=torch.uint8, device=device)
+    assert peer_storage.export_handle(cached) is None

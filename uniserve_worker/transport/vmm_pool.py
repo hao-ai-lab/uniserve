@@ -132,6 +132,7 @@ class VmmPool:
         from uniserve_kernels.peer_storage import (
             allocate,
             allocation_granularity,
+            export_handle,
         )
 
         if capacity_bytes <= 0:
@@ -140,11 +141,15 @@ class VmmPool:
         # units; the chunks inside it are not.
         page = allocation_granularity(device)
         self._capacity = ((capacity_bytes + page - 1) // page) * page
-        self._allocation = allocate(
+        allocation = allocate(
             (self._capacity,), dtype=torch.uint8, device=device
         )
-        self._storage = self._allocation.map_local()
-        self._handle = self._allocation.export_handle()
+        # The mapping holds the allocation, and the handle exported from it
+        # belongs to the mapping: a descriptor stays open as long as the pool.
+        self._storage = allocation.map_local()
+        exported = export_handle(self._storage)
+        assert exported is not None, "a local mapping exports its allocation"
+        self._handle, _, _, self._allocation_id = exported
         self._device = device
 
         self._lock = threading.Lock()
@@ -158,6 +163,11 @@ class VmmPool:
     def handle(self) -> bytes:
         """Return the pool's shareable handle, exported once at reservation."""
         return self._handle
+
+    @property
+    def allocation_id(self) -> int:
+        """Return the pool allocation's identity (``export_handle``)."""
+        return self._allocation_id
 
     @property
     def mapping(self) -> torch.Tensor:

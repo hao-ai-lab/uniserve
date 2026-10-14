@@ -9,9 +9,10 @@
 // exports its shareable handle. PeerMapping owns one reserved virtual address
 // range, the segments mapped into it, and the allocation handles that keep the
 // mapped physical memory alive; every tensor this file returns holds its
-// PeerMapping through the tensor deleter, so the mapping lives exactly as long
-// as the tensor's storage. Handle transport between processes, grants, and
-// retirement ordering belong to the Python callers.
+// PeerMapping as the storage's data pointer context, so the mapping lives
+// exactly as long as the tensor's storage and can be found from any view of
+// it. Handle transport between processes, grants, and retirement ordering
+// belong to the Python callers.
 
 #include <torch/extension.h>
 #include <ATen/core/CachingHostAllocator.h>
@@ -19,7 +20,9 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
+#include <unistd.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -187,6 +190,23 @@ struct PeerMapping {
   std::vector<std::pair<CUdeviceptr, size_t>> ranges;
   int device = 0;
   std::vector<CUmemGenericAllocationHandle> handles;
+  // Nonzero only for a range mapping the whole of one allocation this process
+  // created, which is the only kind `export_handle` exports. Identities come
+  // from one process-wide counter and are never reused, so an importer that
+  // keys its mappings by the exporting process and this value never confuses
+  // two allocations, even after one is freed and its address range reused.
+  uint64_t identity = 0;
+  // The allocation's shareable handle, exported on first request and kept for
+  // this mapping's lifetime: exporting costs a driver call of up to tens of
+  // milliseconds, and the bytes do not change. A POSIX descriptor is an open
+  // file of this process, held in `descriptor` and closed with the mapping, so
+  // a caller lending it out must withdraw every loan while it still holds the
+  // tensor.
+  std::mutex export_mutex;
+  std::string exported;
+  int descriptor = -1;
+  // Whatever else readers of this range need kept alive; see map_peers.
+  std::shared_ptr<const void> owner;
 
   ~PeerMapping() {
     // Teardown issues no synchronization of its own: the owner must drop the
@@ -206,8 +226,45 @@ struct PeerMapping {
     for (const auto handle : handles) {
       cuMemRelease(handle);
     }
+    if (descriptor >= 0) {
+      ::close(descriptor);
+    }
   }
 };
+
+// Returns the next allocation identity of this process, starting at one.
+uint64_t next_identity() {
+  static std::atomic<uint64_t> issued{0};
+  return issued.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+// Data pointer deleter of every tensor this file maps. The context is a heap
+// shared_ptr holding one reference to the tensor's PeerMapping; the deleter's
+// address is also what identifies such storage in `mapping_of`.
+void release_mapping(void* context) {
+  delete static_cast<std::shared_ptr<PeerMapping>*>(context);
+}
+
+// Wraps `mapping`'s range as a tensor of `shape` whose storage holds the
+// mapping until the last view of it is destroyed.
+torch::Tensor mapped_tensor(const std::shared_ptr<PeerMapping>& mapping,
+                            at::IntArrayRef shape, const at::TensorOptions& options) {
+  return at::for_blob(reinterpret_cast<void*>(mapping->address), shape)
+      .context(new std::shared_ptr<PeerMapping>(mapping), &release_mapping)
+      .options(options)
+      .target_device(c10::Device(c10::kCUDA, mapping->device))
+      .make_tensor();
+}
+
+// Returns the mapping behind `tensor`'s storage when this file mapped it, or
+// null for storage from any other allocator.
+PeerMapping* mapping_of(const torch::Tensor& tensor) {
+  const auto& data = tensor.storage().data_ptr();
+  if (data.get_deleter() != &release_mapping) {
+    return nullptr;
+  }
+  return static_cast<std::shared_ptr<PeerMapping>*>(data.get_context())->get();
+}
 
 // Concatenate physical allocations in virtual space, without copying bytes.
 // Each input exposes one complete allocation, starting at its beginning.
@@ -252,12 +309,8 @@ torch::Tensor map_segments(const std::vector<torch::Tensor>& parts) {
   access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   check_cuda(cuMemSetAccess(mapping->address, mapping->total_bytes, &access, 1),
              "enable composite tensor access");
-  return at::for_blob(reinterpret_cast<void*>(mapping->address),
-                     {static_cast<int64_t>(mapping->total_bytes)})
-      .deleter([mapping](void*) {})
-      .options(parts.front().options())
-      .target_device(c10::Device(c10::kCUDA, device))
-      .make_tensor();
+  return mapped_tensor(mapping, {static_cast<int64_t>(mapping->total_bytes)},
+                       parts.front().options());
 }
 
 // One physical allocation of `shape` elements of the prototype's dtype on the
@@ -329,11 +382,10 @@ class PeerAllocation : public std::enable_shared_from_this<PeerAllocation> {
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     check_cuda(cuMemSetAccess(mapping->address, bytes_, &access, 1),
                 "enable shared tensor access");
-    return at::for_blob(reinterpret_cast<void*>(mapping->address), shape_)
-        .deleter([mapping](void*) {})
-        .options(options_)
-        .target_device(c10::Device(c10::kCUDA, device_))
-        .make_tensor();
+    // The range maps this process's own allocation whole, so its storage can
+    // be exported where it lies.
+    mapping->identity = next_identity();
+    return mapped_tensor(mapping, shape_, options_);
   }
 
   // Imports one exported handle per owner and maps them back to back, in list
@@ -378,11 +430,8 @@ class PeerAllocation : public std::enable_shared_from_this<PeerAllocation> {
     // Imported handles keep pages alive but do not keep the original fabric
     // export importable. A slower peer may still be importing that export
     // after this call returns, so retain its owner through tensor retirement.
-    return at::for_blob(reinterpret_cast<void*>(mapping->address), shape)
-        .deleter([mapping, owner = shared_from_this()](void*) {})
-        .options(options_)
-        .target_device(c10::Device(c10::kCUDA, device_))
-        .make_tensor();
+    mapping->owner = shared_from_this();
+    return mapped_tensor(mapping, shape, options_);
   }
 
  private:
@@ -394,44 +443,43 @@ class PeerAllocation : public std::enable_shared_from_this<PeerAllocation> {
 };
 
 // Exports the allocation backing `tensor`'s storage as (handle bytes, storage
-// bytes, byte offset of the tensor's first element within the storage), or
-// nullopt when the driver rejects the storage base as a VMM allocation
-// (CUDA_ERROR_INVALID_VALUE) or the allocation was not created with this
-// device's probed handle type.
-std::optional<std::tuple<pybind11::bytes, size_t, size_t>> export_handle(
+// bytes, byte offset of the tensor's first element within the storage,
+// allocation identity), or nullopt unless that storage maps the whole of one
+// allocation this process created (`PeerAllocation::map_local`).
+//
+// Storage from another allocator is never exported where it lies, even when
+// its driver allocation requested this device's handle type, as PyTorch's
+// expandable segments do: such storage is a block inside a larger mapping
+// assembled from several handles, so no single handle and extent describes
+// it. Imported, peer and composite ranges are refused for the same reason.
+//
+// The handle is exported once per mapping and owned by it (see
+// `PeerMapping::exported`); every call for the same storage returns the same
+// bytes and identity.
+std::optional<std::tuple<pybind11::bytes, size_t, size_t, uint64_t>> export_handle(
     torch::Tensor tensor) {
   TORCH_CHECK(tensor.is_cuda() && tensor.numel() > 0,
               "shared allocation export requires a nonempty CUDA tensor");
-  const c10::cuda::CUDAGuard guard(tensor.get_device());
-  const auto base = tensor.storage().data_ptr().get();
-  CUmemGenericAllocationHandle handle;
-  const auto status = cuMemRetainAllocationHandle(&handle, base);
-  // Ordinary caching-allocator storage needs an exportable materialization.
-  // Driver failures other than an unsupported allocation remain observable.
-  if (status == CUDA_ERROR_INVALID_VALUE) {
+  auto* mapping = mapping_of(tensor);
+  if (mapping == nullptr || mapping->identity == 0) {
     return std::nullopt;
   }
-  check_cuda(status, "retain shared allocation");
-  try {
-    CUmemAllocationProp properties{};
-    check_cuda(cuMemGetAllocationPropertiesFromHandle(&properties, handle),
-                "query shared allocation properties");
-    const auto device = tensor.get_device();
-    // Only allocations created with the probed type can export it.
-    if (!(properties.requestedHandleTypes & shareable_handle_type(device))) {
-      cuMemRelease(handle);
-      return std::nullopt;
+  const c10::cuda::CUDAGuard guard(mapping->device);
+  std::string exported;
+  {
+    const std::lock_guard<std::mutex> lock(mapping->export_mutex);
+    if (mapping->exported.empty()) {
+      mapping->exported = export_handle_bytes(mapping->handles.front(), mapping->device);
+      if (shareable_handle_type(mapping->device) == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
+        std::memcpy(&mapping->descriptor, mapping->exported.data(), sizeof(int));
+      }
     }
-    auto exported = export_handle_bytes(handle, device);
-    cuMemRelease(handle);
-    const auto offset = static_cast<const char*>(tensor.data_ptr()) -
-        static_cast<const char*>(base);
-    return std::make_tuple(pybind11::bytes(exported), tensor.storage().nbytes(),
-                           offset);
-  } catch (...) {
-    cuMemRelease(handle);
-    throw;
+    exported = mapping->exported;
   }
+  const auto offset = static_cast<const char*>(tensor.data_ptr()) -
+      reinterpret_cast<const char*>(mapping->address);
+  return std::make_tuple(pybind11::bytes(exported), mapping->total_bytes,
+                         static_cast<size_t>(offset), mapping->identity);
 }
 
 // Maps the whole of one exported allocation as a flat tensor of the
@@ -461,12 +509,9 @@ torch::Tensor import_handle(torch::Tensor prototype, const std::string& exported
   access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   check_cuda(cuMemSetAccess(mapping->address, allocation_bytes, &access, 1),
               "enable shared allocation access");
-  return at::for_blob(reinterpret_cast<void*>(mapping->address),
-                     {static_cast<int64_t>(allocation_bytes / prototype.element_size())})
-      .deleter([mapping](void*) {})
-      .options(prototype.options())
-      .target_device(c10::Device(c10::kCUDA, device))
-      .make_tensor();
+  return mapped_tensor(
+      mapping, {static_cast<int64_t>(allocation_bytes / prototype.element_size())},
+      prototype.options());
 }
 
 // Records `stream` on the PyTorch pinned host allocator block backing `tensor`,

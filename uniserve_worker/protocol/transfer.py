@@ -145,6 +145,12 @@ class CudaVmmTransfer:
     `endpoint` names the producer's publication table and, for a descriptor
     handle, its grant socket. `publication_id` is 32 characters (the producer
     uses ``uuid.uuid4().hex``) and keys that grant.
+
+    `allocation_id` is the producing process's positive identity of the
+    exported allocation (``peer_storage.export_handle``), never reused within
+    that process. Publications with equal `endpoint` and `allocation_id` name
+    the same physical allocation, so a consumer keeps one mapping of it for
+    every later read.
     """
 
     endpoint: str
@@ -160,7 +166,8 @@ class CudaVmmTransfer:
     # travels with the publication rather than through a descriptor grant that
     # only reaches this one. A descriptor travels only so a consumer can tell
     # which kind it is; the usable one comes from the grant.
-    allocation_handle: bytes = b""
+    allocation_handle: bytes
+    allocation_id: int
     # Byte offset of this publication's acknowledgment header inside the
     # exported allocation. A consumer writes its own slot's word there once its
     # reads retire, which retires the chunk without a host-local connection.
@@ -195,6 +202,7 @@ class CudaVmmTransfer:
             # other length is not a handle this rank can import.
             or len(self.allocation_handle)
             not in (DESCRIPTOR_HANDLE_BYTES, FABRIC_HANDLE_BYTES)
+            or self.allocation_id < 1
         ):
             raise invalid_descriptor("CUDA VMM transfer handle is incomplete")
 
@@ -337,6 +345,7 @@ class Locator:
                 tensor_stride=list(transport.tensor_stride),
                 ready_event_handle=transport.ready_event_handle,
                 allocation_handle=transport.allocation_handle,
+                allocation_id=transport.allocation_id,
                 acknowledgment_offset=transport.acknowledgment_offset,
             )
         return output

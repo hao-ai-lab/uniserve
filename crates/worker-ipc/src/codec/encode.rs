@@ -652,6 +652,7 @@ fn locator<'a>(b: &mut FlatBufferBuilder<'a>, v: &Locator) -> WIPOffset<fbs::Loc
             tensor_stride,
             ready_event_handle,
             allocation_handle,
+            allocation_id,
             acknowledgment_offset,
         } => {
             args.transport = fbs::TransferTransportKind::CudaVmm;
@@ -664,6 +665,7 @@ fn locator<'a>(b: &mut FlatBufferBuilder<'a>, v: &Locator) -> WIPOffset<fbs::Loc
             args.tensor_stride = Some(b.create_vector(tensor_stride));
             args.ready_event_handle = Some(b.create_vector(ready_event_handle));
             args.allocation_handle = Some(b.create_vector(allocation_handle));
+            args.allocation_id = *allocation_id;
             args.acknowledgment_offset = *acknowledgment_offset;
         }
     }
