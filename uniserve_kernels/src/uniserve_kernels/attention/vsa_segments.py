@@ -22,8 +22,10 @@ eager results bit for bit:
   of that interval's exchange.
 - ``select_tiles`` chooses every query tile's key tiles from its pooled
   scores in one pass, the result of the stable sorts, cumulative sums and
-  scatters of ``uniserve.nn.attention.vsa.segments.select``. The query tiles
-  may be a window of the sequence's tiles, as a context partition holds.
+  scatters of ``uniserve.nn.attention.vsa.segments.select``: each segment's
+  kept tiles come from a bisection for its threshold score rather than a
+  sort. The query tiles may be a window of the sequence's tiles, as a
+  context partition holds.
 
 Tensors are ``[rows, heads, width]`` with any row and head strides and a unit
 column stride; compressed tiles are ``[heads, tiles, width]``.
@@ -43,14 +45,6 @@ if triton is not None:  # pragma: no cover - depends on the accelerator stack.
 
 # Rows one program covers: a tile is a whole number of row blocks.
 _BLOCK_ROWS = 16
-
-# Bits of a selection's packed sort key that carry the key tile. The 32 bits
-# above them carry the score and the bits above those the segment, below bit
-# 62, which marks a lane past the last tile: 13 tile bits order 8192 tiles
-# and leave 17 bits for the segments, which number at most the tiles.
-# FIXME: the packed key bounds selection at 8192 tiles (1,048,576 rows of
-# 128); a longer sequence needs a wider key or a multi-pass sort.
-_TILE_BITS = 13
 
 if triton is not None:
 
@@ -435,16 +429,13 @@ if triton is not None:
         scores,
         tile_segments,
         variable_block_sizes,
-        segment_starts,
         segment_keep,
-        kept,
         indices,
         counts,
         query_tiles,
         tiles,
         query_offset,
         block: tl.constexpr,
-        tile_bits: tl.constexpr,
     ):
         """Choose one query tile's key tiles for one head.
 
@@ -455,6 +446,12 @@ if triton is not None:
         stored first in ascending order, then the others in ascending order.
         Query ``q`` of the program grid is tile ``query_offset + q`` of the
         sequence; the tables hold every tile.
+
+        A segment's ``keep``-th highest score key is the largest threshold
+        that ``keep`` of its keys reach; bisection over the 32-bit key range
+        finds it exactly. The segment keeps every tile above it and, of the
+        tiles at it, the first ones in tile order until ``keep`` are kept:
+        the tiles a stable descending sort ranks first.
         """
         query = tl.program_id(0)
         head = tl.program_id(1)
@@ -473,44 +470,43 @@ if triton is not None:
             )
             # Ascending order key of the FP32 score: the sign-flipped bits,
             # with -0 as +0 and every NaN above +inf, as the stable sort
-            # orders them. Descending order is its complement.
+            # orders them.
             bits = (values + 0.0).to(tl.int32, bitcast=True).to(tl.int64)
             bits = bits & 0xFFFFFFFF
             ascending = tl.where(
                 bits >= 0x80000000, 0xFFFFFFFF - bits, bits | 0x80000000
             )
             ascending = tl.where(values != values, 0xFFFFFFFF, ascending)
-            # One packed key orders the key tiles by segment (dense and empty
-            # tiles first), then descending score, then ascending tile.
-            packed = (
-                ((segments + 1).to(tl.int64) << (32 + tile_bits))
-                | ((0xFFFFFFFF - ascending) << tile_bits)
-                | keys.to(tl.int64)
-            )
-            # Lanes past the last tile sort after every key tile, so the
-            # first ``tiles`` positions of the order hold the key tiles and
-            # ``present`` marks them by position as well as by tile.
-            packed = tl.where(present, packed, 1 << 62)
-            ordered = tl.sort(packed)
 
-            # A key's rank within its segment is its position in that order
-            # less the segment's first position. The trailing lanes decode to
-            # tile 0 of a segment past every table, so they neither read the
-            # segment tables nor store a choice.
-            ordered_segments = (ordered >> (32 + tile_bits)).to(tl.int32) - 1
-            ordered_keys = (ordered & ((1 << tile_bits) - 1)).to(tl.int32)
-            ranked = present & (ordered_segments >= 0)
-            segment = tl.maximum(ordered_segments, 0)
-            first = tl.load(segment_starts + segment, mask=ranked, other=0)
-            keep = tl.load(segment_keep + segment, mask=ranked, other=0)
-            chosen = ranked & (keys - first < keep)
+            # The same order on signed 32-bit keys, which halve the lanes'
+            # registers: every key and threshold shifts down by 2**31.
+            signed = (ascending - 0x80000000).to(tl.int32)
 
-            # Return the choice to tile order through this program's row of
-            # scratch; the barrier publishes the stores to the whole program.
-            scratch = kept + row * block
-            tl.store(scratch + ordered_keys, chosen.to(tl.int8), mask=present)
-            tl.debug_barrier()
-            chosen = tl.load(scratch + keys, mask=present, other=0) != 0
+            chosen = present & (segments < -1)
+            for segment in range(tl.max(segments, axis=0) + 1):
+                members = present & (segments == segment)
+                keep = tl.minimum(
+                    tl.load(segment_keep + segment),
+                    tl.sum(members.to(tl.int32), axis=0),
+                )
+                # Invariant: at least ``keep`` member keys reach ``lower`` and
+                # fewer reach ``upper``; 32 halvings leave adjacent bounds.
+                lower = tl.zeros((), dtype=tl.int64)
+                upper = tl.full((), 1 << 32, dtype=tl.int64)
+                for _ in tl.static_range(32):
+                    middle = lower + (upper - lower) // 2
+                    bound = (middle - 0x80000000).to(tl.int32)
+                    reach = tl.sum(
+                        (members & (signed >= bound)).to(tl.int32), axis=0
+                    )
+                    lower = tl.where(reach >= keep, middle, lower)
+                    upper = tl.where(reach >= keep, upper, middle)
+                threshold = (lower - 0x80000000).to(tl.int32)
+                above = members & (signed > threshold)
+                tied = members & (signed == threshold)
+                room = keep - tl.sum(above.to(tl.int32), axis=0)
+                tied_before = tl.cumsum(tied.to(tl.int32), axis=0) - 1
+                chosen = chosen | above | (tied & (tied_before < room))
             mask = (live & (segments < 0)) | chosen
         mask = mask & present
 
@@ -862,7 +858,6 @@ def select_tiles(
     scores: torch.Tensor,
     tile_segments: torch.Tensor,
     variable_block_sizes: torch.Tensor,
-    segment_starts: torch.Tensor,
     segment_keep: torch.Tensor,
     *,
     query_tile_offset: int = 0,
@@ -885,14 +880,13 @@ def select_tiles(
 
     Raises:
         RuntimeError: Triton cannot launch on the scores' device.
-        ValueError: The scores or tables do not describe one tile set, the
-            query tiles leave the sequence, or there are more tiles than the
-            packed key's 13 tile bits hold.
+        ValueError: The scores or tables do not describe one tile set, or the
+            query tiles leave the sequence.
     """
     if not launchable(scores.device):
         raise RuntimeError("tile selection requires Triton")
     heads, query_tiles, tiles = (int(size) for size in scores.shape)
-    tables = (tile_segments, variable_block_sizes, segment_starts, segment_keep)
+    tables = (tile_segments, variable_block_sizes, segment_keep)
     if (
         scores.ndim != 3
         or scores.dtype != torch.float32
@@ -904,12 +898,11 @@ def select_tiles(
             for table in tables
         )
         or not 0 <= query_tile_offset <= tiles - query_tiles
-        or tiles > 1 << _TILE_BITS
     ):
         raise ValueError(
             "tile selection needs [heads, query tiles, tiles] FP32 scores "
-            "over a window of the tables' tiles, int32 tables of the same "
-            f"tiles and at most {1 << _TILE_BITS} tiles"
+            "over a window of the tables' tiles and int32 tables of the same "
+            "tiles"
         )
     indices = torch.empty(
         (heads, query_tiles, tiles), dtype=torch.int32, device=scores.device
@@ -920,25 +913,20 @@ def select_tiles(
     if heads == 0 or query_tiles == 0:
         return indices, counts
     block = triton.next_power_of_2(tiles)
-    # Each program returns its segment choice to tile order through one row.
-    kept = torch.empty(
-        (heads * query_tiles, block), dtype=torch.int8, device=scores.device
-    )
     _select_tiles_kernel[(query_tiles, heads)](
         scores,
         tile_segments,
         variable_block_sizes,
-        segment_starts,
         segment_keep,
-        kept,
         indices,
         counts,
         query_tiles,
         tiles,
         query_tile_offset,
         block,
-        _TILE_BITS,
-        num_warps=8 if block >= 1024 else 4,
+        # Each bisection step reduces the whole row; four warps reduce rows
+        # of up to 2048 lanes fastest, eight the longer rows.
+        num_warps=4 if block <= 2048 else 8,
     )
     return indices, counts
 

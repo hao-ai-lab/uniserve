@@ -214,7 +214,6 @@ def select(
             scores.contiguous(),
             segments.tile_segments,
             segments.variable_block_sizes,
-            segments.segment_starts,
             segments.segment_keep,
             query_tile_offset=query_tile_offset,
         )
