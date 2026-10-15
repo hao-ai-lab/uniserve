@@ -33,6 +33,10 @@ class StreamCollectives(Protocol):
     def start_all_to_all(
         self, output: torch.Tensor, value: torch.Tensor
     ) -> Any: ...
+    def start_exchange(
+        self,
+        transfers: list[tuple[int, torch.Tensor | None, torch.Tensor | None]],
+    ) -> Any: ...
     def all_to_all(
         self,
         output: torch.Tensor,
@@ -162,6 +166,52 @@ def start_all_to_all(
                 output, input, group=group, async_op=True
             )
     return Transfer(work, input.device)
+
+
+class _Works:
+    """Join several process-group works as one transfer."""
+
+    def __init__(self, works):
+        self.works = works
+
+    def block_current_stream(self) -> None:
+        for work in self.works:
+            work.block_current_stream()
+
+    def wait(self) -> None:
+        for work in self.works:
+            work.wait()
+
+
+def start_exchange(
+    transfers: list[tuple[int, torch.Tensor | None, torch.Tensor | None]],
+    group,
+    device: torch.device,
+) -> Transfer:
+    """Send and receive per-peer tensors as one launch and return it.
+
+    Each ``(peer, send, receive)`` names a global rank of ``group`` with the
+    contiguous tensor sent to it and the one received from it, either of
+    which may be ``None``.
+    """
+    with profile_range(
+        f"uniserve.collective kind=exchange_start group={group.group_name} "
+        f"rank={dist.get_rank()}"
+    ):
+        bound = stream_collectives(group.group_name)
+        if bound is not None:
+            work = bound.start_exchange(transfers)
+        else:
+            operations = [
+                dist.P2POp(call, value, peer, group)
+                for peer, send, receive in transfers
+                for call, value in ((dist.isend, send), (dist.irecv, receive))
+                if value is not None and value.numel()
+            ]
+            work = _Works(
+                dist.batch_isend_irecv(operations) if operations else []
+            )
+    return Transfer(work, device)
 
 
 def all_gather(output: torch.Tensor, input: torch.Tensor, group) -> None:

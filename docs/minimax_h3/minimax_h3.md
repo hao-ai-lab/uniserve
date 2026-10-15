@@ -122,6 +122,12 @@ The deployment files are in `configs/minimax_h3/`. Each places the condition enc
 | `ulysses8-reference.json` | Eight on one host | Ulysses8 `transformer_ref` | TP8 |
 | `ulysses8-reference-two-node.json` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on `rank-0` |
 
+A Ulysses denoiser's `sequence_parallel` object also selects how each layer's Q/K/V/gate projection reaches every rank's heads. With `"projection": "gather"`, the default, every rank all-gathers the other ranks' input rows and projects its own heads, holding the projection weights partitioned by head. With `"projection": "exchange"`, every rank projects its own rows for all heads, holding the whole weights, and sends each rank that rank's heads. For FastH3 the exchange transfers two thirds of the gather's bytes with eight ranks and more than the gather with four, and every rank holds the whole Q/K/V/gate weights of the 50 layers, 14.4 GiB in BF16, instead of its share of them. `"projection_rows": <rows>` makes the exchange project and send each rank's rows in steps of that many rows, each step's transfer overlapping the next step's projection; without it the exchange sends the whole shard at once. A step holds whole attention tiles: a multiple of the checkpoint's 64- or 128-row tile, so a multiple of 128 suits every FastH3 checkpoint. Every mode produces the same values and serves every precision preset, and none applies to the `hybrid` and `allgather` kinds:
+
+```json
+"sequence_parallel": { "kind": "ulysses", "ulysses_degree": 8, "projection": "exchange", "projection_rows": 4096 }
+```
+
 One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The two-host reference file spreads a request's condition encoding over both hosts. The media reader runs in a `reader` worker on a GPU of the head's host, where the head hands it the request's references through shared storage, and publishes the decoded pixels from device storage, which the encoder ranks of both hosts read. The text encoder then encodes the prompt on `rank-0`'s four GPUs while the latent encoder, which deals a request's condition units to `rank-1`'s GPUs first and to `rank-0`'s after them, encodes its references. One eight-way reference replica serves both latency and throughput across two hosts. The validated FastH3 settings:
 
 | Hardware | Goal | Deployment | Options |

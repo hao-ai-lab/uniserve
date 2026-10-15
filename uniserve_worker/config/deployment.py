@@ -52,17 +52,28 @@ _SEQUENCE_FIELDS = {
 }
 
 
+# Optional fields of the ``ulysses`` strategy that choose how its merged head
+# projections reach each member's heads; ``uniserve.nn.attention.Ulysses``
+# defines their meaning.
+_PROJECTION_FIELDS = ("projection", "projection_rows")
+
+
 @dataclass(frozen=True, slots=True)
 class SequenceConfig:
     """Select the sequence-parallel algorithm and its active degrees.
 
     ``degrees`` holds one positive value per field that ``kind`` names in
     ``_SEQUENCE_FIELDS``, in that order; for ``hybrid`` it is
-    ``(ulysses_degree, allgather_degree)``.
+    ``(ulysses_degree, allgather_degree)``. ``projection`` and
+    ``projection_rows`` belong to ``ulysses`` only: ``"gather"`` or
+    ``"exchange"`` head projections, and the rows of each overlapped
+    exchange step (``None`` exchanges the whole shard once).
     """
 
     kind: str = "local"
     degrees: tuple[int, ...] = ()
+    projection: Literal["gather", "exchange"] = "gather"
+    projection_rows: int | None = None
 
     def __post_init__(self) -> None:
         names = _SEQUENCE_FIELDS.get(self.kind)
@@ -79,6 +90,21 @@ class SequenceConfig:
 
         for name, degree in zip(names, self.degrees, strict=True):
             _positive_degree(name, degree)
+
+        if self.projection not in ("gather", "exchange"):
+            raise ValueError("projection must be gather or exchange")
+        if self.kind != "ulysses" and (
+            self.projection != "gather" or self.projection_rows is not None
+        ):
+            raise ValueError(
+                "only the ulysses strategy selects its head projection"
+            )
+        if self.projection_rows is not None:
+            if self.projection != "exchange":
+                raise ValueError(
+                    "projection_rows steps an exchange projection only"
+                )
+            _positive_degree("projection_rows", self.projection_rows)
 
     @property
     def size(self) -> int:
@@ -111,30 +137,47 @@ class SequenceConfig:
 
         Raises:
             ValueError: If ``kind`` is unknown, a field does not belong to that
-                strategy, or a degree is not a positive integer.
+                strategy, a degree is not a positive integer, or the
+                projection fields are invalid.
         """
         kind = value.get("kind")
         if not isinstance(kind, str) or kind not in _SEQUENCE_FIELDS:
             raise ValueError(f"unknown sequence parallel strategy {kind!r}")
 
         names = _SEQUENCE_FIELDS[kind]
-        unexpected = value.keys() - {"kind", *names}
+        accepted = {"kind", *names}
+        if kind == "ulysses":
+            accepted.update(_PROJECTION_FIELDS)
+        unexpected = value.keys() - accepted
         if unexpected:
             raise ValueError(
                 f"sequence strategy {kind!r} has unknown fields: "
                 f"{sorted(unexpected)}"
             )
 
+        projection = value.get("projection", "gather")
+        rows = value.get("projection_rows")
+        if projection not in ("gather", "exchange"):
+            raise ValueError("projection must be gather or exchange")
+        if rows is not None:
+            rows = _positive_degree("projection_rows", rows)
         return cls(
             kind,
             tuple(_positive_degree(name, value.get(name, 1)) for name in names),
+            projection,
+            rows,
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "kind": self.kind,
             **dict(zip(_SEQUENCE_FIELDS[self.kind], self.degrees, strict=True)),
         }
+        if self.kind == "ulysses":
+            result["projection"] = self.projection
+            if self.projection_rows is not None:
+                result["projection_rows"] = self.projection_rows
+        return result
 
 
 @dataclass(frozen=True, slots=True)

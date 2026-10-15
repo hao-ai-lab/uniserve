@@ -101,15 +101,18 @@ class MatmulBinding:
             return next(iter(self.module.projections.values())).weight
         return self.module.weight
 
-    def quantize(self, x, quantizer, distribution):
+    def quantize(self, x, quantizer, distribution, *, amax=None):
         """Encode a complete logical domain.
 
         Encode a complete logical domain in this context's activation
-        storage.
+        storage. ``amax`` supplies statistics a caller already reduced over
+        the whole domain when ``x`` holds only some of its rows.
         """
         operator = self._prepare(x.dtype, x.dtype, quantizer, x.shape[0])
         target = operator._input_storage(x)
-        return quantizer.quantize(x, distribution=distribution, out=target)
+        return quantizer.quantize(
+            x, distribution=distribution, amax=amax, out=target
+        )
 
     def __call__(self, x, bias, *, out):
         destination = (
