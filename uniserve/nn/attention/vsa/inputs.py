@@ -211,3 +211,25 @@ class Segments:
     def tiles(self) -> int:
         """Tiles of the packed sequence."""
         return self.padded_tokens // self.tile
+
+
+@dataclass(frozen=True, slots=True)
+class NormRope:
+    """Q/K normalization and rotation applied as projected rows are prepared.
+
+    Each query and key head is RMS-normalized over its whole width, scaled by
+    ``query_weight`` or ``key_weight`` (``[width]``), and its leading
+    ``2 * cos.shape[-1]`` features are rotated split-half; the rest pass
+    through. ``cos`` and ``sin`` hold the compact ``[padded rows, rotated /
+    2]`` factors of every packed row. The arithmetic is
+    ``uniserve.nn.functional.qk_norm_rope`` with one RMS domain and one axis
+    spanning the head and ``Rounding.STEPWISE``: the weighted normalization
+    and the factors round to the activation dtype, in which each rotation
+    product and sum then rounds, as eager PyTorch evaluates the expression.
+    """
+
+    query_weight: torch.Tensor
+    key_weight: torch.Tensor
+    eps: float
+    cos: torch.Tensor
+    sin: torch.Tensor

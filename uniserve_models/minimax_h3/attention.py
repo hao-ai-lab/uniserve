@@ -156,17 +156,18 @@ class Sparse(nn.Module):
         ``hidden`` is the normalized shard, whole or as ``(global row slice,
         rows)`` chunks. ``cos`` and ``sin`` hold the compact rotary factors
         ``[padded rows, 3 * rope_frequency_dim]`` of every packed row: one
-        per rotated channel pair of the three axes' halves. Yields one chunk
-        covering the shard.
+        per rotated channel pair of the three axes' halves. Yields the
+        shard's output in row intervals as their attention exchange
+        completes, or as one chunk when the output projection's input
+        quantizer needs dynamic tensor-wide statistics.
         """
         rows = inputs.segments.padded_tokens
         interval = self.vsa.query_rows(rows)
         count = interval.stop - interval.start
         # Every projected interval of this rank's context interval lands in
         # its rows of one [count, q | k | v | gate] matrix, whose branches
-        # attention reads as strided views. Intervals arrive in any order;
-        # each normalizes and rotates its Q/K rows in place, so the per-row
-        # recipe's temporaries stay the size of one interval.
+        # attention reads as strided views. Intervals arrive in any order,
+        # and attention prepares each as it lands.
         if isinstance(hidden, torch.Tensor):
             source = hidden
         else:
@@ -180,50 +181,55 @@ class Sparse(nn.Module):
             name: value.view(count, -1, self.head_dim)
             for name, value in projected.items()
         }
-        covered = []
-        for chunk, _ in self.projection.forward_chunks(
-            hidden,
-            token_slice=inputs.token_slice,
-            num_tokens=rows,
-            out=projected,
-        ):
-            local = slice(
-                chunk.start - interval.start, chunk.stop - interval.start
+        ready = (
+            chunk
+            for chunk, _ in self.projection.forward_chunks(
+                hidden,
+                token_slice=inputs.token_slice,
+                num_tokens=rows,
+                out=projected,
             )
-            query, key = heads["q"][local], heads["k"][local]
-            # One RMS domain and one rotary axis span each whole head; the
-            # compact factors rotate its leading 96 channels split-half and
-            # the trailing 32 channels pass through.
-            functional.qk_norm_rope(
-                query,
-                key,
-                (self.query_norm.weight,),
-                (self.key_norm.weight,),
-                (cos[chunk],),
-                (sin[chunk],),
-                eps=self.query_norm.eps,
-                axis_dims=(self.head_dim,),
-                out=(query, key),
-                rounding=functional.Rounding.STEPWISE,
-            )
-            covered.append((chunk.start, chunk.stop))
-        covered.sort()
-        if (
-            not covered
-            or [start for start, _ in covered]
-            != [interval.start, *(stop for _, stop in covered[:-1])]
-            or covered[-1][1] != interval.stop
-        ):
-            raise ValueError("H3 segment projections must cover every row")
-        attended = self.vsa(
-            heads["q"], heads["k"], heads["v"], heads["gate"], inputs.segments
         )
-        # The caller runs the feed-forward update while this generator waits
-        # at its yield; release the projections and attended rows first.
+        # One RMS domain and one rotary axis span each whole head; the
+        # compact factors rotate its leading 96 channels split-half and the
+        # trailing 32 channels pass through.
+        norm = vsa.NormRope(
+            self.query_norm.weight,
+            self.key_norm.weight,
+            self.query_norm.eps,
+            cos,
+            sin,
+        )
+        attended = self.vsa.forward_chunks(
+            heads["q"],
+            heads["k"],
+            heads["v"],
+            heads["gate"],
+            inputs.segments,
+            norm=norm,
+            ready=ready,
+        )
         del projected, heads
-        output = self.output(attended.flatten(1))
-        del attended
-        yield inputs.token_slice, output
+
+        # Dynamic tensor-wide statistics (uncalibrated NVFP4, tensor-wide FP8)
+        # span the whole shard, so such an output projection encodes it at
+        # once; every other projection consumes intervals as they arrive.
+        quantizer = self.output.input_quantizer
+        if quantizer is not None and quantizer.requires_complete_source:
+            parts = [values.flatten(1) for _, values in attended]
+            output = self.output(
+                parts[0] if len(parts) == 1 else torch.cat(parts)
+            )
+            del parts
+            yield inputs.token_slice, output
+            return
+        for interval_rows, values in attended:
+            output = self.output(values.flatten(1))
+            del values
+            yield interval_rows, output
 
     def forward(self, hidden, cos, sin, inputs):
-        return next(self.forward_chunks(hidden, cos, sin, inputs))[1]
+        outputs = [
+            value for _, value in self.forward_chunks(hidden, cos, sin, inputs)
+        ]
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs)

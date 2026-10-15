@@ -1,10 +1,11 @@
 """Segment-wise VSA keeps its values through every sequence partition.
 
 Each rank projects its context interval of the gathered sequence for its head
-shard, attends every row of it against the keys of the whole sequence and
-receives its own token shard back with every head; the rows must equal the
-dense equations of the unpartitioned layer, also when a captured call replays
-over changed values.
+shard, normalizes and rotates Q/K as each projected interval lands, attends
+every row of it against the keys of the whole sequence and receives its own
+token shard back with every head; the rows must equal the dense equations of
+the unpartitioned layer over the normalized projections, also when a captured
+call replays over changed values.
 """
 
 import pytest
@@ -19,7 +20,7 @@ from tests.python.fixtures.vsa import (
     segment_tables,
 )
 from uniserve.distributed import DeviceMesh, parallelize_
-from uniserve.nn import MergedColumnParallelLinear
+from uniserve.nn import MergedColumnParallelLinear, functional
 from uniserve.nn.attention import (
     AttentionParallelConfig,
     ContextParallelConfig,
@@ -134,26 +135,65 @@ def _run(rank, rendezvous, case):
             dense_prefix_tiles=3,
         )
 
+        # Q/K normalization over each head and a rotated leading 96 features.
+        phases = torch.rand(ROWS, 48, generator=generator) * 40
+        norm = vsa.NormRope(
+            (torch.rand(WIDTH, generator=generator) + 0.5).to(
+                device, torch.bfloat16
+            ),
+            (torch.rand(WIDTH, generator=generator) + 0.5).to(
+                device, torch.bfloat16
+            ),
+            1e-6,
+            phases.cos().to(device),
+            phases.sin().to(device),
+        )
+
         def attend():
-            chunks = sorted(
-                layer.projection.forward_chunks(
-                    hidden[owned], token_slice=owned, num_tokens=ROWS
-                ),
-                key=lambda chunk: chunk[0].start,
+            # Projected intervals land in one [rows, q | k | v | gate] matrix
+            # in the order the gather delivers them, local rows first.
+            count = interval.stop - interval.start
+            projected = layer.projection.output_buffers(
+                count, dtype=torch.bfloat16, device=device
+            )
+            ready = (
+                rows
+                for rows, _ in layer.projection.forward_chunks(
+                    hidden[owned],
+                    token_slice=owned,
+                    num_tokens=ROWS,
+                    out=projected,
+                )
             )
             q, k, v, gate = (
-                torch.cat([values[name] for _, values in chunks]).view(
-                    interval.stop - interval.start, local_heads, WIDTH
-                )
+                projected[name].view(count, local_heads, WIDTH)
                 for name in matrices
             )
-            return layer.attention(q, k, v, gate, segments)
+            return torch.cat(
+                [
+                    values
+                    for _, values in layer.attention.forward_chunks(
+                        q, k, v, gate, segments, norm=norm, ready=ready
+                    )
+                ]
+            )
 
         def check():
             projections = [
                 F.linear(hidden, value).view(ROWS, HEADS, WIDTH)
                 for value in matrices.values()
             ]
+            projections[0], projections[1] = functional.qk_norm_rope(
+                projections[0],
+                projections[1],
+                (norm.query_weight,),
+                (norm.key_weight,),
+                (norm.cos,),
+                (norm.sin,),
+                eps=norm.eps,
+                axis_dims=(WIDTH,),
+                rounding=functional.Rounding.STEPWISE,
+            )
             expected, attending = segment_reference(*projections)
             assert actual.shape == (shard, HEADS, WIDTH)
             # The established BF16 attention tolerance of the VSA tests.
