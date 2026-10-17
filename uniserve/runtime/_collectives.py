@@ -239,6 +239,29 @@ class NcclCommunicator:
             *self._arguments(value, output, asynchronous=True),
         )
 
+    def start_all_to_all(
+        self, output: torch.Tensor, value: torch.Tensor
+    ) -> _CollectiveWork:
+        """Exchange equal per-rank partitions on the transfer stream.
+
+        Rank ``r`` receives partition ``r`` of every rank's ``value`` into
+        partition ``s`` of ``output`` for sender ``s``, as ``all_to_all``
+        with equal splits; the consumer joins the returned work before it
+        reads ``output``.
+        """
+        if output.numel() != value.numel() or value.numel() % self._size:
+            raise ValueError(
+                "asynchronous exchange requires equal peer payloads"
+            )
+        return self._start(
+            self._nccl.allto_all,
+            value.data_ptr(),
+            output.data_ptr(),
+            value.numel() // self._size,
+            self._dtype(value),
+            *self._arguments(value, output, asynchronous=True),
+        )
+
     def _dtype(self, value: torch.Tensor) -> int:
         types = self._nccl.DataType
         return {

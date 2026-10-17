@@ -1,9 +1,11 @@
 """Logical token partitions and head exchange over borrowed communicators."""
 
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import torch
 
+from .chunks import exchange_rows
 from .mesh import Communicator
 
 
@@ -218,6 +220,97 @@ class HeadExchange:
         result = value.new_empty((tokens, heads * self.group.size, features))
         _merge(received, result)
         return result
+
+    def token_chunks(
+        self,
+        rows: int,
+        heads: int,
+        features: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        compose: Callable[[slice, torch.Tensor, tuple[int, ...]], None],
+    ) -> Iterator[tuple[slice, torch.Tensor]]:
+        """Return composed head outputs to their token owners by interval.
+
+        The result is that of ``tokens``, delivered as row intervals of this
+        member's ``rows`` tokens, each exchanged as soon as it is composed:
+        a consumer of an early interval overlaps the transfers of the later
+        ones. Every member composes and exchanges the same intervals, each
+        about 48 MiB sent per member (``chunks.exchange_rows``).
+
+        ``compose(interval, payload, slots)`` writes, for every member ``m``,
+        this member's ``heads`` local heads of member ``m``'s token rows
+        ``interval`` into ``payload[slots[m]]``: ``payload`` is the contiguous
+        ``[members, count, heads, features]`` send buffer of the interval,
+        ordered for the transport. It must enqueue its writes on the current
+        stream before returning. Every interval is composed and its exchange
+        started before the first is yielded, so the composition's inputs can
+        be released once this generator starts yielding.
+
+        Yields ``(interval, rows)`` in token order, ``rows`` being the
+        ``[count, heads * members, features]`` outputs of those tokens with
+        member ``m``'s heads at head offset ``m * heads``, readable on the
+        current stream. Closing the generator early still joins every started
+        exchange before the buffers can be reused.
+        """
+        size = self.group.size
+        if size == 1:
+            payload = torch.empty(
+                (1, rows, heads, features), dtype=dtype, device=device
+            )
+            compose(slice(0, rows), payload, (0,))
+            yield slice(0, rows), payload[0]
+            return
+
+        width = heads * features
+        step = exchange_rows(width * dtype.itemsize, size - 1)
+        order = self.group.backend_order
+        # The transport sends partition p to the member at backend position
+        # p, so member m's rows go to the slot of its backend position.
+        slots = tuple(order.index(member) for member in range(size))
+        send = torch.empty(size * rows * width, dtype=dtype, device=device)
+        receive = torch.empty_like(send)
+
+        # Chunk-major storage: each interval's [members, count, heads,
+        # features] payload is one contiguous span of every buffer.
+        pending = []
+        consumed = 0
+        try:
+            for start in range(0, rows, step):
+                count = min(step, rows - start)
+                span = slice(
+                    start * size * width, (start + count) * size * width
+                )
+                payload = send[span].view(size, count, heads, features)
+                target = receive[span].view(size, count, heads, features)
+                interval = slice(start, start + count)
+                compose(interval, payload, slots)
+                transfer = self.group.start_all_to_all(target, payload)
+                pending.append((interval, target, transfer))
+            del compose
+
+            for interval, target, transfer in pending:
+                transfer.wait()
+                consumed += 1
+                result = target.new_empty(
+                    (interval.stop - interval.start, heads * size, features)
+                )
+                # Slot p holds the heads of the member at backend position p,
+                # which land at that member's logical head offset.
+                if slots == tuple(range(size)):
+                    _merge(target, result)
+                else:
+                    for member, slot in enumerate(slots):
+                        result[:, member * heads : (member + 1) * heads].copy_(
+                            target[slot]
+                        )
+                yield interval, result
+        finally:
+            # A consumer that stops early still retires every started
+            # transfer before this storage can be lent again.
+            for _, _, transfer in pending[consumed:]:
+                transfer.wait()
 
 
 def _pack(values, layout, out):

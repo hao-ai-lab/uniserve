@@ -7,11 +7,21 @@ highest. A compression branch adds, to every row of a tile, the gated
 softmax-weighted mean of every live tile's mean value under the pooled
 scores. Selection is computed from device tables alone, so one call serves
 every assignment of tiles to segments within a padded sequence.
+
+The layer consumes its projections as they land: each projected row interval
+is prepared (Q/K normalization and rotation, padding and pooling) while later
+intervals are still being gathered and projected, and under Ulysses the
+attended rows return to their token owners interval by interval, so the
+output projection and feed-forward update of an early interval overlap the
+exchange of the later ones.
 """
 
 from __future__ import annotations
 
+import functools
+import itertools
 import math
+from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
 
 import torch
@@ -19,10 +29,10 @@ from torch import nn
 
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.distributed.tokens import HeadExchange
-from uniserve.nn import _binding
+from uniserve.nn import _binding, functional
 
 from ..config import AttentionParallelConfig
-from .inputs import BlockInput, Pattern, Segments
+from .inputs import BlockInput, NormRope, Pattern, Segments
 from .layer import BlockAttention
 
 if TYPE_CHECKING:
@@ -64,6 +74,122 @@ def pool(
     return total / variable_block_sizes.clamp_min(1).view(-1, 1, 1)
 
 
+def prepare(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+    tile: int,
+    pooled: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    norm: NormRope | None,
+    rows: slice,
+) -> None:
+    """Prepare one projected row interval of whole tiles in place.
+
+    ``q``, ``k`` and ``v`` are the interval's ``[rows, heads, width]``
+    projections, ``rows`` its packed rows and ``variable_block_sizes`` the
+    valid rows of its tiles. With ``norm``, Q and K are normalized and
+    rotated in place (``NormRope``). The rows past each tile's valid size of
+    Q, K and V are then overwritten with zeros (``zero_padding``) and the
+    contiguous FP32 ``[tiles, heads, width]`` ``pooled`` query, key and value
+    outputs receive each tile's means (``pool``). Attention never reads
+    padding rows (keys past a tile's valid size are masked and padded query
+    rows are unspecified), so zeroing them leaves every valid result as it
+    was. CUDA tensors take one fused pass (``vsa_segments.prepare_tiles``)
+    that stores the same bits.
+    """
+    if q.is_cuda:
+        from uniserve_kernels.attention import vsa_segments
+
+        if norm is None:
+            vsa_segments.prepare_tiles(
+                q, k, v, variable_block_sizes, tile, *pooled
+            )
+        else:
+            vsa_segments.prepare_tiles(
+                q,
+                k,
+                v,
+                variable_block_sizes,
+                tile,
+                *pooled,
+                query_weight=norm.query_weight,
+                key_weight=norm.key_weight,
+                cosine=norm.cos[rows],
+                sine=norm.sin[rows],
+                eps=norm.eps,
+            )
+        return
+
+    if norm is not None:
+        functional.qk_norm_rope(
+            q,
+            k,
+            (norm.query_weight,),
+            (norm.key_weight,),
+            (norm.cos[rows],),
+            (norm.sin[rows],),
+            eps=norm.eps,
+            axis_dims=(q.shape[-1],),
+            out=(q, k),
+            rounding=functional.Rounding.STEPWISE,
+        )
+    for value, target in zip((q, k, v), pooled, strict=True):
+        zero_padding(value, variable_block_sizes, tile)
+        target.copy_(pool(value, variable_block_sizes, tile))
+
+
+def compose_rows(
+    rows: slice,
+    payload: torch.Tensor,
+    slots: tuple[int, ...],
+    *,
+    fine: torch.Tensor,
+    compressed: torch.Tensor,
+    gate: torch.Tensor,
+    tile: int,
+    owner_rows: int,
+) -> None:
+    """Write one exchanged interval of every member's gated rows.
+
+    ``fine`` and ``gate`` are this rank's ``[members * owner_rows, heads,
+    width]`` attended rows and gate, member ``m`` owning rows ``m *
+    owner_rows`` onward, and ``compressed`` the ``[heads, tiles, width]``
+    compressed tiles. Slot ``slots[m]`` of the ``[members, count, heads,
+    width]`` ``payload`` receives member ``m``'s rows ``rows`` of ``fine +
+    compressed[:, tile] * gate``, the product and the sum each rounded to
+    the rows' dtype as two eager operations round them. CUDA tensors take
+    one launch (``vsa_segments.compose_gated_rows``) that stores the same
+    bits.
+    """
+    if payload.is_cuda:
+        from uniserve_kernels.attention import vsa_segments
+
+        vsa_segments.compose_gated_rows(
+            payload,
+            fine,
+            compressed,
+            gate,
+            tile,
+            owner_rows=owner_rows,
+            start=rows.start,
+            slots=slots,
+        )
+        return
+    count = rows.stop - rows.start
+    tiled = (count // tile, tile, *fine.shape[1:])
+    for member, slot in enumerate(slots):
+        start = member * owner_rows + rows.start
+        tiles = slice(start // tile, (start + count) // tile)
+        gated = compressed[:, tiles].permute(1, 0, 2)[:, None] * gate[
+            start : start + count
+        ].view(tiled)
+        payload[slot].view(tiled).copy_(
+            fine[start : start + count].view(tiled) + gated
+        )
+
+
 def select(
     scores: torch.Tensor, segments: Segments, *, query_tile_offset: int = 0
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -88,7 +214,6 @@ def select(
             scores.contiguous(),
             segments.tile_segments,
             segments.variable_block_sizes,
-            segments.segment_starts,
             segments.segment_keep,
             query_tile_offset=query_tile_offset,
         )
@@ -174,27 +299,41 @@ class SegmentAttention(nn.Module):
         return slice(group.rank * count, (group.rank + 1) * count)
 
     @torch.inference_mode()
-    def forward(
+    def forward_chunks(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         gate: torch.Tensor,
         segments: Segments,
-    ) -> torch.Tensor:
+        *,
+        norm: NormRope | None = None,
+        ready: Iterable[slice] | None = None,
+    ) -> Iterator[tuple[slice, torch.Tensor]]:
         """Attend ``[rows, heads, width]`` projections of ``query_rows``.
 
-        ``q`` and ``k`` are normalized and rotated; ``gate`` weights the
-        compression branch elementwise. Every projection may use its own row
-        and head strides; the rows of ``q``, ``k`` and ``v`` past a tile's
-        valid size are overwritten with zeros. Returns BF16 ``[rows /
-        members, heads * members, width]`` rows of this rank's token shard,
-        ``members`` being the Ulysses group size. Rows past a tile's valid
-        size hold unspecified values.
+        ``ready`` yields the packed row intervals of ``query_rows`` as their
+        projections land in ``q``, ``k``, ``v`` and ``gate``, in any order,
+        each whole tiles and every row once; without it every row is ready.
+        Each interval is prepared as it arrives, while later projections may
+        still be in flight: with ``norm`` its Q and K rows are normalized and
+        rotated in place (``NormRope``), otherwise they arrive normalized and
+        rotated; its Q, K and V rows past a tile's valid size are overwritten
+        with zeros, and its tiles are pooled. ``gate`` weights the compression
+        branch elementwise. Every projection may use its own row and head
+        strides.
+
+        Yields ``(packed rows, values)`` intervals covering this rank's token
+        shard in order: BF16 ``[count, heads * members, width]`` rows,
+        ``members`` being the Ulysses group size, with member ``m``'s heads
+        at head offset ``m * heads``. Under Ulysses every interval's exchange
+        starts as soon as it is composed, so the consumer of an early
+        interval overlaps the exchange of the later ones. Rows past a tile's
+        valid size hold unspecified values.
 
         Raises:
-            ValueError: Projections that do not cover this rank's interval
-                of the segment tiles.
+            ValueError: Projections or ready intervals that do not cover
+                this rank's interval of the segment tiles.
             RuntimeError: A context partition outside an execution context.
         """
         tile = segments.tile
@@ -211,9 +350,65 @@ class SegmentAttention(nn.Module):
         tiles, heads, width = segments.tiles, q.shape[1], q.shape[2]
         queries = slice(interval.start // tile, interval.stop // tile)
         query_tiles = queries.stop - queries.start
+        sizes = segments.variable_block_sizes
+
+        # FP32 tile means [tiles, heads, width] of the prepared rows, written
+        # interval by interval: queries of this rank's interval, and keys and
+        # values of its tiles until a context partition gathers the rest.
+        pooled_query, pooled_key, pooled_value = (
+            torch.empty(
+                (query_tiles, heads, width),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            for _ in range(3)
+        )
+        covered = []
+        for rows in (interval,) if ready is None else ready:
+            if (
+                rows.step not in (None, 1)
+                or rows.start % tile
+                or rows.stop % tile
+                or not interval.start <= rows.start < rows.stop <= interval.stop
+            ):
+                raise ValueError(
+                    "ready projections must be whole tiles of this rank's "
+                    "interval"
+                )
+            local = slice(
+                rows.start - interval.start, rows.stop - interval.start
+            )
+            local_tiles = slice(local.start // tile, local.stop // tile)
+            prepare(
+                q[local],
+                k[local],
+                v[local],
+                sizes[rows.start // tile : rows.stop // tile],
+                tile,
+                (
+                    pooled_query[local_tiles],
+                    pooled_key[local_tiles],
+                    pooled_value[local_tiles],
+                ),
+                norm=norm,
+                rows=rows,
+            )
+            covered.append((rows.start, rows.stop))
+        covered.sort()
+        if (
+            not covered
+            or [start for start, _ in covered]
+            != [interval.start, *(stop for _, stop in covered[:-1])]
+            or covered[-1][1] != interval.stop
+        ):
+            raise ValueError(
+                "ready projections must cover every row of this rank's "
+                "interval once"
+            )
 
         # Every query attends to the keys of the whole sequence, which a
-        # context partition gathers into this rank's storage.
+        # context partition gathers into this rank's storage together with
+        # the means every member pooled from its own tiles.
         parallel = self.context_parallel
         if parallel is not None and parallel.context_group.size > 1:
             binding = _binding.vsa.get().get(id(self.attention))
@@ -223,19 +418,15 @@ class SegmentAttention(nn.Module):
                 )
             binding.exchange(self, q.shape[0], heads, width, q.dtype)
             k, v = parallel.distribute_key_value(k, v)
+            group = parallel.context_group
+            pooled_key, pooled_value = (
+                group.all_gather(value, dim=0)
+                for value in (pooled_key, pooled_value)
+            )
 
         # Pooled scores [heads, query tile, key tile] in FP32: the tile means
         # of the queries and keys, scaled by the inverse square root of the
-        # head width. Attention never reads padding rows (keys past a tile's
-        # valid size are masked and padded query rows are unspecified), so
-        # zeroing them leaves every valid result as it was.
-        zero_padding(q, segments.variable_block_sizes[queries], tile)
-        for value in (k, v):
-            zero_padding(value, segments.variable_block_sizes, tile)
-        pooled_query = pool(q, segments.variable_block_sizes[queries], tile)
-        pooled_key, pooled_value = (
-            pool(value, segments.variable_block_sizes, tile) for value in (k, v)
-        )
+        # head width.
         scores = torch.matmul(
             pooled_query.permute(1, 0, 2), pooled_key.permute(1, 2, 0)
         ) / math.sqrt(width)
@@ -271,17 +462,74 @@ class SegmentAttention(nn.Module):
         # Compression: each query tile's softmax over the live key tiles
         # weights their mean values. The BF16 tile result then scales the
         # gate and adds to the fine rows, each operation rounding to BF16.
-        live = segments.variable_block_sizes > 0
+        live = sizes > 0
         weights = scores.masked_fill(~live, -torch.inf).softmax(-1)
         compressed = torch.matmul(weights, pooled_value.permute(1, 0, 2)).to(
             q.dtype
         )
-        if fine.is_cuda:
-            from uniserve_kernels.attention import vsa_segments
+        del q, k, v, scores, weights, pooled_query, pooled_key, pooled_value
 
-            vsa_segments.add_gated_tiles(fine, compressed, gate, tile)
-        else:
-            tiled = (query_tiles, tile, heads, width)
-            gated = compressed.permute(1, 0, 2)[:, None] * gate.view(tiled)
-            fine.view(tiled).add_(gated)
-        return self.exchange.tokens(fine)
+        group = self.exchange.group
+        if group.size == 1:
+            if fine.is_cuda:
+                from uniserve_kernels.attention import vsa_segments
+
+                vsa_segments.add_gated_tiles(fine, compressed, gate, tile)
+            else:
+                tiled = (query_tiles, tile, heads, width)
+                gated = compressed.permute(1, 0, 2)[:, None] * gate.view(tiled)
+                fine.view(tiled).add_(gated)
+            yield interval, fine
+            return
+
+        # Under Ulysses, member m owns the m-th equal share of the interval's
+        # rows. Each exchanged interval is composed straight into its send
+        # payload, so the gated sum is never stored in place.
+        owner_rows = fine.shape[0] // group.size
+        shard = interval.start + group.rank * owner_rows
+        compose = functools.partial(
+            compose_rows,
+            fine=fine,
+            compressed=compressed,
+            gate=gate,
+            tile=tile,
+            owner_rows=owner_rows,
+        )
+        chunks = self.exchange.token_chunks(
+            owner_rows,
+            heads,
+            width,
+            dtype=fine.dtype,
+            device=fine.device,
+            compose=compose,
+        )
+        # Every interval is composed before the first one is yielded; the
+        # attended rows are then released before the consumers allocate.
+        first = next(chunks)
+        del compose, fine, compressed, gate
+        for rows, values in itertools.chain((first,), chunks):
+            yield slice(shard + rows.start, shard + rows.stop), values
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate: torch.Tensor,
+        segments: Segments,
+        *,
+        norm: NormRope | None = None,
+    ) -> torch.Tensor:
+        """Attend and return this rank's whole token shard.
+
+        The rows ``forward_chunks`` yields for projections that are all
+        ready, concatenated: BF16 ``[rows / members, heads * members,
+        width]``.
+        """
+        chunks = [
+            values
+            for _, values in self.forward_chunks(
+                q, k, v, gate, segments, norm=norm
+            )
+        ]
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)

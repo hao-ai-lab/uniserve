@@ -1,4 +1,4 @@
-"""Chunked row gathers over borrowed numerical communicators."""
+"""Chunked row gathers and exchanges over borrowed numerical communicators."""
 
 from __future__ import annotations
 
@@ -10,6 +10,13 @@ import torch
 # amortizes its launch, small enough that consumers start on the first
 # interval while later transfers are in flight.
 _PAYLOAD_BYTES = 64 * 1024 * 1024
+# Bytes one member sends all its peers in one exchanged row interval, which
+# sets the interval's transfer time. An exchange returns rows whose consumers
+# (an output projection and a feed-forward update) take longer per row than
+# the transfer, so smaller intervals than a gather's start them sooner: the
+# first interval's transfer is the part of the exchange its consumers cannot
+# hide.
+_EXCHANGE_BYTES = 48 * 1024 * 1024
 # Intervals hold whole units of this many rows, a multiple of every sparse
 # attention tile, so consumers see tile-aligned intervals.
 _ROW_UNIT = 128
@@ -23,6 +30,19 @@ def payload_rows(width: int, itemsize: int) -> int:
     """
     return max(
         _ROW_UNIT, _PAYLOAD_BYTES // (width * itemsize) // _ROW_UNIT * _ROW_UNIT
+    )
+
+
+def exchange_rows(row_bytes: int, peers: int) -> int:
+    """Return the rows of one exchanged interval of ``row_bytes``-byte rows.
+
+    ``row_bytes`` is what one member sends one peer per row and ``peers``
+    the members it sends to. The bound is 48 MiB sent per member, rounded
+    down to whole 128-row units and never below one unit.
+    """
+    return max(
+        _ROW_UNIT,
+        _EXCHANGE_BYTES // (row_bytes * max(peers, 1)) // _ROW_UNIT * _ROW_UNIT,
     )
 
 

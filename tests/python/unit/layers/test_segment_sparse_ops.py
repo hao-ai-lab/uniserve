@@ -3,16 +3,20 @@
 Tile padding zeroes exactly the rows past each tile's valid size, and the
 gated tile compression rounds its product and sum as the two eager BF16
 operations do, so both leave segment attention's results bit for bit as the
-eager expressions compute them. Tile selection keeps, per segment, the
-best-scoring key tiles in the order a stable descending sort ranks them.
+eager expressions compute them. Tile preparation stores, in one pass, the
+stepwise Q/K normalization and rotation, the padding and the eager tile means;
+gated row composition stores each member's interval of the gated sum in its
+exchange slot. Tile selection keeps, per segment, the best-scoring key tiles
+in the order a stable descending sort ranks them.
 """
 
 import pytest
 import torch
 from uniserve_kernels.attention import vsa_segments
 
+from uniserve.nn import functional
 from uniserve.nn.attention.vsa.inputs import Segments
-from uniserve.nn.attention.vsa.segments import select
+from uniserve.nn.attention.vsa.segments import pool, select, zero_padding
 
 pytestmark = [pytest.mark.unit, pytest.mark.gpu]
 
@@ -65,6 +69,114 @@ def test_gated_tiles_round_as_the_eager_product_and_sum(scale):
     vsa_segments.add_gated_tiles(output, compressed, gate, TILE)
 
     assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize("tiles", [9, 600], ids=["short", "long"])
+@pytest.mark.parametrize("tile", [64, 128])
+@pytest.mark.parametrize("norm", [False, True], ids=["plain", "norm_rope"])
+def test_tile_preparation_stores_the_eager_row_passes(tiles, tile, norm):
+    torch.manual_seed(tiles + tile + norm)
+    heads = 14
+    sizes = torch.randint(1, tile + 1, (tiles,), device="cuda")
+    sizes[1] = 0
+    sizes[2] = tile
+    sizes[3] = 1
+    valid = sizes.to(torch.int32)
+    rows = tiles * tile
+    # Q | K | V | gate of one merged projection: rows and heads are strided.
+    merged = (torch.randn(rows, 4 * heads * WIDTH, device="cuda") * 3).to(
+        torch.bfloat16
+    )
+    expected = merged.clone()
+
+    def branches(matrix):
+        return tuple(
+            matrix[:, index * heads * WIDTH : (index + 1) * heads * WIDTH].view(
+                rows, heads, WIDTH
+            )
+            for index in range(3)
+        )
+
+    operands = {}
+    query, key, value = branches(expected)
+    if norm:
+        # H3's normalization: one RMS domain over the head and a rotated
+        # leading 96 features with FP32 compact factors.
+        phases = torch.rand(rows, 48, device="cuda") * 40
+        operands = {
+            "query_weight": (torch.rand(WIDTH, device="cuda") + 0.5).to(
+                torch.bfloat16
+            ),
+            "key_weight": (torch.rand(WIDTH, device="cuda") + 0.5).to(
+                torch.bfloat16
+            ),
+            "cosine": phases.cos(),
+            "sine": phases.sin(),
+            "eps": 1e-6,
+        }
+        functional.qk_norm_rope(
+            query,
+            key,
+            (operands["query_weight"],),
+            (operands["key_weight"],),
+            (operands["cosine"],),
+            (operands["sine"],),
+            eps=1e-6,
+            axis_dims=(WIDTH,),
+            out=(query, key),
+            rounding=functional.Rounding.STEPWISE,
+        )
+    for rows_of in (query, key, value):
+        zero_padding(rows_of, valid, tile)
+    means = [pool(rows_of, valid, tile) for rows_of in (query, key, value)]
+
+    pooled = [torch.empty(tiles, heads, WIDTH, device="cuda") for _ in range(3)]
+    vsa_segments.prepare_tiles(
+        *branches(merged), valid, tile, *pooled, **operands
+    )
+
+    # The gate branch is untouched; Q, K, V and every mean are the eager bits.
+    assert torch.equal(merged, expected)
+    for actual, mean in zip(pooled, means, strict=True):
+        assert torch.equal(actual, mean)
+
+
+@pytest.mark.parametrize("slots", [(0, 1, 2, 3), (2, 0, 3, 1)])
+def test_gated_rows_compose_each_members_interval_into_its_slot(slots):
+    torch.manual_seed(len(slots) + slots[0])
+    members, owner_tiles, tile = 4, 6, 64
+    owner_rows = owner_tiles * tile
+    rows = members * owner_rows
+    projected = (torch.randn(rows, 2, HEADS, WIDTH, device="cuda") * 2).to(
+        torch.bfloat16
+    )
+    fine, gate = projected[:, 0], projected[:, 1]
+    compressed = torch.randn(HEADS, rows // tile, WIDTH, device="cuda").to(
+        torch.bfloat16
+    )
+    composed = fine.clone()
+    vsa_segments.add_gated_tiles(composed, compressed, gate, tile)
+    before = projected.clone()
+
+    start, count = 128, 160
+    payload = torch.empty(
+        members, count, HEADS, WIDTH, device="cuda", dtype=torch.bfloat16
+    )
+    vsa_segments.compose_gated_rows(
+        payload,
+        fine,
+        compressed,
+        gate,
+        tile,
+        owner_rows=owner_rows,
+        start=start,
+        slots=slots,
+    )
+
+    for member, slot in enumerate(slots):
+        first = member * owner_rows + start
+        assert torch.equal(payload[slot], composed[first : first + count])
+    assert torch.equal(projected, before)
 
 
 def _segments(tile_segments, variable_block_sizes, keep):
