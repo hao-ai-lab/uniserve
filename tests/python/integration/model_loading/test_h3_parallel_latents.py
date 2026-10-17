@@ -61,6 +61,21 @@ _LAYOUTS = {
         ("heads",),
         AttentionParallelConfig(heads=Ulysses("heads")),
     ),
+    "ulysses4_exchange": (
+        (3, 1, 2, 0),
+        (4,),
+        ("heads",),
+        AttentionParallelConfig(heads=Ulysses("heads", projection="exchange")),
+    ),
+    # 1,024-row exchange steps: several overlapped steps per shard.
+    "ulysses4_exchange_steps": (
+        (3, 1, 2, 0),
+        (4,),
+        ("heads",),
+        AttentionParallelConfig(
+            heads=Ulysses("heads", projection="exchange", projection_rows=1024)
+        ),
+    ),
     "local": ((3,), (1,), ("tp",), AttentionParallelConfig()),
     "ulysses2": (
         (3, 1),
@@ -431,7 +446,11 @@ def generation_requests(request):
         for precision in ("fp8", "mxfp8", "nvfp4", "maximum")
     ]
     + [("fp8", "ulysses2", 1)]
-    + [(precision, "ulysses4", 4) for precision in ("nvfp4", "maximum")],
+    + [(precision, "ulysses4", 4) for precision in ("nvfp4", "maximum")]
+    + [
+        (precision, "ulysses4_exchange_steps", 1)
+        for precision in ("fp8", "mxfp8", "nvfp4", "maximum")
+    ],
 )
 def test_parallel_layout_generates_usable_decoder_latents(
     generation_requests, tmp_path, precision, kind, encoder_tp

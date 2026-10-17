@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import ItemsView, Iterator, Mapping
+from dataclasses import dataclass
 from math import sqrt
 from typing import cast
 
@@ -35,9 +36,14 @@ def _distribution(
     return Distribution(mesh, (Replicate() if dim is None else Shard(dim),))
 
 
-def _input(module: Linear, x: torch.Tensor) -> torch.Tensor:
+def _input(
+    module: Linear, x: torch.Tensor, *, amax: torch.Tensor | None = None
+) -> torch.Tensor:
     """Interpret leading axes as logical matrix rows before choosing
     statistics.
+
+    ``amax`` supplies statistics already reduced over the whole input domain
+    when ``x`` holds only some of its rows.
     """  # noqa: D205
     if module.input_quantizer is None or isinstance(x, QuantizedTensor):
         return x
@@ -45,10 +51,13 @@ def _input(module: Linear, x: torch.Tensor) -> torch.Tensor:
     binding = _binding.matmul.get().get(id(module))
     if binding is not None:
         return binding.quantize(
-            matrix, module.input_quantizer, module.input_distribution
+            matrix,
+            module.input_quantizer,
+            module.input_distribution,
+            amax=amax,
         )
     return module.input_quantizer.quantize(
-        matrix, distribution=module.input_distribution
+        matrix, distribution=module.input_distribution, amax=amax
     )
 
 
@@ -382,6 +391,26 @@ class RowParallelLinear(Linear):
             yield interval, self(encoded, output_dtype=output_dtype)
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectionExchange:
+    """Members a merged head projection sends head shards to.
+
+    Each of ``group.size`` members projects its own token rows for every
+    member's heads and sends each member that member's shard. ``rows`` is
+    the number of local rows each overlapped step projects and sends;
+    ``None`` exchanges the whole shard once, before any row is yielded.
+    """
+
+    group: Communicator
+    rows: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.rows is not None and (
+            type(self.rows) is not int or self.rows < 1
+        ):
+            raise ValueError("exchange steps hold a positive number of rows")
+
+
 class MergedColumnParallelLinear(nn.Module):
     """Fuse named column projections while preserving each logical parameter."""
 
@@ -417,6 +446,10 @@ class MergedColumnParallelLinear(nn.Module):
             }
         )
         self.branch_width = branch_width
+        # Bound by parallelize_ for a Ulysses "exchange" projection: every
+        # member projects all heads of its own rows with whole weights and
+        # sends each member its head shard instead of gathering input rows.
+        self.exchange: ProjectionExchange | None = None
         _coalesce(self.projections)
 
     def _branches(self) -> ItemsView[str, ColumnParallelLinear]:
@@ -491,11 +524,29 @@ class MergedColumnParallelLinear(nn.Module):
         """Allocate ``[rows, width]`` outputs of every branch in one storage.
 
         The branches are adjacent channel views of one row-major matrix, so
-        one fused GEMM can write any row interval of all of them.
+        one fused GEMM can write any row interval of all of them. Under an
+        exchange projection each branch holds this member's head shard as
+        its own contiguous block instead.
         """
         widths = tuple(
             int(branch.weight.shape[0]) for _, branch in self._branches()
         )
+        if self.exchange is not None:
+            # Each branch's head shard is one contiguous [rows, width /
+            # members] block of the storage, the layout one received step of
+            # a peer fills with a single transfer.
+            members = self.exchange.group.size
+            shards = tuple(width // members for width in widths)
+            storage = torch.empty(
+                rows * sum(shards), dtype=dtype, device=device
+            )
+            blocks = storage.split(tuple(rows * width for width in shards))
+            return {
+                name: block.view(rows, width)
+                for name, block, width in zip(
+                    self.projections, blocks, shards, strict=True
+                )
+            }
         packed = torch.empty((rows, sum(widths)), dtype=dtype, device=device)
         return dict(
             zip(self.projections, packed.split(widths, dim=-1), strict=True)
@@ -522,9 +573,21 @@ class MergedColumnParallelLinear(nn.Module):
         from ._chunks import (
             _assemble,
             _partition,
+            exchanged_projection,
             materialize_input,
             projection_inputs,
         )
+
+        if self.exchange is not None:
+            yield from exchanged_projection(
+                self,
+                x,
+                token_slice=token_slice,
+                num_tokens=num_tokens,
+                output_dtype=output_dtype,
+                out=out,
+            )
+            return
 
         branches = tuple(branch for _, branch in self._branches())
         # ``out`` holds the context interval's rows, which start at the

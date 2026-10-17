@@ -262,6 +262,56 @@ class NcclCommunicator:
             *self._arguments(value, output, asynchronous=True),
         )
 
+    def start_exchange(
+        self,
+        transfers: list[tuple[int, torch.Tensor | None, torch.Tensor | None]],
+    ) -> _CollectiveWork:
+        """Send and receive per-peer tensors as one transfer-stream group.
+
+        Each ``(peer, send, receive)`` names a global rank of this group, the
+        contiguous tensor sent to it and the contiguous tensor received from
+        it; either may be ``None``. The consumer joins the returned work
+        before it reads a received tensor or reuses a sent one.
+        """
+        operations = []
+        for peer, send, receive in transfers:
+            for value, call in (
+                (send, self._nccl.send),
+                (receive, self._nccl.recv),
+            ):
+                if value is None or not value.numel():
+                    continue
+                if (
+                    not value.is_contiguous()
+                    or value.device != self._stream.device
+                ):
+                    raise ValueError(
+                        "exchanged tensors must be contiguous on their device"
+                    )
+                operations.append((call, value, self._ranks.index(peer)))
+
+        transfer = self._transfer
+        if not self._comm.value or transfer is None:
+            raise RuntimeError("computation collective is closed")
+
+        def launch():
+            communicator, stream = self._comm.value, transfer.cuda_stream
+            self._nccl.group_start()
+            try:
+                for call, value, peer in operations:
+                    call(
+                        value.data_ptr(),
+                        value.numel(),
+                        self._dtype(value),
+                        peer,
+                        communicator,
+                        stream,
+                    )
+            finally:
+                self._nccl.group_end()
+
+        return self._start(launch)
+
     def _dtype(self, value: torch.Tensor) -> int:
         types = self._nccl.DataType
         return {

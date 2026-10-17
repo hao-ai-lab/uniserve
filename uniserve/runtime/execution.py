@@ -504,6 +504,59 @@ class ExecutionContext(Generic[SizeT]):
                             with pool.borrow(amount, device):
                                 pass
 
+                exchange = getattr(child, "exchange", None)
+                if (
+                    isinstance(child, MergedColumnParallelLinear)
+                    and exchange is not None
+                ):
+                    # An exchange projects each step's rows for every
+                    # member's heads into backing that stays readable until
+                    # the step's transfer is joined: one step slot when the
+                    # whole shard is one step, two when a transfer overlaps
+                    # the next step, and for encoded inputs a whole-weight
+                    # projection region per slot before its member split.
+                    group = exchange.group
+                    amount = None
+                    if max_rows is not None:
+                        capacity = -(-max_rows // group.size)
+                        rows = (
+                            capacity
+                            if exchange.rows is None
+                            else min(exchange.rows, capacity)
+                        )
+                        # Merged construction registers only column branches.
+                        branches = cast(
+                            tuple[ColumnParallelLinear, ...],
+                            tuple(child.projections.values()),
+                        )
+                        width = sum(
+                            int(branch.weight.shape[0]) for branch in branches
+                        )
+                        encoded = any(
+                            branch.input_quantizer is not None
+                            for branch in branches
+                        )
+                        slots = 1 if exchange.rows is None else 2
+                        amount = (
+                            slots
+                            * (1 + encoded)
+                            * rows
+                            * width
+                            * dtype.itemsize
+                        )
+                    if self.stream is not None:
+                        pool = self.stream.communication.gather_pool(group)
+                    else:
+                        if group not in self._gather_pools:
+                            self._gather_pools[group] = GatherPool(group)
+                        pool = self._gather_pools[group]
+                    self._chunks[id(child)] = partial(
+                        pool.borrow, capacity=amount
+                    )
+                    if amount:
+                        with pool.borrow(amount, device):
+                            pass
+
                 if isinstance(child, FusedMoE):
                     moe_binding = MoEBinding(
                         child,

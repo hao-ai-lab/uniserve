@@ -1,6 +1,7 @@
 """Mathematical axes for head exchange and context visibility."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 def _axis(value: str) -> None:
@@ -10,12 +11,44 @@ def _axis(value: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class Ulysses:
-    """Exchange token and head partitions along one topology axis."""
+    """Exchange token and head partitions along one topology axis.
+
+    ``projection`` selects how a merged head projection whose branches are
+    whole heads (``branch_width``) reaches each member's heads; both produce
+    the same values:
+
+    - ``"gather"``: every member gathers all members' input rows and projects
+      its own head shard, with weights partitioned by head. A member receives
+      ``(members - 1) / members`` of the input rows at the input width.
+    - ``"exchange"``: every member projects its own rows for all heads, with
+      whole weights, and sends each member that member's head shard. A member
+      receives the same rows at its shard's projected width.
+
+    ``projection_rows`` applies to ``"exchange"`` only: each member projects
+    and sends its rows in steps of that many rows, so a step's transfer
+    overlaps the next step's projection and the attention preparation of
+    landed rows. ``None`` projects and exchanges the whole shard once and
+    prepares no row before the exchange completes. A step must hold whole
+    attention tiles.
+    """
 
     axis: str = "ulysses"
+    projection: Literal["gather", "exchange"] = "gather"
+    projection_rows: int | None = None
 
     def __post_init__(self) -> None:
         _axis(self.axis)
+        if self.projection not in ("gather", "exchange"):
+            raise ValueError("Ulysses projection must be gather or exchange")
+        if self.projection_rows is not None and (
+            type(self.projection_rows) is not int
+            or self.projection_rows < 1
+            or self.projection != "exchange"
+        ):
+            raise ValueError(
+                "projection_rows is a positive row count of an exchange "
+                "projection"
+            )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

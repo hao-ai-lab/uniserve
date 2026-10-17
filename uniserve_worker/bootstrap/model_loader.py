@@ -302,12 +302,20 @@ def attention_parallel(component: ComponentConfig) -> AttentionParallelConfig:
 
     The ``ulysses`` and ``hybrid`` sequence-parallel kinds partition attention
     heads; ``allgather`` and ``hybrid`` gather the context partition over the
-    ``cp`` axis. ``initialize_components`` passes the same value to
+    ``cp`` axis. A ``ulysses`` component also carries its head projection
+    mode. ``initialize_components`` passes the same value to
     ``communication_axes`` to decide which fibers need backend groups, and
     ``load_worker_model`` passes it to the model loader.
     """
     sequence = component.parallel_config.sequence_parallel
-    heads = Ulysses() if sequence.kind in {"ulysses", "hybrid"} else None
+    heads = (
+        Ulysses(
+            projection=sequence.projection,
+            projection_rows=sequence.projection_rows,
+        )
+        if sequence.kind in {"ulysses", "hybrid"}
+        else None
+    )
     context = (
         ContextParallelConfig(gather_axis="cp")
         if sequence.kind in {"allgather", "hybrid"}

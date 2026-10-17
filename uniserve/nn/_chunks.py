@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TypeGuard
@@ -12,6 +13,7 @@ from uniserve.distributed.chunks import gather_chunks, payload_rows
 from uniserve.quantization import QuantizedTensor, Quantizer, ScaleLayout
 
 from . import _binding
+from .functional._linear import apply_merged_linear
 from .functional._tensors import as_matrix
 
 
@@ -361,6 +363,260 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
         finally:
             for _, _, target, work in pending[consumed:]:
                 work.wait()
+
+
+def exchanged_projection(
+    module,
+    x,
+    *,
+    token_slice: slice,
+    num_tokens: int,
+    output_dtype: torch.dtype | None,
+    out,
+):
+    """Project this member's tokens for every member's heads and exchange them.
+
+    ``module`` is a merged projection bound with a ``ProjectionExchange`` of
+    ``members`` ranks: every rank holds all heads' weights and its own
+    ``token_slice`` of the ``num_tokens`` rows, an equal share each. Each
+    branch's weight rows are ``members`` consecutive head shards, member
+    ``m``'s shard first at row ``m * width``.
+
+    The shard is processed in steps of ``exchange.rows`` local rows counted
+    from its first row, whatever intervals ``x`` arrives in, so every
+    member's step ``s`` covers the same local rows and its sends pair with
+    the peers' receives; without ``rows`` the whole shard is one step. A
+    step projects its rows for every member's head shard (one batched GEMM
+    per branch for unencoded inputs; for an input quantizer, the module's
+    bound encoded GEMM over the whole weight, whose shards are then
+    transposed into contiguous send blocks); this member's own shard is
+    copied into ``out`` and every other shard is sent to its member, while
+    the members' shards of the same local rows of their tokens land in
+    ``out`` at their rows. Quantizers whose statistics span the whole input
+    reduce this member's complete shard with the other members' first, so
+    every step encodes with the statistics a gathered input would have.
+    ``out`` is ``output_buffers`` storage for all ``num_tokens`` rows
+    (allocated when ``None``). Each step's projections and send blocks live
+    in the module's exchange backing, which an ``ExecutionContext`` prepares
+    graph-stable for its token capacity.
+
+    Yields ``(rows, branch views)`` as rows land. With steps, this member's
+    own rows of a step come at once and every other member's rows of a step
+    once the next step's transfer has started; without them, all rows come
+    after the single transfer completes. Closing the generator early joins
+    the transfers in flight before their storage can be reused.
+    """
+    exchange = module.exchange
+    group = exchange.group
+    members, me = group.size, group.rank
+    capacity = num_tokens // members
+    if num_tokens % members or token_slice != slice(
+        me * capacity, (me + 1) * capacity
+    ):
+        raise ValueError(
+            "an exchanged projection takes this member's equal token share"
+        )
+    branches = tuple(module._branches())
+    quantizers = {branch.input_quantizer for _, branch in branches}
+    if len(quantizers) != 1:
+        raise ValueError(
+            "an exchanged projection encodes one input for every branch"
+        )
+    quantizer = next(iter(quantizers))
+    first_branch = branches[0][1]
+    step_rows = (
+        capacity if exchange.rows is None else min(exchange.rows, capacity)
+    )
+
+    chunks = ((token_slice, x),) if isinstance(x, torch.Tensor) else x
+    amax = None
+    if tensor_statistics(quantizer):
+        # Tensor-wide statistics span every member's rows: reduce this
+        # member's complete shard with the others' before encoding a step.
+        whole = _assemble(
+            chunks,
+            token_slice,
+            first_branch.weight.shape[1],
+            first_branch.weight,
+        )
+        if isinstance(whole, QuantizedTensor):
+            raise ValueError("an exchanged projection encodes its own input")
+        amax = quantizer.amax(
+            as_matrix(whole), distribution=first_branch.input_distribution
+        )
+        chunks = ((token_slice, whole),)
+
+    def pieces():
+        """Regroup the input intervals into whole steps of local rows."""
+        held, count, cursor = [], 0, token_slice.start
+        for interval, rows in chunks:
+            rows = as_matrix(rows)
+            _check_chunk(
+                interval, rows, cursor, token_slice.stop, rows.shape[-1]
+            )
+            cursor = interval.stop
+            held.append(rows)
+            count += rows.shape[0]
+            while count >= step_rows or (count and cursor == token_slice.stop):
+                joined = held[0] if len(held) == 1 else torch.cat(held)
+                step = min(count, step_rows)
+                yield joined[:step]
+                held = [joined[step:]] if step < count else []
+                count -= step
+        if cursor != token_slice.stop:
+            raise ValueError("projection chunks must cover the local shard")
+
+    widths = {name: int(branch.weight.shape[0]) for name, branch in branches}
+    total = sum(widths.values())
+    # Projection backing per step slot: the members' shards of every branch,
+    # and for encoded inputs the whole-weight projection they are split
+    # from. A stepped exchange alternates two slots, so a slot is rewritten
+    # only after the transfer that read it has been joined.
+    slots = 1 if exchange.rows is None else 2
+    regions = 1 + (quantizer is not None)
+
+    def blocks(storage, slot, region, count, dtype, element):
+        """Carve ``{branch: count x width}`` blocks of one slot region."""
+        offset = ((slot * regions + region) * step_rows * total) * element
+        flat = storage[offset : offset + count * total * element].view(dtype)
+        result, cursor = {}, 0
+        for name, width in widths.items():
+            result[name] = flat[cursor : cursor + count * width]
+            cursor += count * width
+        return result
+
+    def shards(values, dtype, storage, slot, element):
+        """Project one step's rows: ``{branch: [members, rows, width]}``."""
+        count = values.shape[0]
+        send = {
+            name: block.view(members, count, widths[name] // members)
+            for name, block in blocks(
+                storage, slot, 0, count, dtype, element
+            ).items()
+        }
+        if quantizer is None:
+            # The rows broadcast across the member batch without a copy.
+            batch = values.unsqueeze(0).expand(members, -1, -1)
+            for name, branch in branches:
+                width = widths[name] // members
+                torch.bmm(
+                    batch,
+                    branch.weight.view(members, width, -1).transpose(1, 2),
+                    out=send[name],
+                )
+                if branch.bias is not None:
+                    send[name].add_(branch.bias.view(members, 1, width))
+            return send
+
+        from .linear import _input
+
+        whole = {
+            name: block.view(count, widths[name])
+            for name, block in blocks(
+                storage, slot, 1, count, dtype, element
+            ).items()
+        }
+        apply_merged_linear(
+            _input(first_branch, values, amax=amax),
+            {name: branch.weight for name, branch in branches},
+            {name: branch.bias for name, branch in branches},
+            branch_width=module.branch_width,
+            output_dtype=dtype,
+            out=whole,
+            operator=_binding.merged_matmul.get().get(id(module)),
+        )
+        # Each member's heads are a column block of the whole projection;
+        # a transfer needs them contiguous.
+        for name in widths:
+            send[name].copy_(
+                whole[name].view(count, members, -1).transpose(0, 1)
+            )
+        return send
+
+    pieces_left = pieces()
+    first_piece = next(pieces_left, None)
+    if first_piece is None:
+        return
+    dtype = first_piece.dtype if output_dtype is None else output_dtype
+    if quantizer is None and dtype != first_piece.dtype:
+        raise ValueError(
+            "an unencoded exchanged projection keeps the input dtype"
+        )
+    element = torch.empty((), dtype=dtype).element_size()
+    if out is None:
+        out = module.output_buffers(
+            num_tokens, dtype=dtype, device=first_piece.device
+        )
+
+    pending = previous = None
+    start = 0
+    size = slots * regions * step_rows * total * element
+    with _storage(module, size, first_piece.device) as storage:
+        try:
+            for index, values in enumerate(
+                itertools.chain((first_piece,), pieces_left)
+            ):
+                count = values.shape[0]
+                first = me * capacity + start
+                projected = shards(
+                    values, dtype, storage, index % slots, element
+                )
+                transfers = []
+                for name, value in projected.items():
+                    out[name][first : first + count].copy_(value[me])
+                    for member in range(members):
+                        if member != me:
+                            rows_of = member * capacity + start
+                            transfers.append(
+                                (
+                                    member,
+                                    value[member],
+                                    out[name][rows_of : rows_of + count],
+                                )
+                            )
+                transfer = group.start_exchange(transfers, device=values.device)
+                previous, pending = pending, (transfer, start, count)
+                if exchange.rows is None:
+                    # The whole shard's transfer completes before
+                    # preparation.
+                    transfer.wait()
+                yield (
+                    slice(first, first + count),
+                    {
+                        name: out[name][first : first + count]
+                        for name, _ in branches
+                    },
+                )
+                if previous is not None:
+                    yield from _landed(
+                        previous, members, me, capacity, branches, out
+                    )
+                start += count
+            if pending is not None:
+                previous, pending = pending, None
+                yield from _landed(
+                    previous, members, me, capacity, branches, out
+                )
+        finally:
+            # The backing returns to its pool only after every transfer that
+            # reads or writes it has been joined; joining twice does nothing.
+            for step in (previous, pending):
+                if step is not None:
+                    step[0].wait()
+
+
+def _landed(pending, members, me, capacity, branches, out):
+    """Join one step's transfer and yield the rows the other members sent."""
+    transfer, start, count = pending
+    transfer.wait()
+    for member in range(members):
+        if member == me:
+            continue
+        first = member * capacity + start
+        yield (
+            slice(first, first + count),
+            {name: out[name][first : first + count] for name, _ in branches},
+        )
 
 
 def _check_chunk(interval, value, cursor, stop, width):

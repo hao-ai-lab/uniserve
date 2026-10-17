@@ -16,6 +16,7 @@ from uniserve.nn.linear import (
     ColumnParallelLinear,
     Linear,
     MergedColumnParallelLinear,
+    ProjectionExchange,
     QKVParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
@@ -417,6 +418,7 @@ def parallelize_(
     # interleaved-branch projections and each QKV layer's KV head geometry.
     kv: dict[int, tuple[int, int, slice]] = {}
     projected = {}
+    exchanged: set[int] = set()
     for child in modules:
         if (
             isinstance(child, MergedColumnParallelLinear)
@@ -441,6 +443,24 @@ def parallelize_(
                         "channel groups"
                     )
                 projected[id(branch)] = projection_group, axes, head_axis
+
+            # An exchange projection keeps the weights whole and sends each
+            # member its head shard of this member's rows; it needs every
+            # member to own whole heads of an unpartitioned weight.
+            ulysses = attention.heads
+            if ulysses is not None and ulysses.projection == "exchange":
+                if attention.context is not None or group.size > 1:
+                    raise ValueError(
+                        "an exchange projection requires a Ulysses partition "
+                        "without tensor or context partitions"
+                    )
+                if projection_group.size > 1:
+                    child.exchange = ProjectionExchange(
+                        projection_group, ulysses.projection_rows
+                    )
+                    exchanged.update(
+                        id(branch) for _, branch in child._branches()
+                    )
 
         if isinstance(child, QKVParallelLinear):
             if child.num_heads % group.size:
@@ -583,7 +603,7 @@ def parallelize_(
                 # Replicated KV heads: this rank projects its one head.
                 _, head_dim, local = kv_partition
                 row = slice(local.start * head_dim, local.stop * head_dim)
-            else:
+            elif id(child) not in exchanged:
                 if child.out_features % column_group.size:
                     raise ValueError(
                         "column output channels must divide the "
@@ -598,8 +618,13 @@ def parallelize_(
             if projection is not None:
                 if projection[2] is not None:
                     output_places[mesh.axes.index(projection[2])] = Shard(1)
+                # An exchanged branch projects this member's own rows with
+                # its whole weight; the merged projection sends each head
+                # shard to its member instead of gathering input rows.
                 child.gather_axes = (
-                    () if projection[2] is None else (projection[2],)
+                    ()
+                    if projection[2] is None or id(child) in exchanged
+                    else (projection[2],)
                 )
         elif isinstance(child, RowParallelLinear):
             weight_dim = 1
@@ -622,6 +647,7 @@ def parallelize_(
             tuple(
                 Shard(weight_dim)
                 if weight_dim is not None
+                and id(child) not in exchanged
                 and axis in (("tp",) if projection is None else projection[1])
                 else Replicate()
                 for axis in mesh.axes

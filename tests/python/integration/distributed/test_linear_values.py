@@ -220,6 +220,55 @@ def _run(rank, rendezvous):
                             values[name], expected[name][interval]
                         )
 
+        # Whole-head projections reach every member's heads of every token
+        # in each Ulysses mode; each member's 5 rows arrive in pieces of its
+        # own size while the stepped exchange projects 2 rows at a time.
+        count, heads = 20, torch.arange(64, dtype=torch.float32)
+        heads = (heads.reshape(8, 8) % 7 + 1) / 8
+        source = (
+            torch.arange(count * 8, dtype=torch.float32).reshape(count, 8) % 5
+        ) / 4
+        start, stop = tokens.rank * 5, (tokens.rank + 1) * 5
+        for mode in (
+            Ulysses("tokens"),
+            Ulysses("tokens", projection="exchange"),
+            Ulysses("tokens", projection="exchange", projection_rows=2),
+        ):
+            merged = MergedColumnParallelLinear(
+                8, {"q": 8, "k": 8}, branch_width=2, bias=False
+            )
+            for branch in merged.projections.values():
+                branch.weight.copy_(heads)
+            parallelize_(
+                merged,
+                token_mesh,
+                attention=AttentionParallelConfig(heads=mode),
+            )
+            expected = F.linear(source, heads)[
+                :, tokens.rank * 2 : (tokens.rank + 1) * 2
+            ]
+            with ExecutionContext(merged, matmul="torch") as context:
+                context.prepare(TextSize(count, 1))
+                pieces = (
+                    (
+                        slice(row, min(row + tokens.rank + 1, stop)),
+                        source[row : min(row + tokens.rank + 1, stop)],
+                    )
+                    for row in range(start, stop, tokens.rank + 1)
+                )
+                out = merged.output_buffers(
+                    count, dtype=source.dtype, device=source.device
+                )
+                for _ in merged.forward_chunks(
+                    pieces,
+                    token_slice=slice(start, stop),
+                    num_tokens=count,
+                    out=out,
+                ):
+                    pass
+                for name in merged.projections:
+                    torch.testing.assert_close(out[name], expected)
+
 
 def test_parallel_projection_values(tmp_path):
     mp.spawn(_run, args=((tmp_path / "linear").as_uri(),), nprocs=4, join=True)

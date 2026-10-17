@@ -20,6 +20,33 @@ from .resources import streams_idle
 
 ResultT = TypeVar("ResultT")
 
+# Caching-allocator option that lets a capture reuse a freed block another
+# stream used, once the capture's dependencies show that use complete.
+_CROSS_STREAM_REUSE = "graph_capture_record_stream_reuse"
+
+
+def _reuse_joined_cross_stream_blocks() -> None:
+    """Let captures reuse freed blocks whose other-stream uses are joined.
+
+    PyTorch's NCCL point-to-point calls, which the process-group transport
+    issues for a projection exchange, record the NCCL stream on every tensor
+    they send or receive. By default the caching allocator never reuses such
+    a block inside a capture, even after the consumer stream has joined the
+    NCCL work, so a captured forward that receives into a fresh output each
+    layer keeps every layer's output reserved until the capture ends. With
+    this option the allocator reuses the block once the capture's dependency
+    graph orders the new allocation after those uses.
+
+    The option is added to the process's current allocator settings, which
+    are otherwise re-parsed with their defaults; an explicit setting of it is
+    left as configured.
+    """
+    settings = torch._C._accelerator_getAllocatorSettings()
+    if _CROSS_STREAM_REUSE not in settings:
+        torch._C._accelerator_setAllocatorSettings(
+            ",".join(filter(None, (settings, f"{_CROSS_STREAM_REUSE}:True")))
+        )
+
 
 class CUDAGraphError(RuntimeError):
     """A capture or replay failure.
@@ -188,6 +215,7 @@ class CUDAGraph(Generic[ResultT]):
                     # would defeat their shared allocation lifetime.
                     torch.cuda.synchronize(device)
                     torch.cuda.empty_cache()
+                    _reuse_joined_cross_stream_blocks()
                     # Warmup can run on a different host thread. cuBLAS
                     # handles are thread-local and must be created before
                     # capture, on the stream that will use their workspace.

@@ -152,6 +152,37 @@ class Communicator:
             return communication.Transfer(None, value.device)
         return communication.start_all_to_all(output, value, self._require())
 
+    def start_exchange(
+        self,
+        transfers: list[tuple[int, torch.Tensor | None, torch.Tensor | None]],
+        *,
+        device: torch.device,
+    ) -> communication.Transfer:
+        """Send and receive per-member tensors in one launch.
+
+        Each ``(member, send, receive)`` sends ``send`` to another member
+        and receives ``receive`` from it; a member may appear several times,
+        and its entries pair with the peer's entries for this member in
+        order. Every tensor is contiguous and each received tensor matches
+        what its peer sends. Read a received tensor, or reuse a sent one,
+        after the returned transfer's ``wait``.
+        """
+        if any(
+            not 0 <= member < self.size or member == self.rank
+            for member, _, _ in transfers
+        ):
+            raise ValueError("an exchange names other members of the group")
+        if self.size == 1 or not transfers:
+            return communication.Transfer(None, device)
+        return communication.start_exchange(
+            [
+                (self.ranks[member], send, receive)
+                for member, send, receive in transfers
+            ],
+            self._require(),
+            device,
+        )
+
     def all_reduce(
         self,
         value: torch.Tensor,
