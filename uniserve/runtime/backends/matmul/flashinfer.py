@@ -40,6 +40,19 @@ class _FlashInferOperator(_Operator):
             else torch.empty(out.shape, dtype=out.dtype, device=out.device)
         )
 
+        # FlashInfer launches its CUTLASS NVFP4 GEMM with programmatic
+        # dependent launch: the GEMM's thread blocks may start while the
+        # kernel before it on the stream still runs, and its epilogue reads
+        # alpha from device memory as each block starts, before waiting for
+        # that kernel. Alpha is therefore computed before the operands are
+        # repacked. CUTLASS serves only linear input scales, so their swizzle
+        # kernels always run between the alpha write and the GEMM, which
+        # cannot start before the alpha write has completed.
+        alpha = (
+            x.buffers()["tensor_scale"] * self.weight.buffers()["tensor_scale"]
+            if format == "nvfp4"
+            else None
+        )
         left = x.repack(scale_layout=ScaleLayout.SWIZZLED_128X4).buffers()
         right = self.weight.repack(
             scale_layout=ScaleLayout.SWIZZLED_128X4
@@ -70,7 +83,7 @@ class _FlashInferOperator(_Operator):
                 right["values"].T,
                 left["block_scale"],
                 right["block_scale"],
-                left["tensor_scale"] * right["tensor_scale"],
+                alpha,
                 out=target,
                 out_dtype=out.dtype,
                 backend=backend,
