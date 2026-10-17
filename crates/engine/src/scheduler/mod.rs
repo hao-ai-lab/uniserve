@@ -81,7 +81,7 @@ use crate::scheduler::generation::{
     is_prompt_extend,
 };
 
-use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx};
+use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx, Submission};
 use crate::kv::{BlockPool, BlockTable, KvAllocation, KvCacheCoordinator};
 use crate::storage::{
     BufferPool, BufferSpan, KVCacheManager, LatentPages, LatentPool, RequestPool, RequestSlot,

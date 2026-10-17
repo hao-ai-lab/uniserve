@@ -11,9 +11,12 @@
 //!
 //! - a token request of two tokens, which runs a prefill and a decode that
 //!   consumes the prefill's token;
-//! - `canvas_step_rows` canvas requests that generate one block more each, so
-//!   the canvas steps run at every row count from the whole chunk down to
-//!   one, and the committed blocks run the prefill kernels of a commit;
+//! - for each row count from `canvas_step_rows` down to one, that many
+//!   canvas requests of one block, submitted together: they prefill their
+//!   prompts in one batch and then step together, so every canvas step of
+//!   the group runs with exactly that many rows. The one-row request
+//!   generates a second block, so its committed block runs the prefill
+//!   kernels of a commit;
 //! - for each image shape, one image request of two denoising steps at the
 //!   shape's guidance scales, which also decodes its image. The scheduler's
 //!   denoiser lane runs one request at a time, so serving never batches
@@ -99,13 +102,20 @@ pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<(
             .canvas_sampling
             .context("workers report canvas rows but the deployment has no canvas sampling")?;
         let length = canvas.canvas_length as usize;
-        let requests = servable(
-            (1..=info.canvas_step_rows as usize)
-                .map(|blocks| token(blocks * length))
-                .collect(),
-        );
-        if !requests.is_empty() {
-            run(core, "canvas", requests)?;
+        // Requests of different lengths stop stepping together once the
+        // shortest finishes: each commits its block in its own batch, and
+        // whether two of them step together again depends on timing. So each
+        // row count is its own group of equal requests.
+        let mut warmed = false;
+        for rows in (1..=info.canvas_step_rows as usize).rev() {
+            let blocks = if rows == 1 { 2 } else { 1 };
+            let requests = servable((0..rows).map(|_| token(blocks * length)).collect());
+            if !requests.is_empty() {
+                run(core, "canvas", requests)?;
+                warmed = true;
+            }
+        }
+        if warmed {
             tracing::info!("completed canvas generation warmup");
         }
     }
@@ -198,16 +208,13 @@ fn warmup_request(
 
 /// Submits `requests` together and waits for each to finish.
 ///
-/// The requests are all queued before any is awaited, so the scheduler
-/// batches them as it would concurrent clients.
+/// The requests reach the scheduler in one command, so it queues all of them
+/// before it forms its next batch, as it would concurrent clients that all
+/// arrived before that batch.
 fn run(core: &EngineCore, group: &str, requests: Vec<GenerationRequest>) -> anyhow::Result<()> {
-    let mut streams = requests
-        .into_iter()
-        .map(|request| {
-            core.submit(Request::from(request))
-                .map_err(|error| anyhow::anyhow!("{group} warmup was not accepted: {error}"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut streams = core
+        .submit_all(requests.into_iter().map(Request::from).collect())
+        .map_err(|error| anyhow::anyhow!("{group} warmup was not accepted: {error}"))?;
 
     for stream in &mut streams {
         await_finish(core, group, stream)?;
@@ -415,11 +422,21 @@ mod tests {
         };
         sim.set_canvas_sampling(canvas);
 
-        let steps = warmed_batches(sim, Some(canvas))
-            .into_iter()
-            .filter(|(kind, _)| *kind == CallKind::Forward(ForwardMode::TokenDenoising))
-            .map(|(_, rows)| rows)
+        let batches = warmed_batches(sim, Some(canvas));
+        let step = CallKind::Forward(ForwardMode::TokenDenoising);
+        let steps = batches
+            .iter()
+            .filter(|(kind, _)| *kind == step)
+            .map(|(_, rows)| *rows)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(steps, std::collections::BTreeSet::from([1, 2, 3]));
+
+        // A block a canvas step produced is committed by a prefill.
+        let first_step = batches.iter().position(|(kind, _)| *kind == step).unwrap();
+        assert!(
+            batches[first_step..]
+                .iter()
+                .any(|(kind, _)| *kind == CallKind::Forward(ForwardMode::Prefill))
+        );
     }
 }

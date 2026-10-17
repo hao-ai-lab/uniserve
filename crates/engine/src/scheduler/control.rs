@@ -89,10 +89,14 @@ impl Scheduler {
     /// rejections.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
-            Command::Submit { request, event_tx } => match *request {
-                Request::Generation(request) => self.enqueue(*request, event_tx),
-                Request::Diffusion(request) => self.enqueue_media(request, event_tx, now()),
-            },
+            Command::Submit(submissions) => {
+                for Submission { request, event_tx } in submissions {
+                    match *request {
+                        Request::Generation(request) => self.enqueue(*request, event_tx),
+                        Request::Diffusion(request) => self.enqueue_media(request, event_tx, now()),
+                    }
+                }
+            }
             Command::Cancel(request_id) => self.mark_cancelled(request_id, false),
             Command::Acknowledge {
                 request_id,

@@ -946,6 +946,18 @@ impl EngineCore {
         self.handle.submit(request)
     }
 
+    /// Submits translated requests together, as `EngineHandle::submit_all`:
+    /// the scheduler queues every one of them before it forms its next batch.
+    ///
+    /// Returns their event streams in submission order, and the errors of
+    /// `submit`.
+    pub fn submit_all(&self, requests: Vec<Request>) -> Result<Vec<EventRx>, SubmitError> {
+        if self.is_dead() {
+            return Err(SubmitError::Dead);
+        }
+        self.handle.submit_all(requests)
+    }
+
     /// Shuts down the scheduler, tears down its executor, and joins
     /// its thread. Idempotent.
     ///

@@ -401,15 +401,20 @@ fn event_channel_with_waker(
     )
 }
 
+/// A request and the destination of its public events.
+pub struct Submission {
+    /// Request admitted by the scheduler.
+    pub request: Box<Request>,
+    /// Destination for public request events.
+    pub event_tx: EventTx,
+}
+
 /// Command sent from a frontend handler to the scheduler thread.
 pub enum Command {
-    /// Admits a request and binds its event channel.
-    Submit {
-        /// Request admitted by the scheduler.
-        request: Box<Request>,
-        /// Destination for public request events.
-        event_tx: EventTx,
-    },
+    /// Admits requests in order and binds their event channels. The
+    /// scheduler applies the whole command before it forms another batch, so
+    /// requests submitted together are all queued for the same batch.
+    Submit(Vec<Submission>),
     /// Cancels a request on behalf of its consumer.
     Cancel(RequestId),
     /// Finishes a request with `Stop`: the frontend decoder matched one of
@@ -481,7 +486,36 @@ impl EngineHandle {
     /// channel is closed; this handle never reports `SubmitError::Dead`,
     /// which `EngineCore::submit` checks before calling it.
     pub fn submit(&self, request: impl Into<Request>) -> Result<EventRx, SubmitError> {
-        let request = request.into();
+        let (submission, events) = self.bind(request.into());
+        self.send(Command::Submit(vec![submission]))
+            .map_err(|_| SubmitError::Closed)?;
+        Ok(events)
+    }
+
+    /// Submits requests in one command and returns their event streams in
+    /// submission order.
+    ///
+    /// The scheduler queues every one of them before it forms its next batch,
+    /// as it would requests from concurrent clients that all arrived before
+    /// that batch. Separate `submit` calls give no such guarantee: the
+    /// scheduler may form batches between them. Each receiver behaves as one
+    /// returned by `submit`, and the errors are the same.
+    pub fn submit_all(
+        &self,
+        requests: impl IntoIterator<Item = Request>,
+    ) -> Result<Vec<EventRx>, SubmitError> {
+        let (submissions, streams) = requests
+            .into_iter()
+            .map(|request| self.bind(request))
+            .unzip();
+        self.send(Command::Submit(submissions))
+            .map_err(|_| SubmitError::Closed)?;
+        Ok(streams)
+    }
+
+    /// Pairs a request with a new event channel whose receiver cancels the
+    /// request when dropped before its terminal event.
+    fn bind(&self, request: Request) -> (Submission, EventRx) {
         let request_id = request.request_id();
         // Stop-string matching happens in the frontend decoder, which
         // acknowledges each token it has checked.
@@ -497,12 +531,11 @@ impl EngineHandle {
                 awaits_decoder,
             }),
         );
-        self.send(Command::Submit {
+        let submission = Submission {
             request: Box::new(request),
             event_tx,
-        })
-        .map_err(|_| SubmitError::Closed)?;
-        Ok(event_rx)
+        };
+        (submission, event_rx)
     }
 
     /// Cancels a request.
@@ -565,6 +598,17 @@ mod tests {
         }
     }
 
+    /// Request ids of a `Command::Submit`, in submission order.
+    fn submitted_ids(command: Command) -> Vec<RequestId> {
+        match command {
+            Command::Submit(submissions) => submissions
+                .iter()
+                .map(|submission| submission.request.request_id())
+                .collect(),
+            _ => panic!("expected Submit command"),
+        }
+    }
+
     /// `submit` enqueues a `Command::Submit` carrying the request, and the
     /// scheduler side receives exactly that request id.
     #[test]
@@ -574,12 +618,27 @@ mod tests {
 
         let _events = handle.submit(test_request(11)).unwrap();
 
-        match rx.recv().unwrap() {
-            Command::Submit { request, .. } => {
-                assert_eq!(request.request_id(), RequestId(11));
-            }
-            _ => panic!("expected Submit command"),
-        }
+        assert_eq!(submitted_ids(rx.recv().unwrap()), vec![RequestId(11)]);
+    }
+
+    /// `submit_all` hands the scheduler every request in one command, in
+    /// submission order, so the scheduler queues them all before it forms
+    /// its next batch.
+    #[test]
+    fn submit_all_enqueues_its_requests_in_one_command() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+
+        let events = handle
+            .submit_all([test_request(21), test_request(22), test_request(23)].map(Request::from))
+            .unwrap();
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            submitted_ids(rx.recv().unwrap()),
+            vec![RequestId(21), RequestId(22), RequestId(23)]
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     /// Tokens of a request without stop strings await no decoder decision,
@@ -591,7 +650,9 @@ mod tests {
         let handle = EngineHandle::new(tx);
         let mut events = handle.submit(test_request(12)).unwrap();
         let event_tx = match rx.recv().unwrap() {
-            Command::Submit { event_tx, .. } => event_tx,
+            Command::Submit(mut submissions) if submissions.len() == 1 => {
+                submissions.pop().unwrap().event_tx
+            }
             _ => panic!("expected Submit command"),
         };
 
@@ -626,7 +687,9 @@ mod tests {
         request.stop_strings = vec!["end".to_string()];
         let mut events = handle.submit(request).unwrap();
         let event_tx = match rx.recv().unwrap() {
-            Command::Submit { event_tx, .. } => event_tx,
+            Command::Submit(mut submissions) if submissions.len() == 1 => {
+                submissions.pop().unwrap().event_tx
+            }
             _ => panic!("expected Submit command"),
         };
 
@@ -701,7 +764,9 @@ mod tests {
         let handle = EngineHandle::new(tx);
         let mut events = handle.submit(test_request(13)).unwrap();
         let event_tx = match rx.recv().unwrap() {
-            Command::Submit { event_tx, .. } => event_tx,
+            Command::Submit(mut submissions) if submissions.len() == 1 => {
+                submissions.pop().unwrap().event_tx
+            }
             _ => panic!("expected Submit command"),
         };
 
