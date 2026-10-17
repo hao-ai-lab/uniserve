@@ -37,7 +37,7 @@ pub use crate::executor::{
 };
 pub use crate::handle::{
     Command, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx,
-    StreamCancelCause, SubmitError,
+    StreamCancelCause, Submission, SubmitError,
 };
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
