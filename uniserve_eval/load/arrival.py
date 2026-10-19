@@ -33,7 +33,8 @@ class LoadResult:
     ``window_start`` and ``window_end`` are wall-clock ``time.time()``
     seconds bounding the measured window, for aligning it with telemetry
     sampled on that clock; ``duration_s`` is the same window measured on
-    the monotonic clock.
+    the monotonic clock. ``excluded_outputs`` holds a steady-state load's
+    requests that completed outside its window.
     """
 
     warmup_outputs: tuple[Any, ...]
@@ -41,6 +42,7 @@ class LoadResult:
     duration_s: float
     window_start: float = 0.0
     window_end: float = 0.0
+    excluded_outputs: tuple[Any, ...] = ()
 
 
 class WarmupFailure(RuntimeError):  # noqa: N818  # deliberate taxonomy name
@@ -97,12 +99,21 @@ async def run_load(
     warmup_rows: list[Example] | None = None,
     inspect_warmup: Callable[[list[T]], None] | None = None,
     before_measure: Callable[[], Awaitable[None]] | None = None,
+    window_s: float | None = None,
+    settle_s: float = 0.0,
 ) -> LoadResult:
     """Run excluded warmup and measured requests under a concurrency limit.
 
     Warmup sends ``rows[0]`` ``warmup_requests`` times concurrently, within
     the concurrency limit. The measured phase then submits every row once at
     its arrival time and waits for all of them.
+
+    With ``window_s``, the measured phase is a steady-state load instead:
+    ``max_concurrency`` clients each submit the next row, cycling through
+    ``rows`` in order, as soon as their previous request ends. The window
+    opens ``settle_s`` after these submissions start and lasts ``window_s``;
+    no client submits after it closes. The measured outputs are the requests
+    that completed inside the window, and ``duration_s`` is ``window_s``.
 
     Args:
         rows: Examples in submission order.
@@ -118,6 +129,10 @@ async def run_load(
             and before checking warmup success.
         before_measure: Coroutine awaited before the measured window opens;
             the runner snapshots server counters there.
+        window_s: Length of a steady-state measured window in seconds, or
+            ``None`` to send each row once. Requires ``max_concurrency`` and
+            an infinite ``request_rate``.
+        settle_s: Seconds of steady-state load before the window opens.
 
     Returns:
         Warmup and measured outputs in submission order, and the measured
@@ -135,6 +150,14 @@ async def run_load(
     """
     if not rows:
         return LoadResult((), (), 0.0)
+
+    if window_s is not None and (
+        not max_concurrency or request_rate != float("inf")
+    ):
+        raise ValueError(
+            "a steady-state window requires max_concurrency and an infinite "
+            "request_rate"
+        )
 
     # Warmup and arrival-driven measurement share the declared in-flight
     # limit. The arrival timestamp is taken before the semaphore, so time
@@ -172,6 +195,18 @@ async def run_load(
     # Align monotonic transport timestamps with wall-clock GPU telemetry.
     clock_offset = time.time() - time.perf_counter()
 
+    if window_s is not None:
+        assert max_concurrency is not None
+        return await _steady_window(
+            rows,
+            clients=max_concurrency,
+            submit=submit,
+            window_s=window_s,
+            settle_s=settle_s,
+            warmup_outputs=warmup_outputs,
+            clock_offset=clock_offset,
+        )
+
     tasks: list[asyncio.Task[T]] = []
     try:
         async for row in get_request(rows, request_rate):
@@ -201,4 +236,69 @@ async def run_load(
         last - first,
         clock_offset + first,
         clock_offset + last,
+    )
+
+
+async def _steady_window(
+    rows: list[Example],
+    *,
+    clients: int,
+    submit: Submit[T],
+    window_s: float,
+    settle_s: float,
+    warmup_outputs: list[T],
+    clock_offset: float,
+) -> LoadResult:
+    """Keep ``clients`` requests in flight and measure a fixed window.
+
+    Each client submits its next row as soon as its previous request ends,
+    so the offered load stays at ``clients`` in-flight requests, and the
+    clients share one cursor that cycles through ``rows`` in order. The
+    window spans ``[open + settle_s, open + settle_s + window_s)`` on the
+    monotonic clock, where ``open`` is when the clients start. A request is
+    measured when its final event falls inside the window, wherever it
+    started; clients stop submitting when the window closes and the requests
+    still in flight then are awaited and excluded.
+    """
+    opened = time.perf_counter()
+    start = opened + settle_s
+    end = start + window_s
+    cursor = 0
+    outputs: list[T] = []
+
+    async def client() -> None:
+        nonlocal cursor
+        while time.perf_counter() < end:
+            # The event loop runs one client at a time between awaits, so the
+            # shared cursor needs no lock.
+            row = rows[cursor % len(rows)]
+            cursor += 1
+            outputs.append(await submit(row, time.perf_counter()))
+
+    tasks = [asyncio.create_task(client()) for _ in range(clients)]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    measured: list[T] = []
+    excluded: list[T] = []
+    for output in outputs:
+        if output.final_event_time is None:
+            raise RuntimeError("request dispatch returned an unclosed record")
+        inside = start <= output.final_event_time < end
+        (measured if inside else excluded).append(output)
+    # Submission order, as the fixed-count load reports its outputs.
+    measured.sort(key=lambda output: output.start_time)
+    excluded.sort(key=lambda output: output.start_time)
+    return LoadResult(
+        tuple(warmup_outputs),
+        tuple(measured),
+        window_s,
+        clock_offset + start,
+        clock_offset + end,
+        tuple(excluded),
     )
