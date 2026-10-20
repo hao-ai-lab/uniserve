@@ -1,6 +1,6 @@
 # UniServe
 
-UniServe is a unified serving engine: a Rust server owns HTTP admission, scheduling and response assembly, and Python workers run the models. This documentation covers FastH3 text-to-video and FastH3 OmniRef reference-to-video on NVIDIA Hopper and Blackwell GPUs.
+UniServe is a unified serving engine: a Rust server owns HTTP admission, scheduling and response assembly, and Python workers run the models.
 
 ## Install
 
