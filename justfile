@@ -47,13 +47,13 @@ build-debug:
 test-python-e2e: build-debug
     {{python}} -m pytest -m "e2e and not gpu"
 
-# End-to-end Python tests (GPU, sensenova)
+# End-to-end Python tests that need GPUs and the model checkpoints they name
 test-python-gpu: build-debug
-    UNISERVE_RUN_GPU_E2E=1 {{python}} -m pytest -m "e2e and gpu and sensenova"
+    UNISERVE_RUN_GPU_E2E=1 {{python}} -m pytest -m "e2e and gpu"
 
 # Run all checks
 test-all: fmt clippy test-rust bench-build test-python-fast test-python-integration test-python-e2e
 
-# Resolve the decode-runtime suite without starting a server
-eval-plan:
-    {{python}} -m uniserve_eval plan decode-runtime
+# Resolve an evaluation suite without starting a server
+eval-plan config="uniserve_eval/fast_h3.toml" suite="gb200-4-bf16":
+    {{python}} -m uniserve_eval --config {{config}} plan {{suite}}

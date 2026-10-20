@@ -42,15 +42,6 @@ benchmarks/results/
 artifacts/
 
 target/
-refs/
-specs/
-
-AGENTS.md
-
-profile/
-
-# Standalone applications are developed and versioned outside this repository.
-/apps/
 
 # Native kernels the editable kernel package compiles in place.
 uniserve_kernels/src/**/*.so
