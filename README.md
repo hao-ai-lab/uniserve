@@ -1,6 +1,6 @@
 # UniServe
 
-UniServe is a serving engine for FastH3 video generation. It serves text-to-video (FastH3) and reference-to-video (FastH3 OmniRef) requests over HTTP on NVIDIA Hopper and Blackwell GPUs and returns each video as an MP4 with synchronized stereo audio.
+UniServe is a unified serving engine: a Rust server owns HTTP admission, scheduling and response assembly, and Python workers run the models. This documentation covers FastH3 text-to-video and FastH3 OmniRef reference-to-video on NVIDIA Hopper and Blackwell GPUs.
 
 ## Install
 
