@@ -256,9 +256,7 @@ def _omni() -> str:
     """
     export = os.environ.get("UNISERVE_FASTH3_OMNI_MODEL")
     if not export:
-        pytest.fail(
-            "UNISERVE_FASTH3_OMNI_MODEL must name a FastH3 Omni export"
-        )
+        pytest.fail("UNISERVE_FASTH3_OMNI_MODEL must name a FastH3 Omni export")
     return export
 
 
@@ -280,11 +278,11 @@ def test_omni_reference_requests(tmp_path: Path) -> None:
     )
 
 
-# The image-plus-audio request (W4) packs 7,808 condition rows on FastH3 Omni when
-# references are enlarged to the released pipeline's encoding size: its 16:9
-# reference image, enlarged to a 2048-pixel short edge, fills 57 whole 128-row
-# tiles (7,296 rows of video latents) and the five-second voice four. This
-# deployment states a 4,096-row condition capacity, below that request's.
+# The image-plus-audio request (W4) packs 7,808 condition rows on FastH3 Omni
+# when references are enlarged to the released pipeline's encoding size: its
+# 16:9 reference image, enlarged to a 2048-pixel short edge, fills 57 whole
+# 128-row tiles (7,296 rows of video latents) and the five-second voice four.
+# This deployment states a 4,096-row condition capacity, below that request's.
 SMALL_CAPACITY_OPTIONS = [
     "--mm-processor-kwargs",
     '{"enlarge_references": true}',
