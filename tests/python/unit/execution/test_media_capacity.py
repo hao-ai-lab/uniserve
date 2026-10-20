@@ -11,7 +11,7 @@ from tests.python.fixtures.h3 import (
     WIDE,
     base_config,
     fasth3_config,
-    omniref_denoiser,
+    omni_denoiser,
     text_only_config,
 )
 from uniserve.media import image, video
@@ -353,7 +353,7 @@ def test_the_largest_condition_set_follows_the_served_tasks():
         segmented = Model(
             replace(
                 base_config(),
-                denoisers={"transformer_ref": omniref_denoiser()},
+                denoisers={"transformer_ref": omni_denoiser()},
             )
         ).transformer_ref
     keyframes = (

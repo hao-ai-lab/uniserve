@@ -225,7 +225,7 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
-    /// A FastH3 OmniRef-style export pinning `BASE` at `PIN`.
+    /// A FastH3 Omni-style export pinning `BASE` at `PIN`.
     fn export() -> TempDir {
         let root = tempdir().unwrap();
         write(&root.path().join("modular_model_index.json"), INDEX);

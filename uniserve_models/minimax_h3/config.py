@@ -151,7 +151,7 @@ NAMED_CANVASES = MappingProxyType(
     }
 )
 
-# A FastH3 export, DMD or OmniRef, generates 12 buckets: the named aspect
+# A FastH3 export, DMD or FastH3 Omni, generates 12 buckets: the named aspect
 # ratios at the 768p and 480p resolutions. The 768p buckets are the canvas
 # rule's canvases; the 480p buckets, (height, width) below in the same ratio
 # order, are the training table's own rather than a rescaled rule (21:9 is

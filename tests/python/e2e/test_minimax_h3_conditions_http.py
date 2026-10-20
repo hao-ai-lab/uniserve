@@ -6,7 +6,7 @@ the official first-frame request (W3) on the base release's ``transformer``
 deployment and on a FastH3 DMD student of it, and the image-plus-audio (W4)
 and official video-plus-audio (W5) reference requests on the
 ``transformer_ref`` deployment, with the base release's reference DiT and
-with a FastH3 OmniRef export. An OmniRef deployment that states a smaller
+with a FastH3 Omni export. A FastH3 Omni deployment that states a smaller
 condition capacity than the image-plus-audio request takes refuses it,
 naming its rows. Condition media are read from
 ``file://`` URIs under ``--media-directory``. Every served response is a
@@ -232,12 +232,12 @@ def test_base_reference_requests(tmp_path: Path) -> None:
     )
 
 
-# The OmniRef reference DiT packs each condition into whole 128-row tiles,
+# The FastH3 Omni reference DiT packs each condition into whole 128-row tiles,
 # a video's token grid in tiles of 4 latent frames by 4 by 8 tokens, so the
 # same video-plus-audio request takes 47,104 rows there: its 37 x 24 x 42
 # reference video fills 10 x 6 x 6 tiles and its soundtrack and audio
 # reference 4 tiles each, against 38,124 rows packed densely.
-OMNIREF_OPTIONS = [
+OMNI_OPTIONS = [
     "--max-video-seconds",
     "5",
     "--max-model-len",
@@ -249,22 +249,20 @@ OMNIREF_OPTIONS = [
 ]
 
 
-def _omniref() -> str:
-    """The OmniRef export the environment names.
+def _omni() -> str:
+    """The FastH3 Omni export the environment names.
 
     The Hugging Face cache supplies the base revision it pins.
     """
-    export = os.environ.get("UNISERVE_MINIMAX_H3_OMNIREF")
+    export = os.environ.get("UNISERVE_FASTH3_OMNI_MODEL")
     if not export:
-        pytest.fail(
-            "UNISERVE_MINIMAX_H3_OMNIREF must name a FastH3 OmniRef export"
-        )
+        pytest.fail("UNISERVE_FASTH3_OMNI_MODEL must name a FastH3 Omni export")
     return export
 
 
-def test_omniref_reference_requests(tmp_path: Path) -> None:
+def test_omni_reference_requests(tmp_path: Path) -> None:
     inputs = _inputs()
-    export = _omniref()
+    export = _omni()
     port = find_free_port()
     _reference_requests(
         _command(
@@ -272,7 +270,7 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
             "ulysses4-reference.json",
             port,
             inputs,
-            OMNIREF_OPTIONS,
+            OMNI_OPTIONS,
         ),
         f"http://127.0.0.1:{port}",
         tmp_path,
@@ -280,11 +278,11 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
     )
 
 
-# The image-plus-audio request (W4) packs 7,808 condition rows on OmniRef when
-# references are enlarged to the released pipeline's encoding size: its 16:9
-# reference image, enlarged to a 2048-pixel short edge, fills 57 whole 128-row
-# tiles (7,296 rows of video latents) and the five-second voice four. This
-# deployment states a 4,096-row condition capacity, below that request's.
+# The image-plus-audio request (W4) packs 7,808 condition rows on FastH3 Omni
+# when references are enlarged to the released pipeline's encoding size: its
+# 16:9 reference image, enlarged to a 2048-pixel short edge, fills 57 whole
+# 128-row tiles (7,296 rows of video latents) and the five-second voice four.
+# This deployment states a 4,096-row condition capacity, below that request's.
 SMALL_CAPACITY_OPTIONS = [
     "--mm-processor-kwargs",
     '{"enlarge_references": true}',
@@ -299,12 +297,12 @@ SMALL_CAPACITY_OPTIONS = [
 ]
 
 
-def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
+def test_omni_refuses_conditions_above_capacity(tmp_path: Path) -> None:
     # The latent encoder's declared bound is the condition capacity, so the
     # engine refuses the request at admission, naming the product, the bound
     # and the rows the request needs of it.
     inputs = _inputs()
-    export = _omniref()
+    export = _omni()
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
     command = _command(
