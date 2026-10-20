@@ -55,5 +55,5 @@ test-python-gpu: build-debug
 test-all: fmt clippy test-rust bench-build test-python-fast test-python-integration test-python-e2e
 
 # Resolve an evaluation suite without starting a server
-eval-plan config="uniserve_eval/fast_h3.toml" suite="gb200-4-bf16":
+eval-plan config="uniserve_eval/fasth3.toml" suite="gb200-4-bf16":
     {{python}} -m uniserve_eval --config {{config}} plan {{suite}}
