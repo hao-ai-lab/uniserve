@@ -3,24 +3,18 @@
 # it, so the inference distribution must not carry its dependencies or install
 # its console script.
 [build-system]
-requires = ["setuptools>=70", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "uniserve-eval"
 version = "0.2.0"
 description = "UniServe benchmark and evaluation driver"
+license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9",
     "pillow>=10.4",
-]
-
-[project.optional-dependencies]
-# Hub-hosted evaluation datasets (MJHQ-30K, UEval, ShareGPT, PIE-Bench, Beans).
-datasets = [
-    "datasets>=3",
-    "pyarrow<20",
 ]
 
 [project.scripts]
@@ -32,10 +26,8 @@ include = ["uniserve_eval*"]
 
 [tool.setuptools.package-data]
 uniserve_eval = [
-    "profiles.toml",
     "fast_h3.toml",
     "fast_h3_h200.toml",
     "minimax_h3.toml",
     "workloads/minimax_h3/*.jsonl",
-    "servers/minimax_h3/*.yaml",
 ]

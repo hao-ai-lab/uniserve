@@ -151,12 +151,12 @@ NAMED_CANVASES = MappingProxyType(
     }
 )
 
-# FastH3 DMD students are trained on, and generate only, 12 buckets: the
-# named aspect ratios at the 768p and 480p resolutions. The 768p buckets are
-# the canvas rule's canvases; the 480p buckets, (height, width) below in the
-# same ratio order, are the training table's own rather than a rescaled rule
-# (21:9 is 992x416, not 960x416). A deployment prepares a subset of them.
-DMD_CANVASES = MappingProxyType(
+# A FastH3 export, DMD or OmniRef, generates 12 buckets: the named aspect
+# ratios at the 768p and 480p resolutions. The 768p buckets are the canvas
+# rule's canvases; the 480p buckets, (height, width) below in the same ratio
+# order, are the training table's own rather than a rescaled rule (21:9 is
+# 992x416, not 960x416). A deployment prepares a subset of them.
+FASTH3_CANVASES = MappingProxyType(
     {
         **NAMED_CANVASES,
         (480, "21:9"): image.Config(416, 992),
@@ -744,9 +744,7 @@ def normalize(
             grids=grids,
             attention=attention,
             tasks=tasks,
-            canvases=DMD_CANVASES
-            if contract is not None and "dmd_denoising_steps" in contract
-            else None,
+            canvases=None if contract is None else FASTH3_CANVASES,
         )
     return Config(
         text_encoder=_text_encoder(

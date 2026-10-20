@@ -1,16 +1,17 @@
 """Build MiniMax-H3 video requests and inspect complete MP4s after measurement.
 
-Every request is the official MiniMax-H3 body that UniServe and SGLang
-accept: a ``task``, its ``conditions`` and a ``target`` of short edge, aspect
-ratio and duration. A t2va row carries no conditions; an fl2va or ref2va row
-lists its condition media, which the body names by ``file://`` URI under the
-point's ``video.condition_root``. The canvas and frame count a target
-resolves to follow the model package's request rules
+Every request is the official MiniMax-H3 body that UniServe accepts: a
+``task``, its ``conditions`` and a ``target`` of short edge, aspect ratio and
+duration. A t2va row carries no conditions; an fl2va or ref2va row lists its
+condition media, which the body names by ``file://`` URI under the point's
+``video.condition_root``. The canvas and frame count a target resolves to
+follow the model package's request rules
 (``uniserve_models.minimax_h3.config.canvas`` and
 ``uniserve_models.minimax_h3.processing.frame_count``), which the server's
 planner shares; validation holds every MP4 to its own request's canvas and
-frames. Media files are read when the request is built, before measurement,
-and inspection uses each request's shape and never runs inside a load slot.
+frames. Condition files are checked when the request is built, before
+measurement, and inspection uses each request's shape and never runs inside
+a load slot.
 """
 
 from __future__ import annotations
@@ -22,13 +23,10 @@ from typing import Any, ClassVar
 
 from PIL import Image
 
-from ..transport.native_video import native_request
 from ..transport.video import VideoOutputError, inspect_video_bytes
 from ..types import (
-    VIDEO_SCHEDULE_FIELDS,
     VIDEOS_SYNC,
     BenchmarkPoint,
-    ConditionMedia,
     Example,
     RequestRecord,
     TaskName,
@@ -67,32 +65,46 @@ _EXIF_ORIENTATION = 0x0112
 
 
 def target_canvas(
-    task: str, aspect_ratio: str, keyframe: tuple[int, int] | None = None
+    task: str,
+    aspect_ratio: str,
+    keyframe: tuple[int, int] | None = None,
+    short_edge: int = 768,
 ) -> tuple[int, int]:
     """Resolve the canvas of a target.
 
-    A target names ``auto`` or one of the named ratios, which the
-    adapt_shape_v1 canvas rule turns into pixels. ``auto`` is 16:9 for t2va
-    and ref2va, and for fl2va the displayed aspect of the first keyframe.
+    At the 768-pixel short edge a target names ``auto`` or one of the named
+    ratios, which the adapt_shape_v1 canvas rule turns into pixels. ``auto``
+    is 16:9 for t2va and ref2va, and for fl2va the displayed aspect of the
+    first keyframe. At the 480-pixel short edge a target names a ratio, and
+    its canvas is that FastH3 bucket.
 
     Args:
         task: ``t2va``, ``fl2va`` or ``ref2va``.
         aspect_ratio: The target's aspect ratio.
         keyframe: The first keyframe's displayed ``(width, height)``, which
             an fl2va ``auto`` target requires.
+        short_edge: The target's short edge, 768 or 480.
 
     Returns:
         The canvas as ``(width, height)`` in pixels.
 
     Raises:
-        ValueError: The task does not accept the aspect ratio, or an fl2va
-            ``auto`` target has no keyframe or one outside 1:4 to 4:1.
+        ValueError: The task does not accept the aspect ratio, an fl2va
+            ``auto`` target has no keyframe or one outside 1:4 to 4:1, or a
+            480-pixel target names ``auto``.
     """
     # The model package loads torch, which only video points need, so the
     # rules are imported on first use.
     from uniserve_models.minimax_h3 import config, processing
 
     ratio = _named_ratio(task, aspect_ratio)
+    if short_edge != config.CANVAS_SHORT_EDGE:
+        if ratio is None:
+            raise ValueError(
+                f"a {short_edge}-pixel target names its aspect ratio"
+            )
+        bucket = config.FASTH3_CANVASES[(short_edge, aspect_ratio)]
+        return bucket.width, bucket.height
     if ratio is None:
         if task != "fl2va":
             ratio = processing.DEFAULT_ASPECT_RATIO
@@ -162,7 +174,6 @@ class VideoTask(BenchmarkTask):
     name: ClassVar[TaskName] = TaskName.VIDEO
     allowed_endpoints: ClassVar[tuple[str, ...]] = (VIDEOS_SYNC, "/v1/videos")
     default_endpoint: ClassVar[str] = VIDEOS_SYNC
-    default_stream: ClassVar[bool] = False
 
     def __init__(self, point: BenchmarkPoint) -> None:
         """Bind the point to the condition media root it reads rows from."""
@@ -172,9 +183,13 @@ class VideoTask(BenchmarkTask):
 
     @classmethod
     def check_video(cls, video: VideoConfig, context: str) -> None:
-        """Reject a target ratio the task does not accept."""
+        """Reject a target the task does not accept at its short edge."""
         try:
             _named_ratio(video.task, video.aspect_ratio)
+            if video.aspect_ratio != "auto" or video.short_edge != 768:
+                target_canvas(
+                    video.task, video.aspect_ratio, short_edge=video.short_edge
+                )
         except ValueError as error:
             raise ValueError(f"{context}: {error}") from error
 
@@ -182,41 +197,33 @@ class VideoTask(BenchmarkTask):
         """Build one request from the row's duration, seed and conditions.
 
         A row without its own duration or seed takes the point's video
-        duration and load seed. The stated schedule fields are sent when the
-        point sets them. The row's condition media are read here, so a
-        backend that uploads them sends bytes already in memory.
+        duration and load seed.
 
         Raises:
-            ValueError: The duration lies outside 4 to 15 seconds, the
-                row's conditions do not fit the point's task, or the backend
-                cannot be sent them as the same work.
-            OSError: A condition media file cannot be read.
+            ValueError: The duration lies outside 4 to 15 seconds, or the
+                row's conditions do not fit the point's task.
+            FileNotFoundError: A condition media file does not exist.
         """
-        from uniserve_models.minimax_h3 import config
-
         video = self.point.video
         seconds = float(
             example.seconds if example.seconds is not None else video.seconds
         )
         frames = target_frames(seconds)
-        conditions, media = self._conditions(example)
+        conditions, paths = self._conditions(example)
 
         # Only an fl2va auto target reads its canvas from the first keyframe,
         # whose displayed size the server probes the same way.
-        keyframe = (
-            _displayed_size(Path(media[0].path))
-            if video.task == "fl2va"
-            else None
+        keyframe = _displayed_size(paths[0]) if video.task == "fl2va" else None
+        width, height = target_canvas(
+            video.task, video.aspect_ratio, keyframe, video.short_edge
         )
-        width, height = target_canvas(video.task, video.aspect_ratio, keyframe)
         payload = {
             "model": self.point.model,
             "prompt": example.prompt,
             "task": video.task,
             "conditions": conditions,
             "target": {
-                # The only short edge the canvas rule serves.
-                "short_edge": config.CANVAS_SHORT_EDGE,
+                "short_edge": video.short_edge,
                 "aspect_ratio": video.aspect_ratio,
                 "duration_seconds": seconds,
             },
@@ -226,40 +233,26 @@ class VideoTask(BenchmarkTask):
                 else self.point.load.seed
             ),
         }
-        for name in VIDEO_SCHEDULE_FIELDS:
-            value = getattr(video, name)
-            if value is not None:
-                payload[name] = value
-        request = TaskRequest(
+        return TaskRequest(
             self.point.endpoint,
             payload,
-            stream=False,
-            video_backend=video.backend,
-            poll_interval_s=video.poll_interval_s,
-            video_extra_params=dict(video.extra_params),
             video_shape=VideoShape(width=width, height=height, frames=frames),
-            condition_media=tuple(media),
-            video_parallel_decoding=video.parallel_decoding,
+            poll_interval_s=video.poll_interval_s,
         )
-        # A request its backend cannot take as the same work fails here,
-        # before measurement, rather than as a measured transport failure.
-        native_request(request)
-        return request
 
     def _conditions(
         self, example: Example
-    ) -> tuple[list[dict[str, Any]], list[ConditionMedia]]:
-        """Return a row's request conditions and their media, in row order.
+    ) -> tuple[list[dict[str, Any]], list[Path]]:
+        """Return a row's request conditions and their files, in row order.
 
         Each condition names its file by an absolute ``file://`` URI. The
-        rows' structure is checked only as far as the canvas and the
-        backends' request forms depend on it: t2va takes no conditions,
-        fl2va only image keyframes, and ref2va at least one reference. The
-        server enforces the remaining request rules.
+        rows' structure is checked only as far as the canvas depends on it:
+        t2va takes no conditions, fl2va only image keyframes, and ref2va at
+        least one reference. The server enforces the remaining request rules.
 
         Raises:
             ValueError: The conditions do not fit the point's task.
-            OSError: A media file cannot be read.
+            FileNotFoundError: A media file does not exist.
         """
         task = self.point.video.task
         rows = example.conditions or []
@@ -272,7 +265,7 @@ class VideoTask(BenchmarkTask):
 
         assert self.condition_root is not None
         conditions: list[dict[str, Any]] = []
-        media: list[ConditionMedia] = []
+        paths: list[Path] = []
         for index, row in enumerate(rows):
             context = f"row {example.id} conditions[{index}]"
             kind, role = row.get("type"), row.get("role")
@@ -287,6 +280,9 @@ class VideoTask(BenchmarkTask):
             mime = MEDIA_TYPES.get(path.suffix.lower())
             if mime is None or not mime.startswith(_CONDITION_MEDIA[kind]):
                 raise ValueError(f"{context}: {path.name} is not {kind} media")
+            # A missing file fails here rather than as a measured request.
+            if not path.is_file():
+                raise FileNotFoundError(f"{context}: {path} is not a file")
 
             condition: dict[str, Any] = {
                 "type": kind,
@@ -297,13 +293,13 @@ class VideoTask(BenchmarkTask):
                 if row.get(name) is not None:
                     condition[name] = row[name]
             conditions.append(condition)
-            media.append(ConditionMedia(str(path), mime, path.read_bytes()))
+            paths.append(path)
 
         if task == "ref2va" and not any(
             condition["role"] == "reference" for condition in conditions
         ):
             raise ValueError(f"row {example.id}: ref2va requires a reference")
-        return conditions, media
+        return conditions, paths
 
     def inspect_output(self, record: RequestRecord) -> None:
         """Decode and classify a response outside the load window."""

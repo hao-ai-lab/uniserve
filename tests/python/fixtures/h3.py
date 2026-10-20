@@ -20,13 +20,13 @@ from uniserve_models.minimax_h3 import (
     audio_vae,
     video_vae,
 )
-from uniserve_models.minimax_h3.config import DMD_CANVASES, read_config
+from uniserve_models.minimax_h3.config import FASTH3_CANVASES, read_config
 from uniserve_models.minimax_h3.encoder import TextEncoderConfig
 
 CHECKPOINT = Path(__file__).parent / "models/fasth3"
 
-# The 768p 16:9 canvas, one FastH3 DMD exports generate.
-WIDE = DMD_CANVASES[(768, "16:9")]
+# The 768p 16:9 canvas, one every FastH3 export generates.
+WIDE = FASTH3_CANVASES[(768, "16:9")]
 # Released audio scheduler shift.
 AUDIO_SHIFT = 3.0
 
@@ -67,7 +67,7 @@ def dmd_denoiser(
     """A FastH3 DMD student: sparse tile-64 attention, t2va and fl2va.
 
     It serves the tasks of the ``transformer`` partition it replaces and
-    generates the export's training buckets (``DMD_CANVASES``).
+    generates the export's training buckets (``FASTH3_CANVASES``).
     """
     return DenoiserConfig(
         transformer=transformer or transformer_config(),
@@ -81,7 +81,7 @@ def dmd_denoiser(
         },
         attention=SparseAttention(tile=64, sparsity=sparsity),
         tasks=("t2va", "fl2va"),
-        canvases=DMD_CANVASES,
+        canvases=FASTH3_CANVASES,
     )
 
 

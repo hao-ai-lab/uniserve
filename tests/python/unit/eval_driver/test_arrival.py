@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from uniserve_eval.load.arrival import run_load
-from uniserve_eval.types import Example, RequestRecord
+from uniserve_eval.types import RequestRecord
 
 pytestmark = pytest.mark.unit
 
@@ -16,10 +16,8 @@ def test_warmup_and_measurement_share_the_submission_concurrency_limit():
     peak = dict(active)
 
     async def submit(row, scheduled):
-        record = RequestRecord(request_id="row", task="text")
-        record.begin(
-            endpoint="/test", scheduled_time=scheduled, requested_output_len=0
-        )
+        record = RequestRecord(request_id="row", task="video")
+        record.begin(endpoint="/test", scheduled_time=scheduled)
         phase = "warmup" if scheduled is None else "measured"
         active[phase] += 1
         peak[phase] = max(peak[phase], active[phase])
@@ -48,7 +46,7 @@ def test_measured_duration_excludes_warmup(monkeypatch):
 
     async def submit(row, scheduled):
         record = RequestRecord(
-            request_id="row", task="text", start_time=clock[0]
+            request_id="row", task="video", start_time=clock[0]
         )
         clock[0] += 120.0 if scheduled is None else 7.0
         record.close_now()
@@ -87,7 +85,7 @@ def test_finite_rate_duration_ends_at_the_last_completion(monkeypatch):
 
     async def submit(row, scheduled):
         record = RequestRecord(
-            request_id="row", task="text", start_time=clock[0]
+            request_id="row", task="video", start_time=clock[0]
         )
         record.close_now()
         record.mark_success()
@@ -106,74 +104,3 @@ def test_finite_rate_duration_ends_at_the_last_completion(monkeypatch):
     # Three instantly served rows arrive at 0, 0.25, and 0.5 s into the
     # window, so it closes when the third one finishes.
     assert result.duration_s == 0.5
-
-
-# A trace's sessions are its concurrency: a smaller limit does not hold a
-# session back, so both first requests are in flight together.
-@pytest.mark.parametrize("concurrency", [None, 0, 1, 2])
-def test_closed_loop_sessions_wait_for_their_own_previous_response(concurrency):
-    async def run():
-        first_arrivals = set()
-        all_started = asyncio.Event()
-        completed = {"a": [], "b": []}
-        rows = [
-            Example(id=f"{session}{step}", prompt="", session_id=session)
-            for step in range(3)
-            for session in ("a", "b")
-        ]
-
-        async def submit(row, scheduled):
-            record = RequestRecord(request_id=row.id, task="text")
-            record.begin(
-                endpoint="/test",
-                scheduled_time=scheduled,
-                requested_output_len=0,
-            )
-            session, step = row.session_id, int(row.id[1:])
-            assert completed[session] == list(range(step))
-            if step == 0:
-                first_arrivals.add(session)
-                if len(first_arrivals) == 2:
-                    all_started.set()
-                await all_started.wait()
-            await asyncio.sleep(0)
-            completed[session].append(step)
-            record.close_now()
-            record.mark_success()
-            return record
-
-        result = await asyncio.wait_for(
-            run_load(
-                rows,
-                request_rate=float("inf"),
-                max_concurrency=concurrency,
-                submit=submit,
-            ),
-            timeout=5,
-        )
-        # Each session's first request is measured, not repeated as warmup.
-        assert result.warmup_outputs == ()
-        assert [record.request_id for record in result.outputs] == [
-            row.id for row in rows
-        ]
-        assert completed == {"a": [0, 1, 2], "b": [0, 1, 2]}
-
-    asyncio.run(run())
-
-
-def test_closed_loop_sessions_reject_a_finite_request_rate():
-    async def submit(row, scheduled):
-        return SimpleNamespace(success=True)
-
-    with pytest.raises(ValueError, match="session"):
-        asyncio.run(
-            run_load(
-                [
-                    Example(id="a0", prompt="", session_id="a"),
-                    Example(id="b0", prompt="", session_id="b"),
-                ],
-                request_rate=1.0,
-                max_concurrency=2,
-                submit=submit,
-            )
-        )

@@ -10,7 +10,7 @@ from tests.python.fixtures.h3 import (
 from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.model import ReferenceLimits
 from uniserve_models.minimax_h3 import Model
-from uniserve_models.minimax_h3.config import DMD_CANVASES, NAMED_CANVASES
+from uniserve_models.minimax_h3.config import FASTH3_CANVASES, NAMED_CANVASES
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import media_builder, video_denoiser
 from uniserve_worker.bootstrap.report import (
@@ -138,10 +138,10 @@ def test_a_text_only_export_declares_the_canvases_its_deployment_serves():
     assert info.schedule_points == 5
     # Without a deployment's selection, every training bucket: 21:9, 16:9,
     # 4:3, 1:1, 3:4 and 9:16 at 768p, then at 480p.
-    assert _declared(info) == _trained(DMD_CANVASES)
+    assert _declared(info) == _trained(FASTH3_CANVASES)
     # A deployment's selection is declared in the order it prepares them.
     chosen = {
-        name: DMD_CANVASES[name] for name in ((480, "16:9"), (768, "9:16"))
+        name: FASTH3_CANVASES[name] for name in ((480, "16:9"), (768, "9:16"))
     }
     declared = video_denoiser_info(
         denoiser,

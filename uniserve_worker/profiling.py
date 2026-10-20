@@ -29,7 +29,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -47,7 +47,6 @@ __all__ = [
 ]
 
 _NVTX_ENV = "UNISERVE_NVTX"
-_NULL_CONTEXT = nullcontext()
 
 logger = logging.getLogger(__name__)
 

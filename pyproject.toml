@@ -1,11 +1,12 @@
 [build-system]
-requires = ["setuptools>=70", "wheel", "setuptools-rust>=1.7"]
+requires = ["setuptools>=77", "wheel", "setuptools-rust>=1.7"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "uniserve"
 version = "0.2.0"
 description = "UniServe computation library, numerical models, and Python worker runtime."
+license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.11"
 # Keep the CUDA-13 PyTorch and torchvision release lines aligned. The locked
@@ -45,7 +46,7 @@ dev = [
     "ruff>=0.6",
 ]
 bench = [
-    "uniserve-eval[datasets]",
+    "uniserve-eval",
 ]
 # Optional accelerator kernels for GPU serving. Model bindings require their
 # declared native capabilities at startup. The `uniserve-kernels` extra adds
@@ -131,12 +132,10 @@ markers = [
 # Enforces the Google Python Style Guide
 # (https://google.github.io/styleguide/pyguide.html) on all project Python
 # modules: 80-column line limit (guide section 3.4), Google docstring
-# convention, and PEP 8 naming. The `refs/` reference checkouts keep their own
-# style and are excluded.
+# convention, and PEP 8 naming.
 line-length = 80
 target-version = "py311"
 extend-exclude = [
-    "refs",
     "target",
     ".venv",
     # Preserve upstream style for the vendored FlashInfer MegaMoE sources.
@@ -176,5 +175,5 @@ ignore_missing_imports = true
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 include = ["uniserve", "uniserve_models", "uniserve_worker", "uniserve_eval"]
-exclude = ["refs", "target", ".venv"]
+exclude = ["target", ".venv"]
 reportMissingImports = "warning"

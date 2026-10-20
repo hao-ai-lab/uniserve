@@ -15,7 +15,7 @@ apt-get install -y build-essential cmake pkg-config protobuf-compiler libclang-d
 export LIBRARY_PATH=/usr/local/cuda/lib64/stubs
 cargo build --locked --release -p uniserve-dynamo-worker
 
-uv venv --python /usr/bin/python3.12 artifacts/dynamo/frontend-env
+uv venv --python 3.12 artifacts/dynamo/frontend-env
 uv pip install --python artifacts/dynamo/frontend-env/bin/python ai-dynamo==1.5.0
 ```
 
@@ -24,10 +24,8 @@ The separate frontend environment preserves UniServe's pinned GPU dependencies. 
 Download the complete BF16 checkpoint, or use an existing local copy:
 
 ```bash
-export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
-.venv/bin/hf download FastVideo/FastVideo-FastH3-8-Step-V2 \
-  --revision 3da2ddfe1954d9cda4c05b643dc0f26007a655c5 \
-  --local-dir "$H3_MODEL"
+export H3_MODEL=$PWD/models/FastVideo-FastH3-8-Step-V2
+.venv/bin/hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
 ```
 
 ## Start the frontend and worker
@@ -44,7 +42,7 @@ artifacts/dynamo/frontend-env/bin/python -m dynamo.frontend \
 In another terminal, from the same repository and on the same host, start the worker:
 
 ```bash
-export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
+export H3_MODEL=$PWD/models/FastVideo-FastH3-8-Step-V2
 export DYN_DISCOVERY_BACKEND=file
 
 target/release/uniserve-dynamo-worker \

@@ -1,5 +1,6 @@
-# FastH3 on NVIDIA Blackwell GPUs: the deployments and workload of the
-# UniServe FastH3 post. UNISERVE_FAST_H3_MODEL names a local copy of
+# FastH3 on NVIDIA GB200 and RTX PRO 6000 GPUs: the request latency and the
+# throughput at fixed concurrency of UniServe's BF16 and NVFP4 deployments.
+# UNISERVE_FAST_H3_MODEL names a local copy of
 # FastVideo/FastVideo-FastH3-8-Step-V2 and UNISERVE_FAST_H3_NVFP4_MODEL one of
 # FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4.
 #

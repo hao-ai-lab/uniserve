@@ -544,12 +544,6 @@ pub struct WorkerInfo {
 }
 
 impl WorkerInfo {
-    /// Returns the advertised allocatable KV units, or zero when KV is
-    /// unsupported.
-    pub fn kv_usable_units(&self) -> u32 {
-        self.kv_cache.as_ref().map_or(0, KvCacheInfo::usable_units)
-    }
-
     /// Returns total latent capacity in model-defined units.
     pub fn latent_capacity_units(&self) -> u64 {
         u64::from(self.latent_pages.saturating_sub(1))

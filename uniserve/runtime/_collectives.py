@@ -559,14 +559,9 @@ class GatherPool:
                 raise RuntimeError(
                     "prepare projection exchange backing before capture"
                 )
-            # FIXME: Re-test symmetric windows for these buffers. Windowed
-            # in-place all-gathers failed on GB200 at some sizes under NCCL
-            # 2.29.7 and 2.32.3, including the OmniRef reference layout's
-            # 1,029,439,488-byte transport. Repeat the isolated windowed
-            # all-gathers at those sizes and the FastH3 Ulysses-4 latency
-            # comparison under the pinned NCCL; if every gather is exact,
-            # allocate these buffers symmetrically and register them as
-            # windows.
+            # Ordinary device storage rather than registered symmetric
+            # windows: windowed in-place all-gathers are not exact at every
+            # size on GB200 with the pinned NCCL.
             buffer = torch.empty(amount, dtype=torch.uint8, device=device)
             self.buffers.append(buffer)
 

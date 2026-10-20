@@ -1127,12 +1127,6 @@ def execute(
     return request
 
 
-def _request_label(call: Call) -> str:
-    """Format a stable request and call label for media work."""
-    key = call.request_key
-    return f"{key.engine_id}:{key.request_id}:{key.request_epoch}"
-
-
 __all__ = [
     "decode_range",
     "execute",

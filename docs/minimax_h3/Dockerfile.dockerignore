@@ -6,6 +6,7 @@
 !uv.lock
 !.python-version
 !README.md
+!LICENSE
 !configs
 !configs/**
 !crates

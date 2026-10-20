@@ -1,9 +1,8 @@
-"""Conditioned video requests reach every backend as the same work.
+"""Conditioned video requests name their media by ``file://`` URI.
 
-A conditioned row names its media relative to the point's condition root.
-UniServe and SGLang receive the canonical body with ``file://`` URIs,
-vLLM-Omni the same files as uploaded parts, and FastVideo their local paths;
-each output is validated against the canvas its own request resolves to.
+A conditioned row names its media relative to the point's condition root,
+and the server receives the canonical body with ``file://`` URIs; each
+output is validated against the canvas its own request resolves to.
 """
 
 from __future__ import annotations
@@ -11,8 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
-from email.parser import BytesParser
-from email.policy import default
 from pathlib import Path
 
 import aiohttp
@@ -37,13 +34,6 @@ from uniserve_eval.types import (
 
 pytestmark = pytest.mark.unit
 
-BASE_SCHEDULE = {
-    "num_inference_steps": 50,
-    "flow_shift": 12.0,
-    "audio_flow_shift": 3.0,
-}
-# FastH3 OmniRef: eight fused-block forwards over nine sigma points.
-OMNIREF_POINTS = 9
 VIDEO_BYTES = b"\x00\x00\x00\x18ftypmp42 reference video"
 AUDIO_BYTES = b"ID3 reference voice"
 # EXIF tag and value that display an image turned by 90 degrees.
@@ -67,12 +57,7 @@ def inputs(tmp_path: Path) -> Path:
     return tmp_path / "inputs"
 
 
-def point(inputs: Path, task: str, backend: str = "uniserve", **video):
-    settings = {"num_inference_steps": BASE_SCHEDULE["num_inference_steps"]}
-    if backend in ("sglang", "vllm-omni"):
-        settings = dict(BASE_SCHEDULE)
-    elif backend == "uniserve":
-        settings = {}
+def point(inputs: Path, task: str, **video):
     return BenchmarkPoint(
         name="conditioned",
         server="video",
@@ -84,9 +69,8 @@ def point(inputs: Path, task: str, backend: str = "uniserve", **video):
         video=VideoConfig(
             task=task,
             aspect_ratio="auto",
-            backend=backend,
             condition_root=str(inputs),
-            **{**settings, **video},
+            **video,
         ),
     )
 
@@ -137,42 +121,15 @@ def send(request):
     return sent[0], record
 
 
-def multipart(request):
-    """Decode a multipart request into its text fields and file parts."""
-    message = BytesParser(policy=default).parsebytes(
-        b"Content-Type: "
-        + request[0]["content-type"].encode()
-        + b"\r\n\r\n"
-        + request[1]
-    )
-    fields, files = {}, []
-    for part in message.iter_parts():
-        name = part.get_param("name", header="content-disposition")
-        filename = part.get_filename()
-        if filename is None:
-            fields[name] = part.get_payload(decode=True).decode()
-        else:
-            files.append(
-                (
-                    name,
-                    filename,
-                    part.get_content_type(),
-                    part.get_payload(decode=True),
-                )
-            )
-    return fields, files
-
-
-@pytest.mark.parametrize("backend", ["uniserve", "sglang"])
 @pytest.mark.parametrize(
     "task,conditions",
     [("fl2va", FIRST_FRAME), ("ref2va", IMAGE_AUDIO), ("ref2va", VIDEO_AUDIO)],
     ids=["first-frame", "image-audio", "video-audio"],
 )
 def test_the_canonical_body_names_condition_media_by_file_uri(
-    inputs, backend, task, conditions
+    inputs, task, conditions
 ):
-    task_adapter = VideoTask(point(inputs, task, backend))
+    task_adapter = VideoTask(point(inputs, task))
     request = task_adapter.build_request(
         Example("row", "scene", seconds=5, seed=7, conditions=conditions)
     )
@@ -201,86 +158,31 @@ def test_the_canonical_body_names_condition_media_by_file_uri(
     assert record.video_shape == VideoShape(1344, 768, 124)
 
 
-@pytest.mark.parametrize(
-    "task,conditions,kinds",
-    [
-        ("fl2va", FIRST_FRAME, ["image/png"]),
-        ("ref2va", IMAGE_AUDIO, ["image/png", "audio/mpeg"]),
-        ("ref2va", VIDEO_AUDIO, ["video/mp4", "audio/mpeg"]),
-    ],
-    ids=["first-frame", "image-audio", "video-audio"],
-)
-def test_vllm_omni_receives_the_same_files_as_uploaded_references(
-    inputs, task, conditions, kinds
-):
-    request = VideoTask(point(inputs, task, "vllm-omni")).build_request(
-        Example("row", "scene", seconds=5, seed=7, conditions=conditions)
+def test_a_480p_reference_target_is_its_fasth3_bucket(inputs):
+    portrait = point(inputs, "ref2va", short_edge=480)
+    portrait = replace(
+        portrait, video=replace(portrait.video, aspect_ratio="9:16")
     )
-    received, _ = send(request)
-
-    fields, files = multipart(received)
-    assert [(name, kind) for name, _, kind, _ in files] == [
-        ("input_references", kind) for kind in kinds
-    ]
-    assert [data for *_, data in files] == [
-        (inputs / row["media"]).read_bytes() for row in conditions
-    ]
-    assert (int(fields["width"]), int(fields["height"])) == (1344, 768)
-    assert int(fields["num_inference_steps"]) == 49
-    extra = json.loads(fields["extra_params"])
-    assert extra["task"] == task
-    assert extra["duration"] == 5.0
-    # Keyframes carry their frame indices; references need none.
-    assert extra.get("frame_indices") == ([0] if task == "fl2va" else None)
-
-
-@pytest.mark.parametrize(
-    "conditions,references",
-    [
-        (
-            IMAGE_AUDIO,
-            {
-                "image_reference": [{"image_url": "media/subject.png"}],
-                "audio_reference": [{"audio_url": "media/voice.mp3"}],
-            },
-        ),
-        (
-            VIDEO_AUDIO,
-            {
-                "video_reference": [{"video_url": "media/clip.mp4"}],
-                "audio_reference": [{"audio_url": "media/voice.mp3"}],
-            },
-        ),
-    ],
-    ids=["image-audio", "video-audio"],
-)
-def test_fastvideo_receives_reference_paths_and_its_block_count(
-    inputs, conditions, references
-):
-    config = point(
-        inputs,
-        "ref2va",
-        "fastvideo",
-        num_inference_steps=OMNIREF_POINTS,
-        parallel_decoding=True,
+    VideoTask.check_video(portrait.video, "point")
+    request = VideoTask(portrait).build_request(
+        Example("row", "scene", seconds=5, seed=7, conditions=IMAGE_AUDIO)
     )
-    request = VideoTask(config).build_request(
-        Example("row", "scene", seconds=5, seed=7, conditions=conditions)
-    )
-    received, _ = send(request)
+    received, record = send(request)
 
-    body = json.loads(received[1])
-    for field, entries in references.items():
-        assert body[field] == [
-            {key: str((inputs / path).resolve())}
-            for entry in entries
-            for key, path in entry.items()
-        ]
-    assert body["task"] == "ref2va"
-    assert body["size"] == "1344x768"
-    assert body["num_frames"] == 124
-    # A parallel decoding student is asked for its fused-block forwards.
-    assert body["num_inference_steps"] == OMNIREF_POINTS - 1
+    assert json.loads(received[1])["target"] == {
+        "short_edge": 480,
+        "aspect_ratio": "9:16",
+        "duration_seconds": 5.0,
+    }
+    # The 480p 9:16 bucket is 480x832, from the FastH3 training table.
+    assert record.video_shape == VideoShape(480, 832, 124)
+
+
+def test_a_480p_target_names_its_aspect_ratio(inputs):
+    with pytest.raises(ValueError, match="names its aspect ratio"):
+        VideoTask.check_video(
+            point(inputs, "ref2va", short_edge=480).video, "point"
+        )
 
 
 def test_an_fl2va_auto_canvas_follows_the_displayed_first_keyframe(inputs):
@@ -353,38 +255,13 @@ def test_a_t2va_row_with_conditions_is_not_sent(inputs):
         )
 
 
-@pytest.mark.parametrize("backend", ["vllm-omni", "fastvideo"])
-def test_a_type_grouping_backend_refuses_conditions_it_would_reorder(
-    inputs, backend
-):
-    """Audio before an image would be presented after it there.
-
-    The request is refused when it is built, before any measurement.
-    """
-    schedule = (
-        {"num_inference_steps": OMNIREF_POINTS, "parallel_decoding": True}
-        if backend == "fastvideo"
-        else {}
-    )
-    task = VideoTask(point(inputs, "ref2va", backend, **schedule))
-    with pytest.raises(ValueError, match="images, then videos, then audio"):
-        task.build_request(
-            Example("row", "scene", seconds=5, conditions=IMAGE_AUDIO[::-1])
-        )
-
-
-def test_fastvideo_refuses_a_reference_start_offset_it_cannot_take(inputs):
-    config = point(
-        inputs,
-        "ref2va",
-        "fastvideo",
-        num_inference_steps=OMNIREF_POINTS,
-        parallel_decoding=True,
-    )
-    offset = [{**VIDEO_AUDIO[0], "start_time_seconds": 1.5}, VIDEO_AUDIO[1]]
-    with pytest.raises(ValueError, match="start offset"):
-        VideoTask(config).build_request(
-            Example("row", "scene", seconds=5, conditions=offset)
+def test_a_row_naming_a_missing_file_is_not_sent(inputs):
+    missing = [
+        {"type": "audio", "media": "media/missing.wav", "role": "reference"}
+    ]
+    with pytest.raises(FileNotFoundError, match="missing.wav"):
+        VideoTask(point(inputs, "ref2va")).build_request(
+            Example("row", "scene", seconds=5, conditions=missing)
         )
 
 
@@ -406,7 +283,6 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
                         "status": "completed",
                         "inference_time_s": 33.0,
                         "stage_durations": stages,
-                        "peak_memory_mb": 91000.5,
                     },
                 )
             headers = {"content-type": "video/mp4"}
@@ -414,19 +290,12 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
                 headers |= {
                     "x-inference-time-s": "33.0",
                     "x-stage-durations": json.dumps(stages),
-                    "x-peak-memory-mb": "91000.5",
                 }
             return web.Response(body=b"mp4", headers=headers)
 
-        config = point(
-            inputs,
-            "ref2va",
-            "fastvideo",
-            num_inference_steps=OMNIREF_POINTS,
-            parallel_decoding=True,
-            poll_interval_s=0.001,
+        config = replace(
+            point(inputs, "ref2va", poll_interval_s=0.001), endpoint=endpoint
         )
-        config = replace(config, endpoint=endpoint)
         request = VideoTask(config).build_request(
             Example("row", "scene", seconds=5, conditions=IMAGE_AUDIO)
         )
@@ -441,7 +310,6 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
     record = asyncio.run(exercise())
     assert record.server_inference_s == 33.0
     assert record.server_stage_s == stages
-    assert record.server_peak_memory_mib == 91000.5
     assert record.record_dict()["server_stage_s"] == stages
 
     # Summaries cover the requests whose output decoded.
@@ -465,13 +333,10 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
     metrics = summarize([record], 40.0)
     assert metrics["server_inference_ms"]["p50"] == 33_000.0
     assert metrics["server_stage_ms"]["denoising_stage"]["p50"] == 30_500.0
-    assert metrics["server_peak_memory_mib"] == 91000.5
 
 
 @pytest.mark.parametrize("endpoint", [VIDEOS_SYNC, "/v1/videos"])
-def test_stage_durations_alone_are_recorded_for_a_uniserve_request(
-    inputs, endpoint
-):
+def test_stage_durations_alone_are_recorded(inputs, endpoint):
     """A server may report its stage durations without the other timings."""
     stages = {"encoding": 4.5, "denoising": 30.0, "decoding": 2.0}
 
@@ -511,4 +376,3 @@ def test_stage_durations_alone_are_recorded_for_a_uniserve_request(
     record = asyncio.run(exercise())
     assert record.server_stage_s == stages
     assert record.server_inference_s is None
-    assert record.server_peak_memory_mib is None

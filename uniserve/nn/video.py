@@ -1,4 +1,4 @@
-"""Numerical overlap blending and decoded video pixel conversion."""
+"""Blending of decoded video frames where two clips overlap."""
 
 from __future__ import annotations
 

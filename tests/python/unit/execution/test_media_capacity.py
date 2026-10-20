@@ -18,7 +18,7 @@ from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
 from uniserve_models.minimax_h3 import Model
 from uniserve_models.minimax_h3 import config as h3_config
-from uniserve_models.minimax_h3.config import DMD_CANVASES, NAMED_CANVASES
+from uniserve_models.minimax_h3.config import FASTH3_CANVASES, NAMED_CANVASES
 from uniserve_models.minimax_h3.processing import REFERENCE_IMAGE_SHORT_EDGE
 from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
@@ -29,11 +29,11 @@ pytestmark = pytest.mark.unit
 ADMITTED_FRAMES = tuple(107 + 17 * index for index in range(16))
 
 # The default FastH3 deployment's canvases: 768p 16:9 and 9:16.
-TALL = DMD_CANVASES[(768, "9:16")]
+TALL = FASTH3_CANVASES[(768, "9:16")]
 SERVED = (WIDE, TALL)
 
 # FastH3's training buckets: every named aspect ratio at 768p, then at 480p.
-BUCKETS = tuple(DMD_CANVASES.values())
+BUCKETS = tuple(FASTH3_CANVASES.values())
 
 
 def _enlarged_image(width: int, height: int) -> image.Config:

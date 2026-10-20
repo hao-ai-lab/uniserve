@@ -2,13 +2,14 @@
 # library. The package build compiles the native extensions (setup.py);
 # extras select optional kernel runtimes.
 [build-system]
-requires = ["setuptools>=68", "wheel", "ninja>=1.13"]
+requires = ["setuptools>=77", "wheel", "ninja>=1.13"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "uniserve-kernels"
 version = "0.1.0"
 description = "UniServe device kernels"
+license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
   "torch>=2.13,<2.14",

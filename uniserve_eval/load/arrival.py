@@ -1,7 +1,7 @@
-"""Executes immediate, Poisson, or closed-loop session arrivals.
+"""Executes immediate or Poisson arrivals.
 
 ``run_point`` drives one benchmark point through ``run_load`` with a
-``submit`` coroutine that builds and sends one request. This module owns only
+``submit`` coroutine that sends one request. This module owns only
 arrival timing, the client-side concurrency limit, and the measured window;
 request construction, transport, and metrics live elsewhere. Submission
 records supply monotonic start and terminal timestamps for the load window.
@@ -102,22 +102,17 @@ async def run_load(
 
     Warmup sends ``rows[0]`` ``warmup_requests`` times concurrently, within
     the concurrency limit. The measured phase then submits every row once at
-    its arrival time and waits for all of them. When every row has a
-    ``session_id``, sessions run concurrently and each awaits its previous
-    response before submitting its next row. Session traces require an
-    infinite request rate; their sessions are their concurrency, one request
-    in flight per session. A trace measures each session's initial cold
-    request, so it has no repeated-row warmup.
+    its arrival time and waits for all of them.
 
     Args:
         rows: Examples in submission order.
         request_rate: Mean arrivals per second; ``inf`` submits all rows at
-            once, or starts all declared closed-loop sessions.
-        max_concurrency: Maximum in-flight warmup and arrival-driven
-            submissions, or ``None`` (or ``0``) for no limit.
+            once.
+        max_concurrency: Maximum in-flight warmup and measured submissions,
+            or ``None`` (or ``0``) for no limit.
         submit: Coroutine that sends one example; see ``Submit``.
         warmup_requests: Number of first-row warmup submissions; ``0`` skips
-            them, and so does a session trace.
+            them.
         warmup_rows: Explicit excluded corpus, replacing first-row repetition.
         inspect_warmup: Inspect excluded outputs after their slots are released
             and before checking warmup success.
@@ -141,19 +136,6 @@ async def run_load(
     if not rows:
         return LoadResult((), (), 0.0)
 
-    sessions: dict[str, list[tuple[int, Example]]] = {}
-    if any(getattr(row, "session_id", None) is not None for row in rows):
-        if request_rate != float("inf"):
-            raise ValueError(
-                "closed-loop sessions require infinite request_rate"
-            )
-        for index, row in enumerate(rows):
-            if not row.session_id:
-                raise ValueError(
-                    "closed-loop sessions require every session_id"
-                )
-            sessions.setdefault(row.session_id, []).append((index, row))
-
     # Warmup and arrival-driven measurement share the declared in-flight
     # limit. The arrival timestamp is taken before the semaphore, so time
     # queued here appears as the gap between ``scheduled`` and the moment
@@ -168,13 +150,10 @@ async def run_load(
             return await submit(row, scheduled)
 
     # Warmup exercises the same request path outside the reported duration.
-    # Repeating the first row is the warmup of a load that names no corpus;
-    # in a session trace that row is a session's measured cold request.
+    # Repeating the first row is the warmup of a load that names no corpus.
     warmup_outputs: list[T] = []
     if warmup_rows is not None:
         excluded = warmup_rows
-    elif sessions:
-        excluded = []
     else:
         excluded = [rows[0]] * warmup_requests
     if excluded:
@@ -195,40 +174,9 @@ async def run_load(
 
     tasks: list[asyncio.Task[T]] = []
     try:
-        if sessions:
-
-            async def run_session(
-                sequence: list[tuple[int, Example]],
-            ) -> list[tuple[int, T]]:
-                completed = []
-                for index, row in sequence:
-                    # Arrival follows this client's previous completion;
-                    # another client's speed cannot advance its trace.
-                    output = await submit(row, time.perf_counter())
-                    completed.append((index, output))
-                return completed
-
-            session_tasks = [
-                asyncio.create_task(run_session(sequence))
-                for sequence in sessions.values()
-            ]
-            try:
-                completed = await asyncio.gather(*session_tasks)
-            except BaseException:
-                for session_task in session_tasks:
-                    session_task.cancel()
-                await asyncio.gather(*session_tasks, return_exceptions=True)
-                raise
-            ordered = sorted(
-                item for sequence in completed for item in sequence
-            )
-            outputs = [output for _, output in ordered]
-        else:
-            async for row in get_request(rows, request_rate):
-                tasks.append(
-                    asyncio.create_task(limited(row, time.perf_counter()))
-                )
-            outputs = await asyncio.gather(*tasks)
+        async for row in get_request(rows, request_rate):
+            tasks.append(asyncio.create_task(limited(row, time.perf_counter())))
+        outputs = await asyncio.gather(*tasks)
     except BaseException:
         # ``gather`` leaves sibling tasks running when one raises. They are
         # cancelled and awaited here, so no submission outlives the failed

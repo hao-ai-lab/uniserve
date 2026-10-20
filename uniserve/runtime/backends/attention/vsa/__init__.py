@@ -169,7 +169,9 @@ class Backend:
         )
 
 
-# Provider modules in the order ``"auto"`` probes them.
+# Provider modules in the order ``"auto"`` probes them. Each serves the tile
+# sizes in its ``TILES``: sm100 64 and 128 rows, sm90 128 rows, sm120 64 rows
+# and 128 rows as two 64-row halves, flashinfer 64 rows and triton 64 rows.
 _PROVIDERS = ("sm100", "sm90", "sm120", "flashinfer", "triton")
 
 
