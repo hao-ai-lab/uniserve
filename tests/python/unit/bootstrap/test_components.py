@@ -88,3 +88,12 @@ def test_placement_rejects_an_undeclared_computation_entry():
             {"first": ComponentConfig((0,)), "second": ComponentConfig((0,))},
             entries={"first": ComponentEntry("first", (EntryPoint("encode"),))},
         )
+
+
+def test_component_weights_are_written_only_off_the_device():
+    host = ComponentConfig.from_dict({"ranks": [0], "weights": "host"})
+    assert host.weights == "host"
+    assert host.to_dict()["weights"] == "host"
+    assert "weights" not in ComponentConfig.from_dict({"ranks": [0]}).to_dict()
+    with pytest.raises(ValueError, match="unsupported component weights"):
+        ComponentConfig.from_dict({"ranks": [0], "weights": "disk"})

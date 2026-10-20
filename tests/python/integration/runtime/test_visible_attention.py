@@ -28,6 +28,9 @@ def test_prefix_tiles_preserve_live_visibility_and_sequence_boundaries(
     Partial tiles are preserved as well.
     """
     device = torch.device("cuda", 0)
+    architecture = torch.cuda.get_device_capability(device)[0]
+    if provider == "flash_attn_4" and architecture in (8, 12):
+        pytest.skip("FlashAttention-4 reads no mask functions on SM80 or SM120")
     torch.manual_seed(793)
     query_lengths = [193, 301] if variable_length else [301, 301]
     key_lengths = [129, 385] if variable_length else [385, 385]

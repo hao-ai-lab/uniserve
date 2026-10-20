@@ -796,6 +796,136 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
+# Eight one-GPU denoiser replicas sharing one TP8 text encoder on the same
+# eight RTX PRO 6000 GPUs, under the throughput points' workload. A replica
+# keeps its denoising local, so no denoiser collective crosses PCIe. A
+# replica's workspace holds a whole 15-second sequence on one 96 GB GPU, so
+# these deployments bound prompts at 10240 tokens (the workload's longest is
+# 10000) and prepare only the workload's 16:9 canvas.
+[servers.rtx-pro-6000-8-dp8-nvfp4]
+host = "127.0.0.1"
+port = 18083
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-dp8-text-tp8.json", "--max-running-requests", "8", "--max-model-len", "10240", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024", "--video-aspect-ratios", "16:9"]
+
+[benchmarks.rtx-pro-6000-8-dp8-nvfp4-throughput-c8]
+server = "rtx-pro-6000-8-dp8-nvfp4"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-dp8-nvfp4-throughput-c8.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 8
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
+
+[benchmarks.rtx-pro-6000-8-dp8-nvfp4-throughput-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-dp8-nvfp4-throughput-c16]
+server = "rtx-pro-6000-8-dp8-nvfp4"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-dp8-nvfp4-throughput-c16.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 16
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c16.jsonl"
+
+[benchmarks.rtx-pro-6000-8-dp8-nvfp4-throughput-c16.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[servers.rtx-pro-6000-8-dp8-tp4x2-nvfp4]
+host = "127.0.0.1"
+port = 18083
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-dp8-text-tp4x2.json", "--max-running-requests", "8", "--max-model-len", "10240", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024", "--video-aspect-ratios", "16:9"]
+
+[benchmarks.rtx-pro-6000-8-dp8-tp4x2-nvfp4-throughput-c8]
+server = "rtx-pro-6000-8-dp8-tp4x2-nvfp4"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-dp8-tp4x2-nvfp4-throughput-c8.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 8
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
+
+[benchmarks.rtx-pro-6000-8-dp8-tp4x2-nvfp4-throughput-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# The BF16 checkpoint's 50 transformer layers hold 0.79 GiB of projection
+# weights each, which would leave a replica too little device memory for a
+# 15-second step beside the text encoder's shard. Each replica keeps them in
+# page-locked host memory and streams them through five layer buffers.
+[servers.rtx-pro-6000-8-dp8-bf16]
+host = "127.0.0.1"
+port = 18083
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-dp8-text-tp8-host-weights.json", "--max-running-requests", "8", "--max-model-len", "10240", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024", "--video-aspect-ratios", "16:9", "--quantization-config", "{\"mode\":\"quality\"}"]
+
+[benchmarks.rtx-pro-6000-8-dp8-bf16-throughput-c8]
+server = "rtx-pro-6000-8-dp8-bf16"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-dp8-bf16-throughput-c8.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 8
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
+
+[benchmarks.rtx-pro-6000-8-dp8-bf16-throughput-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-dp8-bf16-throughput-c16]
+server = "rtx-pro-6000-8-dp8-bf16"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-dp8-bf16-throughput-c16.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 16
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c16.jsonl"
+
+[benchmarks.rtx-pro-6000-8-dp8-bf16-throughput-c16.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
 # W1 and W2 of uniserve_eval/minimax_h3.toml on the same deployment: 8 and 4
 # requests at one at a time. The requests state no schedule: the server serves
 # the checkpoint's, 9 sigma points (8 DMD forwards) with shifts 10 and 3.
@@ -867,3 +997,12 @@ points = ["rtx-pro-6000-8-bf16-latency", "rtx-pro-6000-8-bf16-throughput-c1", "r
 
 [suites.rtx-pro-6000-8-nvfp4]
 points = ["rtx-pro-6000-8-nvfp4-latency", "rtx-pro-6000-8-nvfp4-throughput-c1", "rtx-pro-6000-8-nvfp4-throughput-c2", "rtx-pro-6000-8-nvfp4-throughput-c4", "rtx-pro-6000-8-nvfp4-throughput-c8", "rtx-pro-6000-8-nvfp4-throughput-c16"]
+
+[suites.rtx-pro-6000-8-dp8-bf16]
+points = ["rtx-pro-6000-8-dp8-bf16-throughput-c8", "rtx-pro-6000-8-dp8-bf16-throughput-c16"]
+
+[suites.rtx-pro-6000-8-dp8-nvfp4]
+points = ["rtx-pro-6000-8-dp8-nvfp4-throughput-c8", "rtx-pro-6000-8-dp8-nvfp4-throughput-c16"]
+
+[suites.rtx-pro-6000-8-dp8-tp4x2-nvfp4]
+points = ["rtx-pro-6000-8-dp8-tp4x2-nvfp4-throughput-c8"]

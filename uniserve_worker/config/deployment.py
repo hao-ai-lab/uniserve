@@ -269,13 +269,16 @@ class ComponentConfig:
     ``uniserve_worker.bootstrap.components``. The video decoder and the video
     codec are always ``temporal_units`` with one unit per rank; the engine
     completes that placement from a deployment that omits it, so a launch
-    descriptor always carries it.
+    descriptor always carries it. ``weights`` is ``device`` unless the
+    deployment keeps the dense projection weights of the component's layer
+    stack in host memory (``host``); ``load_worker_model`` installs that.
     """
 
     ranks: tuple[int, ...]
     parallel_config: ParallelConfig = ParallelConfig()
     distribution: str | None = None
     units_per_rank: int = 1
+    weights: str = "device"
 
     def __post_init__(self) -> None:
         if not self.ranks or len(set(self.ranks)) != len(self.ranks):
@@ -288,6 +291,8 @@ class ComponentConfig:
             )
         if type(self.units_per_rank) is not int or self.units_per_rank < 1:
             raise ValueError("units_per_rank must be a positive integer")
+        if self.weights not in ("device", "host"):
+            raise ValueError(f"unsupported component weights {self.weights!r}")
         if (
             self.distribution is None
             and len(self.ranks) != self.parallel_config.world_size
@@ -311,6 +316,7 @@ class ComponentConfig:
             "parallel_config",
             "distribution",
             "units_per_rank",
+            "weights",
         }
         if unknown:
             raise ValueError(f"unknown component fields: {sorted(unknown)}")
@@ -327,21 +333,26 @@ class ComponentConfig:
         # Type checks happen here; value checks happen in ``__post_init__``.
         distribution = value.get("distribution")
         units = value.get("units_per_rank", 1)
+        weights = value.get("weights", "device")
         if distribution is not None and not isinstance(distribution, str):
             raise ValueError("component distribution must be a string")
         if type(units) is not int:
             raise ValueError("units_per_rank must be a positive integer")
+        if not isinstance(weights, str):
+            raise ValueError("component weights must be a string")
 
         return cls(
             tuple(ranks),
             ParallelConfig.from_dict(parallel),
             distribution,
             units,
+            weights,
         )
 
     def to_dict(self) -> dict[str, object]:
-        # The distribution fields appear only with a distribution;
-        # ``from_dict`` restores their defaults when they are absent.
+        # The distribution fields appear only with a distribution and the
+        # weights only off the device; ``from_dict`` restores their defaults
+        # when they are absent.
         value: dict[str, object] = {
             "ranks": list(self.ranks),
             "parallel_config": self.parallel_config.to_dict(),
@@ -351,6 +362,8 @@ class ComponentConfig:
                 distribution=self.distribution,
                 units_per_rank=self.units_per_rank,
             )
+        if self.weights != "device":
+            value["weights"] = self.weights
         return value
 
 

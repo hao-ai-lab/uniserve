@@ -52,6 +52,40 @@ The `h200-ulysses8`, `h200-ulysses4` and `h200-fp8` suites and the `h200-gather8
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3_h200.toml run h200-ulysses8 --reuse-deployment
 ```
 
+## RTX PRO 6000
+
+These run on one host with eight RTX PRO 6000 Blackwell Server Edition GPUs (PCIe, GPUs 0-3 and 4-7 on separate NUMA nodes), with FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4 under the throughput points of the [FastH3 post](#fasth3-post): six unmeasured warmups, the priming requests of the concurrency, then the 32 throughput requests. Every output validated as 1344×768 H.264 with stereo 32-kHz AAC. A one-GPU replica holds a whole 15-second sequence, so the DP8 servers bound prompts at 10240 tokens (the workload's longest is 10000) and prepare only the 16:9 canvas.
+
+| Deployment | Concurrency | Videos/s | Latency p50 / p95 | Peak device memory |
+| --- | --- | --- | --- | --- |
+| `fasth3-ulysses4x2.json` (`rtx-pro-6000-8-nvfp4-throughput-c4`) | 4 | 0.0415 | 89.9 / 149.6 s | 74,408 MiB |
+| `fasth3-dp8-text-tp8.json` (`rtx-pro-6000-8-dp8-nvfp4`) | 8 | 0.0426 | 127.9 / 318.5 s | 97,156 MiB |
+| `fasth3-dp8-text-tp8.json` (`rtx-pro-6000-8-dp8-nvfp4`) | 16 | 0.0404* | 310.4 / 489.7 s | 96,706 MiB |
+| `fasth3-dp8-text-tp4x2.json` (`rtx-pro-6000-8-dp8-tp4x2-nvfp4`) | 8 | 0.0423* | 126.1 / 312.5 s | 97,342 MiB |
+| `fasth3-dp8-text-tp8-host-weights.json` (`rtx-pro-6000-8-dp8-bf16`, BF16 checkpoint) | 8 | 0.0346 | 167.2 / 366.5 s | 79,692 MiB |
+
+\* Measured on an earlier revision without the payload-sized feed-forward ranges, the interval output exchange and the threshold tile selection; the concurrency-16 row also predates the calibrated NVFP4 encodings and the in-place SM120 sparse-attention launch. Peak device memory is the highest per-GPU use sampled once a second during the run; the DP8 servers run within 1 GiB of the device's 97,887 MiB, and in the NVFP4 TP8 run PyTorch's expandable-segment allocator retried four mappings after freeing cached blocks, without a failed request. The GPUs throttle under sustained load (power limit 600 W), so a run's busy SM clock moves its speed: the Ulysses4x2, NVFP4 DP8 and BF16 DP8 rows at concurrency eight and four averaged 2197, 2070 and 2033 MHz while busy. Throughput also depends on the run's tail: 14–19% of DP8 replica time is idle while the last 15-second requests finish, and when the last one starts varies between runs by tens of seconds, so the summed server time of the 32 requests is the steadier comparison. Running the TP8 deployment's processes as clients of one MPS daemon lowered it to 0.0353 videos/s with 20% more replica time per request.
+
+Each Ulysses4 replica of `fasth3-ulysses4x2.json` gathers every layer's normalized rows for its head-parallel projection and returns the attended rows to their token owners in intervals of about 48 MiB sent per member (4,608 rows), each exchanged as soon as it is composed, so the output projection, the gated residual and the feed-forward of an early interval run while the later intervals are in flight. One request at a time takes 15.9 s at 5 seconds, 30.1 s at 10 seconds and 55.6 s at 15 seconds with 1000-token prompts, and 48.6 s at 10 seconds with 10000 tokens; with each shard returned as one interval, the same requests take 16.3, 31.7, 58.5 and 50.8 s. The intervals also split the output projection and feed-forward GEMMs into other row ranges, which changes their last bits and with them the sampled videos: returned as one interval, the four videos are byte-identical to the revision before the interval exchange. At concurrency four the 32 requests sum to 1362.4 s of server time. The persistent NVFP4 GEMM slows beside the transfers: it assigns its tiles to one CTA per SM, so the SMs a transfer's NCCL kernel holds delay their CTAs until the transfer ends, and beside a four-GPU all-gather it takes 2.30 instead of 1.34 ms, still 2.24 ms with NCCL limited to two channels, while a cuBLAS BF16 GEMM of the same shape slows by 1.7%. FlashInfer's cuDNN FP4 GEMM keeps its speed beside the transfer (+2.1%), but in the 14336-deep feed-forward down projection one to three of its 33 million products per call differ from CUTLASS's in the last BF16 bit, so the deployments keep CUTLASS and their outputs.
+
+A one-GPU replica serves one request at a time; in the concurrency-eight run a request's server time averages 76.4 s at 5 seconds, 154.3 s at 10 seconds and 261.2 s at 15 seconds. The DP8 replicas keep every denoiser collective off PCIe, so their throughput is bounded by single-GPU compute: in a 10-second request profiled before the feed-forward ranges, the device is busy 99.9% of the time, with sparse attention 48% of each denoising step's kernel time, the BF16 attention projections 32% and the NVFP4 feed-forward GEMMs 11%; decoding takes 434 ms of device time per 25-frame clip. The feed-forward runs over ranges of one projection payload (6144 rows), which keeps a 15-second shard's intermediates near 0.5 GiB; its GEMMs of a 10-second sequence take 93.2 ms per layer in BF16 and 27.3 ms in NVFP4, against 93.1 and 26.5 ms over 16384-row ranges. With the BF16 checkpoint (`quality`) and resident weights, a DP8 replica beside the TP8 text encoder serves 10 seconds with a 10000-token prompt (96,075 MiB peak for one request) and runs out of device memory at 15 seconds. Shrinking the text encoder's grant does not close the gap: capped at three request slots it still holds 12.4 GiB of each device under load, which leaves a replica 82.6 GiB, and a 15-second BF16 step needs more (its 6.21 GiB Q/K/V/gate projection buffer arrives with 5.9 GiB free). Keeping the transformer's layer projections in host memory (`fasth3-dp8-text-tp8-host-weights.json`) releases 35.5 GiB of each device and leaves every output byte unchanged (the 10-second request gives the resident server's MP4); in the concurrency-eight run a request's server time averages 98.7 s at 5 seconds, 194.2 s at 10 seconds and 315.4 s at 15 seconds. A layer's 0.79 GiB copy finishes while earlier layers compute, so streaming adds no measurable time.
+
+OmniRef runs as one Ulysses8 reference replica (`rtx-pro-6000-8-omniref-refs` of `uniserve_eval/minimax_h3.toml`, the eight-H200 capacities with graphs off: at most 56,192 condition rows and 24,576 model rows) with peak device memory 91,537 MiB and no allocator mapping failures across all twelve points; each cell is the mean ± SD of three requests after its warmup, with the GPUs at 2284 MHz while busy.
+
+| Composition | 5 s | 10 s | 15 s |
+| --- | ---: | ---: | ---: |
+| `image` | 21.15 ± 0.13 s | 33.52 ± 0.46 s | 49.00 ± 0.36 s |
+| `image-voice` | 21.39 ± 0.16 s | 34.56 ± 0.27 s | 50.33 ± 0.46 s |
+| `video` | 36.80 ± 0.10 s | 56.06 ± 0.47 s | 74.04 ± 0.34 s |
+| `mixed` | 46.49 ± 0.26 s | 69.26 ± 0.25 s | 93.07 ± 0.87 s |
+
+Every collective in these runs uses NCCL's default transport. On this host `NCCL_P2P_LEVEL=SYS` makes NCCL use PCIe peer-to-peer between GPUs that share no PCIe switch, which its default connects through host memory: eight-GPU all-to-all bus bandwidth falls from 24.5 to 1.1 GB/s and all-reduce from 30 to 13 GB/s, and the Ulysses8 replica runs 2.5 times slower.
+
+```bash
+.venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run rtx-pro-6000-8-dp8-nvfp4 --reuse-deployment
+.venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run rtx-pro-6000-8-omniref-refs --reuse-deployment --keep-going
+```
+
 ## MiniMax-H3 workloads
 
 `uniserve_eval/minimax_h3.toml` runs these workloads on UniServe, SGLang, vLLM-Omni and FastVideo:

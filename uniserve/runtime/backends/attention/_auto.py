@@ -13,7 +13,9 @@ On CUDA, automatic selection chooses native kernels for half precision:
   visible-endpoint and segmented inputs and for paged rows without a history
   window. Its SM100 head-dimension-256 kernel accepts neither per-sequence key
   lengths nor mask functions, so it serves only dense and variable-length
-  inputs of that width;
+  inputs of that width. On SM80 and SM120 it serves dense and
+  variable-length inputs and contiguous visible-endpoint inputs that need no
+  row mask;
 - SGLang's FlashAttention-3 build on SM90.
 
 A call no native kernel serves raises when its layer is prepared or bound,
@@ -50,7 +52,7 @@ from uniserve.tensors import BufferConfig
 
 from .. import record_kernel_choice
 from . import Backend as _Backend
-from . import CachePages
+from . import CachePages, flash_attn_4
 from . import Operator as _Operator
 from ._sequences import causal_runs
 
@@ -192,10 +194,16 @@ def _names(batch, *, head_dim, window, architecture):
             if isinstance(batch, SegmentedInput) and batch.fully_visible_current
             else ()
         )
-        # FA4 captures device-visible endpoints directly.
+        # FA4 captures device-visible endpoints directly. Its SM80 and SM120
+        # kernel reads neither paged keys nor mask functions, so there it
+        # serves only the visible inputs that need neither.
         fa4 = (
             ("flash_attn_4",)
-            if architecture in (9, 10, 11) and fa4_indexed
+            if fa4_indexed
+            and (
+                architecture in (9, 10, 11)
+                or flash_attn_4.reads_without_mask(batch)
+            )
             else ()
         )
         return (*block, *fa4)

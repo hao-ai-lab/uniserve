@@ -399,20 +399,9 @@ def load_worker_model(
     for name, binding in bindings.items():
         if binding.mesh is None:
             continue
-        paths = {call.path for call in declarations[name]}
         # Only the outermost declared paths receive a mesh: a path nested in
-        # another declared path is bound by its parent's traversal, and the
-        # empty path (the model root) contains every other path. Siblings
-        # sharing a backbone remain independent roots.
-        roots = {
-            path
-            for path in paths
-            if not any(
-                parent != path and (not parent or path.startswith(parent + "."))
-                for parent in paths
-            )
-        }
-        for path in sorted(roots):
+        # another declared path is bound by its parent's traversal.
+        for path in _outermost(declarations[name]):
             meshes[path] = binding.mesh
             attention[path] = attention_parallel(binding.config)
 
@@ -440,6 +429,7 @@ def load_worker_model(
         experts=partition,
     )
     model = loaded.model
+    _stream_host_weights(model, config, bindings, declarations)
     if dedicated:
         # Keep the actual loaded expert modules in numerical traversal order.
         # The worker owns their invocation; no model capability or KV cache
@@ -463,6 +453,79 @@ def load_worker_model(
         source.flow_prompt,
         {} if dedicated else source.entry_points,
     )
+
+
+def _outermost(calls: tuple[Call, ...]) -> list[str]:
+    """Return the declared module paths no other declared path contains.
+
+    The empty path (the model root) contains every other path; siblings
+    sharing a backbone remain independent.
+    """
+    paths = {call.path for call in calls}
+    return sorted(
+        path
+        for path in paths
+        if not any(
+            parent != path and (not parent or path.startswith(parent + "."))
+            for parent in paths
+        )
+    )
+
+
+def _stream_host_weights(
+    model: nn.Module,
+    config: WorkerProcessArgs,
+    bindings: Mapping[str, ComponentBinding],
+    declarations: Mapping[str, tuple[Call, ...]],
+) -> None:
+    """Move the layer projections of host-weight components to host memory.
+
+    A component placed with ``weights = "host"`` streams the dense projection
+    weights of the layer stack under each of its outermost declared module
+    paths (``LayerWeights``), before any numerical operator binds them. The
+    worker plans its device memory afterwards, so the released weights
+    become capacity. Streamed layers cannot be captured into CUDA graphs.
+
+    Raises:
+        WorkerError: ``UNSUPPORTED_SETUP`` when graphs are enabled, the
+            component runs off CUDA, or a module cannot stream its layers.
+    """
+    from uniserve.runtime.layer_weights import LayerWeights, layer_stack
+
+    for name, binding in bindings.items():
+        if binding.config.weights != "host":
+            continue
+        if config.execution.graph_policy != "off":
+            raise unsupported_setup(
+                f"component {name} keeps its weights in host memory, which "
+                "requires --graph-policy off"
+            )
+        device = binding.device
+        if device.type != "cuda":
+            raise unsupported_setup(
+                f"component {name} streams host weights to a CUDA device, "
+                f"not {device}"
+            )
+        for path in _outermost(declarations.get(name, ())):
+            resident = torch.cuda.memory_allocated(device)
+            try:
+                layers = layer_stack(model.get_submodule(path))
+                streamed = LayerWeights(layers)
+            except ValueError as error:
+                raise unsupported_setup(
+                    f"component {name} cannot stream {path!r} from host "
+                    f"memory: {error}"
+                ) from error
+            logger.info(
+                "streaming %d layers of %s from host memory through %d "
+                "device buffers of %.2f GiB; %.2f GiB of device memory "
+                "released",
+                len(layers),
+                path,
+                streamed.slots,
+                streamed.layer_bytes / 2**30,
+                (resident - torch.cuda.memory_allocated(device)) / 2**30,
+            )
 
 
 def _devices(

@@ -10,8 +10,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod parallel;
 pub use parallel::{
-    ComponentConfig, ComponentDistribution, HeadProjection, ParallelConfig, ParallelConfigError,
-    SequenceParallel,
+    ComponentConfig, ComponentDistribution, ComponentWeights, HeadProjection, ParallelConfig,
+    ParallelConfigError, SequenceParallel,
 };
 
 use std::sync::{Arc, OnceLock};

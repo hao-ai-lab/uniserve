@@ -54,6 +54,21 @@ def unsupported(
     return None
 
 
+def reads_without_mask(batch) -> bool:
+    """Whether a visible input reads contiguous keys without a row mask.
+
+    Every key is visible, or each sequence has one endpoint, which the kernel
+    reads as that sequence's used key count. These are the visible inputs
+    the SM80 and SM120 kernel serves: it reads neither paged keys nor mask
+    functions.
+    """
+    return (
+        isinstance(batch, VisibleInput)
+        and batch.block_table is None
+        and (batch.fully_visible or batch.visible_end.shape[1] == 1)
+    )
+
+
 def available() -> bool:
     """Report whether the FlashAttention-4 CuTe runtime can be imported."""
     try:
@@ -177,11 +192,13 @@ class _FlashAttentionOperator(_Operator):
     def __call__(self, q, k, v, batch, *, scale, out):
         if not q.is_cuda:
             raise ValueError("FlashAttention-4 requires CUDA tensors")
-        if not isinstance(
-            batch, (DenseInput, VarlenInput)
-        ) and torch.cuda.get_device_capability(q.device)[0] in (8, 12):
+        if torch.cuda.get_device_capability(q.device)[0] in (8, 12) and not (
+            isinstance(batch, (DenseInput, VarlenInput))
+            or reads_without_mask(batch)
+        ):
             raise ValueError(
-                "paged FlashAttention-4 requires an SM90 or SM100 family GPU"
+                "FlashAttention-4 on SM80 and SM120 reads neither paged keys "
+                "nor mask functions"
             )
         if isinstance(batch, DenseInput) and batch.mask is not None:
             raise ValueError(

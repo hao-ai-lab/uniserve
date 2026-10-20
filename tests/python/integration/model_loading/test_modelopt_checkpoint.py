@@ -175,6 +175,17 @@ def test_packed_manifest_rejects_inconsistent_calibration(tmp_path, mutation):
         models.read_config(tmp_path)
 
 
+def test_a_declared_export_without_packed_weights_is_refused(tmp_path):
+    """An export that declares static NVFP4 but stores every Linear dense."""
+    qwen_checkpoint(tmp_path)
+    config = json.loads((tmp_path / "config.json").read_text())
+    config["quantization_config"] = MODELOPT_NVFP4
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match="stores no packed NVFP4 weights"):
+        models.read_config(tmp_path)
+
+
 @pytest.mark.parametrize(
     "change",
     (

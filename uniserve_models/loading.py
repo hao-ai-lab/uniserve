@@ -209,9 +209,21 @@ def _inventory(root, repository, revision, io):
             if path.is_file()
         )
     else:
-        from huggingface_hub import HfApi
+        from huggingface_hub import HfApi, constants
 
-        names = HfApi().list_repo_files(repo_id=repository, revision=revision)
+        if constants.HF_HUB_OFFLINE:
+            # Offline, the cached snapshot of the commit is the whole
+            # checkpoint: a file it lacks cannot be fetched, so loading a
+            # component that needs one fails when it opens that file.
+            names = (
+                path.relative_to(root).as_posix()
+                for path in root.rglob("*")
+                if path.is_file()
+            )
+        else:
+            names = HfApi().list_repo_files(
+                repo_id=repository, revision=revision
+            )
 
     return frozenset(
         name
@@ -552,9 +564,11 @@ def _calibrated_quantization(
 
     The checkpoint tensors decide which modules are quantized: a module whose
     weight is stored as packed NVFP4 executes with that weight and its
-    calibrated static activation scale; every other module stays dense. The
-    activation's per-block K16 encoding is computed at run time against that
-    fixed tensor scale.
+    calibrated static activation scale; every other module stays dense,
+    including every module of a component that shares a calibrated directory
+    with a sibling whose modules hold all of its packed weights (a VAE whose
+    decoder alone is calibrated). The activation's per-block K16 encoding is
+    computed at run time against that fixed tensor scale.
 
     Args:
         model: Meta-device model whose module paths receive the result.
@@ -575,7 +589,8 @@ def _calibrated_quantization(
         ValueError: A declared recipe is not static NVFP4 with 16-element
             blocks, a packed weight lacks a positive finite input scale, maps
             onto a non-``Linear`` module or gives one module conflicting
-            scales, or a read source stores no packed weight.
+            scales, or the files of a declared source store no packed
+            weight.
     """
     for name, value in declared.items():
         _require_static_nvfp4(name, value)
@@ -590,8 +605,15 @@ def _calibrated_quantization(
     for source in sources:
         if manifest_scales is None and source.name not in declared:
             continue
-        packed = 0
         with source.open(io=io) as reader:
+            # The export is judged by its files: one VAE directory feeds both
+            # its encoder and its decoder, and the export may calibrate only
+            # one half, whose sibling then reads dense weights from the same
+            # files.
+            stores_packed = any(
+                isinstance(reader.get(name), checkpoint.NVFP4Weight)
+                for name in reader.names()
+            )
             for component in declarations:
                 if component.source != source.name:
                     continue
@@ -645,8 +667,7 @@ def _calibrated_quantization(
                                 f"{path} receives conflicting calibrated "
                                 "activation scales"
                             )
-                    packed += 1
-        if not packed and source.name in declared:
+        if not stores_packed and source.name in declared:
             raise ValueError(
                 f"ModelOpt source {source.name} stores no packed NVFP4 weights"
             )

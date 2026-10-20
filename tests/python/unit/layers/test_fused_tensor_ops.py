@@ -7,6 +7,7 @@ from uniserve.nn.functional import (
     qk_bias_rms_norm_rope_,
     scaled_residual_layer_norm_absmax,
     scaled_residual_rms_norm_absmax_,
+    scaled_residual_rms_norm_nvfp4_,
     swiglu,
     swiglu_absmax,
     unpatchify_video_tokens,
@@ -345,6 +346,67 @@ def test_scaled_residual_normalizes_the_unrounded_fp32_sum(device, width):
     torch.testing.assert_close(actual, expected)
     assert torch.equal(magnitude, actual.float().abs().amax())
     assert magnitude.dtype is torch.float32
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("biased", (False, True))
+def test_scaled_residual_encodes_its_rms_rows_in_calibrated_nvfp4(biased):
+    """The encoded normalization is the quantizer's encoding of its rows.
+
+    With the H3 VAE decoder's FP32 residual stream and BF16 updates at width
+    2048, the residual update equals the unencoded call's and the values,
+    block scales and tensor scale equal, bit for bit, what the calibrated
+    quantizer stores for the unencoded normalization. One row's weights zero
+    a K16 block and another's saturate a block scale.
+    """
+    from uniserve.quantization import QuantizedTensor, Quantizer, ScaleLayout
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("NVFP4 encoding requires compute capability 10 or newer")
+    generator = torch.Generator(device="cuda").manual_seed(29 + biased)
+    width = 2048
+    hidden = (
+        torch.randn((2, 151, width), generator=generator, device="cuda") * 4
+    )
+    update = torch.randn(
+        (2, 151, width), generator=generator, device="cuda"
+    ).to(torch.bfloat16)
+    scale, weight, update_bias = (
+        torch.randn((width,), generator=generator, device="cuda").to(
+            torch.bfloat16
+        )
+        for _ in range(3)
+    )
+    weight[:16] = 0
+    weight[16:32] = 300
+    quantizer = Quantizer("nvfp4", calibrated_scale=0.0123)
+    bias = update_bias if biased else None
+
+    with torch.inference_mode():
+        plain_hidden, plain, _ = scaled_residual_rms_norm_absmax_(
+            hidden.clone(), update, scale, weight, bias, eps=1e-5
+        )
+        encoded_hidden, encoded = scaled_residual_rms_norm_nvfp4_(
+            hidden.clone(),
+            update,
+            scale,
+            weight,
+            bias,
+            eps=1e-5,
+            quantizer=quantizer,
+        )
+        expected = quantizer.quantize(plain.reshape(-1, width)).buffers()
+
+    assert torch.equal(encoded_hidden, plain_hidden)
+    assert isinstance(encoded, QuantizedTensor)
+    assert encoded.shape == plain.shape
+    assert encoded.scale_layout is ScaleLayout.LINEAR
+    for name, field in encoded.buffers().items():
+        want = expected[name]
+        if field.dtype != torch.float32:
+            field, want = field.view(torch.uint8), want.view(torch.uint8)
+        assert torch.equal(field.reshape(want.shape), want), name
 
 
 @pytest.mark.parametrize(

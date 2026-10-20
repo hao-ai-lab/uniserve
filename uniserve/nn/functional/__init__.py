@@ -8,11 +8,14 @@ when a kernel supports their layout.
 """
 
 from ._activation import (
+    GatingInput,
+    calibrated_nvfp4,
     gelu_and_mul,
     silu_and_mul,
     softcap,
     swiglu,
     swiglu_absmax,
+    swiglu_nvfp4,
     value_first_swiglu,
     value_first_swiglu_absmax,
     value_first_swiglu_fp8,
@@ -35,6 +38,7 @@ from ._norm import (
     scaled_residual_layer_norm_absmax,
     scaled_residual_rms_norm_,
     scaled_residual_rms_norm_absmax_,
+    scaled_residual_rms_norm_nvfp4_,
     weighted_rms_norm,
     weighted_rms_norm_absmax,
 )
@@ -43,12 +47,14 @@ from ._rope import apply_rotary, qk_bias_rms_norm_rope_, qk_norm_rope
 from ._tensors import Rounding
 
 __all__ = [
+    "GatingInput",
     "Rounding",
     "Routes",
     "add_rms_norm",
     "apply_rotary",
     "attention",
     "bias_add",
+    "calibrated_nvfp4",
     "frame_norm_pad",
     "frame_pad",
     "gated_residual",
@@ -69,10 +75,12 @@ __all__ = [
     "scaled_residual_layer_norm_absmax",
     "scaled_residual_rms_norm_",
     "scaled_residual_rms_norm_absmax_",
+    "scaled_residual_rms_norm_nvfp4_",
     "silu_and_mul",
     "softcap",
     "swiglu",
     "swiglu_absmax",
+    "swiglu_nvfp4",
     "topk_softmax",
     "unpatchify",
     "unpatchify_video_tokens",

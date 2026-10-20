@@ -170,7 +170,7 @@ class Backend:
 
 
 # Provider modules in the order ``"auto"`` probes them.
-_PROVIDERS = ("sm100", "sm90", "flashinfer", "triton")
+_PROVIDERS = ("sm100", "sm90", "sm120", "flashinfer", "triton")
 
 
 def resolve(backend, *, device, tile):

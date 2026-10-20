@@ -18,7 +18,7 @@ __all__ = [
 
 
 class SiLUAndMul(nn.Module):
-    """Apply SiLU gating to equal channel halves of a packed tensor.
+    """Apply SiLU gating to packed channel halves or a ``(gate, value)`` pair.
 
     ``rounding`` states whether the activated gate rounds to the input dtype
     before the product (see ``functional.Rounding``).
@@ -29,14 +29,14 @@ class SiLUAndMul(nn.Module):
         self.rounding = rounding
 
     def forward(
-        self, x: torch.Tensor, *, out: torch.Tensor | None = None
+        self, x: functional.GatingInput, *, out: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Apply SiLU to the gate half and multiply by the value half."""
+        """Apply SiLU to the gate channels and multiply by the value ones."""
         return functional.silu_and_mul(x, out=out, rounding=self.rounding)
 
 
 class GELUAndMul(nn.Module):
-    """Apply GELU gating to equal channel halves of a packed tensor."""
+    """Apply GELU gating to packed channel halves or a gate/value pair."""
 
     def __init__(self, approximate: Literal["none", "tanh"] = "none") -> None:
         """Select the PyTorch GELU approximation used by the gate."""
@@ -44,15 +44,15 @@ class GELUAndMul(nn.Module):
         self.approximate = approximate
 
     def forward(
-        self, x: torch.Tensor, *, out: torch.Tensor | None = None
+        self, x: functional.GatingInput, *, out: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Apply GELU to the gate half and multiply by the value half."""
+        """Apply GELU to the gate channels and multiply by the value ones."""
         return functional.gelu_and_mul(x, approximate=self.approximate, out=out)
 
 
 # Elementwise activations of non-gated MLPs, by the names checkpoints use. A
-# name resolves to one module per numerical formula; gated activations take a
-# packed tensor of both halves and are the MLP's own (``SiLUAndMul``,
+# name resolves to one module per numerical formula; gated activations take
+# gate and value channels and are the MLP's own (``SiLUAndMul``,
 # ``GELUAndMul``).
 _ACT_FN_REGISTRY: dict[str, Callable[[], nn.Module]] = {
     "silu": nn.SiLU,

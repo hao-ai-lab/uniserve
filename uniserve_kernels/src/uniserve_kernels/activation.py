@@ -9,9 +9,11 @@ Launchers write caller-supplied outputs and validate nothing. The callers in
 and raise on CUDA when it reports a reason; tensor operations evaluate the
 same formulas only off CUDA.
 
-Every input is addressed as rows with unit channel stride: packed inputs
-``[..., 2 * width]`` whose leading axes flatten to rows of one stride (see
-:func:`row_stride`), separate SwiGLU views likewise, and contiguous outputs.
+Every input is addressed as rows with unit channel stride: gate and value
+views ``[..., width]`` whose leading axes each flatten to rows of one stride
+(see :func:`row_stride`), the two halves of packed ``[gate, value]`` rows or
+two separately written projections alike, separate SwiGLU views likewise,
+and contiguous outputs.
 
 :func:`softcap` bounds contiguous values to ``(-cap, cap)`` as
 ``tanh(x * (1 / cap)) * cap`` in one pass, with PyTorch's CUDA arithmetic.
@@ -30,13 +32,13 @@ from uniserve_kernels.triton import (
     unsupported_operands,
 )
 
-#: Gate activations of the packed ``act_and_mul`` kernels: ``silu``, exact
+#: Gate activations of the ``act_and_mul`` kernels: ``silu``, exact
 #: (erf) ``gelu`` and ``gelu_tanh``, PyTorch's ``approximate="tanh"`` form.
 ACTIVATIONS = ("silu", "gelu", "gelu_tanh")
 #: Elements per program for the kernels that neither quantize per row nor
 #: report absmax partials.
 _ACT_BLOCK = 1024
-#: Output elements per program and warps of the packed ``act_and_mul``
+#: Output elements per program and warps of the ``act_and_mul``
 #: kernel. Programs tile the flattened output, so no row width leaves a
 #: mostly masked tail program; 16 elements per thread keep enough loads in
 #: flight to stream HBM (measured on SM100 against the registered copy line).
@@ -58,6 +60,8 @@ _FLOATING = (torch.float16, torch.bfloat16, torch.float32)
 
 if triton is not None:
     from triton.language.extra.cuda import libdevice
+
+    from uniserve_kernels.quantization import nvfp4_encode_tile
 
     # Largest finite float8_e4m3fn magnitude. The epsilon keeps the scale of
     # an all-zero row positive so the FP8 kernels' division stays finite.
@@ -83,10 +87,12 @@ if triton is not None:
 
     @triton.jit
     def _act_and_mul_kernel(
-        x_ptr,
+        gate_ptr,
+        value_ptr,
         out_ptr,
         elements,
-        x_row_stride,
+        gate_row_stride,
+        value_row_stride,
         n_cols: tl.constexpr,
         ACTIVATION: tl.constexpr,  # noqa: N803
         BLOCK: tl.constexpr,  # noqa: N803
@@ -97,10 +103,11 @@ if triton is not None:
         """Store ``act(gate) * value`` for one block of the flattened output.
 
         Grid: ``ceil(elements / BLOCK)`` programs over the contiguous
-        ``[rows, n_cols]`` output. Input rows start ``x_row_stride``
-        elements apart. ``WIDE`` computes offsets in int64, which launches
-        whose input or output spans ``2**31`` elements require. ``PDL``
-        launches run :func:`pdl_prologue` before the first load.
+        ``[rows, n_cols]`` output. Gate rows start ``gate_row_stride`` and
+        value rows ``value_row_stride`` elements apart. ``WIDE`` computes
+        offsets in int64, which launches whose input or output spans
+        ``2**31`` elements require. ``PDL`` launches run
+        :func:`pdl_prologue` before the first load.
         """
         pdl_prologue(PDL)
 
@@ -110,51 +117,53 @@ if triton is not None:
         mask = offsets < elements
         row = offsets // n_cols
         column = offsets - row * n_cols
-        base = row * x_row_stride + column
 
-        # The gate occupies the first half of each row and its multiplicative
-        # value occupies the second half.
-        gate = tl.load(x_ptr + base, mask=mask, other=0.0).to(tl.float32)
-        value = tl.load(x_ptr + base + n_cols, mask=mask, other=0.0).to(
-            tl.float32
-        )
+        gate = tl.load(
+            gate_ptr + row * gate_row_stride + column, mask=mask, other=0.0
+        ).to(tl.float32)
+        value = tl.load(
+            value_ptr + row * value_row_stride + column, mask=mask, other=0.0
+        ).to(tl.float32)
         activated = _activate(gate, ACTIVATION)
         if stepwise:
-            activated = activated.to(x_ptr.dtype.element_ty).to(tl.float32)
+            activated = activated.to(gate_ptr.dtype.element_ty).to(tl.float32)
         out = activated * value
         tl.store(out_ptr + offsets, out, mask=mask)
 
     @triton.jit
     def _act_and_mul_fp8_kernel(
-        x_ptr,
+        gate_ptr,
+        value_ptr,
         out_ptr,
         scale_ptr,
-        x_row_stride,
+        gate_row_stride,
+        value_row_stride,
         n_cols: tl.constexpr,
         ACTIVATION: tl.constexpr,  # noqa: N803
         block: tl.constexpr,
         stepwise: tl.constexpr,
     ):
-        """Apply packed gating and emit its row-scaled E4M3 output.
+        """Apply gating and emit its row-scaled E4M3 output.
 
-        One program owns one complete ``[gate, value]`` row, with ``block``
-        at least ``n_cols``, so the row maximum is a single block reduction.
-        Row offsets are int64, so one launch covers every row of a packed
-        input past ``2**31`` elements. ``stepwise`` rounds the activated gate
-        and the product to the input dtype before encoding.
+        One program owns one complete gate and value row, with ``block`` at
+        least ``n_cols``, so the row maximum is a single block reduction.
+        Row offsets are int64, so one launch covers every row of inputs past
+        ``2**31`` elements. ``stepwise`` rounds the activated gate and the
+        product to the input dtype before encoding.
         """
         row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, block)
         mask = cols < n_cols
-        base = row * x_row_stride
 
-        gate = tl.load(x_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
-        value = tl.load(x_ptr + base + n_cols + cols, mask=mask, other=0.0).to(
-            tl.float32
-        )
+        gate = tl.load(
+            gate_ptr + row * gate_row_stride + cols, mask=mask, other=0.0
+        ).to(tl.float32)
+        value = tl.load(
+            value_ptr + row * value_row_stride + cols, mask=mask, other=0.0
+        ).to(tl.float32)
         activated = _activate(gate, ACTIVATION)
         if stepwise:
-            dtype = x_ptr.dtype.element_ty
+            dtype = gate_ptr.dtype.element_ty
             activated = activated.to(dtype).to(tl.float32)
             output = (activated * value).to(dtype).to(tl.float32)
         else:
@@ -333,6 +342,91 @@ if triton is not None:
         tl.store(output_ptr + row * width + columns, quantized, mask=mask)
         tl.store(output_scale_ptr + row, output_scale)
 
+    @triton.jit
+    def _gated_nvfp4_kernel(
+        gate_ptr,
+        value_ptr,
+        gate_bias_ptr,
+        value_bias_ptr,
+        values_ptr,
+        block_scales_ptr,
+        tensor_scale_ptr,
+        encode_scale,
+        rows,
+        gate_row_stride,
+        value_row_stride,
+        width: tl.constexpr,
+        ACTIVATION: tl.constexpr,  # noqa: N803
+        STEPWISE: tl.constexpr,  # noqa: N803
+        HAS_GATE_BIAS: tl.constexpr,  # noqa: N803
+        HAS_VALUE_BIAS: tl.constexpr,  # noqa: N803
+        BLOCK_M: tl.constexpr,  # noqa: N803
+        BLOCK_N: tl.constexpr,  # noqa: N803
+    ):
+        """Store one ``[BLOCK_M, BLOCK_N]`` tile of gating in calibrated NVFP4.
+
+        The tile's products are the values :func:`_act_and_mul_kernel`
+        (``ACTIVATION`` one of :data:`ACTIVATIONS`) or, for ``"swiglu"``,
+        :func:`_swiglu_kernel` stores, rounded to the input dtype by the same
+        arithmetic; ``nvfp4_encode_tile`` encodes them against the static
+        ``encode_scale`` instead of storing them. Program ``(0, 0)`` also
+        stores that scale as the encoding's tensor scale.
+        """
+        row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        column = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        live = (row < rows)[:, None] & (column < width)[None, :]
+        offset = row.to(tl.int64)[:, None]
+
+        gate = tl.load(
+            gate_ptr + offset * gate_row_stride + column[None, :],
+            mask=live,
+            other=0.0,
+        ).to(tl.float32)
+        value = tl.load(
+            value_ptr + offset * value_row_stride + column[None, :],
+            mask=live,
+            other=0.0,
+        ).to(tl.float32)
+        if HAS_VALUE_BIAS:
+            value += tl.load(
+                value_bias_ptr + column, mask=column < width, other=0.0
+            ).to(tl.float32)[None, :]
+        if HAS_GATE_BIAS:
+            gate += tl.load(
+                gate_bias_ptr + column, mask=column < width, other=0.0
+            ).to(tl.float32)[None, :]
+
+        dtype = gate_ptr.dtype.element_ty
+        if ACTIVATION == "swiglu":
+            product = value * gate / (1.0 + tl.exp(-gate))
+        else:
+            activated = _activate(gate, ACTIVATION)
+            if STEPWISE:
+                activated = activated.to(dtype).to(tl.float32)
+            product = activated * value
+        # Encode the products as the unencoded output would store them.
+        product = tl.where(live, product.to(dtype).to(tl.float32), 0.0)
+        packed, scale_bytes = nvfp4_encode_tile(
+            product, encode_scale, BLOCK_M, BLOCK_N
+        )
+
+        pairs = tl.program_id(1) * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
+        tl.store(
+            values_ptr + offset * (width // 2) + pairs[None, :],
+            packed,
+            mask=(row < rows)[:, None] & (pairs < width // 2)[None, :],
+        )
+        groups = tl.program_id(1) * (BLOCK_N // 16) + tl.arange(
+            0, BLOCK_N // 16
+        )
+        tl.store(
+            block_scales_ptr + offset * (width // 16) + groups[None, :],
+            scale_bytes,
+            mask=(row < rows)[:, None] & (groups < width // 16)[None, :],
+        )
+        if tl.program_id(0) == 0 and tl.program_id(1) == 0:
+            tl.store(tensor_scale_ptr, encode_scale)
+
 
 if triton is not None:
 
@@ -427,22 +521,30 @@ def row_stride(x: torch.Tensor) -> int | None:
 
 
 def unsupported(
-    x: torch.Tensor, *operands: torch.Tensor | None, fp8_width: int = 0
+    x: torch.Tensor,
+    *operands: torch.Tensor | None,
+    value: torch.Tensor | None = None,
+    fp8_width: int = 0,
 ) -> str | None:
-    """Return why the kernels cannot evaluate packed rows ``x``, or ``None``.
+    """Return why the kernels cannot evaluate input rows ``x``, or ``None``.
 
     ``x`` is a floating tensor whose rows (see :func:`row_stride`) carry the
-    gating channels. ``operands`` are the outputs and biases the launch
-    touches (``None`` for an absent bias); each must be contiguous.
+    gating channels: packed ``[gate, value]`` rows, or the gate view of a
+    separate ``value`` view, which must match its shape and dtype and also
+    have rows of one stride. ``operands`` are the outputs and biases the
+    launch touches (``None`` for an absent bias); each must be contiguous.
     ``fp8_width`` is the per-row output width of an FP8 launch, which one
     program reduces completely and is bounded by :data:`MAX_FP8_WIDTH`.
     """
-    reason = unsupported_operands(x, *operands)
+    inputs = (x,) if value is None else (x, value)
+    reason = unsupported_operands(*inputs, *operands)
     if reason is not None:
         return reason
     if x.dtype not in _FLOATING:
         return f"input dtype {x.dtype} is not float16, bfloat16 or float32"
-    if row_stride(x) is None:
+    if value is not None and (value.shape != x.shape or value.dtype != x.dtype):
+        return "gate and value views differ in shape or dtype"
+    if any(row_stride(view) is None for view in inputs):
         return (
             "input channels are not unit-strided or its leading axes do not "
             "flatten to rows of one stride"
@@ -461,33 +563,37 @@ def unsupported(
 
 
 def act_and_mul(
-    x: torch.Tensor,
+    gate: torch.Tensor,
+    value: torch.Tensor,
     out: torch.Tensor,
     *,
     activation: str,
     stepwise: bool = False,
 ) -> None:
-    """Store ``activation(gate) * value`` for packed ``[gate, value]`` rows.
+    """Store ``activation(gate) * value`` for gate and value rows.
 
-    ``x`` is ``[..., 2 * width]`` with rows of one stride and ``out`` is
-    contiguous ``[..., width]``; ``out`` receives the result in its own
-    dtype. ``activation`` is one of :data:`ACTIVATIONS`.
+    ``gate`` and ``value`` are ``[..., width]`` views whose rows each have
+    one stride (see :func:`row_stride`): the two halves of packed
+    ``[gate, value]`` rows, or two separately written projections. ``out``
+    is contiguous ``[..., width]`` and receives the result in its own dtype.
+    ``activation`` is one of :data:`ACTIVATIONS`.
     """
-    width = int(x.shape[-1]) // 2
+    width = int(gate.shape[-1])
     rows = out.numel() // width
     if rows == 0:
         return
-    stride = row_stride(x)
+    strides = (row_stride(gate), row_stride(value))
     elements = rows * width
-    # The last program's offsets reach elements + BLOCK; input offsets reach
-    # rows * stride (packed rows span at least 2 * width).
-    span = max(rows * max(stride, 2 * width), elements) + _GATED_BLOCK
-    pdl = dependent_launch(x.device)
+    # The last program's offsets reach elements + BLOCK; input offsets from
+    # each view's start reach rows * its row stride.
+    span = max(rows * max(*strides, width), elements) + _GATED_BLOCK
+    pdl = dependent_launch(gate.device)
     _act_and_mul_kernel[(triton.cdiv(elements, _GATED_BLOCK),)](
-        x,
+        gate,
+        value,
         out,
         elements,
-        stride,
+        *strides,
         width,
         activation,
         _GATED_BLOCK,
@@ -501,31 +607,34 @@ def act_and_mul(
 
 
 def act_and_mul_fp8(
-    x: torch.Tensor,
+    gate: torch.Tensor,
+    value: torch.Tensor,
     out: torch.Tensor,
     scale: torch.Tensor,
     *,
     activation: str,
     stepwise: bool = False,
 ) -> None:
-    """Store row-scaled E4M3 packed gating values and ``[rows, 1]`` scales.
+    """Store row-scaled E4M3 gating values and ``[rows, 1]`` scales.
 
-    ``x`` packs ``[gate, value]`` rows like :func:`act_and_mul`. ``out`` is
+    ``gate`` and ``value`` are rows like :func:`act_and_mul`'s. ``out`` is
     contiguous float8_e4m3fn ``[rows, width]`` and ``scale`` is FP32; one
     program handles each complete row, so ``width`` is at most
     :data:`MAX_FP8_WIDTH`. ``stepwise`` rounds the activated gate and product
-    to ``x.dtype`` before encoding.
+    to the input dtype before encoding.
     """
-    width = int(x.shape[-1]) // 2
+    width = int(gate.shape[-1])
     rows = out.numel() // width
     if rows == 0:
         return
     block = triton.next_power_of_2(width)
     _act_and_mul_fp8_kernel[(rows,)](
-        x,
+        gate,
+        value,
         out,
         scale,
-        row_stride(x),
+        row_stride(gate),
+        row_stride(value),
         width,
         activation,
         block,
@@ -629,4 +738,72 @@ def swiglu(
         RETURN_ABSMAX=partials is not None,
         BLOCK=block,
         num_warps=4 if partials is None else 8,
+    )
+
+
+#: Tile and warps of the calibrated NVFP4 gating kernel: whole K16 blocks of
+#: a few rows per program.
+_NVFP4_BLOCK_M = 16
+_NVFP4_BLOCK_N = 256
+_NVFP4_WARPS = 4
+
+
+def gated_nvfp4(
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    values: torch.Tensor,
+    block_scales: torch.Tensor,
+    tensor_scale: torch.Tensor,
+    encode_scale: float,
+    *,
+    activation: str,
+    stepwise: bool = False,
+    gate_bias: torch.Tensor | None = None,
+    value_bias: torch.Tensor | None = None,
+) -> None:
+    """Store gating rows in a calibrated NVFP4 encoding without storing them.
+
+    ``gate`` and ``value`` are ``[..., width]`` rows like
+    :func:`act_and_mul`'s, ``width`` a whole number of K16 blocks.
+    ``activation`` is one of :data:`ACTIVATIONS`, whose products (and
+    ``stepwise``) are :func:`act_and_mul`'s, or ``"swiglu"``, whose products
+    are :func:`swiglu`'s with its optional biases. ``values`` (uint8
+    ``[rows, width // 2]``), ``block_scales`` (uint8 ``[rows, width // 16]``,
+    linear layout) and the FP32 scalar ``tensor_scale`` receive the encoding
+    of those products, as rounded to the input dtype, against the static
+    ``encode_scale``: bit for bit what FlashInfer's NVFP4 encoder stores for
+    the unencoded output.
+    """
+    width = int(gate.shape[-1])
+    rows = gate.numel() // width
+    if rows == 0:
+        tensor_scale.fill_(encode_scale)
+        return
+    grid = (
+        triton.cdiv(rows, _NVFP4_BLOCK_M),
+        triton.cdiv(width, _NVFP4_BLOCK_N),
+    )
+    _gated_nvfp4_kernel[grid](
+        gate,
+        value,
+        gate_bias,
+        value_bias,
+        values,
+        block_scales,
+        tensor_scale,
+        encode_scale,
+        rows,
+        row_stride(gate),
+        row_stride(value),
+        width,
+        activation,
+        stepwise,
+        gate_bias is not None,
+        value_bias is not None,
+        _NVFP4_BLOCK_M,
+        _NVFP4_BLOCK_N,
+        num_warps=_NVFP4_WARPS,
+        # The products contract exactly as the unencoded kernels' do:
+        # act_and_mul fuses only without stepwise rounding, swiglu always.
+        enable_fp_fusion=activation == "swiglu" or not stepwise,
     )

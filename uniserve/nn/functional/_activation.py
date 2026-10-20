@@ -32,11 +32,127 @@ def _row_fp8(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return buffers["values"].reshape(values.shape), buffers["scale"]
 
 
+GatingInput = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+
+def calibrated_nvfp4(quantizer) -> bool:
+    """Whether ``quantizer`` encodes NVFP4 against a static tensor scale."""
+    return (
+        quantizer.format == "nvfp4" and quantizer.calibrated_scale is not None
+    )
+
+
+def _encode_gating(
+    function: str,
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    out: QuantizedTensor,
+    *,
+    activation: str,
+    stepwise: bool,
+    gate_bias: torch.Tensor | None = None,
+    value_bias: torch.Tensor | None = None,
+) -> QuantizedTensor:
+    """Encode gating products into a calibrated NVFP4 ``out`` on CUDA.
+
+    ``out`` is ``[rows, width]`` (or the products' shape) with linear block
+    scales; the kernel fills its values, block scales and tensor scale, and
+    the products themselves are never stored.
+
+    Raises:
+        ValueError: ``out`` is not that encoding, or no kernel takes the
+            operands.
+    """
+    from uniserve.quantization import ScaleLayout
+    from uniserve_kernels import activation as kernels
+
+    width = int(gate.shape[-1])
+    rows = gate.numel() // width
+    if (
+        not calibrated_nvfp4(out.quantizer)
+        or out.scale_layout is not ScaleLayout.LINEAR
+        or tuple(out.shape) not in {(rows, width), tuple(gate.shape)}
+        or out.dtype != gate.dtype
+        or out.device != gate.device
+    ):
+        raise ValueError(
+            "encoded gating requires a calibrated NVFP4 output of the "
+            "products' rows with linear block scales"
+        )
+    fields = out.buffers()
+    require_kernel(
+        function,
+        kernels.unsupported(
+            gate,
+            fields["values"],
+            fields["block_scale"],
+            gate_bias,
+            value_bias,
+            value=value,
+        )
+        or (
+            None
+            if gate.dtype in (torch.bfloat16, torch.float16) and width % 16 == 0
+            else "NVFP4 encodes 16-bit rows of whole K16 blocks"
+        ),
+        gate=gate,
+        value=value,
+    )
+    kernels.gated_nvfp4(
+        gate,
+        value,
+        fields["values"],
+        fields["block_scale"],
+        fields["tensor_scale"],
+        out.quantizer.calibrated_scale,
+        activation=activation,
+        stepwise=stepwise,
+        gate_bias=gate_bias,
+        value_bias=value_bias,
+    )
+    return out
+
+
+def _operands(x: GatingInput) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the gate and value views of packed rows or of a separate pair.
+
+    Packed ``[..., 2 * width]`` rows split into their two halves as views; a
+    ``(gate, value)`` pair, such as two separately written projections, must
+    agree in shape, dtype and device.
+
+    Raises:
+        ValueError: Packed rows without two equal, non-empty channel halves,
+            or a pair that disagrees.
+    """
+    if isinstance(x, torch.Tensor):
+        if x.ndim < 1 or x.shape[-1] % 2 or x.shape[-1] == 0:
+            raise ValueError("gating requires equal channel halves")
+        width = x.shape[-1] // 2
+        return x[..., :width], x[..., width:]
+    gate, value = x
+    if (
+        gate.ndim < 1
+        or gate.shape[-1] == 0
+        or gate.shape != value.shape
+        or gate.dtype != value.dtype
+        or gate.device != value.device
+    ):
+        raise ValueError(
+            "gating requires gate and value views of one shape, dtype and "
+            "device"
+        )
+    return gate, value
+
+
 def _gate_value(
-    x: torch.Tensor, activation: str, rounding: Rounding
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    activation: str,
+    rounding: Rounding,
 ) -> torch.Tensor:
-    """Return FP32 ``activation(gate) * value`` for packed ``[gate, value]``."""
-    gate, value = x.float().chunk(2, dim=-1)
+    """Return FP32 ``activation(gate) * value``."""
+    dtype = gate.dtype
+    gate, value = gate.float(), value.float()
     if activation == "silu":
         activated = F.silu(gate)
     else:
@@ -44,126 +160,161 @@ def _gate_value(
             gate, approximate="tanh" if activation == "gelu_tanh" else "none"
         )
     if rounding is Rounding.STEPWISE:
-        activated = activated.to(x.dtype).float()
-        return (activated * value).to(x.dtype).float()
+        activated = activated.to(dtype).float()
+        return (activated * value).to(dtype).float()
     return activated * value
 
 
 def _act_and_mul(
     function: str,
-    x: torch.Tensor,
+    x: GatingInput,
     activation: str,
     out: torch.Tensor | None,
     *,
     rounding: Rounding,
 ) -> torch.Tensor:
-    """Evaluate packed gating into a plain or row-scaled FP8 output.
+    """Evaluate gating into a plain or row-scaled FP8 output.
 
-    ``activation`` names a formula of ``uniserve_kernels.activation``. A
-    row-scaled FP8 ``QuantizedTensor`` output receives the E4M3 encoding of
-    the unrounded FP32 products with one scale per row.
+    ``x`` is packed ``[gate, value]`` rows or a ``(gate, value)`` pair (see
+    `_operands`). ``activation`` names a formula of
+    ``uniserve_kernels.activation``. A row-scaled FP8 ``QuantizedTensor``
+    output receives the E4M3 encoding of the unrounded FP32 products with
+    one scale per row.
     """
     from uniserve.quantization import Quantizer
     from uniserve_kernels import activation as kernels
 
-    if x.ndim < 1 or x.shape[-1] % 2 or x.shape[-1] == 0:
-        raise ValueError("gating requires equal channel halves")
-    shape = (*x.shape[:-1], x.shape[-1] // 2)
+    gate, value = _operands(x)
+    shape = tuple(gate.shape)
 
+    if isinstance(out, QuantizedTensor) and calibrated_nvfp4(out.quantizer):
+        if not gate.is_cuda:
+            raise ValueError("calibrated NVFP4 gating requires CUDA")
+        return _encode_gating(
+            function,
+            gate,
+            value,
+            out,
+            activation=activation,
+            stepwise=rounding is Rounding.STEPWISE,
+        )
     if isinstance(out, QuantizedTensor):
         if out.quantizer != Quantizer("fp8", axis=0):
-            raise ValueError("fused gating output requires row-scaled FP8")
-        if x.is_cuda:
+            raise ValueError(
+                "fused gating output requires row-scaled FP8 or calibrated "
+                "NVFP4"
+            )
+        if gate.is_cuda:
             require_kernel(
                 function,
                 "a row-scaled FP8 output keeps one scale per leading index "
                 "of a rank-2 input; other ranks have no kernel"
-                if x.ndim != 2
-                else kernels.unsupported(x, fp8_width=shape[-1]),
-                x=x,
+                if gate.ndim != 2
+                else kernels.unsupported(
+                    gate, value=value, fp8_width=shape[-1]
+                ),
+                gate=gate,
+                value=value,
             )
             values = torch.empty(
-                shape, dtype=torch.float8_e4m3fn, device=x.device
+                shape, dtype=torch.float8_e4m3fn, device=gate.device
             )
             scales = torch.empty(
-                (x.shape[0], 1), dtype=torch.float32, device=x.device
+                (gate.shape[0], 1), dtype=torch.float32, device=gate.device
             )
             kernels.act_and_mul_fp8(
-                x,
+                gate,
+                value,
                 values,
                 scales,
                 activation=activation,
                 stepwise=rounding is Rounding.STEPWISE,
             )
-        elif x.ndim != 2:
+        elif gate.ndim != 2:
             # Axis zero of a higher-rank tensor retains that axis alone; it
             # must not silently become one separate scale per flattened row.
             encoded = out.quantizer.quantize(
-                _gate_value(x, activation, rounding)
+                _gate_value(gate, value, activation, rounding)
             )
-            return result(encoded.to(dtype=x.dtype), out)
+            return result(encoded.to(dtype=gate.dtype), out)
         else:
-            values, scales = _row_fp8(_gate_value(x, activation, rounding))
+            values, scales = _row_fp8(
+                _gate_value(gate, value, activation, rounding)
+            )
         encoded = out.quantizer.from_tensors(
             {"values": values, "scale": scales},
             shape=tuple(values.shape),
-            dtype=x.dtype,
+            dtype=gate.dtype,
         )
         return result(encoded, out)
 
     if out is not None and (
-        out.shape != shape or out.dtype != x.dtype or out.device != x.device
+        out.shape != shape
+        or out.dtype != gate.dtype
+        or out.device != gate.device
     ):
         raise ValueError(
             "output must match the numerical result's shape, dtype and device"
         )
-    if x.is_cuda:
+    if gate.is_cuda:
         # The kernel stores contiguous rows; another caller layout receives
         # a copy of them.
         target = (
             out
             if out is not None and out.is_contiguous()
-            else torch.empty(shape, dtype=x.dtype, device=x.device)
+            else torch.empty(shape, dtype=gate.dtype, device=gate.device)
         )
-        require_kernel(function, kernels.unsupported(x, target), x=x, out=out)
+        require_kernel(
+            function,
+            kernels.unsupported(gate, target, value=value),
+            gate=gate,
+            value=value,
+            out=out,
+        )
         kernels.act_and_mul(
-            x,
+            gate,
+            value,
             target,
             activation=activation,
             stepwise=rounding is Rounding.STEPWISE,
         )
         return target if out is None else result(target, out)
-    return result(_gate_value(x, activation, rounding).to(x.dtype), out)
+    return result(
+        _gate_value(gate, value, activation, rounding).to(gate.dtype), out
+    )
 
 
 def silu_and_mul(
-    x: torch.Tensor,
+    x: GatingInput,
     *,
     out: torch.Tensor | None = None,
     rounding: Rounding,
 ) -> torch.Tensor:
-    """Apply SiLU to the first channel half and multiply by the second.
+    """Apply SiLU to the gate channels and multiply by the value channels.
 
-    ``x`` packs ``[gate, value]`` along its final axis. A row-scaled FP8
+    ``x`` packs ``[gate, value]`` along its final axis, or is a ``(gate,
+    value)`` pair of separate ``[..., width]`` views, which gate without
+    joining their storage. A row-scaled FP8
     ``QuantizedTensor`` output receives the encoded activation directly.
-    ``rounding`` states whether the activated gate rounds to ``x.dtype``
+    ``rounding`` states whether the activated gate rounds to the input dtype
     before the product, as the model's reference evaluates it.
     """
     return _act_and_mul("silu_and_mul", x, "silu", out, rounding=rounding)
 
 
 def gelu_and_mul(
-    x: torch.Tensor,
+    x: GatingInput,
     *,
     approximate: Literal["none", "tanh"],
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Apply the selected GELU formula to the first channel half, then
-    multiply by the second.
+    """Apply the selected GELU formula to the gate channels, then multiply
+    by the value channels.
 
     ``approximate="none"`` is the exact erf form; ``"tanh"`` is PyTorch's
-    tanh approximation (``gelu_pytorch_tanh``). Outputs follow
-    :func:`silu_and_mul`, including a row-scaled FP8 ``QuantizedTensor``.
+    tanh approximation (``gelu_pytorch_tanh``). Inputs and outputs follow
+    :func:`silu_and_mul`, including a ``(gate, value)`` pair and a
+    row-scaled FP8 ``QuantizedTensor``.
     """  # noqa: D205
     if approximate not in {"none", "tanh"}:
         raise ValueError("GELU gating requires a supported approximation")
@@ -377,6 +528,40 @@ def swiglu_absmax(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return :func:`swiglu` and the FP32 absmax of its rounded output."""
     return _swiglu(value, gate, value_bias, gate_bias, absmax=True)
+
+
+def swiglu_nvfp4(
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    *,
+    out: QuantizedTensor,
+    value_bias: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+) -> QuantizedTensor:
+    """Encode :func:`swiglu` into ``out``, a calibrated NVFP4 tensor.
+
+    ``out`` is ``[rows, width]`` (or ``value``'s shape) with linear block
+    scales, as ``Quantizer.empty`` allocates it; it receives the encoding
+    FlashInfer's NVFP4 encoder gives :func:`swiglu`'s rounded output, which
+    is never stored. CUDA only.
+
+    Raises:
+        ValueError: Off CUDA, mismatched operands, or an ``out`` that is not
+            that encoding.
+    """
+    _swiglu_width(value, gate, value_bias, gate_bias)
+    if not value.is_cuda:
+        raise ValueError("calibrated NVFP4 SwiGLU requires CUDA")
+    return _encode_gating(
+        "swiglu_nvfp4",
+        gate,
+        value,
+        out,
+        activation="swiglu",
+        stepwise=False,
+        gate_bias=gate_bias,
+        value_bias=value_bias,
+    )
 
 
 def softcap(

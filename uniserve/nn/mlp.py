@@ -7,7 +7,7 @@ from uniserve.quantization import Quantizer
 from uniserve.tensors import _join_channels
 
 from .activation import GELUAndMul, SiLUAndMul
-from .functional import Rounding
+from .functional import Rounding, calibrated_nvfp4
 from .linear import MergedColumnParallelLinear, RowParallelLinear
 
 
@@ -65,25 +65,39 @@ class GatedMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         branches = self.gate_up(x)
-        packed = _join_channels((branches["gate"], branches["up"]))
+        gate, up = branches["gate"], branches["up"]
+        # Branches written back to back gate as packed rows; separately
+        # written branches gate as a pair, without joining their storage.
+        packed = _join_channels((gate, up), copy=False)
+        operands = (gate, up) if packed is None else packed
 
+        quantizer = self.down.input_quantizer
         if (
-            self.down.input_quantizer == Quantizer("fp8", axis=0)
+            quantizer is not None
             and self.down.group.size == 1
+            and (
+                quantizer == Quantizer("fp8", axis=0)
+                or (calibrated_nvfp4(quantizer) and gate.is_cuda)
+            )
         ):
             # The fused producer computes the gating under the activation's
-            # rounding recipe and encodes once before the contraction.
-            # K-sharded scales must instead cover all shards.
-            shape = (*packed.shape[:-1], packed.shape[-1] // 2)
-            matrix = packed.reshape(-1, packed.shape[-1])
-            encoded = self.down.input_quantizer.empty(
-                (matrix.shape[0], shape[-1]),
-                dtype=packed.dtype,
-                device=packed.device,
+            # rounding recipe and encodes once before the contraction: one
+            # E4M3 scale per row, or NVFP4 blocks against the calibrated
+            # tensor scale, so the gated rows are never stored. K-sharded
+            # row scales must instead cover all shards.
+            width = gate.shape[-1]
+            rows = gate.numel() // width
+            matrix = (
+                (gate.reshape(rows, width), up.reshape(rows, width))
+                if packed is None
+                else packed.reshape(rows, 2 * width)
+            )
+            encoded = quantizer.empty(
+                (rows, width), dtype=gate.dtype, device=gate.device
             )
             hidden = self.activation(matrix, out=encoded)
             return self.down(hidden).reshape(
-                *shape[:-1], self.down.out_features
+                *gate.shape[:-1], self.down.out_features
             )
 
-        return self.down(self.activation(packed))
+        return self.down(self.activation(operands))

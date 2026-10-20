@@ -6,6 +6,9 @@ the residual ``hidden`` in place; the RMS variant normalizes the unrounded sum.
 ``scaled_residual_layer_norm`` leaves ``hidden`` unchanged. Magnitude
 variants, selected by passing ``partials``, record one per-row absolute maximum
 of the stored output; ``uniserve_kernels.reduction.absmax`` finishes them.
+:func:`scaled_residual_rms_norm_nvfp4_` stores the RMS rows in a calibrated
+NVFP4 encoding, by :func:`uniserve_kernels.quantization.nvfp4_encode`, bit
+for bit as FlashInfer's encoder encodes the rows the other variants store.
 
 ``uniserve.nn.functional`` owns validation and output allocation, and
 raises on CUDA when :func:`unsupported` reports a reason.
@@ -23,6 +26,7 @@ _FLOATING = (torch.float16, torch.bfloat16, torch.float32)
 
 
 if triton is not None:
+    from uniserve_kernels.quantization import nvfp4_encode
 
     @triton.jit
     def _weighted_rms_norm_kernel(
@@ -194,6 +198,77 @@ if triton is not None:
                 axis=0,
             ),
         )
+
+    @triton.jit
+    def _scaled_residual_rms_norm_nvfp4_kernel(
+        hidden_ptr,
+        update_ptr,
+        update_bias_ptr,
+        scale_ptr,
+        weight_ptr,
+        values_ptr,
+        block_scales_ptr,
+        tensor_scale_ptr,
+        eps,
+        encode_scale,
+        HAS_UPDATE_BIAS: tl.constexpr,  # noqa: N803
+        WIDTH: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
+        OUTPUT_DTYPE: tl.constexpr,  # noqa: N803
+    ):
+        """Update a residual row and store its normalization in NVFP4.
+
+        The row's normalization is the one the other kernels store in
+        ``OUTPUT_DTYPE``, rounded to it and encoded against the calibrated
+        ``encode_scale`` instead of stored; row 0 also stores that scale.
+        """
+        row = tl.program_id(0)
+        columns = tl.arange(0, BLOCK)
+        offsets = row * WIDTH + columns
+
+        hidden = tl.load(
+            hidden_ptr + offsets, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        update = tl.load(
+            update_ptr + offsets, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        if HAS_UPDATE_BIAS:
+            update += tl.load(
+                update_bias_ptr + columns, mask=columns < WIDTH, other=0.0
+            ).to(tl.float32)
+        scale = tl.load(
+            scale_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+
+        residual = hidden + update * scale
+        inverse_rms = tl.rsqrt(
+            tl.sum(residual * residual, axis=0) / WIDTH + eps
+        )
+        weight = tl.load(
+            weight_ptr + columns, mask=columns < WIDTH, other=0.0
+        ).to(tl.float32)
+        output = (residual * inverse_rms * weight).to(OUTPUT_DTYPE)
+
+        tl.store(hidden_ptr + offsets, residual, mask=columns < WIDTH)
+        packed, scale_bytes = nvfp4_encode(
+            tl.where(columns < WIDTH, output.to(tl.float32), 0.0),
+            encode_scale,
+            BLOCK,
+        )
+        pairs = tl.arange(0, BLOCK // 2)
+        tl.store(
+            values_ptr + row * (WIDTH // 2) + pairs,
+            packed,
+            mask=pairs < WIDTH // 2,
+        )
+        blocks = tl.arange(0, BLOCK // 16)
+        tl.store(
+            block_scales_ptr + row * (WIDTH // 16) + blocks,
+            scale_bytes,
+            mask=blocks < WIDTH // 16,
+        )
+        if row == 0:
+            tl.store(tensor_scale_ptr, encode_scale)
 
     @triton.jit
     def _scaled_residual_kernel(
@@ -443,6 +518,50 @@ def scaled_residual_rms_norm_(
         HAS_UPDATE_BIAS=update_bias is not None,
         WIDTH=width,
         BLOCK=triton.next_power_of_2(width),
+        num_warps=8,
+    )
+
+
+def scaled_residual_rms_norm_nvfp4_(
+    hidden: torch.Tensor,
+    update: torch.Tensor,
+    scale: torch.Tensor,
+    weight: torch.Tensor,
+    update_bias: torch.Tensor | None,
+    eps: float,
+    values: torch.Tensor,
+    block_scales: torch.Tensor,
+    tensor_scale: torch.Tensor,
+    encode_scale: float,
+    output_dtype: torch.dtype,
+) -> None:
+    """Add the scaled update into ``hidden`` and encode its RMS rows.
+
+    ``hidden`` is updated as by :func:`scaled_residual_rms_norm_`. Its RMS
+    rows, as that function stores them in ``output_dtype`` (BF16 or FP16),
+    are encoded against the calibrated ``encode_scale`` into ``values``
+    (uint8 ``[rows, width // 2]``), ``block_scales`` (uint8 ``[rows, width //
+    16]``, linear layout) and the FP32 scalar ``tensor_scale``; ``width`` is
+    a whole number of K16 blocks.
+    """
+    rows, width = _rows(hidden)
+    _scaled_residual_rms_norm_nvfp4_kernel[(rows,)](
+        hidden,
+        update,
+        update_bias,
+        scale,
+        weight,
+        values,
+        block_scales,
+        tensor_scale,
+        eps,
+        encode_scale,
+        HAS_UPDATE_BIAS=update_bias is not None,
+        WIDTH=width,
+        BLOCK=triton.next_power_of_2(width),
+        OUTPUT_DTYPE=tl.bfloat16
+        if output_dtype == torch.bfloat16
+        else tl.float16,
         num_warps=8,
     )
 

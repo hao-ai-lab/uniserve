@@ -3253,6 +3253,319 @@ videos_per_second = "higher"
 # gb200-8 matrix suites. An H200 holds 141 GB, so both servers grant their
 # workers 0.92 of a device.
 
+# FastH3 OmniRef on eight RTX PRO 6000 GPUs as one Ulysses8 reference
+# replica, with the eight-H200 matrix's capacities and seeds; SM120 runs
+# its 128-row sparse-attention tiles as 64-row kernel tiles.
+[servers.rtx-pro-6000-8-omniref-refs]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-reference.json", "--max-running-requests", "2", "--max-model-len", "24576", "--video-text-capacities", "4096,7168,8192,9216,10240,12288,15360", "--max-video-seconds", "15", "--max-condition-rows", "56192", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--quantization-config", "{\"mode\":\"quality\"}"]
+
+[servers.rtx-pro-6000-8-omniref-refs.environment]
+CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-5s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-5s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-5s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-5s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-5s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-5s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-10s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-10s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-10s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-10s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-10s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-10s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-15s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-15s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-15s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-15s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-15s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-15s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-5s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-5s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-5s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-5s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-5s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-5s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-10s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-10s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-10s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-10s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-10s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-10s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-15s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-15s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-15s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-15s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-image-voice-15s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-15s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-5s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-5s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-5s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-5s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-5s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-5s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-10s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-10s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-10s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-10s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-10s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-10s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-15s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-15s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-15s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-15s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-video-15s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-video-15s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-5s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-5s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-5s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-5s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-5s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-5s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-10s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-10s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-10s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-10s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-10s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-10s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-15s]
+server = "rtx-pro-6000-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-15s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-15s.video]
+task = "ref2va"
+aspect_ratio = "16:9"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-15s.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 7200
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/ref-mixed-15s-warmup.jsonl"
+
+[benchmarks.rtx-pro-6000-8-omniref-ref-mixed-15s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+
 [servers.h200-8-omniref-refs]
 host = "127.0.0.1"
 port = 18083
@@ -4692,3 +5005,9 @@ points = ["sglang-gb200-8-w1", "sglang-gb200-8-w2", "sglang-gb200-8-w3"]
 
 [suites.sglang-gb200-8-reference]
 points = ["sglang-gb200-8-ref-image-5s", "sglang-gb200-8-ref-image-voice-5s", "sglang-gb200-8-ref-images3-5s", "sglang-gb200-8-ref-images9-5s", "sglang-gb200-8-ref-clip-5s", "sglang-gb200-8-ref-video-5s", "sglang-gb200-8-ref-clips3-5s", "sglang-gb200-8-ref-mixed-5s", "sglang-gb200-8-ref-full-5s", "sglang-gb200-8-ref-image-10s", "sglang-gb200-8-ref-image-voice-10s", "sglang-gb200-8-ref-images3-10s", "sglang-gb200-8-ref-images9-10s", "sglang-gb200-8-ref-clip-10s", "sglang-gb200-8-ref-video-10s", "sglang-gb200-8-ref-clips3-10s", "sglang-gb200-8-ref-mixed-10s", "sglang-gb200-8-ref-full-10s", "sglang-gb200-8-ref-image-15s", "sglang-gb200-8-ref-image-voice-15s", "sglang-gb200-8-ref-images3-15s", "sglang-gb200-8-ref-images9-15s", "sglang-gb200-8-ref-clip-15s", "sglang-gb200-8-ref-video-15s", "sglang-gb200-8-ref-clips3-15s", "sglang-gb200-8-ref-mixed-15s", "sglang-gb200-8-ref-full-15s"]
+
+[suites.rtx-pro-6000-8-omniref-refs]
+points = ["rtx-pro-6000-8-omniref-ref-image-5s", "rtx-pro-6000-8-omniref-ref-image-voice-5s", "rtx-pro-6000-8-omniref-ref-video-5s", "rtx-pro-6000-8-omniref-ref-mixed-5s", "rtx-pro-6000-8-omniref-ref-image-10s", "rtx-pro-6000-8-omniref-ref-image-voice-10s", "rtx-pro-6000-8-omniref-ref-video-10s", "rtx-pro-6000-8-omniref-ref-mixed-10s", "rtx-pro-6000-8-omniref-ref-image-15s", "rtx-pro-6000-8-omniref-ref-image-voice-15s", "rtx-pro-6000-8-omniref-ref-video-15s", "rtx-pro-6000-8-omniref-ref-mixed-15s"]
+
+[suites.rtx-pro-6000-8-omniref-smoke]
+points = ["rtx-pro-6000-8-omniref-ref-image-5s", "rtx-pro-6000-8-omniref-ref-image-voice-5s", "rtx-pro-6000-8-omniref-ref-video-5s", "rtx-pro-6000-8-omniref-ref-mixed-5s", "rtx-pro-6000-8-omniref-ref-image-15s"]

@@ -1006,6 +1006,7 @@ mod tests {
                 parallel_config: ParallelConfig::default(),
                 distribution: Some(ComponentDistribution::TemporalUnits),
                 units_per_rank: 1,
+                weights: Default::default(),
             },
         );
         components.insert(

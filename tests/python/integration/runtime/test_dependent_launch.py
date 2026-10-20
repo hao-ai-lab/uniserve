@@ -156,8 +156,11 @@ def _chain(inputs, values, *, serialized=False):
     )
     step()
     # The attended rows read as packed [gate, value] halves.
+    attended = values["attended"].view(tokens, -1)
+    width = attended.shape[-1] // 2
     activation.act_and_mul(
-        values["attended"].view(tokens, -1),
+        attended[:, :width],
+        attended[:, width:],
         values["gated"],
         activation="gelu_tanh",
     )

@@ -15,7 +15,8 @@ row stride; outputs are contiguous.
 :func:`nvfp4_encode` is a Triton device function, not a launch: kernels
 that produce a row in registers call it to store the row directly in a
 calibrated NVFP4 encoding, bit for bit as FlashInfer's NVFP4 encoder
-would store it.
+would store it. :func:`nvfp4_encode_tile` encodes a tile of whole K16
+blocks of several rows the same way.
 """
 
 from __future__ import annotations
@@ -217,6 +218,37 @@ if triton is not None:
 
         scaled = blocks * output_scale[:, None]
         even, odd = tl.split(tl.reshape(scaled, [BLOCK // 2, 2]))
+        return _e2m1_pair(even, odd), scale_bytes
+
+    @triton.jit
+    def nvfp4_encode_tile(
+        values,
+        tensor_scale,
+        ROWS: tl.constexpr,  # noqa: N803
+        COLUMNS: tl.constexpr,  # noqa: N803
+    ):
+        """Encode a ``[ROWS, COLUMNS]`` FP32 tile as :func:`nvfp4_encode`.
+
+        A calibrated encoding scales every K16 block on its own, so a tile
+        of whole blocks of any rows and columns encodes to the bytes those
+        columns of the rows' :func:`nvfp4_encode` hold. Returns the
+        ``[ROWS, COLUMNS // 2]`` packed E2M1 bytes and the
+        ``[ROWS, COLUMNS // 16]`` E4M3 block-scale bytes.
+        """
+        blocks = tl.reshape(values, [ROWS, COLUMNS // 16, 16])
+        amax = tl.max(tl.abs(blocks), axis=2)
+
+        global_scale = tl.math.div_rn(1.0, tensor_scale)
+        sixth = _rcp_approx(tl.full([ROWS, COLUMNS // 16], 6.0, tl.float32))
+        scale_bytes = _e4m3_byte(global_scale * (amax * sixth))
+        decoded = scale_bytes.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        inverse_global = _rcp_approx(tl.zeros_like(amax) + global_scale)
+        output_scale = tl.where(
+            amax != 0.0, _rcp_approx(decoded * inverse_global), 0.0
+        )
+
+        scaled = blocks * output_scale[:, :, None]
+        even, odd = tl.split(tl.reshape(scaled, [ROWS, COLUMNS // 2, 2]))
         return _e2m1_pair(even, odd), scale_bytes
 
 

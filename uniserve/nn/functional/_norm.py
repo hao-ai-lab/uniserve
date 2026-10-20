@@ -437,6 +437,75 @@ def scaled_residual_rms_norm_absmax_(
     return hidden, output, output.float().abs().amax()
 
 
+def scaled_residual_rms_norm_nvfp4_(
+    hidden: torch.Tensor,
+    update: torch.Tensor,
+    scale: torch.Tensor,
+    weight: torch.Tensor,
+    update_bias: torch.Tensor | None = None,
+    *,
+    eps: float,
+    quantizer,
+):
+    """Return :func:`scaled_residual_rms_norm_` with its rows encoded.
+
+    ``quantizer`` is a calibrated NVFP4 quantizer. The normalized rows are
+    stored only in its encoding, a ``QuantizedTensor`` of ``hidden``'s shape
+    with linear block scales whose values, block scales and tensor scale
+    equal, bit for bit, ``quantizer.quantize`` of the rows
+    :func:`scaled_residual_rms_norm_` returns. CUDA only.
+
+    Raises:
+        ValueError: Off CUDA, a quantizer that is not calibrated NVFP4, rows
+            that are not 16-bit whole K16 blocks, or operands no kernel
+            takes.
+    """
+    from uniserve_kernels.norm import residual
+
+    from ._activation import calibrated_nvfp4
+
+    _check_update(hidden, update)
+    _check_vectors(hidden, scale, weight, update_bias)
+    dtype = _autocast_dtype(update)
+    if (
+        not hidden.is_cuda
+        or not calibrated_nvfp4(quantizer)
+        or dtype not in (torch.bfloat16, torch.float16)
+        or hidden.shape[-1] % 16
+    ):
+        raise ValueError(
+            "encoded residual normalization needs CUDA, a calibrated NVFP4 "
+            "quantizer and 16-bit rows of whole K16 blocks"
+        )
+    encoded = quantizer.empty(
+        tuple(hidden.shape), dtype=dtype, device=hidden.device
+    )
+    fields = encoded.buffers()
+    _require_residual(
+        "scaled_residual_rms_norm_nvfp4_",
+        hidden,
+        update,
+        scale,
+        weight,
+        update_bias,
+        output=fields["values"],
+    )
+    residual.scaled_residual_rms_norm_nvfp4_(
+        hidden,
+        update,
+        scale,
+        weight,
+        update_bias,
+        eps,
+        fields["values"],
+        fields["block_scale"],
+        fields["tensor_scale"],
+        quantizer.calibrated_scale,
+        dtype,
+    )
+    return hidden, encoded
+
+
 def scaled_residual_(
     hidden: torch.Tensor,
     update: torch.Tensor,

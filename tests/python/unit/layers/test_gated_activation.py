@@ -1,4 +1,4 @@
-"""Packed gated activations: formulas, layouts, FP8 rows and CUDA coverage."""
+"""Gated activations: formulas, layouts, FP8 rows and CUDA coverage."""
 
 from __future__ import annotations
 
@@ -6,7 +6,13 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve.nn.functional import Rounding, gelu_and_mul, silu_and_mul
+from uniserve.nn.functional import (
+    Rounding,
+    gelu_and_mul,
+    silu_and_mul,
+    swiglu,
+    swiglu_nvfp4,
+)
 from uniserve.quantization import Quantizer
 
 pytestmark = pytest.mark.unit
@@ -76,6 +82,74 @@ def test_packed_gating_matches_the_fp32_formula(
         rtol=tolerance,
         atol=tolerance,
     )
+
+
+@pytest.mark.parametrize("activation", ("silu", "gelu", "gelu_tanh"))
+@pytest.mark.parametrize("rounding", (Rounding.ONCE, Rounding.STEPWISE))
+def test_separate_gate_and_value_equal_their_packed_rows(
+    device, activation, rounding
+):
+    """Two separately stored projections gate exactly as their packed rows."""
+    if activation != "silu" and rounding is Rounding.STEPWISE:
+        pytest.skip("GELU gating rounds once")
+    generator = torch.Generator(device=device).manual_seed(17)
+    packed = (
+        torch.randn((7, 2 * 1025), generator=generator, device=device)
+        .mul_(4)
+        .to(torch.bfloat16)
+    )
+    # Distinct allocations, as two projections write their own outputs.
+    gate = packed[:, :1025].clone()
+    value = packed[:, 1025:].clone()
+
+    def gating(x):
+        if activation == "silu":
+            return silu_and_mul(x, rounding=rounding)
+        return gelu_and_mul(
+            x, approximate="tanh" if activation == "gelu_tanh" else "none"
+        )
+
+    with torch.inference_mode():
+        assert torch.equal(gating((gate, value)), gating(packed))
+
+
+def test_a_gate_and_value_pair_must_agree():
+    gate = torch.zeros((4, 8), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="one shape, dtype and device"):
+        silu_and_mul((gate, gate[:, :4]), rounding=Rounding.ONCE)
+    with pytest.raises(ValueError, match="one shape, dtype and device"):
+        silu_and_mul((gate, gate.float()), rounding=Rounding.ONCE)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_separate_operands_encode_their_packed_fp8_rows():
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("FP8 execution requires compute capability 9 or newer")
+    generator = torch.Generator(device="cuda").manual_seed(23)
+    packed = torch.randn((9, 2 * 2112), generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+    gate, value = packed[:, :2112].clone(), packed[:, 2112:].clone()
+    encodings = [
+        Quantizer("fp8", axis=0).empty(
+            (9, 2112), dtype=torch.bfloat16, device="cuda"
+        )
+        for _ in range(2)
+    ]
+
+    with torch.inference_mode():
+        silu_and_mul(packed, out=encodings[0], rounding=Rounding.STEPWISE)
+        silu_and_mul(
+            (gate, value), out=encodings[1], rounding=Rounding.STEPWISE
+        )
+
+    packed_buffers, separate_buffers = (e.buffers() for e in encodings)
+    assert torch.equal(
+        separate_buffers["values"].view(torch.uint8),
+        packed_buffers["values"].view(torch.uint8),
+    )
+    assert torch.equal(separate_buffers["scale"], packed_buffers["scale"])
 
 
 @pytest.mark.gpu
@@ -181,3 +255,114 @@ def test_cuda_gating_raises_without_a_kernel(case, reason):
 
     with pytest.raises(ValueError, match=f"gelu_and_mul.*{reason}"):
         gelu_and_mul(x, approximate="tanh", out=out)
+
+
+def _assert_same_encoding(encoded, expected):
+    """Compare every buffer of two NVFP4 encodings bit for bit."""
+    from uniserve.quantization import QuantizedTensor, ScaleLayout
+
+    assert isinstance(encoded, QuantizedTensor)
+    assert encoded.scale_layout is ScaleLayout.LINEAR
+    reference = expected.buffers()
+    for name, field in encoded.buffers().items():
+        if field.dtype != torch.float32:
+            field, want = (
+                field.view(torch.uint8),
+                reference[name].view(torch.uint8),
+            )
+        else:
+            want = reference[name]
+        assert torch.equal(field, want), name
+
+
+def _nvfp4_operands(width, *, generator):
+    """Separate strided gate and value rows with two edge K16 blocks.
+
+    Row 0's first block gates to zero and row 1's second block saturates its
+    E4M3 block scale under the test's calibrated scale.
+    """
+    rows = (
+        torch.randn((300, 2, width), generator=generator, device="cuda").to(
+            torch.bfloat16
+        )
+        * 3
+    )
+    gate, value = rows.unbind(1)
+    gate[0, :16] = 0
+    value[1, 16:32] = 1e4
+    return gate, value
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("activation", "rounding"),
+    (
+        ("silu", Rounding.STEPWISE),
+        ("silu", Rounding.ONCE),
+        ("gelu", Rounding.ONCE),
+        ("gelu_tanh", Rounding.ONCE),
+    ),
+)
+# 8192 is the H3 VAE decoder's MLP width and 14336 the H3 DiT's; 400 leaves
+# a partial column tile.
+@pytest.mark.parametrize("width", (400, 8192, 14336))
+def test_cuda_gating_encodes_calibrated_nvfp4(activation, rounding, width):
+    """Calibrated NVFP4 gating stores the quantizer's encoding of its rows.
+
+    Values, block scales and tensor scale equal, bit for bit, what the
+    calibrated quantizer stores for the unencoded gating of the same rows.
+    """
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("NVFP4 encoding requires compute capability 10 or newer")
+    generator = torch.Generator(device="cuda").manual_seed(width)
+    gate, value = _nvfp4_operands(width, generator=generator)
+    quantizer = Quantizer("nvfp4", calibrated_scale=0.0123)
+
+    def gating(**options):
+        if activation == "silu":
+            return silu_and_mul((gate, value), rounding=rounding, **options)
+        approximate = "tanh" if activation == "gelu_tanh" else "none"
+        return gelu_and_mul((gate, value), approximate=approximate, **options)
+
+    with torch.inference_mode():
+        plain = gating()
+        encoded = gating(
+            out=quantizer.empty(
+                (300, width), dtype=torch.bfloat16, device="cuda"
+            )
+        )
+        _assert_same_encoding(encoded, quantizer.quantize(plain))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("biased", (False, True))
+@pytest.mark.parametrize("width", (400, 8192))
+def test_cuda_swiglu_encodes_calibrated_nvfp4(biased, width):
+    """Calibrated NVFP4 SwiGLU stores the quantizer's encoding of swiglu."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("NVFP4 encoding requires compute capability 10 or newer")
+    generator = torch.Generator(device="cuda").manual_seed(width + biased)
+    gate, value = _nvfp4_operands(width, generator=generator)
+    biases = {
+        name: torch.randn(width, generator=generator, device="cuda").to(
+            torch.bfloat16
+        )
+        if biased
+        else None
+        for name in ("value_bias", "gate_bias")
+    }
+    quantizer = Quantizer("nvfp4", calibrated_scale=0.0123)
+
+    with torch.inference_mode():
+        plain = swiglu(value, gate, **biases)
+        encoded = swiglu_nvfp4(
+            value,
+            gate,
+            out=quantizer.empty(
+                (300, width), dtype=torch.bfloat16, device="cuda"
+            ),
+            **biases,
+        )
+        _assert_same_encoding(encoded, quantizer.quantize(plain))

@@ -12,7 +12,9 @@ With quantized projection weights, projections return their bias separately
 so the consuming fused kernel (residual update, Q/K normalization and RoPE,
 SwiGLU, or unpatchify) adds it, and the fused normalization before such a
 projection also returns the tensor-wide absmax that its input quantizer can
-reuse.
+reuse. Calibrated NVFP4 projections need no absmax: the residual
+normalization before Q/K/V or gate/up, and SwiGLU before the down
+projection, store their rows in that encoding directly.
 
 The encoder is a causal 3D CNN: ``CausalCNN`` maps ImageNet-normalized
 pixels of one temporal clip to posterior moments, and ``Encoder`` adds the
@@ -38,8 +40,10 @@ from uniserve.nn.functional import (
     scaled_residual_layer_norm_absmax,
     scaled_residual_rms_norm_,
     scaled_residual_rms_norm_absmax_,
+    scaled_residual_rms_norm_nvfp4_,
     swiglu,
     swiglu_absmax,
+    swiglu_nvfp4,
     unpatchify_video_tokens,
     weighted_rms_norm,
     weighted_rms_norm_absmax,
@@ -221,6 +225,44 @@ class Config:
         return math.ceil(self.clip_length / self.temporal_compression)
 
 
+def _residual_norm(hidden, update, scale, weight, bias, eps, projection):
+    """Fold a scaled update into ``hidden`` and normalize it for a projection.
+
+    Returns ``(hidden, normalized, maximum)``. When every branch of the
+    merged ``projection`` reads one calibrated NVFP4 encoding, ``normalized``
+    is stored only in it and ``maximum`` is None; other quantized branches
+    receive activation-dtype rows with their tensor-wide absmax, and dense
+    ones plain rows.
+    """
+    branches = tuple(projection.projections.values())
+    quantizers = {branch.input_quantizer for branch in branches}
+    quantizer = next(iter(quantizers))
+    if (
+        len(quantizers) == 1
+        and quantizer is not None
+        and functional.calibrated_nvfp4(quantizer)
+        and hidden.is_cuda
+    ):
+        hidden, normalized = scaled_residual_rms_norm_nvfp4_(
+            hidden,
+            update,
+            scale,
+            weight,
+            update_bias=bias,
+            eps=eps,
+            quantizer=quantizer,
+        )
+        return hidden, normalized, None
+    if isinstance(branches[0].weight, QuantizedTensor):
+        return scaled_residual_rms_norm_absmax_(
+            hidden, update, scale, weight, update_bias=bias, eps=eps
+        )
+    hidden, normalized = scaled_residual_rms_norm_(
+        hidden, update, scale, weight, update_bias=bias, eps=eps
+    )
+    return hidden, normalized, None
+
+
 def _encoded_input(layer, hidden, maximum):
     """Quantize a projection input, reusing the caller's tensor-wide amax if any."""  # noqa: E501
     quantizer = layer.input_quantizer
@@ -323,9 +365,30 @@ def _feed_forward(mlp, hidden, maximum=None):
         "value_bias": biases["up"],
         "gate_bias": biases["gate"],
     }
+    quantizer = mlp.down.input_quantizer
+    value = branches["up"]
+    if (
+        quantizer is not None
+        and functional.calibrated_nvfp4(quantizer)
+        and value.is_cuda
+    ):
+        # A calibrated encoding needs no statistics of the activation, so
+        # SwiGLU encodes its rows directly for the down projection.
+        width = value.shape[-1]
+        encoded = swiglu_nvfp4(
+            value,
+            branches["gate"],
+            out=quantizer.empty(
+                (value.numel() // width, width),
+                dtype=value.dtype,
+                device=value.device,
+            ),
+            **options,
+        )
+        update, bias = _project(mlp.down, encoded)
+        return update.reshape(*value.shape[:-1], update.shape[-1]), bias
     # SwiGLU's absmax is tensor-wide, so only a tensor-wide down-projection
     # input quantizer (tensor-wide FP8 or NVFP4) can reuse it.
-    quantizer = mlp.down.input_quantizer
     if (
         quantizer is not None
         and quantizer.axis is None
@@ -429,28 +492,15 @@ class TransformerLayer(nn.Module):
         )
 
         weight, eps = self._norm(1)
-        quantized = isinstance(
-            self.mlp.gate_up.projections["gate"].weight, QuantizedTensor
+        hidden, normalized, maximum = _residual_norm(
+            hidden,
+            attended,
+            self.scales[0],
+            weight,
+            bias,
+            eps,
+            self.mlp.gate_up,
         )
-        if quantized:
-            hidden, normalized, maximum = scaled_residual_rms_norm_absmax_(
-                hidden,
-                attended,
-                self.scales[0],
-                weight,
-                update_bias=bias,
-                eps=eps,
-            )
-        else:
-            hidden, normalized = scaled_residual_rms_norm_(
-                hidden,
-                attended,
-                self.scales[0],
-                weight,
-                update_bias=bias,
-                eps=eps,
-            )
-            maximum = None
         update, bias = _feed_forward(self.mlp, normalized, maximum)
         return hidden, update, bias
 
@@ -579,25 +629,15 @@ class Transformer(nn.Module):
         for layer in self.layers[1:]:
             layer = cast(TransformerLayer, layer)
             weight, eps = layer._norm(0)
-            if isinstance(layer.qkv.projections["q"].weight, QuantizedTensor):
-                hidden, normalized, maximum = scaled_residual_rms_norm_absmax_(
-                    hidden,
-                    update,
-                    previous.scales[1],
-                    weight,
-                    update_bias=bias,
-                    eps=eps,
-                )
-            else:
-                hidden, normalized = scaled_residual_rms_norm_(
-                    hidden,
-                    update,
-                    previous.scales[1],
-                    weight,
-                    update_bias=bias,
-                    eps=eps,
-                )
-                maximum = None
+            hidden, normalized, maximum = _residual_norm(
+                hidden,
+                update,
+                previous.scales[1],
+                weight,
+                bias,
+                eps,
+                layer.qkv,
+            )
             hidden, update, bias = layer._advance(
                 hidden, normalized, cos, sin, maximum
             )

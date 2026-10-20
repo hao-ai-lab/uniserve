@@ -24,6 +24,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve.distributed import DeviceMesh
+from uniserve.distributed.chunks import payload_rows
 from uniserve.nn import (
     AdaLNCache,
     ColumnParallelLinear,
@@ -39,6 +40,24 @@ from .attention import Dense, Sparse
 from .config import TransformerConfig
 from .inputs import SegmentInput, SequenceInput
 from .modulation import OutputNorm
+
+
+def _feed_forward_rows(hidden_size: int, itemsize: int) -> int:
+    """Rows of one feed-forward range of a long interval.
+
+    The feed-forward stage is row-local, so a long interval runs it over
+    successive row ranges and its intermediates (the gate and up
+    projections, 2 * intermediate_size wide, and their activated product)
+    stay the size of one range: a one-device shard of a 15-second 768p clip
+    is about 110,000 rows, whose whole-shard intermediates would take about
+    8.8 GiB in BF16 against about 0.5 GiB per 6144-row range. A range is one
+    payload of the next layer's sequence-parallel projection input
+    (``payload_rows`` of the hidden width), so that layer publishes each
+    payload as soon as the range that completes it is computed and its
+    exchange overlaps the ranges after it. Ranges this long keep the
+    projections compute-bound.
+    """
+    return payload_rows(hidden_size, itemsize)
 
 
 class TransformerLayer(nn.Module):
@@ -89,9 +108,10 @@ class TransformerLayer(nn.Module):
             tables: ``modulation_indices`` and the rotary ``cos``/``sin``.
 
         Yields:
-            ``(global row slice, rows)`` output chunks covering the shard, or
-            the whole shard as one chunk when a feed-forward input quantizer
-            needs dynamic tensor-wide statistics.
+            ``(global row slice, rows)`` output chunks covering the shard, at
+            most one ``_feed_forward_rows`` range each, or the whole shard as one
+            chunk when a feed-forward input quantizer needs dynamic
+            tensor-wide statistics.
 
         Raises:
             TypeError: ``inputs`` is not the kind the layer's attention reads.
@@ -237,7 +257,14 @@ class TransformerLayer(nn.Module):
             yield inputs.token_slice, finish(inputs.token_slice, update)
             return
         for interval, value in attended:
-            yield interval, finish(interval, value)
+            step = _feed_forward_rows(self.hidden_size, value.element_size())
+            for start in range(0, len(value), step):
+                local = slice(start, start + step)
+                rows = slice(
+                    interval.start + start,
+                    min(interval.start + local.stop, interval.stop),
+                )
+                yield rows, finish(rows, value[local])
 
     def forward(
         self,

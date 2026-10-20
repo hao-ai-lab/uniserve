@@ -14,6 +14,15 @@ def _requires_grouped(weights):
     return any(min(weight.shape) < 128 for weight in weights.values())
 
 
+def _scale_matrix(scales, rows, columns):
+    """View flat 128x4-swizzled block scales as their padded matrix.
+
+    The swizzle keeps ``rows`` padded to a multiple of 128 and ``columns`` to
+    a multiple of 4, so the flat storage is exactly that matrix row-major.
+    """
+    return scales.reshape(-(-rows // 128) * 128, -(-columns // 4) * 4)
+
+
 class _FlashInferOperator(_Operator):
     def __call__(self, x, bias, *, out):
         import flashinfer
@@ -68,21 +77,27 @@ class _FlashInferOperator(_Operator):
                 backend="cudnn",
             )
         else:
-            # cuDNN reads accelerator-swizzled scales in the two- or
-            # three-dimensional form they are produced in; scales repacked
-            # from the linear layout reach it flattened, which it rejects.
-            # CUTLASS accepts that flattened form and is the one FP4 kernel
-            # FlashInfer builds for both SM100 and SM120.
-            backend = (
-                "cudnn"
-                if x.scale_layout is ScaleLayout.SWIZZLED_128X4
-                else "cutlass"
-            )
+            # cuDNN runs natively swizzled activations and reads their flat
+            # scales as the padded matrices they are produced as. Scales
+            # repacked from the linear layout take CUTLASS, the one FP4
+            # kernel FlashInfer builds for both SM100 and SM120; cuDNN's
+            # products differ from it in the last bit of a few elements.
+            rows, columns = left["values"].shape
+            features = right["values"].shape[0]
+            left_scale, right_scale = left["block_scale"], right["block_scale"]
+            if x.scale_layout is ScaleLayout.SWIZZLED_128X4:
+                backend = "cudnn"
+                left_scale = _scale_matrix(left_scale, rows, columns // 8)
+                right_scale = _scale_matrix(
+                    right_scale, features, columns // 8
+                ).T
+            else:
+                backend = "cutlass"
             flashinfer.mm_fp4(
                 left["values"],
                 right["values"].T,
-                left["block_scale"],
-                right["block_scale"],
+                left_scale,
+                right_scale,
                 alpha,
                 out=target,
                 out_dtype=out.dtype,

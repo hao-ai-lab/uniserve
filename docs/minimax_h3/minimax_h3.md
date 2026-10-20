@@ -4,7 +4,7 @@ UniServe serves the MiniMax-H3 video-and-audio models: the base MiniMax-H3 check
 
 ## Requirements
 
-- Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Hopper or Blackwell GPUs. Four local GPUs are the standard setup. FastH3 is validated on H200, GB200 and RTX PRO 6000 Blackwell Server Edition; OmniRef on GB200 and H200; the base checkpoint on four GB200. OmniRef's 128-row sparse-attention tiles have kernels on data-center Blackwell (SM100) and Hopper (SM90) GPUs.
+- Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Hopper or Blackwell GPUs. Four local GPUs are the standard setup. FastH3 is validated on H200, GB200 and RTX PRO 6000 Blackwell Server Edition; OmniRef on GB200, H200 and RTX PRO 6000; the base checkpoint on four GB200. OmniRef's 128-row sparse-attention tiles have kernels on data-center Blackwell (SM100) and Hopper (SM90) GPUs; RTX PRO 6000 (SM120) evaluates each 128-row tile as two tiles of its 64-row kernel.
 - FFmpeg for keyframe and reference requests: the server probes condition media with `ffprobe` and the worker decodes reference videos with `ffmpeg`, both from `PATH` unless `--ffprobe` and `--ffmpeg` name them.
 - Shared storage and pinned-storage access for worker IPC, as the container command below provisions.
 
@@ -117,6 +117,8 @@ The deployment files are in `configs/minimax_h3/`. Each places the condition enc
 | `fasth3-ulysses4x2.json` | Eight on one host | Two Ulysses4 replicas | TP4 per replica |
 | `fasth3-ulysses4x2-two-node.json` | Four on each of two hosts | One Ulysses4 replica per host | TP4 per replica |
 | `fasth3-dp8-text-tp8.json` | Eight on one host | Eight one-GPU replicas | One shared TP8 |
+| `fasth3-dp8-text-tp4x2.json` | Eight on one host | Eight one-GPU replicas | Two TP4, one per four-GPU half |
+| `fasth3-dp8-text-tp8-host-weights.json` | Eight on one host | Eight one-GPU replicas, layer projections in host memory | One shared TP8 |
 | `gather8.json` | Eight on one host | Eight-way all-gather | TP8 |
 | `ulysses4-reference.json` | Four on one host | Ulysses4 `transformer_ref` | TP4 |
 | `ulysses8-reference.json` | Eight on one host | Ulysses8 `transformer_ref` | TP8 |
@@ -128,7 +130,11 @@ A Ulysses denoiser's `sequence_parallel` object also selects how each layer's Q/
 "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 8, "projection": "exchange", "projection_rows": 4096 }
 ```
 
-One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The two-host reference file spreads a request's condition encoding over both hosts. The media reader runs in a `reader` worker on a GPU of the head's host, where the head hands it the request's references through shared storage, and publishes the decoded pixels from device storage, which the encoder ranks of both hosts read. The text encoder then encodes the prompt on `rank-0`'s four GPUs while the latent encoder, which deals a request's condition units to `rank-1`'s GPUs first and to `rank-0`'s after them, encodes its references. One eight-way reference replica serves both latency and throughput across two hosts. The validated FastH3 settings:
+One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The two-host reference file spreads a request's condition encoding over both hosts. The media reader runs in a `reader` worker on a GPU of the head's host, where the head hands it the request's references through shared storage, and publishes the decoded pixels from device storage, which the encoder ranks of both hosts read. The text encoder then encodes the prompt on `rank-0`'s four GPUs while the latent encoder, which deals a request's condition units to `rank-1`'s GPUs first and to `rank-0`'s after them, encodes its references. One eight-way reference replica serves both latency and throughput across two hosts.
+
+A component placed with `"weights": "host"` keeps the dense projection weights of its layer stack in page-locked host memory. Each rank holds a few layer-sized device buffers, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and a copy stream fills a layer's buffer up to that count less two layers ahead of its use, while the layers before it compute. `fasth3-dp8-text-tp8-host-weights.json` places every replica's transformer this way: with the BF16 checkpoint a layer's projections are 0.79 GiB, so each GPU keeps 3.9 of the 39.5 GiB on the device and releases 35.5 GiB for activations, and each replica holds its own 39.5 GiB host copy. The option requires `--graph-policy off`.
+
+The validated FastH3 settings:
 
 | Hardware | Goal | Deployment | Options |
 | --- | --- | --- | --- |
@@ -137,6 +143,7 @@ One replica across every GPU gives the lowest latency; replicas serve more reque
 | 8 x GB200, two hosts | Throughput | `fasth3-ulysses4x2-two-node.json` | `--max-running-requests 4` |
 | 8 x RTX PRO 6000 | Latency | `ulysses8.json` | `--max-running-requests 2 --graph-policy off --mem-fraction-static 0.92 --video-text-capacities 1024,10240` |
 | 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.json` | `--max-running-requests 4 --graph-policy off --mem-fraction-static 0.92 --video-text-capacities 1024,10240` |
+| 8 x RTX PRO 6000 | Throughput, BF16 checkpoint, up to 10240 prompt tokens | `fasth3-dp8-text-tp8-host-weights.json` | `--max-running-requests 8 --max-model-len 10240 --video-text-capacities 1024 --video-aspect-ratios 16:9 --graph-policy off --mem-fraction-static 0.92` |
 | 4 x H200 | Latency and throughput | `ulysses4.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --video-text-capacities 1024` |
 | 8 x H200 | Latency, up to 10240 prompt tokens | `ulysses8.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --video-text-capacities 1024` |
 | 8 x H200 | Throughput, up to 5 s and 1024 prompt tokens | `fasth3-dp8-text-tp8.json` | `--max-running-requests 8 --max-video-seconds 5 --max-model-len 1024` |
