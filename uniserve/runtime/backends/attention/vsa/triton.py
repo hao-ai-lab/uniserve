@@ -6,9 +6,6 @@ from . import Backend as BaseBackend
 from . import Operator as BaseOperator
 
 # Tile sizes this provider's kernels address.
-# FIXME: no 128-row build exists here, so 128-row tiles (the ref2va FastH3
-# students) run only on SM100, SM90 and SM120 (``sm100.TILES``,
-# ``sm90.TILES``, ``sm120.TILES``).
 TILES = (64,)
 
 

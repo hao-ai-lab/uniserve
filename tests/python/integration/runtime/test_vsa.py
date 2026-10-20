@@ -426,11 +426,11 @@ def test_sm120_attends_strided_projections_in_place():
     kernel on those views, which must give the output and log-sum-exp the
     public wrapper gives on contiguous copies, bit for bit.
     """
-    from uniserve.runtime.backends.attention.vsa import sm120
+    from uniserve.runtime.backends.attention.vsa import _flashinfer_sm120
 
     device = torch.device("cuda")
-    if not sm120.available(device):
-        pytest.skip("the SM120 provider is unavailable on this device")
+    if not _flashinfer_sm120.available(device):
+        pytest.skip("FlashInfer's SM120 kernel is unavailable on this device")
     torch.manual_seed(1201)
     tiles, heads = 9, 4
     rows = tiles * TILE
@@ -438,7 +438,7 @@ def test_sm120_attends_strided_projections_in_place():
         rows, 4, heads, 128, device=device, dtype=torch.bfloat16
     )
     q, k, v, _ = projections.unbind(1)
-    assert all(sm120._in_place(value) for value in (q, k, v))
+    assert _flashinfer_sm120._launches_in_place(q, k, v)
     sizes = torch.tensor(
         (64, 17, 64, 40, 0, 64, 23, 64, 1), device=device, dtype=torch.int32
     )
@@ -457,12 +457,12 @@ def test_sm120_attends_strided_projections_in_place():
 
     out = torch.empty_like(q)
     lse = torch.empty((1, heads, rows), device=device, dtype=torch.float32)
-    sm120._launch(
+    _flashinfer_sm120.launch(
         q, k, v, indices, counts, sizes, scale=scale, out=out, lse=lse
     )
     want = torch.empty_like(out)
     want_lse = torch.empty_like(lse)
-    sm120.bsa_attn_sm120_blk64_fwd(
+    _flashinfer_sm120.bsa_attn_sm120_blk64_fwd(
         q.contiguous().unsqueeze(0),
         k.contiguous().unsqueeze(0),
         v.contiguous().unsqueeze(0),
