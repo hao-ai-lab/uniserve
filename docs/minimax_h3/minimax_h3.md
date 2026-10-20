@@ -153,7 +153,18 @@ The validated FastH3 settings:
 | 8 x H200 | Latency, up to 10240 prompt tokens | `ulysses8.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --video-text-capacities 1024` |
 | 8 x H200 | Throughput, up to 5 s and 1024 prompt tokens | `fasth3-dp8-text-tp8.json` | `--max-running-requests 8 --max-video-seconds 5 --max-model-len 1024` |
 
-Run GB200 deployments with `NCCL_NVLS_ENABLE=0`, as the settings above are validated. On H200, OmniRef serves reference requests as one Ulysses8 replica on one eight-GPU host (`ulysses8-reference.json`) with `--mem-fraction-static 0.92`; [OmniRef on H200](evaluation.md#omniref-on-h200) states the validated capacities.
+The validated FastH3 OmniRef settings serve references up to 15 seconds with `--max-video-seconds 15 --max-model-len 24576 --video-text-capacities 4096,7168,8192,9216,10240,12288,15360 --max-condition-rows 56192 --max-running-requests 2` and:
+
+| Hardware | Deployment | Options |
+| --- | --- | --- |
+| 1 x GB200 | `single-gpu-reference.json` | `--video-resolutions 768p,480p --mem-fraction-static 0.96 --max-model-len 15360 --max-condition-rows 45056`; add `--graph-policy off` for 768p beyond 10 seconds or with a 10-second reference video |
+| 2 x GB200 | `ulysses2-reference.json` | `--video-resolutions 768p,480p --mem-fraction-static 0.92` |
+| 4 x GB200 | `ulysses4-reference.json` | `--video-resolutions 768p,480p` |
+| 8 x GB200, two hosts | `ulysses8-reference-two-node.json` | `--video-resolutions 768p,480p --host-identity rank-0` |
+| 8 x H200, 768p | `ulysses8-reference.json` | `--mem-fraction-static 0.92` |
+| 8 x RTX PRO 6000, 768p | `ulysses8-reference.json` | `--graph-policy off --mem-fraction-static 0.92` |
+
+One or two GB200 need the larger memory fraction for the decoders' captured graphs, and one GB200 also needs the smaller prompt and condition bounds: the startup log names the graph storage that does not fit. Run GB200 deployments with `NCCL_NVLS_ENABLE=0`, as the settings above are validated. [Evaluation](evaluation.md) lists the measured latencies.
 
 ### Two hosts
 
