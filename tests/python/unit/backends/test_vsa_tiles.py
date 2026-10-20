@@ -1,7 +1,7 @@
 """VSA providers serve the tile sizes their kernels address.
 
-128-row tiles have a kernel on SM100 (data-center Blackwell) devices only, so
-no provider resolves them elsewhere.
+128-row tiles have kernels on SM100, SM90 and SM120 devices, so no provider
+resolves them on a device without CUDA or through a 64-row-only provider.
 """
 
 import pytest
@@ -13,7 +13,7 @@ from uniserve.runtime.backends.attention import vsa
 pytestmark = pytest.mark.unit
 
 
-def test_128_row_tiles_resolve_only_on_sm100():
+def test_128_row_tiles_need_a_provider_that_serves_them():
     with pytest.raises(RuntimeError, match="serves 128-row tiles"):
         vsa.resolve("auto", device=torch.device("cpu"), tile=128)
     with pytest.raises(RuntimeError, match="does not serve 128-row tiles"):
