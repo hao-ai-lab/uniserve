@@ -141,7 +141,7 @@ docker run --rm --gpus all --pid=host --shm-size=4g --ulimit memlock=-1 -p 8000:
     --served-model-name FastH3 --host 0.0.0.0 --max-running-requests 2
 ```
 
-Mount `/root/.cache` and `/root/.triton` to keep the kernels the first start compiles. The image holds no FFmpeg: for video and audio references, mount FFmpeg into the container and name it with `--ffprobe` and `--ffmpeg`.
+Mount `/root/.cache` and `/root/.triton` to keep the kernels the first start compiles.
 
 ## Troubleshooting
 
@@ -155,5 +155,5 @@ Mount `/root/.cache` and `/root/.triton` to keep the kernels the first start com
 | Startup refuses a memory grant, or out of memory | Raise `--mem-fraction-static`, serve fewer canvases, capacities or seconds, use `--graph-policy off`, or spread the denoiser over more GPUs. |
 | `invalid_request` naming rows or the prompt length | Serve with a larger `--max-condition-rows` or `--max-model-len`, or send fewer or smaller references. |
 | A refused `file://` reference | Set `--media-directory` to a directory that holds it. |
-| `server_error` naming `cannot run ffprobe` | Put FFmpeg on `PATH` or name it with `--ffprobe`. |
+| `server_error` naming `cannot run ffprobe` | Run `scripts/install-ffmpeg.sh`, or name FFmpeg with `--ffprobe` and `--ffmpeg`. |
 | FastH3 OmniRef cannot find a base file | Let the server download the pinned MiniMax-H3 revision, or download it into the Hugging Face cache. |

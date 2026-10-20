@@ -6,6 +6,8 @@
 !uv.lock
 !.python-version
 !README.md
+!scripts
+!scripts/**
 !LICENSE
 !configs
 !configs/**

@@ -7,7 +7,9 @@ UniServe is a unified serving engine: a Rust server owns HTTP admission, schedul
 UniServe needs Linux on x86-64 or aarch64, NVIDIA Hopper or Blackwell GPUs, CUDA 13, Python 3.12 and a stable Rust toolchain. From the repository root:
 
 ```bash
-apt-get update && apt-get install -y build-essential python3.12-dev pkg-config cmake git curl ca-certificates
+apt-get update && apt-get install -y build-essential python3.12-dev pkg-config cmake git curl ca-certificates \
+  nasm zlib1g-dev xz-utils
+scripts/install-ffmpeg.sh
 curl -LsSf https://astral.sh/uv/install.sh | sh
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 export CUDA_HOME=/usr/local/cuda MAX_JOBS=2
@@ -16,7 +18,7 @@ uv sync --locked --python 3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` and `uniserve-host` binaries and compiles the kernels, with `MAX_JOBS` parallel jobs, for the visible GPUs or the architectures `TORCH_CUDA_ARCH_LIST` names. Video and audio references also need FFmpeg: `ffprobe` and `ffmpeg` on `PATH`, or the paths `--ffprobe` and `--ffmpeg` name.
+`install-ffmpeg.sh` installs FFmpeg 8.1.2, which reads reference media, into `/usr/local/bin`. The sync builds the `uniserve` and `uniserve-host` binaries and compiles the kernels, with `MAX_JOBS` parallel jobs, for the visible GPUs or the architectures `TORCH_CUDA_ARCH_LIST` names.
 
 ## Text to video
 

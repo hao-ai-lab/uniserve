@@ -1,3 +1,10 @@
+FROM docker.io/ubuntu:24.04 AS ffmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential nasm zlib1g-dev xz-utils curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/install-ffmpeg.sh /tmp/install-ffmpeg.sh
+RUN /tmp/install-ffmpeg.sh /opt/ffmpeg
+
 FROM docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
 
 # The image build sees no GPU, so the native kernels compile for the named
@@ -14,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl git ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin/
 
 WORKDIR /opt/uniserve
 COPY . .
