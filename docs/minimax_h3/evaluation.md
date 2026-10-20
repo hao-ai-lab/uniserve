@@ -1,24 +1,18 @@
 # Evaluation
 
-`uniserve-eval` starts a server, sends a fixed workload, validates every MP4 (canvas, frame count, frame rate and soundtrack), and writes each request's latency and stage timings under `artifacts/`. It installs with the `bench` extra:
+`uniserve-eval` starts a server, sends a fixed workload, checks every MP4 (canvas, frame count, frame rate and soundtrack), and writes each request's latency and stage timings under `artifacts/`. It installs with the `bench` extra and runs a suite or a single point of a profile:
 
 ```bash
 uv sync --locked --python 3.12 --extra gpu --extra bench
-.venv/bin/uniserve-eval --config uniserve_eval/fasth3.toml plan gb200-4-bf16
-.venv/bin/uniserve-eval --config uniserve_eval/fasth3.toml run gb200-4-bf16 --reuse-deployment
+uniserve-eval --config uniserve_eval/fasth3.toml plan gb200-4-bf16
+uniserve-eval --config uniserve_eval/fasth3.toml run gb200-4-bf16 --reuse-deployment
 ```
 
-| Profile | Measures |
-| --- | --- |
-| `uniserve_eval/fasth3.toml` | FastH3 text-to-video latency and throughput on GB200, H200 and RTX PRO 6000 |
-| `uniserve_eval/fasth3_omniref.toml` | FastH3 OmniRef reference-to-video on GB200, H200 and RTX PRO 6000 |
-| `uniserve_eval/minimax_h3.toml` | The MiniMax-H3 checkpoint on GB200 |
-
-Each profile's header names the environment variables it reads. Suites are named `<gpu>-<count>[-<variant>]`; run them one at a time. For two-host suites, start `uniserve-host` on `rank-1` as in [Two hosts](minimax_h3.md#two-hosts).
+`uniserve_eval/fasth3.toml` measures FastH3 and `uniserve_eval/fasth3_omniref.toml` FastH3 OmniRef. Each profile's header names the environment variables it reads, its workloads and its suites. Run one suite at a time; for a two-host suite, start `uniserve-host` on `rank-1` as in [Two hosts](minimax_h3.md#two-hosts). `plan` prints the server command of every point it selects.
 
 ## FastH3 OmniRef on GB200
 
-16 reference requests (one to three images, up to one reference video and up to two audio references; 5, 10 and 15 s; 16:9 and 9:16), each at 768p and 480p, on one replica of one to eight GB200 with the [validated settings](minimax_h3.md#deployments). Each cell is the mean end-to-end seconds of three requests at concurrency one after a warmup, MP4 encoding included; no cell's standard deviation exceeds 0.39 s.
+16 reference requests, each at 768p and 480p, on one replica of one to eight GB200 with the [validated settings](minimax_h3.md#validated-settings). Each cell is the mean end-to-end seconds of three requests at concurrency one after a warmup, MP4 encoding included; no cell's standard deviation exceeds 0.39 s. The requests' media are not distributed with UniServe.
 
 768p:
 
@@ -38,8 +32,10 @@ Each profile's header names the environment variables it reads. Suites are named
 | 12 | 10 s, 9:16, 2 images + 1 video + 1 audio | 74.67* | 40.76 | 20.85 | 11.30 |
 | 13 | 15 s, 16:9, 1 image + 2 audio | 69.89* | 38.11 | 19.65 | 10.50 |
 | 14 | 15 s, 16:9, 3 images | 73.99* | 40.36 | 20.74 | 10.98 |
-| 15 | 15 s, 16:9, 2 images + 1 audio | 72.53* | 39.71 | 20.42 | 10.86 |
-| 16 | 15 s, 16:9, 2 images + 1 audio | 79.88* | 43.77 | 22.33 | 11.87 |
+| 15 | 15 s, 16:9, 2 images (1024×1024) + 1 audio | 72.53* | 39.71 | 20.42 | 10.86 |
+| 16 | 15 s, 16:9, 2 images (1306×1204, 1774×887) + 1 audio | 79.88* | 43.77 | 22.33 | 11.87 |
+
+\* With `--graph-policy off`, which one GB200 needs for these requests.
 
 480p:
 
@@ -59,48 +55,34 @@ Each profile's header names the environment variables it reads. Suites are named
 | 12 | 10 s, 9:16, 2 images + 1 video + 1 audio | 44.51 | 24.30 | 12.61 | 6.91 |
 | 13 | 15 s, 16:9, 1 image + 2 audio | 28.43 | 15.77 | 8.32 | 4.74 |
 | 14 | 15 s, 16:9, 3 images | 30.58 | 16.85 | 8.87 | 4.95 |
-| 15 | 15 s, 16:9, 2 images + 1 audio | 29.98 | 16.62 | 8.72 | 5.22 |
-| 16 | 15 s, 16:9, 2 images + 1 audio | 34.23 | 18.69 | 9.78 | 5.67 |
-
-\* With `--graph-policy off`, which one GB200 needs for these requests.
+| 15 | 15 s, 16:9, 2 images (1024×1024) + 1 audio | 29.98 | 16.62 | 8.72 | 5.22 |
+| 16 | 15 s, 16:9, 2 images (1306×1204, 1774×887) + 1 audio | 34.23 | 18.69 | 9.78 | 5.67 |
 
 ## FastH3 on H200
 
-`FastVideo/FastVideo-FastH3-8-Step-V2`, `--mem-fraction-static 0.92` and `NCCL_CUMEM_HOST_ENABLE=1`. Latency is the mean ± SD of three requests at concurrency one; the DP8 rows measure 16 requests at concurrency eight.
+`FastVideo/FastVideo-FastH3-8-Step-V2` on 8 H200 unless noted. Latency is the mean ± SD of three requests at concurrency one; the DP8 rows measure 16 requests at concurrency eight.
 
-| Deployment | Precision | Workload | Result |
-| --- | --- | --- | --- |
-| 8 x H200, Ulysses8 | `quality` | 5 s, 1000 tokens | 8.194 ± 0.818 s |
-| 8 x H200, Ulysses8 | `quality` | 5 s, 10000 tokens | 14.218 ± 0.880 s |
-| 8 x H200, Ulysses8 | `quality` | 10 s, 1000 tokens | 18.539 ± 1.071 s |
-| 8 x H200, Ulysses8 | `quality` | 10 s, 10000 tokens | 26.578 ± 0.600 s |
-| 8 x H200, Ulysses8 | `quality` | 15 s, 1000 tokens | 31.069 ± 0.045 s |
-| 8 x H200, Ulysses8 | `quality` | 15 s, 10000 tokens | 44.228 ± 0.878 s |
-| 4 x H200, Ulysses4 | `quality` | 5 s, 1000 tokens | 13.864 ± 0.013 s |
-| 8 x H200, all-gather | `quality` | 5 s, 10000 tokens | 20.170 ± 0.698 s |
-| 8 x H200, Ulysses8 | FP8 MLPs | 5 s, 1000 tokens | 7.448 ± 0.734 s |
-| 8 x H200, Ulysses8 | FP8 MLPs | 15 s, 10000 tokens | 42.380 ± 0.807 s |
-| 8 x H200, `dp8-text-tp8.json` | `quality` | 5 s, 1000 tokens, concurrency 8 | 0.1519 videos/s, 52.231 ± 0.358 s, 90,329 MiB peak per GPU |
-| 8 x H200, `dp8-text-tp8.json` | FP8 MLPs | 5 s, 1000 tokens, concurrency 8 | 0.1676 videos/s, 47.314 ± 0.386 s, 81,531 MiB peak per GPU |
-
-```bash
-.venv/bin/uniserve-eval --config uniserve_eval/fasth3.toml run h200-8-bf16 --reuse-deployment
-```
+| Deployment | Precision | Workload | Result | Point |
+| --- | --- | --- | --- | --- |
+| `ulysses8.json` | `quality` | 5 s, 1000 tokens | 8.194 ± 0.818 s | `h200-8-bf16-5s-1k` |
+| `ulysses8.json` | `quality` | 5 s, 10000 tokens | 14.218 ± 0.880 s | `h200-8-bf16-5s-10k` |
+| `ulysses8.json` | `quality` | 10 s, 1000 tokens | 18.539 ± 1.071 s | `h200-8-bf16-10s-1k` |
+| `ulysses8.json` | `quality` | 10 s, 10000 tokens | 26.578 ± 0.600 s | `h200-8-bf16-10s-10k` |
+| `ulysses8.json` | `quality` | 15 s, 1000 tokens | 31.069 ± 0.045 s | `h200-8-bf16-15s-1k` |
+| `ulysses8.json` | `quality` | 15 s, 10000 tokens | 44.228 ± 0.878 s | `h200-8-bf16-15s-10k` |
+| `ulysses4.json`, 4 H200 | `quality` | 5 s, 1000 tokens | 13.864 ± 0.013 s | `h200-4-bf16-5s-1k` |
+| `gather8.json` | `quality` | 5 s, 10000 tokens | 20.170 ± 0.698 s | `h200-8-bf16-gather8-5s-10k` |
+| `ulysses8.json` | FP8 MLPs | 5 s, 1000 tokens | 7.448 ± 0.734 s | `h200-8-fp8-5s-1k` |
+| `ulysses8.json` | FP8 MLPs | 15 s, 10000 tokens | 42.380 ± 0.807 s | `h200-8-fp8-15s-10k` |
+| `dp8-text-tp8.json` | `quality` | 5 s, 1000 tokens, concurrency 8 | 0.1519 videos/s, 52.231 ± 0.358 s, 90,329 MiB peak per GPU | `h200-8-bf16-dp8-5s-1k` |
+| `dp8-text-tp8.json` | FP8 MLPs | 5 s, 1000 tokens, concurrency 8 | 0.1676 videos/s, 47.314 ± 0.386 s, 81,531 MiB peak per GPU | `h200-8-fp8-dp8-5s-1k` |
 
 ## FastH3 on RTX PRO 6000
 
-Eight RTX PRO 6000 Blackwell Server Edition GPUs on one PCIe host, `FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4` unless noted, 32 requests per concurrency. Leave `NCCL_P2P_LEVEL` at its default on such a host: `SYS` cuts eight-GPU all-to-all bandwidth from 24.5 to 1.1 GB/s.
+Eight RTX PRO 6000 Blackwell Server Edition GPUs on one PCIe host, `FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4` unless noted, 32 requests per concurrency.
 
-| Deployment | Point | Concurrency | Videos/s | Latency p50 / p95 | Peak device memory |
+| Deployment | Concurrency | Videos/s | Latency p50 / p95 | Peak device memory | Point |
 | --- | --- | --- | --- | --- | --- |
-| `ulysses4x2.json` | `rtx-pro-6000-8-nvfp4-throughput-c4` | 4 | 0.0415 | 89.9 / 149.6 s | 74,408 MiB |
-| `dp8-text-tp8.json` | `rtx-pro-6000-8-nvfp4-dp8-throughput-c8` | 8 | 0.0426 | 127.9 / 318.5 s | 97,156 MiB |
-| `dp8-text-tp8-host-weights.json`, BF16 checkpoint | `rtx-pro-6000-8-bf16-dp8-throughput-c8` | 8 | 0.0346 | 167.2 / 366.5 s | 79,692 MiB |
-
-```bash
-.venv/bin/uniserve-eval --config uniserve_eval/fasth3.toml run rtx-pro-6000-8-nvfp4-dp8 --reuse-deployment
-```
-
-## Other suites
-
-`fasth3_omniref.toml` also measures the OmniRef reference matrix, nine reference compositions at 5, 10 and 15 seconds (`gb200-8-refs`, `h200-8-refs`, `rtx-pro-6000-8-refs`, and `-enlarged` suites that enlarge every reference image to its encoding size). `minimax_h3.toml` measures the MiniMax-H3 checkpoint on its official text, keyframe and reference requests. The workload files are in `uniserve_eval/workloads/minimax_h3/`; each row names its condition media with their source URLs and SHA-256.
+| `ulysses4x2.json` | 4 | 0.0415 | 89.9 / 149.6 s | 74,408 MiB | `rtx-pro-6000-8-nvfp4-throughput-c4` |
+| `dp8-text-tp8.json` | 8 | 0.0426 | 127.9 / 318.5 s | 97,156 MiB | `rtx-pro-6000-8-nvfp4-dp8-throughput-c8` |
+| `dp8-text-tp8-host-weights.json`, BF16 checkpoint | 8 | 0.0346 | 167.2 / 366.5 s | 79,692 MiB | `rtx-pro-6000-8-bf16-dp8-throughput-c8` |

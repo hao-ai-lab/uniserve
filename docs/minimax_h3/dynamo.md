@@ -1,14 +1,10 @@
 # Run FastH3 through NVIDIA Dynamo
 
-Serve FastH3 through Dynamo's `/v1/videos` endpoint using UniServe as the execution backend. Dynamo handles the frontend, discovery and routing; UniServe runs the full text-to-video-and-audio pipeline and returns the completed MP4. The integration is experimental.
-
-This quickstart uses Dynamo 1.5.0 and the FastH3 8-Step V2 checkpoint on four local GB200 GPUs.
+Dynamo's frontend serves `/v1/videos` and routes each request to a UniServe worker, which runs the whole pipeline and returns the MP4. The integration is experimental and serves `t2va` only. This guide uses Dynamo 1.5.0 and four GB200 GPUs on one host.
 
 ## Install
 
-First complete the [installation](minimax_h3.md#install), including GPU providers, shared storage and a complete checkpoint. Run the following commands from the UniServe repository root. The examples use `.venv/bin/python` for UniServe; substitute your installed UniServe interpreter if it is elsewhere.
-
-The Rust worker additionally needs Clang's library and builtin headers, a C++ compiler, CMake, pkg-config and protoc. On Ubuntu:
+Install UniServe as in the [README](../../README.md#install), then build the worker and a separate frontend environment, which keeps UniServe's pinned GPU dependencies apart from Dynamo's:
 
 ```bash
 apt-get install -y build-essential cmake pkg-config protobuf-compiler libclang-dev
@@ -17,19 +13,14 @@ cargo build --locked --release -p uniserve-dynamo-worker
 
 uv venv --python 3.12 artifacts/dynamo/frontend-env
 uv pip install --python artifacts/dynamo/frontend-env/bin/python ai-dynamo==1.5.0
+hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir models/FastH3
 ```
 
-The separate frontend environment preserves UniServe's pinned GPU dependencies. Set the CUDA library path to match your CUDA installation.
-
-Download the complete BF16 checkpoint, or use an existing local copy:
-
-```bash
-.venv/bin/hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir models/FastH3
-```
+`LIBRARY_PATH` names the CUDA stub libraries of your CUDA installation.
 
 ## Start the frontend and worker
 
-In one terminal, start the frontend:
+In one terminal:
 
 ```bash
 artifacts/dynamo/frontend-env/bin/python -m dynamo.frontend \
@@ -38,12 +29,10 @@ artifacts/dynamo/frontend-env/bin/python -m dynamo.frontend \
   --discovery-backend file
 ```
 
-In another terminal, from the same repository and on the same host, start the worker:
+In another, from the same repository on the same host:
 
 ```bash
-export DYN_DISCOVERY_BACKEND=file
-
-target/release/uniserve-dynamo-worker \
+DYN_DISCOVERY_BACKEND=file target/release/uniserve-dynamo-worker \
   --namespace uniserve-fasth3 \
   --model-path models/FastH3 --served-model-name FastH3 \
   --worker-python "$PWD/.venv/bin/python" \
@@ -52,21 +41,11 @@ target/release/uniserve-dynamo-worker \
   --max-running-requests 2 --quantization-config '{"mode":"quality"}'
 ```
 
-The placement uses four-way Ulysses denoising and TP4 text encoding, distributes temporal decoder units across the GPUs, and starts four host video codec ranks plus a host muxer. Weights remain resident; the quality configuration retains BF16 text encoding and denoising with the configured FP16 VAE projections.
-
-This single-host setup uses file discovery; requests travel over Dynamo's default TCP request plane. Both processes must share the discovery directory, `/tmp/dynamo_store_kv` by default, and the same namespace.
-
-Model loading and CUDA graph preparation run before the worker registers. Check the frontend's model list:
-
-```bash
-curl -fsS http://127.0.0.1:18090/v1/models
-```
-
-Proceed when the returned model list contains `FastH3`.
+Both processes share the file discovery directory, `/tmp/dynamo_store_kv` by default, and the namespace. The worker registers once its startup has prepared every request shape; it is ready when `curl -fsS http://127.0.0.1:18090/v1/models` lists `FastH3`.
 
 ## Generate a video
 
-The endpoint is `POST /v1/videos`. It returns a JSON response after generation completes. With `b64_json`, the MP4 is embedded in `data[0].b64_json`:
+`POST /v1/videos` answers once generation completes; with `b64_json` the MP4 is in `data[0].b64_json`:
 
 ```bash
 curl --fail-with-body --max-time 600 \
@@ -95,10 +74,4 @@ Path("artifacts/dynamo/video.mp4").write_bytes(
 PY
 ```
 
-Open `artifacts/dynamo/video.mp4` to play the generated video and soundtrack. FastH3 aligns the requested duration to its temporal layout, so the resulting clip can be slightly longer than requested.
-
-`size` selects one of the canvases the worker serves: those its `--video-resolutions` and `--video-aspect-ratios` prepare, as for `uniserve serve` (1344x768 and 768x1344 by default). Without `size` the worker generates the first of them. A client may instead name the canvas with top-level `resolution` (`768p` or `480p`) and `aspect_ratio` fields, which the frontend forwards to the worker; a `size` that disagrees with them is refused.
-
-The checkpoint determines the denoising schedule and the frame rate, and `seconds` the frame count, so `nvext.num_inference_steps`, `nvext.fps` and `nvext.num_frames` are refused. This integration supports text-to-video requests with completed responses; image input, streaming and guidance overrides are unsupported. Use `b64_json` to retrieve the MP4 directly, as above.
-
-Stop the worker and frontend with Ctrl-C in their respective terminals.
+`size` selects one of the canvases the worker prepares with `--video-resolutions` and `--video-aspect-ratios`, as for `uniserve serve` (1344x768 and 768x1344 by default); without it the worker generates the first. A client may instead send top-level `resolution` (`768p` or `480p`) and `aspect_ratio`; a `size` that disagrees with them is refused. The clip is `seconds` rounded up to the frame layout, as in the [serving guide](minimax_h3.md#requests). The checkpoint fixes the schedule and frame rate, so `nvext.num_inference_steps`, `nvext.fps` and `nvext.num_frames` are refused; image input, streaming and guidance overrides are unsupported.

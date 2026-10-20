@@ -1,31 +1,16 @@
 # Serving guide
 
-UniServe serves FastH3 text-to-video and keyframe requests (`t2va`, `fl2va`), FastH3 OmniRef reference requests (`ref2va`), and the MiniMax-H3 checkpoint they are distilled from. Every response is an H.264 MP4 at 24 fps with stereo 32-kHz AAC audio.
-
-## Install
-
-```bash
-apt-get install -y build-essential python3.12-dev pkg-config cmake git curl ca-certificates
-curl -LsSf https://astral.sh/uv/install.sh | sh
-curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-export CUDA_HOME=/usr/local/cuda MAX_JOBS=2
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$CUDA_HOME/bin:$PATH"
-uv sync --locked --python 3.12 --extra gpu
-source .venv/bin/activate
-```
-
-The sync builds the `uniserve` and `uniserve-host` binaries and UniServe's kernels for the visible GPUs, or for the architectures `TORCH_CUDA_ARCH_LIST` names. Keyframe and reference requests also need FFmpeg: `ffprobe` and `ffmpeg` from `PATH`, or the paths `--ffprobe` and `--ffmpeg` name.
+Install UniServe as in the [README](../../README.md#install).
 
 ## Checkpoints
 
-| Checkpoint | Tasks | Resolutions | Forwards |
+| Checkpoint | Tasks | Resolutions | Steps |
 | --- | --- | --- | --- |
 | [`FastVideo/FastVideo-FastH3-8-Step-V2`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4) | `t2va`, `fl2va` | 768p, 480p | 8 |
 | [`FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | `t2va`, `fl2va` | 768p, 480p | 4 |
 | [`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`](https://huggingface.co/FastVideo/FastVideo-FastH3-Omni-8-Step-V1) (FastH3 OmniRef) | `ref2va` | 768p, 480p | 8 |
-| [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) | `t2va`, `fl2va`; `ref2va` with its `transformer_ref` | 768p | 49 |
 
-The NVFP4 checkpoints need Blackwell. FastH3 OmniRef holds only its denoiser; UniServe reads the text encoder, tokenizer and VAEs from the Hugging Face cache at the MiniMax-H3 revision its `fastvideo_inference.json` pins, and downloads what the cache lacks. A server places one denoiser, so it serves either `t2va` and `fl2va` or `ref2va`.
+`t2va` is text to video, `fl2va` text and first or last keyframe to video, and `ref2va` reference to video; every task returns an H.264 MP4 at 24 fps with stereo 32-kHz AAC audio. The NVFP4 checkpoints need Blackwell. FastH3 OmniRef ships only its denoiser: UniServe reads the text encoder, tokenizer and VAEs from the Hugging Face cache at the MiniMax-H3 revision its `fastvideo_inference.json` pins, and downloads what the cache lacks. A server loads one checkpoint, so it serves either `t2va` and `fl2va` or `ref2va`.
 
 ## Deployments
 
@@ -45,31 +30,33 @@ The NVFP4 checkpoints need Blackwell. FastH3 OmniRef holds only its denoiser; Un
 
 The `-reference` files serve `ref2va`; the others serve `t2va` and `fl2va`. One replica across every GPU gives the lowest latency; more replicas serve more requests at once.
 
-Validated settings for FastH3 (`t2va`, `fl2va`):
+### Validated settings
+
+These are the settings the [evaluation](evaluation.md) measured. GB200 deployments ran with `NCCL_NVLS_ENABLE=0` and H200 deployments with `NCCL_CUMEM_HOST_ENABLE=1`. On a PCIe host such as RTX PRO 6000, leave `NCCL_P2P_LEVEL` at its default: `SYS` cuts eight-GPU all-to-all bandwidth from 24.5 to 1.1 GB/s.
+
+FastH3 (`t2va`, `fl2va`, 768p):
 
 | Hardware | Goal | Deployment | Options |
 | --- | --- | --- | --- |
 | 4 x GB200 | Latency and throughput | `ulysses4.json` | `--max-running-requests 2` |
 | 8 x GB200, two hosts | Latency | `ulysses8-two-node.json` | `--max-running-requests 2 --graph-policy off` |
 | 8 x GB200, two hosts | Throughput | `ulysses4x2-two-node.json` | `--max-running-requests 4` |
-| 4 x H200 | Latency and throughput | `ulysses4.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --video-text-capacities 1024` |
-| 8 x H200 | Latency | `ulysses8.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --video-text-capacities 1024` |
-| 8 x H200 | Throughput, up to 5 s | `dp8-text-tp8.json` | `--max-running-requests 8 --max-video-seconds 5 --max-model-len 1024` |
-| 8 x RTX PRO 6000 | Latency | `ulysses8.json` | `--max-running-requests 2 --graph-policy off --mem-fraction-static 0.92 --video-text-capacities 1024,10240` |
-| 8 x RTX PRO 6000 | Throughput | `ulysses4x2.json` | `--max-running-requests 4 --graph-policy off --mem-fraction-static 0.92 --video-text-capacities 1024,10240` |
+| 4 x H200 | Latency, up to 5 s | `ulysses4.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --graph-policy full --max-video-seconds 5 --max-model-len 1024 --video-text-capacities 1024` |
+| 8 x H200 | Latency | `ulysses8.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --graph-policy full --max-model-len 10240 --video-text-capacities 1024` |
+| 8 x H200 | Throughput, up to 5 s | `dp8-text-tp8.json` | `--max-running-requests 8 --mem-fraction-static 0.92 --graph-policy full --max-video-seconds 5 --max-model-len 1024 --video-text-capacities 1024` |
+| 8 x RTX PRO 6000 | Latency | `ulysses8.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --graph-policy off --video-text-capacities 1024,10240` |
+| 8 x RTX PRO 6000 | Throughput | `ulysses4x2.json` | `--max-running-requests 4 --mem-fraction-static 0.92 --graph-policy off --video-text-capacities 1024,10240` |
 
-Validated settings for FastH3 OmniRef (`ref2va`, up to 15 s), each with `--max-running-requests 2 --max-model-len 24576 --video-text-capacities 4096,7168,8192,9216,10240,12288,15360 --max-condition-rows 56192` unless stated:
+FastH3 OmniRef (`ref2va`, up to 15 s). Every row also takes `--max-running-requests 2 --max-model-len 24576 --video-text-capacities 4096,7168,8192,9216,10240,12288,15360 --max-condition-rows 56192`, except where its options restate one:
 
-| Hardware | Deployment | Options |
-| --- | --- | --- |
-| 1 x GB200 | `ulysses1-reference.json` | `--video-resolutions 768p,480p --mem-fraction-static 0.96 --max-model-len 15360 --max-condition-rows 45056`; add `--graph-policy off` for 768p beyond 10 s or with a 10-second reference video |
-| 2 x GB200 | `ulysses2-reference.json` | `--video-resolutions 768p,480p --mem-fraction-static 0.92` |
-| 4 x GB200 | `ulysses4-reference.json` | `--video-resolutions 768p,480p` |
-| 8 x GB200, two hosts | `ulysses8-reference-two-node.json` | `--video-resolutions 768p,480p --host-identity rank-0` |
-| 8 x H200 | `ulysses8-reference.json` | `--mem-fraction-static 0.92` (768p) |
-| 8 x RTX PRO 6000 | `ulysses8-reference.json` | `--graph-policy off --mem-fraction-static 0.92` (768p) |
-
-Run GB200 deployments with `NCCL_NVLS_ENABLE=0`, as validated.
+| Hardware | Resolutions | Deployment | Options |
+| --- | --- | --- | --- |
+| 1 x GB200 | 768p, 480p | `ulysses1-reference.json` | `--video-resolutions 768p,480p --mem-fraction-static 0.96 --max-model-len 15360 --max-condition-rows 45056`, and `--graph-policy off` for 768p requests of 15 s, or of 10 s with a reference video |
+| 2 x GB200 | 768p, 480p | `ulysses2-reference.json` | `--video-resolutions 768p,480p --mem-fraction-static 0.92` |
+| 4 x GB200 | 768p, 480p | `ulysses4-reference.json` | `--video-resolutions 768p,480p` |
+| 8 x GB200, two hosts | 768p, 480p | `ulysses8-reference-two-node.json` | `--video-resolutions 768p,480p` |
+| 8 x H200 | 768p | `ulysses8-reference.json` | `--mem-fraction-static 0.92` |
+| 8 x RTX PRO 6000 | 768p | `ulysses8-reference.json` | `--mem-fraction-static 0.92 --graph-policy off` |
 
 ### Two hosts
 
@@ -99,10 +86,11 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 
 | Field | Rule |
 | --- | --- |
-| `model`, `prompt` | The served model name, and plain text. A reference prompt names its references in request order as `<Picture n>`, `<Video n>` and `<Audio n>`. |
-| `task` | `t2va`, `fl2va` or `ref2va`, one the served denoiser serves. |
+| `model` | The served model name. |
+| `task` | `t2va`, `fl2va` or `ref2va`, one the served checkpoint serves. |
+| `prompt` | Plain text. A `ref2va` prompt names its references in request order as `<Picture n>`, `<Video n>` and `<Audio n>`. |
 | `conditions` | `t2va` takes none; `fl2va` one or two image keyframes (`frame_index` 0 or -1); `ref2va` up to 9 images, 3 videos and 3 audio tracks, 12 in all. Each has `type` (`image`, `video`, `video_audio` or `audio`), `uri` (`data:`, `http(s)://` or `file://`), `role` (`keyframe` or `reference`), and optionally `frame_index` or `start_time_seconds`. |
-| `target` | `short_edge` (768, or 480 for FastH3 checkpoints), `aspect_ratio` (below, or `auto`: the keyframe's aspect for `fl2va`, 16:9 otherwise) and `duration_seconds` (4 to the served maximum). |
+| `target` | `short_edge` (768 or 480), `aspect_ratio` (below, or `auto`: the keyframe's aspect for `fl2va`, 16:9 otherwise) and `duration_seconds` (4 to the served maximum). |
 | `seed` | Default 42. |
 
 | `short_edge` | `21:9` | `16:9` | `4:3` | `1:1` | `3:4` | `9:16` |
@@ -110,7 +98,9 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 | 768 | 1536×672 | 1344×768 | 1024×768 | 768×768 | 768×1024 | 768×1344 |
 | 480 | 992×416 | 832×480 | 640×480 | 480×480 | 480×640 | 480×832 |
 
-A video has `duration_seconds × 24` frames, extended to the next count of the form 17n + 5: 5 seconds give 124 frames and 15 give 362. Any other field is refused. `POST /v1/videos` creates an asynchronous job instead; `GET /v1/videos/{id}` reports its state, `GET /v1/videos/{id}/content` returns the MP4 and `DELETE /v1/videos/{id}` cancels it. `GET /v1/capabilities` reports the served tasks, canvases, durations and capacities.
+A video has `duration_seconds × 24` frames, rounded up to the next count of the form 17n + 5: 5 seconds give 124 frames and 15 give 362. Any other field is refused.
+
+`POST /v1/videos` creates an asynchronous job instead: `GET /v1/videos/{id}` reports its state, `GET /v1/videos/{id}/content` returns the MP4 and `DELETE /v1/videos/{id}` cancels it. `GET /v1/capabilities` reports the served tasks, canvases, durations and capacities.
 
 ## Options
 
@@ -118,24 +108,17 @@ A video has `duration_seconds × 24` frames, extended to the next count of the f
 | --- | --- |
 | `--max-video-seconds` | Longest admitted duration, 4 to 15; 15 by default. |
 | `--video-resolutions`, `--video-aspect-ratios` | Canvases startup prepares; `768p` and `16:9,9:16` by default. Other canvases are refused. |
-| `--max-model-len` | Longest prompt in tokens, vision tokens included; 16384 by default. |
+| `--max-model-len` | Longest prompt in tokens, reference tokens included; 16384 by default. |
 | `--video-text-capacities` | Prompt capacities startup prepares; each prompt runs in the smallest that holds it. |
-| `--max-condition-rows` | Denoiser rows one request's conditions may occupy. A request beyond it is refused with `invalid_request`, naming the rows it needs. |
+| `--max-condition-rows` | Denoiser rows one request's conditions may occupy. A request beyond it is refused with `invalid_request`, naming the rows it needs. With the validated OmniRef settings, eight GB200 serve nine square images with three 2-second clips at 15 seconds. |
 | `--max-running-requests` | Concurrently resident requests. |
 | `--mm-processor-kwargs` | Reference sizing, as JSON: `reference_image_short_edge` (at most 2048, the default) and `enlarge_references` (`false` by default: a reference is only ever scaled down). |
 | `--media-directory`, `--remote-media` | Where `file://` references resolve (refused without it), and whether `http(s)://` references are fetched (on by default). |
 | `--mem-fraction-static` | Device memory each worker may hold; 0.70 by default. |
-| `--graph-policy` | `auto` (default) captures CUDA graphs at startup; `off` runs eagerly and needs less memory. |
+| `--graph-policy` | `auto` (default) captures CUDA graphs at startup, `full` refuses to start without them, and `off` runs eagerly with less memory. |
 | `--quantization-config` | Precision of a BF16 checkpoint, below. |
 
-Startup prepares every admitted request shape and logs `worker still busy during Worker startup` until it is ready; fewer canvases, capacities and seconds start faster and use less memory. A deployment whose prepared shapes do not fit fails at startup and logs what each component holds; a large reference request can still run out of device memory at run time, as long 768p requests do on one GB200 with graphs on.
-
-A reference request packs its prompt, its condition rows and its generated rows into one sequence:
-
-- A 16:9 768p target generates 37,710 rows at 5 seconds and 109,062 at 15.
-- An image reference is (height / 32) × (width / 32) prompt tokens and as many condition rows, at its own size unless its short edge exceeds 2048 pixels.
-- FastH3 OmniRef packs each condition into whole 128-row tiles.
-- `--max-model-len` and `--max-condition-rows` bound what a deployment accepts. On eight GB200 the OmniRef settings above serve nine square images with three 2-second clips at 15 seconds.
+Startup prepares every admitted request shape, and `/health` reports ready when it is done; fewer canvases, capacities and seconds start faster and use less memory. A deployment whose prepared shapes do not fit fails at startup and logs what each component holds.
 
 ## Precision
 
@@ -148,17 +131,17 @@ A reference request packs its prompt, its condition rows and its generated rows 
 
 Attention stays BF16, and NVFP4 needs Blackwell. `components` overrides parts of a mode, as in `{"mode":"performance","components":{"video_vae":"bf16"}}`. The NVFP4 checkpoints carry their own precision and take no `--quantization-config`. Modes other than `quality` change the generated media.
 
-## Docker
+## Build and run with Docker
 
 ```bash
 docker build -f docs/minimax_h3/Dockerfile -t uniserve .
 docker run --rm --gpus all --pid=host --shm-size=4g --ulimit memlock=-1 -p 8000:8000 \
   -v "$PWD/models/FastH3:/models/FastH3:ro" \
   uniserve serve /models/FastH3 --workers configs/minimax_h3/ulysses4.json \
-    --served-model-name FastH3 --host 0.0.0.0
+    --served-model-name FastH3 --host 0.0.0.0 --max-running-requests 2
 ```
 
-Mount `/root/.cache` and `/root/.triton` to keep the kernels the first start compiles.
+Mount `/root/.cache` and `/root/.triton` to keep the kernels the first start compiles. The image holds no FFmpeg: for video and audio references, mount FFmpeg into the container and name it with `--ffprobe` and `--ffmpeg`.
 
 ## Troubleshooting
 
