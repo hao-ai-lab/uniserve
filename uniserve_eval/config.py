@@ -37,9 +37,6 @@ from .types import (
     VideoConfig,
 )
 
-#: The profiles this driver ships, which `--config` replaces.
-DEFAULT_CONFIG = Path(__file__).resolve().parent / "profiles.toml"
-
 # `${NAME}` and `${NAME:-default}`. The default is matched non-greedily, so it
 # ends at the first `}` and cannot itself contain one.
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -184,7 +181,7 @@ class EvaluationConfig:
         return tuple(self.benchmarks[name] for name in suite.points)
 
 
-def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
+def load_config(path: Path) -> EvaluationConfig:
     """Load and validate an evaluator TOML file.
 
     A profile's relative paths -- its executable, its interpreter, its

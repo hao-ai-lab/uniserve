@@ -7,7 +7,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from .config import DEFAULT_CONFIG, load_config, server_launch
+from .config import load_config, server_launch
 from .pipeline.run import run_point
 from .pipeline.setup import (
     applied_environment,
@@ -195,7 +195,7 @@ def _log_path(
 def build_parser() -> argparse.ArgumentParser:
     """Build the evaluator command-line parser."""
     parser = argparse.ArgumentParser(prog="uniserve-eval", description=__doc__)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--config", type=Path, required=True)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     command = subparsers.add_parser("list")
