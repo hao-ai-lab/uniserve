@@ -33,7 +33,7 @@ curl --fail-with-body http://127.0.0.1:8000/v1/videos/sync \
 
 ## Reference to video
 
-FastH3 OmniRef follows up to twelve references: at most nine images, three videos and three audio tracks.
+A `ref2va` request takes up to twelve references: at most nine images, three videos and three audio tracks.
 
 ```bash
 hf download FastVideo/FastVideo-FastH3-Omni-8-Step-V1 --local-dir models/FastH3-OmniRef
