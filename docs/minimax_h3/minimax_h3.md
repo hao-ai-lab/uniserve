@@ -8,9 +8,9 @@ Install UniServe as in the [README](../../README.md#install).
 | --- | --- | --- | --- |
 | [`FastVideo/FastVideo-FastH3-8-Step-V2`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4) | `t2va`, `fl2va` | 768p, 480p | 8 |
 | [`FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | `t2va`, `fl2va` | 768p, 480p | 4 |
-| [`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`](https://huggingface.co/FastVideo/FastVideo-FastH3-Omni-8-Step-V1) (FastH3 OmniRef) | `ref2va` | 768p, 480p | 8 |
+| [`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`](https://huggingface.co/FastVideo/FastVideo-FastH3-Omni-8-Step-V1) (FastH3 Omni) | `ref2va` | 768p, 480p | 8 |
 
-`t2va` is text to video, `fl2va` text and first or last keyframe to video, and `ref2va` reference to video; every task returns an H.264 MP4 at 24 fps with stereo 32-kHz AAC audio. The NVFP4 checkpoints need Blackwell. FastH3 OmniRef ships only its denoiser: UniServe reads the text encoder, tokenizer and VAEs from the Hugging Face cache at the MiniMax-H3 revision its `fastvideo_inference.json` pins, and downloads what the cache lacks. A server loads one checkpoint, so it serves either `t2va` and `fl2va` or `ref2va`.
+`t2va` is text to video, `fl2va` text and first or last keyframe to video, and `ref2va` reference to video; every task returns an H.264 MP4 at 24 fps with stereo 32-kHz AAC audio. The NVFP4 checkpoints need Blackwell. FastH3 Omni ships only its denoiser: UniServe reads the text encoder, tokenizer and VAEs from the Hugging Face cache at the MiniMax-H3 revision its `fastvideo_inference.json` pins, and downloads what the cache lacks. A server loads one checkpoint, so it serves either `t2va` and `fl2va` or `ref2va`.
 
 ## Deployments
 
@@ -47,7 +47,7 @@ FastH3 (`t2va`, `fl2va`, 768p):
 | 8 x RTX PRO 6000 | Latency | `ulysses8.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --graph-policy off --video-text-capacities 1024,10240` |
 | 8 x RTX PRO 6000 | Throughput | `ulysses4x2.json` | `--max-running-requests 4 --mem-fraction-static 0.92 --graph-policy off --video-text-capacities 1024,10240` |
 
-FastH3 OmniRef (`ref2va`, up to 15 s). Every row also takes `--max-running-requests 2 --max-model-len 24576 --video-text-capacities 4096,7168,8192,9216,10240,12288,15360 --max-condition-rows 56192`, except where its options restate one:
+FastH3 Omni (`ref2va`, up to 15 s). Every row also takes `--max-running-requests 2 --max-model-len 24576 --video-text-capacities 4096,7168,8192,9216,10240,12288,15360 --max-condition-rows 56192`, except where its options restate one:
 
 | Hardware | Resolutions | Deployment | Options |
 | --- | --- | --- | --- |
@@ -75,7 +75,7 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 
 ```json
 {
-  "model": "FastH3-OmniRef",
+  "model": "FastH3-Omni",
   "task": "ref2va",
   "prompt": "<Subject 1> is the man in <Picture 1>. <Audio 1> is his voice. ...",
   "conditions": [
@@ -113,7 +113,7 @@ A video has `duration_seconds × 24` frames, rounded up to the next count of the
 | `--video-resolutions`, `--video-aspect-ratios` | Canvases startup prepares; `768p` and `16:9,9:16` by default. Other canvases are refused. |
 | `--max-model-len` | Longest prompt in tokens, reference tokens included; 16384 by default. |
 | `--video-text-capacities` | Prompt capacities startup prepares; each prompt runs in the smallest that holds it. |
-| `--max-condition-rows` | Denoiser rows one request's conditions may occupy. A request beyond it is refused with `invalid_request`, naming the rows it needs. With the validated OmniRef settings, eight GB200 serve nine square images with three 2-second clips at 15 seconds. |
+| `--max-condition-rows` | Denoiser rows one request's conditions may occupy. A request beyond it is refused with `invalid_request`, naming the rows it needs. With the validated FastH3 Omni settings, eight GB200 serve nine square images with three 2-second clips at 15 seconds. |
 | `--max-running-requests` | Concurrently resident requests. |
 | `--mm-processor-kwargs` | Reference sizing, as JSON: `reference_image_short_edge` (at most 2048, the default) and `enlarge_references` (`false` by default: a reference is only ever scaled down). |
 | `--media-directory`, `--remote-media` | Where `file://` references resolve (refused without it), and whether `http(s)://` references are fetched (on by default). |
@@ -159,4 +159,4 @@ Mount `/root/.cache` and `/root/.triton` to keep the kernels the first start com
 | `invalid_request` naming rows or the prompt length | Serve with a larger `--max-condition-rows` or `--max-model-len`, or send fewer or smaller references. |
 | A refused `file://` reference | Set `--media-directory` to a directory that holds it. |
 | `server_error` naming `cannot run ffprobe` | Run `scripts/install-ffmpeg.sh`, or name FFmpeg with `--ffprobe` and `--ffmpeg`. |
-| FastH3 OmniRef cannot find a base file | Let the server download the pinned MiniMax-H3 revision, or download it into the Hugging Face cache. |
+| FastH3 Omni cannot find a base file | Let the server download the pinned MiniMax-H3 revision, or download it into the Hugging Face cache. |

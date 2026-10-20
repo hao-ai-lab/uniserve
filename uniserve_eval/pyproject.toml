@@ -27,7 +27,7 @@ include = ["uniserve_eval*"]
 [tool.setuptools.package-data]
 uniserve_eval = [
     "fasth3.toml",
-    "fasth3_omniref.toml",
+    "fasth3_omni.toml",
     "minimax_h3.toml",
     "workloads/minimax_h3/*.jsonl",
 ]

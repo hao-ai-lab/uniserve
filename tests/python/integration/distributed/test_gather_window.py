@@ -1,6 +1,6 @@
-"""A streamed projection gathers the OmniRef reference layout's sequence.
+"""A streamed projection gathers the FastH3 Omni reference layout's sequence.
 
-The FastH3 OmniRef reference layout gathers a 95,744-row sequence of
+The FastH3 Omni reference layout gathers a 95,744-row sequence of
 5376-wide BF16 rows over a four-member Ulysses group: a 1,029,439,488-byte
 gather transport. Every gathered row must equal the unpartitioned
 projection.

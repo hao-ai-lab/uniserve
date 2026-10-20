@@ -1,6 +1,6 @@
-"""Multi-segment sparse layouts reproduce FastVideo's OmniRef packing.
+"""Multi-segment sparse layouts reproduce FastVideo's FastH3 Omni packing.
 
-FastVideo's FastH3 OmniRef path packs ``[text | references | target audio |
+FastVideo's FastH3 Omni path packs ``[text | references | target audio |
 target video]`` and tiles it per segment: text, every
 audio track, images and the target audio form dense tiles of their own
 segment, and each reference video and the target video form a segment of

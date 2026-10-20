@@ -8,9 +8,9 @@ uniserve-eval --config uniserve_eval/fasth3.toml plan gb200-4-bf16
 uniserve-eval --config uniserve_eval/fasth3.toml run gb200-4-bf16 --reuse-deployment
 ```
 
-`uniserve_eval/fasth3.toml` measures FastH3 and `uniserve_eval/fasth3_omniref.toml` FastH3 OmniRef. Each profile's header names the environment variables it reads, its workloads and its suites. Run one suite at a time; for a two-host suite, start `uniserve-host` on `rank-1` as in [Two hosts](minimax_h3.md#two-hosts). `plan` prints the server command of every point it selects.
+`uniserve_eval/fasth3.toml` measures FastH3 and `uniserve_eval/fasth3_omni.toml` FastH3 Omni. Each profile's header names the environment variables it reads, its workloads and its suites. Run one suite at a time; for a two-host suite, start `uniserve-host` on `rank-1` as in [Two hosts](minimax_h3.md#two-hosts). `plan` prints the server command of every point it selects.
 
-## FastH3 OmniRef on GB200
+## FastH3 Omni on GB200
 
 16 reference requests, each at 768p and 480p, on one replica of one to eight GB200 with the [validated settings](minimax_h3.md#validated-settings). Each cell is the mean end-to-end seconds of three requests at concurrency one after a warmup, MP4 encoding included; no cell's standard deviation exceeds 0.39 s. The requests' media are not distributed with UniServe.
 

@@ -153,7 +153,7 @@ def test_ref2va_fasth3_branches_from_the_reference_partition(checkpoint):
         tile=128, sparsity=0.9, reference_keep=0.1
     )
     assert denoiser.tasks == ("ref2va",)
-    # An OmniRef export generates the FastH3 buckets, 480p among them.
+    # A FastH3 Omni export generates the FastH3 buckets, 480p among them.
     assert denoiser.canvases == FASTH3_CANVASES
 
 

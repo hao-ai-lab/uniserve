@@ -1,6 +1,6 @@
 """A FastH3 export reads the components it omits at its pinned base revision.
 
-FastH3 OmniRef ships its DiT partition and schedulers and pins, in
+FastH3 Omni ships its DiT partition and schedulers and pins, in
 ``base_model_revision``, the MiniMax-H3 revision that supplies the text
 encoder, tokenizer, processor and VAEs. The loader reads every directory the
 export omits from the Hub snapshot of that revision.
@@ -24,7 +24,7 @@ REVISION = "9bfb6693f2cf6de171db46d1aa586f67d773a1da"
 
 @pytest.fixture
 def checkpoints(tmp_path):
-    """An OmniRef-like export and the files of its base revision."""
+    """A FastH3 Omni-like export and the files of its base revision."""
     fixture = Path(__file__).parents[2] / "fixtures/models/fasth3"
     base, export = tmp_path / "base", tmp_path / "export"
     shutil.copytree(fixture, base)

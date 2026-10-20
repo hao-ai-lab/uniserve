@@ -104,10 +104,10 @@ def base_denoiser(
     )
 
 
-def omniref_denoiser(
+def omni_denoiser(
     transformer: TransformerConfig | None = None,
 ) -> DenoiserConfig:
-    """A FastH3 OmniRef PDD student: 32 heads, tile-128 VSA over segments."""
+    """A FastH3 Omni PDD student: 32 heads, tile-128 VSA over segments."""
     return DenoiserConfig(
         transformer=replace(
             transformer or transformer_config(), output_heads=32

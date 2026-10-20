@@ -7,8 +7,8 @@ UniServe is a unified serving engine: a Rust server owns HTTP admission, schedul
 UniServe needs Linux on x86-64 or aarch64, NVIDIA Hopper or Blackwell GPUs, CUDA 13, Python 3.12 and a stable Rust toolchain. From the repository root:
 
 ```bash
-apt-get update && apt-get install -y build-essential python3.12-dev pkg-config cmake git curl ca-certificates \
-  nasm zlib1g-dev xz-utils
+apt-get update && apt-get install -y build-essential python3.12-dev pkg-config cmake \
+  git curl ca-certificates nasm zlib1g-dev xz-utils
 scripts/install-ffmpeg.sh
 curl -LsSf https://astral.sh/uv/install.sh | sh
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
@@ -40,9 +40,9 @@ curl --fail-with-body http://127.0.0.1:8000/v1/videos/sync \
 ## Reference to video
 
 ```bash
-hf download FastVideo/FastVideo-FastH3-Omni-8-Step-V1 --local-dir models/FastH3-OmniRef
-uniserve serve models/FastH3-OmniRef --workers configs/minimax_h3/ulysses4-reference.json \
-  --served-model-name FastH3-OmniRef --host 0.0.0.0 --max-running-requests 2 \
+hf download FastVideo/FastVideo-FastH3-Omni-8-Step-V1 --local-dir models/FastH3-Omni
+uniserve serve models/FastH3-Omni --workers configs/minimax_h3/ulysses4-reference.json \
+  --served-model-name FastH3-Omni --host 0.0.0.0 --max-running-requests 2 \
   --media-directory /srv/media --max-model-len 24576 \
   --video-text-capacities 4096,7168,8192,9216,10240,12288,15360 --max-condition-rows 56192
 ```
@@ -52,7 +52,7 @@ A `ref2va` request takes up to nine images, three videos and three audio tracks,
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/v1/videos/sync \
   -H 'Content-Type: application/json' \
-  -d '{"model":"FastH3-OmniRef","task":"ref2va","prompt":"<Subject 1> is the man in <Picture 1>; <Audio 1> is his voice. ...","conditions":[{"type":"image","uri":"file:///srv/media/subject.png","role":"reference"},{"type":"audio","uri":"file:///srv/media/voice.mp3","role":"reference"}],"target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5}}' \
+  -d '{"model":"FastH3-Omni","task":"ref2va","prompt":"<Subject 1> is the man in <Picture 1>; <Audio 1> is his voice. ...","conditions":[{"type":"image","uri":"file:///srv/media/subject.png","role":"reference"},{"type":"audio","uri":"file:///srv/media/voice.mp3","role":"reference"}],"target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5}}' \
   --output reference.mp4
 ```
 

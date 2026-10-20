@@ -13,7 +13,7 @@ from tests.python.fixtures.h3 import (
     WIDE,
     base_denoiser,
     dmd_denoiser,
-    omniref_denoiser,
+    omni_denoiser,
     transformer_config,
 )
 from uniserve.media import image, video
@@ -67,7 +67,7 @@ def test_each_denoiser_takes_the_conditions_of_its_tasks():
     assert size.condition_rows == 2 * 1024
     with pytest.raises(ValueError, match="no references"):
         students.make_size(124, 64, canvas=WIDE, conditions=(IMAGE,))
-    size = _meta(omniref_denoiser()).make_size(
+    size = _meta(omni_denoiser()).make_size(
         124, 64, canvas=WIDE, conditions=(IMAGE, FIRST)
     )
     assert size.condition_rows == 2304 + 1024
@@ -181,7 +181,7 @@ def test_encoded_conditions_fill_the_rows_past_the_prompt():
 
 
 def test_reference_segments_take_whole_tiles():
-    model = _meta(omniref_denoiser())
+    model = _meta(omni_denoiser())
     voice = Condition(ConditionRole.REFERENCE, None, 32_000)
     size = model.make_size(
         124, 300, canvas=WIDE, conditions=(CLIP, IMAGE, voice)
@@ -203,7 +203,7 @@ def test_reference_segments_take_whole_tiles():
 
 def test_reference_segment_state_follows_its_layout():
     model = Denoiser(
-        omniref_denoiser(
+        omni_denoiser(
             transformer_config(
                 hidden_size=64,
                 num_attention_heads=4,
@@ -283,7 +283,7 @@ def test_a_condition_layout_respects_the_attention_kind():
     assert model.holds(widened, size)
 
     # Segment packing takes conditions in its own 128-row tiles.
-    model = _meta(omniref_denoiser())
+    model = _meta(omni_denoiser())
     layout = model.layout_size(model.make_size(124, 300, canvas=WIDE))
     widened = model.condition_layout(layout, 7000)
     assert widened.condition_rows == 55 * 128
