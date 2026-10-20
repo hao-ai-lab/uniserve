@@ -7,8 +7,8 @@ names end in `_total`, or a histogram's `_sum` and `_count`; the difference
 of a gauge between two instants carries no window meaning and is left out.
 UniServe's execution-domain times (`uniserve:scheduler_domain_time_us`, by
 domain and phase) and worker forward times are such counters, so their
-deltas attribute the window's server time; other servers' counters are kept
-under their own names.
+deltas attribute the window's server time; every counter is kept under its
+own name.
 """
 
 from __future__ import annotations

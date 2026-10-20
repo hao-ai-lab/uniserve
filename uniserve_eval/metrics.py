@@ -126,7 +126,7 @@ def summarize(records: list[RequestRecord], dur_s: float) -> dict[str, Any]:
 
 
 def _server_timings(successful: list[RequestRecord]) -> dict[str, Any]:
-    """Summarize reported video timings using each server's definitions."""
+    """Summarize reported video timings using the server's definitions."""
     summary: dict[str, Any] = {}
     inference = [
         record.server_inference_s
@@ -145,12 +145,4 @@ def _server_timings(successful: list[RequestRecord]) -> dict[str, Any]:
             name: distribution(values, scale=1000)
             for name, values in stages.items()
         }
-
-    peaks = [
-        record.server_peak_memory_mib
-        for record in successful
-        if record.server_peak_memory_mib is not None
-    ]
-    if peaks:
-        summary["server_peak_memory_mib"] = max(peaks)
     return summary

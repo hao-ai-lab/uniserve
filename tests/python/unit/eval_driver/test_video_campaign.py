@@ -7,8 +7,6 @@ import json
 import threading
 import time
 from dataclasses import replace
-from email.parser import BytesParser
-from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -49,47 +47,6 @@ def point(**kwargs):
         metrics=(MetricDefinition(("videos_per_second",), "higher"),),
         **kwargs,
     )
-
-
-# The released schedules in sigma points including the clean endpoint, with
-# the video and audio shifts: the base checkpoint and FastH3 8-Step V2.
-BASE_SCHEDULE = {
-    "num_inference_steps": 50,
-    "flow_shift": 12.0,
-    "audio_flow_shift": 3.0,
-}
-FAST_H3_SCHEDULE = {
-    "num_inference_steps": 9,
-    "flow_shift": 10.0,
-    "audio_flow_shift": 3.0,
-}
-
-
-def stated_schedule(backend, schedule=FAST_H3_SCHEDULE):
-    """The schedule fields a point measuring ``backend`` states."""
-    if backend == "uniserve":
-        # UniServe's checkpoint fixes its schedule.
-        return {}
-    if backend == "fastvideo":
-        # FastVideo takes its shifts from the checkpoint.
-        return {"num_inference_steps": schedule["num_inference_steps"]}
-    return dict(schedule)
-
-
-def form_fields(request):
-    """Decode a multipart request's text fields."""
-    message = BytesParser(policy=default).parsebytes(
-        b"Content-Type: "
-        + request[0]["content-type"].encode()
-        + b"\r\n\r\n"
-        + request[1]
-    )
-    return {
-        part.get_param("name", header="content-disposition"): part.get_payload(
-            decode=True
-        ).decode()
-        for part in message.iter_parts()
-    }
 
 
 def decoded(width=1344, height=768, frames=124, audio_samples=None):
@@ -154,7 +111,7 @@ def test_each_duration_uses_ties_to_even_and_native_alignment():
 @pytest.mark.parametrize(
     "frames,audio_samples,valid",
     [
-        # One frame short with full-length audio, as FastVideo returns 15 s.
+        # One frame short or long with full-length audio.
         (361, 483328, True),
         (363, 483328, True),
         (360, 483328, False),
@@ -200,33 +157,23 @@ def test_media_must_have_the_canvas_the_target_resolves_to(
 
 
 @pytest.mark.parametrize(
-    "backend", ["uniserve", "sglang", "vllm-omni", "fastvideo"]
-)
-@pytest.mark.parametrize(
     "aspect_ratio,canvas", [("16:9", (1344, 768)), ("9:16", (768, 1344))]
 )
-@pytest.mark.parametrize("schedule", [BASE_SCHEDULE, FAST_H3_SCHEDULE])
 @pytest.mark.parametrize("seconds,frames", [(5, 124), (7.3, 175)])
-def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
-    backend, aspect_ratio, canvas, schedule, seconds, frames
+def test_the_server_receives_the_canonical_body_without_a_schedule(
+    aspect_ratio, canvas, seconds, frames
 ):
-    """The canonical body reaches every backend as the same generated work."""
+    """The checkpoint fixes the schedule, so the request states none."""
     sent = []
 
     async def exercise():
         async def handler(request):
-            sent.append((request.headers, await request.read()))
+            sent.append(await request.read())
             return web.Response(
                 body=b"mp4", headers={"content-type": "video/mp4"}
             )
 
-        config = point(
-            video=VideoConfig(
-                backend=backend,
-                aspect_ratio=aspect_ratio,
-                **stated_schedule(backend, schedule),
-            )
-        )
+        config = point(video=VideoConfig(aspect_ratio=aspect_ratio))
         request = VideoTask(config).build_request(
             Example("row", "precise prompt", seconds=seconds, seed=11)
         )
@@ -239,71 +186,18 @@ def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
             )
         assert record.success
         assert record.requested_seconds == seconds
+        assert record.video_shape == VideoShape(*canvas, frames)
 
     asyncio.run(exercise())
-    width, height = canvas
-    points = schedule["num_inference_steps"]
-    if backend in ("uniserve", "sglang"):
-        # Both take the official body; SGLang also runs the stated schedule.
-        assert json.loads(sent[0][1]) == {
-            "model": "h3",
-            "prompt": "precise prompt",
-            "task": "t2va",
-            "conditions": [],
-            "target": {
-                "short_edge": 768,
-                "aspect_ratio": aspect_ratio,
-                "duration_seconds": seconds,
-            },
-            "seed": 11,
-            **stated_schedule(backend, schedule),
-        }
-    elif backend == "vllm-omni":
-        fields = form_fields(sent[0])
-        assert fields["prompt"] == "precise prompt"
-        assert int(fields["seed"]) == 11
-        assert (int(fields["width"]), int(fields["height"])) == canvas
-        assert fields["aspect_ratio"] == aspect_ratio
-        assert int(fields["fps"]) == 24
-        # vLLM-Omni counts schedule intervals: one fewer than the points.
-        assert int(fields["num_inference_steps"]) == points - 1
-        assert float(fields["guidance_scale"]) == 1
-        assert float(fields["flow_shift"]) == schedule["flow_shift"]
-        assert json.loads(fields["extra_params"]) == {
-            "task": "t2va",
-            "duration": seconds,
-            "audio_flow_shift": schedule["audio_flow_shift"],
-        }
-    else:
-        payload = json.loads(sent[0][1])
-        assert payload["prompt"] == "precise prompt"
-        assert payload["seed"] == 11
-        assert payload["size"] == f"{width}x{height}"
-        assert payload["fps"] == 24
-        assert payload["num_inference_steps"] == points
-        assert payload["num_frames"] == frames
-        # The generic seconds field takes integers; the frames carry the rest.
-        assert payload.get("seconds") == (
-            seconds if float(seconds).is_integer() else None
-        )
-        assert "flow_shift" not in payload
-        assert "audio_flow_shift" not in payload
-
-
-def test_uniserve_request_without_a_stated_schedule_omits_it():
-    request = VideoTask(point()).build_request(
-        Example("row", "precise prompt", seconds=15, seed=11)
-    )
-
-    assert request.payload == {
+    assert json.loads(sent[0]) == {
         "model": "h3",
         "prompt": "precise prompt",
         "task": "t2va",
         "conditions": [],
         "target": {
             "short_edge": 768,
-            "aspect_ratio": "16:9",
-            "duration_seconds": 15.0,
+            "aspect_ratio": aspect_ratio,
+            "duration_seconds": seconds,
         },
         "seed": 11,
     }
@@ -317,17 +211,9 @@ def test_a_duration_outside_the_api_range_is_not_sent(seconds):
         )
 
 
-@pytest.mark.parametrize(
-    "backend,endpoint",
-    [
-        ("uniserve", VIDEOS_SYNC),
-        ("vllm-omni", VIDEOS_SYNC),
-        ("fastvideo", VIDEOS_SYNC),
-        ("sglang", "/v1/videos"),
-    ],
-)
+@pytest.mark.parametrize("endpoint", [VIDEOS_SYNC, "/v1/videos"])
 def test_native_transport_waits_for_media_and_enforces_logical_deadline(
-    backend, endpoint
+    endpoint,
 ):
     async def exercise():
         async def handler(request):
@@ -344,17 +230,7 @@ def test_native_transport_waits_for_media_and_enforces_logical_deadline(
             )
 
         config = replace(
-            point(
-                video=VideoConfig(
-                    backend=backend,
-                    poll_interval_s=0.001,
-                    **(
-                        stated_schedule(backend)
-                        if backend != "uniserve"
-                        else {}
-                    ),
-                )
-            ),
+            point(video=VideoConfig(poll_interval_s=0.001)),
             endpoint=endpoint,
         )
         request = VideoTask(config).build_request(
@@ -391,151 +267,18 @@ def test_native_transport_waits_for_media_and_enforces_logical_deadline(
     asyncio.run(exercise())
 
 
-def test_vllm_omni_request_carries_configured_extra_params():
-    async def exercise():
-        sent = {}
-
-        async def handler(request):
-            sent.update(
-                json.loads(
-                    form_fields((request.headers, await request.read()))[
-                        "extra_params"
-                    ]
-                )
-            )
-            return web.Response(
-                body=b"original bytes",
-                headers={"content-type": "video/mp4"},
-            )
-
-        config = point(
-            video=VideoConfig(
-                backend="vllm-omni",
-                extra_params={"preencode_mp4": True},
-                **FAST_H3_SCHEDULE,
-            )
-        )
-        request = VideoTask(config).build_request(
-            Example("row", "precise prompt", seconds=10, seed=11)
-        )
-        async with (
-            stub_server(handler) as base_url,
-            aiohttp.ClientSession() as client,
-        ):
-            record = await send_request(
-                client, base_url, request, "row", task="video"
-            )
-        assert record.success
-        # The configured option joins the fields that fix the work.
-        assert sent == {
-            "task": "t2va",
-            "duration": 10.0,
-            "audio_flow_shift": 3.0,
-            "preencode_mp4": True,
-        }
-
-    asyncio.run(exercise())
-
-
-def test_sglang_request_carries_configured_extra_params():
-    async def exercise():
-        sent = {}
-
-        async def handler(request):
-            if request.method == "POST":
-                sent.update(await request.json())
-                return web.json_response({"id": "job", "status": "completed"})
-            return web.Response(
-                body=b"original bytes",
-                headers={"content-type": "video/mp4"},
-            )
-
-        config = replace(
-            point(
-                video=VideoConfig(
-                    backend="sglang",
-                    extra_params={
-                        "x264_preset": "ultrafast",
-                        "output_compression": 53,
-                    },
-                    **FAST_H3_SCHEDULE,
-                )
-            ),
-            endpoint="/v1/videos",
-        )
-        request = VideoTask(config).build_request(
-            Example("row", "precise prompt", seconds=10, seed=11)
-        )
-        async with (
-            stub_server(handler) as base_url,
-            aiohttp.ClientSession() as client,
-        ):
-            record = await send_request(
-                client, base_url, request, "row", task="video"
-            )
-        assert record.success
-        # The configured options join the native fields that fix the work.
-        assert sent["x264_preset"] == "ultrafast"
-        assert sent["output_compression"] == 53
-        assert sent["task"] == "t2va"
-        assert sent["target"]["duration_seconds"] == 10
-
-    asyncio.run(exercise())
-
-
-@pytest.mark.parametrize(
-    "backend,extra_params,message",
-    [
-        ("fastvideo", {"preencode_mp4": True}, "only to sglang and vllm-omni"),
-        ("uniserve", {"preencode_mp4": True}, "only to sglang and vllm-omni"),
-        ("vllm-omni", {"duration": 5}, "duration"),
-        ("vllm-omni", {"task": "t2v"}, "task"),
-        ("sglang", {"target": {}}, "target"),
-        ("sglang", {"num_inference_steps": 4}, "num_inference_steps"),
-    ],
-)
-def test_video_extra_params_cannot_change_the_work_or_go_unsent(
-    backend, extra_params, message
-):
-    schedule = stated_schedule(backend) if backend != "uniserve" else {}
-    with pytest.raises(ValueError, match=message):
-        VideoConfig(backend=backend, extra_params=extra_params, **schedule)
-
-
 @pytest.mark.parametrize(
     "settings,message",
     [
-        # A baseline runs whatever schedule it is sent.
-        ({"backend": "sglang"}, "requires"),
-        (
-            {
-                "backend": "vllm-omni",
-                "num_inference_steps": 9,
-                "flow_shift": 10.0,
-            },
-            "audio_flow_shift",
-        ),
-        ({"backend": "fastvideo"}, "num_inference_steps"),
-        # FastVideo takes its shifts from the checkpoint.
-        (
-            {
-                "backend": "fastvideo",
-                "num_inference_steps": 9,
-                "flow_shift": 10.0,
-            },
-            "cannot receive",
-        ),
-        ({"num_inference_steps": 1}, "at least 2"),
-        ({"flow_shift": 0.0}, "flow_shift"),
-        ({"audio_flow_shift": float("nan")}, "audio_flow_shift"),
         # A conditioned task reads its rows' media from a condition root,
         # which a t2va point has no use for.
         ({"task": "fl2va"}, "condition_root"),
         ({"task": "ref2va"}, "condition_root"),
         ({"condition_root": "inputs"}, "condition_root"),
+        ({"poll_interval_s": 0.0}, "poll_interval_s"),
     ],
 )
-def test_video_config_refuses_work_a_backend_cannot_be_sent(settings, message):
+def test_video_config_refuses_settings_it_cannot_send(settings, message):
     with pytest.raises(ValueError, match=message):
         VideoConfig(**settings)
 
@@ -545,7 +288,9 @@ def test_video_config_refuses_work_a_backend_cannot_be_sent(settings, message):
     [
         ('aspect_ratio = "16:10"', "aspect_ratio must be auto or one of"),
         ('aspect_ratio = "016:9"', "aspect_ratio must be auto or one of"),
-        ('backend = "sglang"', "requires"),
+        # The checkpoint fixes the schedule, and UniServe is the only server.
+        ("num_inference_steps = 9", "unknown fields: num_inference_steps"),
+        ('backend = "uniserve"', "unknown fields: backend"),
     ],
 )
 def test_profiles_refuse_a_video_point_that_cannot_be_built(
@@ -580,7 +325,9 @@ videos_per_second = "higher"
 
 
 @pytest.mark.parametrize("failed", [False, True])
-def test_async_job_failure_or_published_media_url_is_terminal(failed):
+def test_a_failed_job_is_terminal_and_a_completed_one_reads_its_content(
+    failed,
+):
     async def exercise():
         async def handler(request):
             if request.method == "POST":
@@ -591,26 +338,19 @@ def test_async_job_failure_or_published_media_url_is_terminal(failed):
                         "id": "job",
                         "status": "failed" if failed else "completed",
                         "error": "decoder failed",
-                        "url": "/published/output.mp4",
                     },
                 )
-            if request.path == "/published/output.mp4":
+            if request.path == "/v1/videos/job/content":
                 await asyncio.sleep(0.02)
                 return web.Response(
-                    body=b"published media",
+                    body=b"job media",
                     headers={"content-type": "video/mp4"},
                 )
             return web.Response(status=404)
 
         task = VideoTask(
             replace(
-                point(
-                    video=VideoConfig(
-                        backend="sglang",
-                        poll_interval_s=0.001,
-                        **FAST_H3_SCHEDULE,
-                    )
-                ),
+                point(video=VideoConfig(poll_interval_s=0.001)),
                 endpoint="/v1/videos",
             )
         )
@@ -632,7 +372,7 @@ def test_async_job_failure_or_published_media_url_is_terminal(failed):
             assert "decoder failed" in record.error
         else:
             assert record.success
-            assert record.video_body == b"published media"
+            assert record.video_body == b"job media"
             assert record.latency >= 0.02
 
     asyncio.run(exercise())
