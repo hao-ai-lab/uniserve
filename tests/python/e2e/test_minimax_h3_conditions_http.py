@@ -254,10 +254,10 @@ def _omniref() -> str:
 
     The Hugging Face cache supplies the base revision it pins.
     """
-    export = os.environ.get("UNISERVE_MINIMAX_H3_OMNIREF")
+    export = os.environ.get("UNISERVE_FASTH3_OMNIREF_MODEL")
     if not export:
         pytest.fail(
-            "UNISERVE_MINIMAX_H3_OMNIREF must name a FastH3 OmniRef export"
+            "UNISERVE_FASTH3_OMNIREF_MODEL must name a FastH3 OmniRef export"
         )
     return export
 
