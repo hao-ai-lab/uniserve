@@ -153,9 +153,8 @@ def condition_segments(
     """Order a request's conditions as the packed sequence holds them.
 
     Keyframes come first, in request order, then the references in request
-    order: the released ``fl2va`` layout holds only keyframes, and a
-    ``ref2va`` request's keyframes lead its references as in the SGLang
-    layout, the only implementation of that combination. A one-frame
+    order: the ``fl2va`` layout holds only keyframes, and a ``ref2va``
+    request's keyframes lead its references. A one-frame
     reference is an image; a longer one is a video, with its soundtrack
     when it carries audio; a reference without pixels is audio.
 

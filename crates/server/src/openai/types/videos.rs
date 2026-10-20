@@ -1,7 +1,7 @@
 //! MiniMax-H3 video-generation request schema.
 //!
-//! The body is the official MiniMax / SGLang request form: a `task`, its
-//! ordered `conditions` and the requested `target`. The same names arrive as
+//! The body is MiniMax-H3's request form: a `task`, its ordered
+//! `conditions` and the requested `target`. The same names arrive as
 //! JSON or as multipart text fields; the HTTP `VideoBody` extractor parses
 //! both into [`VideoGenerationRequest`], and `deny_unknown_fields` rejects
 //! every field not listed here, at every level.
@@ -14,7 +14,7 @@ use uniserve_core::VideoTask;
 
 use crate::serving::video::plan::{ConditionRole, ConditionType};
 
-/// The seed a request without one uses, as the official reference does.
+/// The seed a request without one uses, the MiniMax-H3 pipeline's default.
 pub const DEFAULT_VIDEO_SEED: u64 = 42;
 
 /// One video, audio or image condition of a request, in request order.

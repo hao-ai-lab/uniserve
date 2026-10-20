@@ -83,9 +83,8 @@ def dependent_launch(device: torch.device) -> bool:
     order.
     """
     major, _minor = torch.cuda.get_device_capability(device)
-    # FIXME: the instructions exist from compute capability 9.0, but only
-    # 10.x has been validated and measured (GB200); enable `major >= 9` once
-    # Hopper is.
+    # The instructions exist from compute capability 9.0; the launches use
+    # them on 10.x, where they are validated.
     return major == 10
 
 
