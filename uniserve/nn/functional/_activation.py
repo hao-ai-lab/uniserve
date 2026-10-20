@@ -68,8 +68,12 @@ def _encode_gating(
 
     width = int(gate.shape[-1])
     rows = gate.numel() // width
+    # The static scale the encoding divides by, which a calibrated NVFP4
+    # quantizer holds.
+    encode_scale = out.quantizer.calibrated_scale
     if (
         not calibrated_nvfp4(out.quantizer)
+        or encode_scale is None
         or out.scale_layout is not ScaleLayout.LINEAR
         or tuple(out.shape) not in {(rows, width), tuple(gate.shape)}
         or out.dtype != gate.dtype
@@ -104,7 +108,7 @@ def _encode_gating(
         fields["values"],
         fields["block_scale"],
         fields["tensor_scale"],
-        out.quantizer.calibrated_scale,
+        encode_scale,
         activation=activation,
         stepwise=stepwise,
         gate_bias=gate_bias,
