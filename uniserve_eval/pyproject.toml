@@ -3,13 +3,14 @@
 # it, so the inference distribution must not carry its dependencies or install
 # its console script.
 [build-system]
-requires = ["setuptools>=70", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "uniserve-eval"
 version = "0.2.0"
 description = "UniServe benchmark and evaluation driver"
+license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9",

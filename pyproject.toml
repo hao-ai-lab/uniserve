@@ -1,11 +1,12 @@
 [build-system]
-requires = ["setuptools>=70", "wheel", "setuptools-rust>=1.7"]
+requires = ["setuptools>=77", "wheel", "setuptools-rust>=1.7"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "uniserve"
 version = "0.2.0"
 description = "UniServe computation library, numerical models, and Python worker runtime."
+license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.11"
 # Keep the CUDA-13 PyTorch and torchvision release lines aligned. The locked
