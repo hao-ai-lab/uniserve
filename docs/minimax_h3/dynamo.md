@@ -24,8 +24,7 @@ The separate frontend environment preserves UniServe's pinned GPU dependencies. 
 Download the complete BF16 checkpoint, or use an existing local copy:
 
 ```bash
-export H3_MODEL=$PWD/models/FastVideo-FastH3-8-Step-V2
-.venv/bin/hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
+.venv/bin/hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir models/FastH3
 ```
 
 ## Start the frontend and worker
@@ -42,12 +41,11 @@ artifacts/dynamo/frontend-env/bin/python -m dynamo.frontend \
 In another terminal, from the same repository and on the same host, start the worker:
 
 ```bash
-export H3_MODEL=$PWD/models/FastVideo-FastH3-8-Step-V2
 export DYN_DISCOVERY_BACKEND=file
 
 target/release/uniserve-dynamo-worker \
   --namespace uniserve-fasth3 \
-  --model-path "$H3_MODEL" --served-model-name FastH3 \
+  --model-path models/FastH3 --served-model-name FastH3 \
   --worker-python "$PWD/.venv/bin/python" \
   --workers configs/minimax_h3/ulysses4.json \
   --max-model-len 16384 --max-video-seconds 15 \

@@ -1,4 +1,4 @@
-# MiniMax-H3 computation library
+# Python library
 
 The model package loads the base MiniMax-H3 checkpoint and FastH3, its fast variant, through the public model catalog. The base checkpoint holds two DiT partitions, `transformer` (`t2va`, `fl2va`) and `transformer_ref` (`ref2va`); a FastH3 student replaces the partition its task selects and serves that partition's tasks (DMD students `transformer`, OmniRef students `transformer_ref`), and its `fastvideo_inference.json` determines its schedule, sparse attention and output heads. An export reads the components it omits, such as the text encoder, processor and VAEs, at the base revision it records.
 
@@ -18,7 +18,7 @@ from uniserve_models.minimax_h3 import config as h3_config
 from uniserve_models.minimax_h3 import processing, weight_config
 from uniserve_models.minimax_h3.generation import generate
 
-root = Path("/path/to/MiniMax-H3")
+root = Path("models/MiniMax-H3")
 config = loading.read_config(
     root,
     modules=frozenset(
