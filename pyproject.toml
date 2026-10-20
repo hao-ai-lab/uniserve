@@ -46,7 +46,7 @@ dev = [
     "ruff>=0.6",
 ]
 bench = [
-    "uniserve-eval[datasets]",
+    "uniserve-eval",
 ]
 # Optional accelerator kernels for GPU serving. Model bindings require their
 # declared native capabilities at startup. The `uniserve-kernels` extra adds

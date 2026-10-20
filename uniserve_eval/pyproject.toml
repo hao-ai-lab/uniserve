@@ -17,13 +17,6 @@ dependencies = [
     "pillow>=10.4",
 ]
 
-[project.optional-dependencies]
-# Hub-hosted evaluation datasets (MJHQ-30K, UEval, ShareGPT, PIE-Bench, Beans).
-datasets = [
-    "datasets>=3",
-    "pyarrow<20",
-]
-
 [project.scripts]
 uniserve-eval = "uniserve_eval.cli:main"
 

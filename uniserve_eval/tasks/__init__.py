@@ -3,24 +3,12 @@
 from __future__ import annotations
 
 from ..types import TaskName
-from .base import BenchmarkTask, ImageCountRule
-from .i2i import I2ITask
-from .i2t import I2TTask
-from .interleave import InterleaveTask
-from .systemone import SystemOneTask
-from .t2i import T2ITask
-from .text import TextTask
+from .base import BenchmarkTask
 from .video import VideoTask
 
 # Keyed by `TaskName` value strings, the form profiles declare.
 TASKS: dict[str, type[BenchmarkTask]] = {
-    TaskName.TEXT.value: TextTask,
-    TaskName.T2I.value: T2ITask,
-    TaskName.I2I.value: I2ITask,
-    TaskName.I2T.value: I2TTask,
-    TaskName.INTERLEAVE.value: InterleaveTask,
     TaskName.VIDEO.value: VideoTask,
-    TaskName.SYSTEMONE.value: SystemOneTask,
 }
 
 
@@ -40,13 +28,6 @@ def get_task(name: str | TaskName) -> type[BenchmarkTask]:
 __all__ = [
     "TASKS",
     "BenchmarkTask",
-    "I2ITask",
-    "I2TTask",
-    "ImageCountRule",
-    "InterleaveTask",
-    "SystemOneTask",
-    "T2ITask",
-    "TextTask",
     "VideoTask",
     "get_task",
 ]

@@ -1,9 +1,9 @@
 """Loads evaluator examples from a local JSON Lines file.
 
 Each non-blank line is one JSON object that becomes one ``Example``. Rows
-require ``id`` and ``prompt``; the per-example overrides named in
-``_OPTIONAL`` are copied through unchanged when present. Unlike the
-shuffling adapters, this one keeps file order.
+require ``id`` and ``prompt``; the per-example fields named in ``_OPTIONAL``
+are copied through unchanged when present, and other keys are ignored. Rows
+keep file order.
 """
 
 from __future__ import annotations
@@ -18,17 +18,8 @@ from .base import Dataset
 # Example fields a row may set. Values are passed to ``Example`` as-is;
 # neither this adapter nor ``Example`` checks their types.
 _OPTIONAL = (
-    "messages",
     "prompt_len",
-    "output_len",
-    "max_tokens",
-    "input_image_b64",
-    "input_image_mime",
-    "width",
-    "height",
-    "steps",
     "seed",
-    "aspect_ratio",
     "seconds",
     "conditions",
     "metadata",
@@ -49,17 +40,15 @@ class JsonlDataset(Dataset):
         ``load_examples`` rejects that count mismatch.
 
         Args:
-            tokenizer: Unused; rows may declare ``prompt_len`` and
-                ``output_len`` directly.
+            tokenizer: Unused; rows may declare ``prompt_len`` directly.
 
         Returns:
             Examples in file order, at most ``num_prompts`` of them.
 
         Raises:
             ValueError: If ``dataset_path`` is unset, a line is not valid
-                JSON, a row is not an object, a row lacks ``id`` or
-                ``prompt``, or a row sets only one of ``width`` and
-                ``height``.
+                JSON, a row is not an object, or a row lacks ``id`` or
+                ``prompt``.
             OSError: If the file cannot be opened.
         """
         point = self.point
@@ -77,11 +66,6 @@ class JsonlDataset(Dataset):
                 if "id" not in raw or "prompt" not in raw:
                     raise ValueError(
                         f"jsonl row {line_no} requires id and prompt"
-                    )
-                if ("width" in raw) != ("height" in raw):
-                    raise ValueError(
-                        f"jsonl row {line_no} must provide width "
-                        f"and height together"
                     )
                 fields = {key: raw[key] for key in _OPTIONAL if key in raw}
                 rows.append(

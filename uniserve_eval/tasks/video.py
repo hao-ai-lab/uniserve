@@ -176,7 +176,6 @@ class VideoTask(BenchmarkTask):
     name: ClassVar[TaskName] = TaskName.VIDEO
     allowed_endpoints: ClassVar[tuple[str, ...]] = (VIDEOS_SYNC, "/v1/videos")
     default_endpoint: ClassVar[str] = VIDEOS_SYNC
-    default_stream: ClassVar[bool] = False
 
     def __init__(self, point: BenchmarkPoint) -> None:
         """Bind the point to the condition media root it reads rows from."""
@@ -250,7 +249,6 @@ class VideoTask(BenchmarkTask):
         request = TaskRequest(
             self.point.endpoint,
             payload,
-            stream=False,
             video_backend=video.backend,
             poll_interval_s=video.poll_interval_s,
             video_extra_params=dict(video.extra_params),

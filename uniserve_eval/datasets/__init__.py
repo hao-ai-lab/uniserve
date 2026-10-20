@@ -12,25 +12,13 @@ from typing import Any
 
 from ..types import BenchmarkPoint, Example
 from .base import Dataset
-from .beans import BeansDataset
 from .jsonl import JsonlDataset
 from .minimax_h3 import MiniMaxH3Dataset
-from .mjhq import MJHQDataset
-from .pie_bench import PieBenchDataset
-from .sharegpt import ShareGPTDataset
-from .systemone import SystemOneDataset
-from .ueval import UEvalDataset
 
 # Maps the `dataset` configuration name to its adapter class.
 DATASETS: dict[str, type[Dataset]] = {
-    "sharegpt": ShareGPTDataset,
-    "mjhq": MJHQDataset,
-    "beans": BeansDataset,
-    "ueval": UEvalDataset,
-    "pie-bench": PieBenchDataset,
     "jsonl": JsonlDataset,
     "minimax-h3": MiniMaxH3Dataset,
-    "systemone": SystemOneDataset,
 }
 
 
@@ -46,8 +34,8 @@ def get_dataset(name: str) -> type[Dataset]:
     return DATASETS[name]
 
 
-def load_examples(point: BenchmarkPoint) -> tuple[list[Example], Any | None]:
-    """Load the exact row count and optional tokenizer for a benchmark point.
+def load_examples(point: BenchmarkPoint) -> list[Example]:
+    """Load the exact row count for a benchmark point.
 
     `config.load_config` validates a point's path and tokenizer settings
     with `Dataset.check_point`; the checks here also apply to a
@@ -57,8 +45,7 @@ def load_examples(point: BenchmarkPoint) -> tuple[list[Example], Any | None]:
     loading the tokenizer, and the adapter's `load` propagate unchanged.
 
     Returns:
-        The adapter's rows and the tokenizer, or `None` when the adapter
-        does not require one.
+        The adapter's rows.
 
     Raises:
         KeyError: If `point.dataset` names no registered adapter.
@@ -87,20 +74,14 @@ def load_examples(point: BenchmarkPoint) -> tuple[list[Example], Any | None]:
             f"dataset resolved {len(rows)} rows; benchmark point requires "
             f"exactly {point.load.num_prompts}"
         )
-    return rows, tokenizer
+    return rows
 
 
 __all__ = [
     "DATASETS",
-    "BeansDataset",
     "Dataset",
     "JsonlDataset",
-    "MJHQDataset",
     "MiniMaxH3Dataset",
-    "PieBenchDataset",
-    "ShareGPTDataset",
-    "SystemOneDataset",
-    "UEvalDataset",
     "get_dataset",
     "load_examples",
 ]

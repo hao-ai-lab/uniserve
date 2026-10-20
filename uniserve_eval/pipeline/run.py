@@ -14,8 +14,8 @@ The bundle in the output directory contains:
   measured requests that finished before it, in completion order, and
   `run.json` is `failed`.
 - `gpu_samples.jsonl`: `GpuStorageSampler` telemetry snapshots.
-- `samples/`: image outputs and original video response bodies, including
-  invalid bodies. A configured `video.media_dir` holds measured videos.
+- `samples/`: original video response bodies, including invalid bodies. A
+  configured `video.media_dir` holds measured videos.
 - `media_index.jsonl` and `media_validity.jsonl`: original-output references,
   checksums, request identities, timing records, and validity checks.
 - `server_metrics.json`: each replica's `/metrics` exposition immediately
@@ -49,7 +49,6 @@ from ..datasets import load_examples
 from ..load import GpuStorageSampler, WarmupFailure, run_load
 from ..server_metrics import scrape_metrics, window_summary
 from ..tasks import get_task
-from ..tasks.video import VideoTask
 from ..transport import send_request
 from ..types import (
     BenchmarkPoint,
@@ -131,20 +130,17 @@ async def run_point(
         # window opens, and the rows' identity is persisted with the running
         # state.
         task = get_task(point.task)(point)
-        rows, tokenizer = load_examples(point)
+        rows = load_examples(point)
         if len({row.id for row in rows}) != len(rows):
             raise ValueError("request IDs must be unique within a manifest")
         warmup_rows = _excluded_rows(point, point.load.warmup_manifest)
         priming_rows = _excluded_rows(point, point.load.priming_manifest)
         # Frozen manifests can carry thousands of token IDs per row. Copying
-        # those provenance fields belongs before dispatch, outside every slot.
+        # those provenance fields and building every request belong before
+        # dispatch, outside every slot.
         all_rows = [*rows, *(warmup_rows or []), *(priming_rows or [])]
         examples = {id(row): row.as_dict() for row in all_rows}
-        video_requests = (
-            {id(row): task.build_request(row) for row in all_rows}
-            if isinstance(task, VideoTask)
-            else {}
-        )
+        requests = {id(row): task.build_request(row) for row in all_rows}
         selection = selected_rows_identity(rows)
         writer.write_jsonl("examples.jsonl", [row.as_dict() for row in rows])
         writer.write_json(
@@ -189,34 +185,21 @@ async def run_point(
             async def submit(
                 example: Example, scheduled: float | None
             ) -> RequestRecord:
-                """Build and send one task request with its token fallbacks.
+                """Send one prebuilt task request.
 
                 `scheduled` is None for warmup requests and the measured
                 arrival time from `time.perf_counter` otherwise.
                 """
-                request = video_requests.get(id(example))
-                if request is None:
-                    request = task.build_request(example)
-
-                # The fallback becomes the record's `requested_output_len`;
-                # it is 0 when neither the row nor `sampling.max_tokens`
-                # declares an output limit.
-                output_len_fallback = int(
-                    example.output_len
-                    if example.output_len is not None
-                    else point.sampling.max_tokens or 0
-                )
                 # Routing happens inside the submission slot, so a request
                 # waits on its chosen replica like on any queueing server.
                 with router.route() as base_url:
                     record = await send_request(
                         session,
                         base_url,
-                        request,
+                        requests[id(example)],
                         request_id=example.id,
                         task=point.task.value,
                         prompt_len=int(example.prompt_len or 0),
-                        output_len_fallback=output_len_fallback,
                         scheduled_time=scheduled,
                         timeout_s=timeout_s,
                     )
@@ -246,9 +229,8 @@ async def run_point(
             sampler.start()
 
             def inspect(records: list[RequestRecord]) -> None:
-                if isinstance(task, VideoTask):
-                    for record in records:
-                        task.inspect_output(record)
+                for record in records:
+                    task.inspect_output(record)
 
             try:
                 if priming_rows:
@@ -313,7 +295,6 @@ async def run_point(
             duration,
             task=task,
             selected_rows=selection,
-            tokenizer=tokenizer,
             server_version=server_version,
             launch=launch_record,
         )
@@ -494,13 +475,10 @@ def _write_records(
     references them.
 
     Raises:
-        ValueError: A content-addressed image sample collision or an
-            unsafe media request ID.
+        ValueError: An unsafe media request ID.
         FileExistsError: Different media already occupies the requested path.
     """
     for record in records:
-        for image in record.decoded_images:
-            writer.write_image_sample(image)
         if record.video_body is not None:
             checksum = hashlib.sha256(record.video_body).hexdigest()
             if media_dir is not None:
@@ -553,7 +531,6 @@ def _write_records(
                     else None,
                 }
                 for record in records
-                if record.task == "video"
             ],
         )
 
@@ -573,8 +550,7 @@ def _excluded_rows(
         dataset_path=path,
         load=replace(point.load, num_prompts=count),
     )
-    rows, _ = load_examples(excluded)
-    return rows
+    return load_examples(excluded)
 
 
 def _run_state(

@@ -1,7 +1,7 @@
 """Writes durable benchmark metadata and validated media artifacts.
 
 `ArtifactWriter` writes into one benchmark point's result directory: JSON and
-JSON Lines records at its top level and generated media under `samples/`.
+JSON Lines records at its top level and generated videos under `samples/`.
 `pipeline.run.run_point` is its caller and decides which records exist and
 when each is rewritten.
 
@@ -21,15 +21,12 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from .types import DecodedImage
-
 
 class ArtifactWriter:
     """Writes one benchmark result bundle with atomic metadata updates.
 
-    Media samples are content-addressed: `DecodedImage.sample_filename` and
-    `DecodedVideo.sample_filename` are the SHA-256 of the encoded bytes plus an
-    extension, so identical outputs from different requests share one file.
+    `run_point` names a video sample under `samples/` by the SHA-256 of its
+    bytes, so identical outputs from different requests share one file.
     """
 
     def __init__(self, output_dir: str | Path) -> None:
@@ -115,46 +112,6 @@ class ArtifactWriter:
                 for payload in payloads:
                     json.dump(_jsonable(payload), handle, sort_keys=True)
                     handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, path)
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
-        return path
-
-    def write_image_sample(self, image: DecodedImage) -> Path:
-        """Store a content-addressed image sample.
-
-        `image` comes from `inspect_image_bytes`, which decoded its bytes and
-        derived the metadata the request record holds, so the stored file
-        matches the record that references it.
-
-        Returns:
-            The sample path under `samples/`. An existing file with identical
-            bytes is reused without rewriting.
-
-        Raises:
-            ValueError: If an existing sample of the same name holds
-                different bytes.
-        """
-        path = self.samples_dir / image.sample_filename
-        if path.exists():
-            if path.read_bytes() != image.data:
-                raise ValueError("content-addressed image sample collision")
-            return path
-
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=path.parent,
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temporary_path = Path(handle.name)
-                handle.write(image.data)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, path)

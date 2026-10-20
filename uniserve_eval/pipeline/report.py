@@ -31,7 +31,6 @@ def build_summary(
     *,
     task: BenchmarkTask,
     selected_rows: dict[str, Any],
-    tokenizer: Any | None = None,
     server_version: dict[str, Any] | None = None,
     launch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -46,7 +45,6 @@ def build_summary(
         task: The task adapter whose `validate` supplies request and output
             checks.
         selected_rows: The `selected_rows_identity` of the dataset rows.
-        tokenizer: Optional tokenizer forwarded to `summarize`.
         server_version: The server's `/version` payload, or None when it
             could not be fetched.
         launch: The `describe_deployment` provenance record, if any.
@@ -58,11 +56,11 @@ def build_summary(
         ValueError: If a task check name collides with another check, since
             `ValidationResult.merged` requires disjoint check names.
     """
-    metrics = summarize(records, dur_s, tokenizer=tokenizer)
+    metrics = summarize(records, dur_s)
     validation = task.validate(records).merged(
         _metric_validation(point.metrics, metrics)
     )
-    warnings = _warnings(records, server_version, launch or {})
+    warnings = _warnings(server_version, launch or {})
 
     # Per-outcome request counts keyed by the transport classifier.
     classifiers: dict[str, int] = {}
@@ -187,20 +185,14 @@ def _metric_validation(
 
 
 def _warnings(
-    records: Sequence[RequestRecord],
-    server_version: dict[str, Any] | None,
-    launch: dict[str, Any],
+    server_version: dict[str, Any] | None, launch: dict[str, Any]
 ) -> list[str]:
-    """Collect stable request and launch provenance warnings.
+    """Collect stable launch provenance warnings.
 
-    Request warnings are deduplicated and sorted; the provenance warnings
-    `server_version_unavailable` and `dirty_workspace` follow, when present,
-    in that order.
+    The warnings are `server_version_unavailable` and `dirty_workspace`,
+    when present, in that order.
     """
-    values = sorted(
-        {warning for record in records for warning in record.warnings}
-    )
-
+    values: list[str] = []
     if server_version is None:
         values.append("server_version_unavailable")
     if launch.get("dirty") is True:

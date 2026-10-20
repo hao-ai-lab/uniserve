@@ -25,14 +25,11 @@ from typing import Any, TypeVar, cast
 
 from .datasets import get_dataset
 from .tasks import get_task
-from .tasks.base import BenchmarkTask
 from .types import (
     BenchmarkPoint,
-    ImageConfig,
     LoadConfig,
     MetricDefinition,
     MetricDirection,
-    SamplingConfig,
     TaskName,
     VideoConfig,
 )
@@ -45,8 +42,8 @@ _ENV_DEFAULT_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-(.*?)\}")
 # Keys accepted at the top level of a profile.
 _PROFILE_FIELDS = {"root", "artifact_root", "servers", "benchmarks", "suites"}
 
-# Keys accepted in a `[benchmarks.<name>]` table. The nested load, sampling,
-# image, and video tables accept exactly the fields of their dataclasses.
+# Keys accepted in a `[benchmarks.<name>]` table. The nested load and video
+# tables accept exactly the fields of their dataclasses.
 _ROOT_FIELDS = {
     "server",
     "task",
@@ -56,38 +53,16 @@ _ROOT_FIELDS = {
     "dataset_path",
     "tokenizer",
     "endpoint",
-    "question",
     "load",
-    "sampling",
-    "image",
     "video",
     "metrics",
     "provenance",
 }
 _LOAD_FIELDS = set(LoadConfig.__dataclass_fields__)
-_SAMPLING_FIELDS = set(SamplingConfig.__dataclass_fields__)
-_IMAGE_FIELDS = set(ImageConfig.__dataclass_fields__)
 _VIDEO_FIELDS = set(VideoConfig.__dataclass_fields__)
 
-# Request-level sampling controls a point with server-owned sampling may not
-# set: every token-sampling parameter and ignore_eos. A request seed only
-# selects the random stream the server's schedule draws from, so it stays
-# available to servers that accept one.
-_TOKEN_SAMPLING_CONTROLS = {
-    "temperature",
-    "top_p",
-    "top_k",
-    "min_p",
-    "repetition_penalty",
-    "frequency_penalty",
-    "presence_penalty",
-    "ignore_eos",
-}
-
 # The settings dataclasses a benchmark table's nested tables construct.
-_Settings = TypeVar(
-    "_Settings", LoadConfig, SamplingConfig, ImageConfig, VideoConfig
-)
+_Settings = TypeVar("_Settings", LoadConfig, VideoConfig)
 
 
 @dataclass(frozen=True)
@@ -197,9 +172,9 @@ def load_config(path: Path) -> EvaluationConfig:
     checked.
 
     Validation stops at the first violation. Schema violations raise
-    `ValueError` naming the offending table, including a load, sampling,
-    image, or video value whose type or range its settings dataclass
-    rejects; an unregistered task or dataset name raises `KeyError`.
+    `ValueError` naming the offending table, including a load or video value
+    whose type or range its settings dataclass rejects; an unregistered task
+    or dataset name raises `KeyError`.
     """
     config_path = Path(path).resolve()
     with config_path.open("rb") as handle:
@@ -502,13 +477,8 @@ def _benchmark_point(
     # enforce modality and source requirements that cross table boundaries.
     metrics = _metrics(value.get("metrics"), f"benchmarks.{name}")
     load = _load_config(value.get("load"), f"benchmarks.{name}.load")
-    sampling = _sampling_config(
-        value.get("sampling"), task, f"benchmarks.{name}.sampling"
-    )
-    image = _image_config(value.get("image"), task, f"benchmarks.{name}.image")
     video = _video_config(value.get("video"), f"benchmarks.{name}.video")
     endpoint = task.check_endpoint(value.get("endpoint"), f"benchmarks.{name}")
-    question = task.check_question(value.get("question"), f"benchmarks.{name}")
     tokenizer = value.get("tokenizer")
     dataset_path = value.get("dataset_path")
     dataset_cls.check_point(
@@ -521,7 +491,6 @@ def _benchmark_point(
         raise ValueError(f"benchmarks.{name}.dataset_revision must be a string")
 
     # Construct only after every referenced component has accepted the point.
-    task.check_image(image, f"benchmarks.{name}")
     task.check_video(video, f"benchmarks.{name}.video")
     return BenchmarkPoint(
         name=name,
@@ -531,14 +500,11 @@ def _benchmark_point(
         dataset=dataset_name,
         metrics=metrics,
         load=load,
-        sampling=sampling,
-        image=image,
         video=video,
         dataset_revision=revision,
         dataset_path=dataset_path,
         tokenizer=tokenizer,
         endpoint=endpoint,
-        question=question,
         provenance=_mapping(
             value.get("provenance", {}), f"benchmarks.{name}.provenance"
         ),
@@ -582,66 +548,6 @@ def _load_config(raw: Any, context: str) -> LoadConfig:
     if "request_rate" in value and value["request_rate"] == "inf":
         value["request_rate"] = float("inf")
     return _build_settings(LoadConfig, value, context)
-
-
-def _sampling_config(
-    raw: Any, task: type[BenchmarkTask], context: str
-) -> SamplingConfig:
-    """Parse sampling settings with task-specific streaming defaults.
-
-    `server_sampling = true` declares that the server's configured sampling
-    schedule governs every request, as on a block-diffusion server that
-    refuses token-sampling controls. TOML has no null, so this key stands
-    for setting `temperature`, `top_p`, and `ignore_eos` to `None`; the
-    requests then carry no token-sampling control at all, and the table may
-    not name any of them. `sampling_seed` stays allowed: a seed selects the
-    random stream of the server's own schedule. The key itself is not a
-    `SamplingConfig` field: the resolved workload shows the omitted controls
-    as nulls.
-    """
-    value = dict(_mapping(raw, context)) if raw is not None else {}
-    server_sampling = value.pop("server_sampling", False)
-    if not isinstance(server_sampling, bool):
-        raise ValueError(f"{context}.server_sampling must be a boolean")
-    _reject_unknown(value, _SAMPLING_FIELDS, context)
-    if server_sampling:
-        named = sorted(_TOKEN_SAMPLING_CONTROLS & set(value))
-        if named:
-            raise ValueError(
-                f"{context} declares server_sampling and sets token-sampling "
-                f"controls: {', '.join(named)}"
-            )
-        value.update(temperature=None, top_p=None, ignore_eos=None)
-    if "stream" not in value:
-        value["stream"] = task.default_stream
-    extra = value.get("extra_body", {})
-    if extra and not isinstance(extra, dict):
-        raise ValueError(f"{context}.extra_body must be a table")
-    return _build_settings(SamplingConfig, value, context)
-
-
-def _image_config(
-    raw: Any, task: type[BenchmarkTask], context: str
-) -> ImageConfig:
-    """Parse image-generation settings accepted by the selected task."""
-    if raw is None:
-        return ImageConfig()
-    if not task.accepts_image:
-        raise ValueError(f"{context} is not valid for this task")
-    value = _mapping(raw, context)
-    _reject_unknown(value, _IMAGE_FIELDS, context)
-    if "cfg_interval" in value:
-        interval = value["cfg_interval"]
-        if not isinstance(interval, list) or len(interval) != 2:
-            raise ValueError(f"{context}.cfg_interval must have two values")
-        # TOML arrays arrive as lists; the dataclass field is a float pair.
-        try:
-            value["cfg_interval"] = (float(interval[0]), float(interval[1]))
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                f"{context}.cfg_interval must have two numeric values"
-            ) from error
-    return _build_settings(ImageConfig, value, context)
 
 
 def _video_config(raw: Any, context: str) -> VideoConfig:

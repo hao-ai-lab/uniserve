@@ -16,8 +16,6 @@ from typing import Any
 import httpx
 from PIL import Image
 
-from uniserve_eval.transport.sse import iter_sse_events
-
 
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -117,11 +115,34 @@ def post_sse(
     payload: dict[str, Any],
     timeout_s: float = 600.0,
 ) -> list[dict[str, Any]]:
+    """POST a streaming request and decode its Server-Sent Events.
+
+    Consecutive `data:` lines join into one JSON event, which a blank line or
+    the end of the body dispatches; `[DONE]` becomes `{"type": "sse_done"}`.
+    """
+    events: list[dict[str, Any]] = []
+    data: list[str] = []
+
+    def dispatch() -> None:
+        if data:
+            text = "\n".join(data)
+            data.clear()
+            events.append(
+                {"type": "sse_done"} if text == "[DONE]" else json.loads(text)
+            )
+
     with httpx.stream(
         "POST", f"{base_url}{endpoint}", json=payload, timeout=timeout_s
     ) as response:
         response.raise_for_status()
-        return list(iter_sse_events(response.iter_lines()))
+        for line in response.iter_lines():
+            if not line:
+                dispatch()
+            elif line.startswith("data:"):
+                value = line.removeprefix("data:")
+                data.append(value.removeprefix(" "))
+        dispatch()
+    return events
 
 
 def t2va_request(
