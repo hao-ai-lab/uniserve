@@ -32,7 +32,7 @@ The `-reference` files serve `ref2va`; the others serve `t2va` and `fl2va`. One 
 
 ### Validated settings
 
-These are the settings the [evaluation](evaluation.md) measured. GB200 deployments ran with `NCCL_NVLS_ENABLE=0` and H200 deployments with `NCCL_CUMEM_HOST_ENABLE=1`. On a PCIe host such as RTX PRO 6000, leave `NCCL_P2P_LEVEL` at its default: `SYS` cuts eight-GPU all-to-all bandwidth from 24.5 to 1.1 GB/s.
+These are the settings the [evaluation](evaluation.md) measured. GB200 deployments ran with `NCCL_NVLS_ENABLE=0`, and the FastH3 H200 deployments with `NCCL_CUMEM_HOST_ENABLE=1`. On a PCIe host such as RTX PRO 6000, leave `NCCL_P2P_LEVEL` at its default: `SYS` cuts eight-GPU all-to-all bandwidth from 24.5 to 1.1 GB/s.
 
 FastH3 (`t2va`, `fl2va`, 768p):
 
@@ -57,6 +57,9 @@ FastH3 OmniRef (`ref2va`, up to 15 s). Every row also takes `--max-running-reque
 | 8 x GB200, two hosts | 768p, 480p | `ulysses8-reference-two-node.json` | `--video-resolutions 768p,480p` |
 | 8 x H200 | 768p | `ulysses8-reference.json` | `--mem-fraction-static 0.92` |
 | 8 x RTX PRO 6000 | 768p | `ulysses8-reference.json` | `--mem-fraction-static 0.92 --graph-policy off` |
+| 4 x GB200, enlarged references, up to 5 s | 768p | `ulysses4-reference.json` | `--mm-processor-kwargs '{"enlarge_references":true}' --max-video-seconds 5 --max-model-len 8192 --video-text-capacities 8192 --max-condition-rows 49152` |
+| 8 x GB200, two hosts, enlarged references | 768p | `ulysses8-reference-two-node.json` | `--mm-processor-kwargs '{"enlarge_references":true}' --max-model-len 48128 --video-text-capacities 4096,7168,8192,10240,14336,15360,22528,37888 --max-condition-rows 79104` |
+| 8 x H200, enlarged references | 768p | `ulysses8-reference.json` | `--mm-processor-kwargs '{"enlarge_references":true}' --mem-fraction-static 0.92 --max-model-len 48128 --video-text-capacities 4096,7168,8192,10240,14336,15360,22528,37888 --max-condition-rows 79104` |
 
 ### Two hosts
 
