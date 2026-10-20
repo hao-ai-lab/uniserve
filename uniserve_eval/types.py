@@ -228,11 +228,12 @@ _SCHEDULE_FIELDS = {
 class VideoConfig:
     """Configures the generated video work and how a backend is asked for it.
 
-    ``task`` and ``aspect_ratio`` form each request's target together with the
-    768-pixel short edge; ``seconds`` is the target duration of rows without
-    a per-row override. ``aspect_ratio`` is ``auto`` or a named ``W:H`` ratio
-    the task accepts; the video task resolves it to the generated canvas with
-    the model package's canvas rule when the profile loads.
+    ``task``, ``short_edge`` and ``aspect_ratio`` form each request's target;
+    ``seconds`` is the target duration of rows without a per-row override.
+    ``short_edge`` is 768, the canvas rule's, or 480, the FastH3 buckets'.
+    ``aspect_ratio`` is ``auto`` or a named ``W:H`` ratio the task accepts,
+    and ``auto`` needs the 768-pixel short edge; the video task resolves the
+    target to the generated canvas when the profile loads.
 
     ``num_inference_steps``, ``flow_shift`` and ``audio_flow_shift`` state the
     sampling schedule the point measures: sigma points including the clean
@@ -262,6 +263,7 @@ class VideoConfig:
 
     seconds: float = 5.0
     task: str = "t2va"
+    short_edge: int = 768
     aspect_ratio: str = "16:9"
     num_inference_steps: int | None = None
     flow_shift: float | None = None
@@ -287,6 +289,8 @@ class VideoConfig:
                 "video condition_root names the condition media of fl2va "
                 "and ref2va rows and is required exactly for those tasks"
             )
+        if self.short_edge not in (768, 480):
+            raise ValueError("video short_edge must be 768 or 480")
         if not isinstance(self.aspect_ratio, str):
             raise ValueError("video aspect_ratio must be a string")
         if self.prompt_tokens < 1:

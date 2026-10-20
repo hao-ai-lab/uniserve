@@ -201,6 +201,33 @@ def test_the_canonical_body_names_condition_media_by_file_uri(
     assert record.video_shape == VideoShape(1344, 768, 124)
 
 
+def test_a_480p_reference_target_is_its_fasth3_bucket(inputs):
+    portrait = point(inputs, "ref2va", short_edge=480)
+    portrait = replace(
+        portrait, video=replace(portrait.video, aspect_ratio="9:16")
+    )
+    VideoTask.check_video(portrait.video, "point")
+    request = VideoTask(portrait).build_request(
+        Example("row", "scene", seconds=5, seed=7, conditions=IMAGE_AUDIO)
+    )
+    received, record = send(request)
+
+    assert json.loads(received[1])["target"] == {
+        "short_edge": 480,
+        "aspect_ratio": "9:16",
+        "duration_seconds": 5.0,
+    }
+    # The 480p 9:16 bucket is 480x832, from the FastH3 training table.
+    assert record.video_shape == VideoShape(480, 832, 124)
+
+
+def test_a_480p_target_names_its_aspect_ratio(inputs):
+    with pytest.raises(ValueError, match="names its aspect ratio"):
+        VideoTask.check_video(
+            point(inputs, "ref2va", short_edge=480).video, "point"
+        )
+
+
 @pytest.mark.parametrize(
     "task,conditions,kinds",
     [

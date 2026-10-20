@@ -67,32 +67,46 @@ _EXIF_ORIENTATION = 0x0112
 
 
 def target_canvas(
-    task: str, aspect_ratio: str, keyframe: tuple[int, int] | None = None
+    task: str,
+    aspect_ratio: str,
+    keyframe: tuple[int, int] | None = None,
+    short_edge: int = 768,
 ) -> tuple[int, int]:
     """Resolve the canvas of a target.
 
-    A target names ``auto`` or one of the named ratios, which the
-    adapt_shape_v1 canvas rule turns into pixels. ``auto`` is 16:9 for t2va
-    and ref2va, and for fl2va the displayed aspect of the first keyframe.
+    At the 768-pixel short edge a target names ``auto`` or one of the named
+    ratios, which the adapt_shape_v1 canvas rule turns into pixels. ``auto``
+    is 16:9 for t2va and ref2va, and for fl2va the displayed aspect of the
+    first keyframe. At the 480-pixel short edge a target names a ratio, and
+    its canvas is that FastH3 bucket.
 
     Args:
         task: ``t2va``, ``fl2va`` or ``ref2va``.
         aspect_ratio: The target's aspect ratio.
         keyframe: The first keyframe's displayed ``(width, height)``, which
             an fl2va ``auto`` target requires.
+        short_edge: The target's short edge, 768 or 480.
 
     Returns:
         The canvas as ``(width, height)`` in pixels.
 
     Raises:
-        ValueError: The task does not accept the aspect ratio, or an fl2va
-            ``auto`` target has no keyframe or one outside 1:4 to 4:1.
+        ValueError: The task does not accept the aspect ratio, an fl2va
+            ``auto`` target has no keyframe or one outside 1:4 to 4:1, or a
+            480-pixel target names ``auto``.
     """
     # The model package loads torch, which only video points need, so the
     # rules are imported on first use.
     from uniserve_models.minimax_h3 import config, processing
 
     ratio = _named_ratio(task, aspect_ratio)
+    if short_edge != config.CANVAS_SHORT_EDGE:
+        if ratio is None:
+            raise ValueError(
+                f"a {short_edge}-pixel target names its aspect ratio"
+            )
+        bucket = config.FASTH3_CANVASES[(short_edge, aspect_ratio)]
+        return bucket.width, bucket.height
     if ratio is None:
         if task != "fl2va":
             ratio = processing.DEFAULT_ASPECT_RATIO
@@ -172,9 +186,13 @@ class VideoTask(BenchmarkTask):
 
     @classmethod
     def check_video(cls, video: VideoConfig, context: str) -> None:
-        """Reject a target ratio the task does not accept."""
+        """Reject a target the task does not accept at its short edge."""
         try:
             _named_ratio(video.task, video.aspect_ratio)
+            if video.aspect_ratio != "auto" or video.short_edge != 768:
+                target_canvas(
+                    video.task, video.aspect_ratio, short_edge=video.short_edge
+                )
         except ValueError as error:
             raise ValueError(f"{context}: {error}") from error
 
@@ -192,8 +210,6 @@ class VideoTask(BenchmarkTask):
                 cannot be sent them as the same work.
             OSError: A condition media file cannot be read.
         """
-        from uniserve_models.minimax_h3 import config
-
         video = self.point.video
         seconds = float(
             example.seconds if example.seconds is not None else video.seconds
@@ -208,15 +224,16 @@ class VideoTask(BenchmarkTask):
             if video.task == "fl2va"
             else None
         )
-        width, height = target_canvas(video.task, video.aspect_ratio, keyframe)
+        width, height = target_canvas(
+            video.task, video.aspect_ratio, keyframe, video.short_edge
+        )
         payload = {
             "model": self.point.model,
             "prompt": example.prompt,
             "task": video.task,
             "conditions": conditions,
             "target": {
-                # The only short edge the canvas rule serves.
-                "short_edge": config.CANVAS_SHORT_EDGE,
+                "short_edge": video.short_edge,
                 "aspect_ratio": video.aspect_ratio,
                 "duration_seconds": seconds,
             },

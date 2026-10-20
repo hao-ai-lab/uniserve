@@ -19,7 +19,11 @@ from uniserve_models.minimax_h3 import (
     entry_points,
 )
 from uniserve_models.minimax_h3.checkpoint import base_checkpoint, detect
-from uniserve_models.minimax_h3.config import Config, read_config
+from uniserve_models.minimax_h3.config import (
+    FASTH3_CANVASES,
+    Config,
+    read_config,
+)
 from uniserve_models.minimax_h3.precision import weight_config
 
 pytestmark = pytest.mark.unit
@@ -149,7 +153,8 @@ def test_ref2va_fasth3_branches_from_the_reference_partition(checkpoint):
         tile=128, sparsity=0.9, reference_keep=0.1
     )
     assert denoiser.tasks == ("ref2va",)
-    assert denoiser.canvases is None
+    # An OmniRef export generates the FastH3 buckets, 480p among them.
+    assert denoiser.canvases == FASTH3_CANVASES
 
 
 def test_parallel_decoding_blocks_must_cover_the_heads(checkpoint):
