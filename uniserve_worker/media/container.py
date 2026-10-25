@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass, replace
 from fractions import Fraction
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -43,8 +44,8 @@ AUDIO_CODEC = "aac"
 # libx264's ultrafast preset and zerolatency tuning, at constant quality 23,
 # libx264's default CRF. Baseline profile keeps the CAVLC syntax and the
 # absence of B-frames that `encoded_video_bytes` bounds. One 124-frame 768p
-# unit encodes to about the size and fidelity of libx264's (2.90 against
-# 2.81 MB, 39.1 against 39.3 dB PSNR to the decoded RGB24 source, measured on
+# unit encodes to about the size and fidelity of libx264's (2.74 against
+# 2.50 MB, 42.1 against 41.5 dB PSNR to the decoded RGB24 source, measured on
 # an RTX PRO 6000).
 _NVENC_OPTIONS = {
     "preset": "p1",
@@ -63,6 +64,40 @@ _NVENC_OPTIONS = {
 # value also sizes the encoded unit rows reserved for a round's product
 # (`encoded_unit_bytes` in `uniserve_worker.media.mux`).
 _ENCODER_THREADS = 8
+
+# The CUDA device contexts this process holds for NVENC, by GPU index.
+_NVENC_DEVICES: dict[int, Any] = {}
+_NVENC_DEVICES_LOCK = Lock()
+
+
+def _nvenc_device(gpu: int) -> Any:
+    """Return the CUDA device an NVENC stream on ``gpu`` encodes with.
+
+    Without a device, FFmpeg's NVENC creates a CUDA context for every
+    encoder session and destroys it when the session closes, once per media
+    unit. Each stream instead opens on the GPU's primary context, which this
+    process retains for its life from its first stream on (the codec slot's
+    startup probe, `require_media_codecs`), so a session finds the context
+    alive. Measured on an RTX PRO 6000, one 124-frame 768p unit then takes
+    0.42 s and 0.40 CPU seconds instead of 0.54 and 0.53, with the same
+    bytes.
+    """
+    import av
+
+    with _NVENC_DEVICES_LOCK:
+        if gpu not in _NVENC_DEVICES:
+            primary = av.codec.hwaccel.HWAccel(
+                "cuda", device=str(gpu), options={"primary_ctx": "1"}
+            )
+            _NVENC_DEVICES[gpu] = primary.create(
+                av.codec.Codec(NVENC_VIDEO_CODEC, "w"), for_encoding=True
+            )
+    return av.codec.hwaccel.HWAccel(
+        "cuda",
+        device=str(gpu),
+        allow_software_fallback=False,
+        options={"primary_ctx": "1"},
+    )
 
 
 def encoded_video_bytes(frames: int, height: int, width: int) -> int:
@@ -213,7 +248,11 @@ def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
     container = av.open(buffer, mode="w", format="mp4")
     try:
         stream = container.add_stream(
-            config.video_codec, rate=config.frame_rate
+            config.video_codec,
+            rate=config.frame_rate,
+            hwaccel=None
+            if config.video_gpu is None
+            else _nvenc_device(config.video_gpu),
         )
         if not isinstance(stream, av.VideoStream):
             raise ValueError(f"{config.video_codec} is not a video encoder")
