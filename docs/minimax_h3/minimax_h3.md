@@ -22,11 +22,15 @@ Install UniServe as in the [README](../../README.md#install).
 | `ulysses8-two-node.json` | 4 on each of two hosts | One Ulysses8 replica |
 | `ulysses4x2.json` | 8 on one host | Two Ulysses4 replicas |
 | `ulysses4x2-two-node.json` | 4 on each of two hosts | One Ulysses4 replica per host |
-| `dp8-text-tp8.json`, `dp8-text-tp4x2.json` | 8 on one host | Eight one-GPU replicas, shared text encoder |
+| `dp8-text-tp8.json`, `dp8-text-tp4x2.json`, `dp8-text-tp2x4.json` | 8 on one host | Eight one-GPU replicas, the text encoder shared by all eight, by four or by two |
 | `dp8-text-tp8-host-weights.json` | 8 on one host | As `dp8-text-tp8.json`, with the denoiser's projection weights in host memory (needs `--graph-policy off`) |
+| `dp7-text-tp1.json` | 8 on one host | Seven one-GPU replicas, the text encoder alone on the eighth GPU |
 | `gather8.json` | 8 on one host | All-gather sequence parallel |
 | `ulysses1-reference.json`, `ulysses2-reference.json`, `ulysses4-reference.json`, `ulysses8-reference.json` | 1 to 8 on one host | One reference replica |
 | `ulysses8-reference-two-node.json` | 4 on each of two hosts | One Ulysses8 reference replica |
+| `ulysses4x2-reference-host-weights.json` | 8 on one host | Two Ulysses4 reference replicas with the denoiser's projection weights in host memory, shared text encoder (needs `--graph-policy off`) |
+| `dp8-reference-text-tp8-host-weights.json` | 8 on one host | Eight one-GPU reference replicas with the denoiser's projection weights in host memory, one request each, shared text encoder (needs `--graph-policy off`) |
+| `dp7-reference-text-tp1-host-weights.json` | 8 on one host | Seven one-GPU reference replicas with the denoiser's projection weights in host memory, the text encoder alone on the eighth GPU (needs `--graph-policy off`) |
 
 The `-reference` files serve `ref2va`; the others serve `t2va` and `fl2va`. One replica across every GPU gives the lowest latency; more replicas serve more requests at once.
 
