@@ -24,6 +24,7 @@ import numpy as np
 
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.media.container import (
+    NVENC_VIDEO_CODEC,
     AvMuxConfig,
     AvMuxSession,
     encode_audio_track,
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
     from uniserve_worker.transport.shm import HostBorrow
 
 __all__ = [
+    "NVENC_VIDEO_CODEC",
     "AvMuxConfig",
     "MediaEncoder",
     "MediaMux",

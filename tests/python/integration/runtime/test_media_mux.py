@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from uniserve_worker.media.container import (
+    NVENC_VIDEO_CODEC,
     AvMuxConfig,
     AvMuxSession,
     encode_audio_track,
@@ -202,3 +203,115 @@ def test_encoded_units_cross_hosts_without_transferring_reserved_padding(
             transports[location.backend].release(location)
         for transport in transports.values():
             transport.close()
+
+
+def _nvenc_gpus() -> tuple[int, ...]:
+    """Up to two GPUs NVENC can encode on here, none without it."""
+    import torch
+
+    if NVENC_VIDEO_CODEC not in av.codecs_available:
+        return ()
+    if not torch.cuda.is_available():
+        return ()
+    return tuple(range(min(2, torch.cuda.device_count())))
+
+
+def test_nvenc_names_exactly_one_gpu():
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="exactly one named GPU"):
+        replace(_config(), video_codec=NVENC_VIDEO_CODEC)
+    with pytest.raises(ValueError, match="exactly one named GPU"):
+        replace(_config(), video_gpu=0)
+
+
+@pytest.mark.skipif(not _nvenc_gpus(), reason="NVENC is unavailable")
+def test_nvenc_units_fit_their_rows_and_assemble_under_one_template():
+    from dataclasses import replace
+
+    gpus = _nvenc_gpus()
+    frames, height, width = 8, 256, 256
+    config = replace(
+        _config(),
+        frame_count=2 * frames,
+        video_unit_frames=(frames, frames),
+        height=height,
+        width=width,
+        video_codec=NVENC_VIDEO_CODEC,
+        video_gpu=gpus[0],
+    )
+    # Noise is the least compressible content, so it is the closest a unit
+    # comes to its row's syntax bound.
+    noise = np.random.default_rng(0).integers(
+        0, 256, (2 * frames, height, width, 3), dtype=np.uint8
+    )
+    # A request's units may be encoded by codec slots on different GPUs; the
+    # muxer copies every unit under the first unit's parameter sets.
+    units = tuple(
+        encode_video_unit(
+            replace(config, video_gpu=gpus[index % len(gpus)]),
+            noise[index * frames : (index + 1) * frames],
+        )
+        for index in range(2)
+    )
+    for unit in units:
+        assert len(unit) + 8 <= encoded_unit_bytes(frames, height, width)
+    extradata = []
+    for unit in units:
+        with av.open(io.BytesIO(unit)) as container:
+            context = container.streams.video[0].codec_context
+            extradata.append(bytes(context.extradata))
+            assert "Baseline" in str(context.profile)
+    assert extradata[0] == extradata[1]
+
+    session = AvMuxSession(config)
+    session.append(units)
+    encoded = session.finalize(
+        encode_audio_track(config, np.zeros((16000, 2), dtype=np.int16))
+    )
+    with av.open(io.BytesIO(encoded)) as container:
+        decoded = tuple(container.decode(video=0))
+    assert len(decoded) == 2 * frames
+    assert all(
+        (frame.height, frame.width) == (height, width) for frame in decoded
+    )
+
+
+@pytest.mark.skipif(not _nvenc_gpus(), reason="NVENC is unavailable")
+def test_nvenc_preserves_smooth_content():
+    from dataclasses import replace
+
+    frames, height, width = 24, 384, 672
+    config = replace(
+        _config(),
+        frame_count=frames,
+        video_unit_frames=(frames,),
+        height=height,
+        width=width,
+        video_codec=NVENC_VIDEO_CODEC,
+        video_gpu=_nvenc_gpus()[0],
+    )
+    rows = np.linspace(0, 255, height)[:, None]
+    columns = np.linspace(0, 255, width)[None, :]
+    source = np.stack(
+        [
+            np.stack(
+                (
+                    np.broadcast_to(rows, (height, width)),
+                    np.broadcast_to(columns, (height, width)),
+                    np.full((height, width), 8.0 * index),
+                ),
+                axis=-1,
+            )
+            for index in range(frames)
+        ]
+    ).astype(np.uint8)
+    with av.open(io.BytesIO(encode_video_unit(config, source))) as container:
+        decoded = np.stack(
+            [
+                frame.to_ndarray(format="rgb24")
+                for frame in container.decode(video=0)
+            ]
+        )
+    error = np.mean((decoded.astype(np.float64) - source) ** 2)
+    assert 10 * np.log10(255.0**2 / error) > 35

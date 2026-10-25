@@ -1007,6 +1007,7 @@ mod tests {
                 distribution: Some(ComponentDistribution::TemporalUnits),
                 units_per_rank: 1,
                 weights: Default::default(),
+                accelerator: None,
             },
         );
         components.insert(

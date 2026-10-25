@@ -254,6 +254,19 @@ pub(crate) fn video_unit_codecs(
             .collect::<Vec<_>>()
     };
     let encoders = holders(encoder);
+    // The muxer templates a request's video track from its first unit and
+    // copies every later unit's packets under it, so a request's units, which
+    // may be encoded by several codec workers, must come from one encoder.
+    let hardware = encoders
+        .iter()
+        .filter(|(_, _, config)| config.accelerator.is_some())
+        .count();
+    anyhow::ensure!(
+        hardware == 0 || hardware == encoders.len(),
+        "every video codec worker must encode on an accelerator, or none: \
+         {hardware} of {} state one",
+        encoders.len()
+    );
     for (decoder_worker, decoder_ranks, decoder_config) in holders(decoder) {
         let per_decoder = decoder_config.units_per_rank.max(1);
         let round_units = decoder_config.ranks.len() * per_decoder;
@@ -2030,6 +2043,7 @@ mod placement_tests {
             distribution: Some(uniserve_core::ComponentDistribution::TemporalUnits),
             units_per_rank,
             weights: Default::default(),
+            accelerator: None,
         }
     }
 
@@ -2090,6 +2104,7 @@ mod placement_tests {
                 distribution: None,
                 units_per_rank: 1,
                 weights: Default::default(),
+                accelerator: None,
             },
         )]);
         let peers = BTreeMap::from([
@@ -2365,6 +2380,41 @@ mod placement_tests {
             message.contains("host b") && message.contains("host a"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn codec_workers_share_one_encoder() {
+        // One host, one replica, two codec workers that may each encode a
+        // unit of its requests: both on NVENC, or both on the CPU.
+        let flow = WorkerId("flow".to_owned());
+        let flow_ranks = vec![rank("a", "cuda:0")];
+        let decoder = BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0], 1))]);
+        let encoder_ranks = vec![rank("a", "cpu")];
+        let codec = |accelerator: Option<&str>| {
+            let mut config = distributed(vec![0], 1);
+            config.accelerator = accelerator
+                .map(|device| uniserve_core::ComponentAccelerator::Shared(device.into()));
+            BTreeMap::from([("video_codec".to_owned(), config)])
+        };
+        let encoders = [
+            WorkerId("encoder-0".to_owned()),
+            WorkerId("encoder-1".to_owned()),
+        ];
+        let place = |first: &BTreeMap<String, ComponentConfig>,
+                     second: &BTreeMap<String, ComponentConfig>| {
+            let placements = [
+                (&flow, flow_ranks.as_slice(), &decoder),
+                (&encoders[0], encoder_ranks.as_slice(), first),
+                (&encoders[1], encoder_ranks.as_slice(), second),
+            ];
+            pairing(&placements).map(|pairings| pairings[&flow].len())
+        };
+
+        let (software, nvenc) = (codec(None), codec(Some("cuda:0")));
+        assert_eq!(place(&software, &software).unwrap(), 2);
+        assert_eq!(place(&nvenc, &codec(Some("cuda:1"))).unwrap(), 2);
+        let error = place(&nvenc, &software).expect_err("mixed encoders");
+        assert!(error.to_string().contains("1 of 2"), "{error}");
     }
 }
 

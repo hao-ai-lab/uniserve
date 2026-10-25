@@ -224,6 +224,24 @@ pub struct ComponentConfig {
     /// component without a repeated layer stack.
     #[serde(default, skip_serializing_if = "ComponentWeights::is_device")]
     pub weights: ComponentWeights,
+    /// The GPUs (`cuda:<index>`) whose hardware video engines a host media
+    /// component uses: the video codec encodes on their NVENC and the media
+    /// reader decodes reference videos on their NVDEC. One device serves
+    /// every rank, or a list names one per entry of `ranks`, in order. `None`
+    /// keeps both on the CPU. The worker refuses it on any other component.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accelerator: Option<ComponentAccelerator>,
+}
+
+/// The GPUs a host media component's ranks use for video encoding and
+/// decoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ComponentAccelerator {
+    /// One device for every rank.
+    Shared(String),
+    /// One device per entry of the component's `ranks`, in order.
+    PerRank(Vec<String>),
 }
 
 impl ComponentConfig {
@@ -236,6 +254,7 @@ impl ComponentConfig {
             distribution: None,
             units_per_rank: 1,
             weights: ComponentWeights::Device,
+            accelerator: None,
         }
     }
 
@@ -337,6 +356,43 @@ mod tests {
         assert!(
             serde_json::from_str::<ComponentConfig>(r#"{"ranks": [0], "weights": "disk"}"#)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn only_a_stated_accelerator_is_written_out() {
+        let encoder: ComponentConfig =
+            serde_json::from_str(r#"{"ranks": [0], "accelerator": "cuda:3"}"#).unwrap();
+        assert_eq!(
+            encoder.accelerator,
+            Some(ComponentAccelerator::Shared("cuda:3".to_owned()))
+        );
+        assert_eq!(
+            serde_json::to_value(&encoder).unwrap()["accelerator"],
+            "cuda:3"
+        );
+
+        let encoders: ComponentConfig =
+            serde_json::from_str(r#"{"ranks": [0, 1], "accelerator": ["cuda:0", "cuda:1"]}"#)
+                .unwrap();
+        assert_eq!(
+            encoders.accelerator,
+            Some(ComponentAccelerator::PerRank(vec![
+                "cuda:0".to_owned(),
+                "cuda:1".to_owned()
+            ]))
+        );
+        assert_eq!(
+            serde_json::to_value(&encoders).unwrap()["accelerator"],
+            serde_json::json!(["cuda:0", "cuda:1"])
+        );
+
+        let host = ComponentConfig::parallel(vec![0], Default::default());
+        assert!(
+            serde_json::to_value(&host)
+                .unwrap()
+                .get("accelerator")
+                .is_none()
         );
     }
 }

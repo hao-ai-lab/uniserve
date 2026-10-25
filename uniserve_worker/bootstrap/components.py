@@ -383,7 +383,8 @@ def validate_components(
             with one unit per rank; a component with an ``AudioDecoder`` or
             ``VideoEncoder`` call and no ``VideoDecoder`` call accepts no
             distribution or ``temporal_units`` with at least one unit per
-            rank; every other component accepts no distribution.
+            rank; every other component accepts no distribution. Only the
+            video codec and the media reader take an ``accelerator``.
     """
     declared = (
         describe_components(model, entries=entries)
@@ -395,6 +396,15 @@ def validate_components(
         raise unsupported_setup(f"unknown components {sorted(unknown)}")
     for name, component in components.items():
         calls = declared[name]
+        if component.accelerator is not None and name not in (
+            VIDEO_CODEC_COMPONENT,
+            MEDIA_READER_COMPONENT,
+        ):
+            raise unsupported_setup(
+                f"component {name!r} has no hardware video engine to use; "
+                "only the video codec and the media reader take an "
+                "accelerator"
+            )
         if not calls:
             if name not in HOST_COMPONENTS:
                 raise unsupported_setup(

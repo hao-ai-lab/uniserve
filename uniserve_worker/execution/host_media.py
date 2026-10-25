@@ -19,6 +19,7 @@ reserved for the call during batch preparation and returns the call's
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -29,6 +30,7 @@ from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.media.mux import (
+    NVENC_VIDEO_CODEC,
     MediaEncoder,
     MediaMux,
     frame_encoded_unit,
@@ -316,6 +318,14 @@ def execute(
 
         cursor = int(decode_range(call, state=state).cursor)
         config = mux_config(model_executor, media)
+        # A codec slot with an accelerator encodes on that GPU's NVENC.
+        gpu = binding.config.accelerator_index(
+            model_executor.worker_config.rank
+        )
+        if gpu is not None:
+            config = replace(
+                config, video_codec=NVENC_VIDEO_CODEC, video_gpu=gpu
+            )
         publication = _input_publication(call, state)
         # Batch preparation borrows the round only when it is published over
         # shared storage on this node; otherwise the tensor store holds it.

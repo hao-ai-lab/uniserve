@@ -14,7 +14,8 @@ reference's own:
 - ``read_video``: one FFmpeg pass resampling the video to the model's frame
   rate, skipping the planned start frames and scaling onto the planned canvas
   with LANCZOS (``fps=R,trim=start_frame=S,scale=W:H:flags=lanczos,setsar=1``)
-  to RGB24.
+  to RGB24. With a GPU named, FFmpeg decodes on its NVDEC (``-hwaccel
+  cuda``) and the filters still run on the CPU.
 - ``read_audio``: PyAV decoding to planar float at the track's native rate
   and channel layout, the planned native samples kept, a mono track
   duplicated to stereo, and one torchaudio resample to the model's rate.
@@ -98,14 +99,21 @@ def read_image(data: bytes, fit: ImageFit) -> np.ndarray:
 
 
 def read_video(
-    path: Path, clip: VideoClip, *, frame_rate: int, ffmpeg: str
+    path: Path,
+    clip: VideoClip,
+    *,
+    frame_rate: int,
+    ffmpeg: str,
+    gpu: int | None = None,
 ) -> np.ndarray:
     """Decode a reference video's kept frames on its planned canvas.
 
     The video is resampled to ``frame_rate``, the model's output frame rate,
     before its start frames are skipped, so the offset counts frames of that
     timeline. Scaling follows the trim and is per frame, so it never sees a
-    skipped frame.
+    skipped frame. With ``gpu``, the stream decodes on that GPU's NVDEC and
+    its frames return to host memory before the filters; FFmpeg decodes a
+    stream NVDEC does not support on the CPU instead.
 
     Returns:
         ``[frames, height, width, 3]`` uint8 RGB, ``clip.frames`` frames at
@@ -115,10 +123,14 @@ def read_video(
         ValueError: FFmpeg failed or produced another frame count.
     """
     canvas = clip.canvas
+    hwaccel = (
+        [] if gpu is None else ["-hwaccel", "cuda", "-hwaccel_device", str(gpu)]
+    )
     command = [
         ffmpeg,
         "-v",
         "error",
+        *hwaccel,
         "-i",
         str(path),
         "-map",
@@ -172,6 +184,37 @@ def read_video(
             f"{clip.frames} were planned"
         )
     return frames
+
+
+def require_hwaccel(ffmpeg: str, gpu: int) -> None:
+    """Check that ``ffmpeg`` can decode on the NVDEC of GPU ``gpu``.
+
+    FFmpeg initializes a CUDA device on that GPU and runs one frame of its
+    null source through it, so a build without the ``cuda`` accelerator, or
+    a GPU it cannot open, fails at startup rather than under a request.
+
+    Raises:
+        RuntimeError: FFmpeg could not initialize the device.
+    """
+    command = [
+        ffmpeg,
+        "-v",
+        "error",
+        "-init_hw_device",
+        f"cuda=nvdec:{gpu}",
+        "-f",
+        "lavfi",
+        "-i",
+        "nullsrc=s=64x64:d=0.04",
+        "-f",
+        "null",
+        "-",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(
+            f"{ffmpeg} cannot decode on cuda:{gpu}: {result.stderr.strip()}"
+        )
 
 
 def read_audio(source: bytes | Path, clip: AudioClip, *, rate: int):
@@ -247,4 +290,5 @@ __all__ = [
     "read_bytes",
     "read_image",
     "read_video",
+    "require_hwaccel",
 ]
