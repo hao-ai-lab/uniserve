@@ -5,7 +5,8 @@
 (``uniserve.nn.vision.merged_grid_coordinates``). Each patch receives a
 learned position bilinearly resampled to its grid and a 2D rotary position
 (row, column). Attention never crosses a time step: every temporal patch of
-every grid is its own sequence. After the blocks, ``PatchMerger`` merges each
+every grid is its own sequence, so the tower runs the time steps in passes
+of a bounded number of rows. After the blocks, ``PatchMerger`` merges each
 ``merge x merge`` patch block into one language-width token, and DeepStack
 mergers do the same with the outputs of selected intermediate blocks.
 """
@@ -40,6 +41,39 @@ from .config import VisionConfig
 # frequency base.
 LAYER_NORM_EPS = 1e-6
 ROPE_THETA = 10_000.0
+
+# Most patch rows one pass of the tower holds. Every block's intermediates
+# grow with the rows of a pass, and a request's vision tokens may fill its
+# whole prompt capacity: 30,720 tokens are 122,880 patch rows, whose
+# intermediates the text encoder's grant never planned for. A pass of this
+# many rows holds one 2048x3648 reference image (29,184 patches), and a time
+# step larger than it is a pass of its own.
+_GROUP_PATCHES = 32_768
+
+
+def _frame_groups(grid_shapes: tuple[tuple[int, int, int], ...], budget: int):
+    """Split grids into runs of whole time steps of at most ``budget`` rows.
+
+    Yields each pass's ``(time, height, width)`` grids in input order; a grid
+    may continue into the next pass, and a time step larger than ``budget``
+    is a pass of its own.
+    """
+    group: list[tuple[int, int, int]] = []
+    rows = 0
+    for time, height, width in grid_shapes:
+        frame, done = height * width, 0
+        while done < time:
+            room = (budget - rows) // frame
+            if room < 1 and group:
+                yield tuple(group)
+                group, rows = [], 0
+                continue
+            take = min(max(room, 1), time - done)
+            group.append((take, height, width))
+            rows += take * frame
+            done += take
+    if group:
+        yield tuple(group)
 
 
 class Attention(nn.Module):
@@ -214,6 +248,35 @@ class VisionTower(nn.Module):
                 "declared grids"
             )
 
+        # Attention never crosses a time step and every other operation is
+        # row-local, so the frames run in groups of whole time steps, each
+        # writing its merged tokens into the result.
+        width = config.out_hidden_size
+        output = None
+        row, token = 0, 0
+        for shapes in _frame_groups(grid_shapes, _GROUP_PATCHES):
+            rows = sum(prod(shape) for shape in shapes)
+            features = self._encode_frames(pixels[row : row + rows], shapes)
+            if output is None:
+                output = features[0].new_empty(
+                    (pixels.shape[0] // merge**2, len(features) * width)
+                )
+            tokens = rows // merge**2
+            for index, value in enumerate(features):
+                columns = slice(index * width, (index + 1) * width)
+                output[token : token + tokens, columns] = value
+            row, token = row + rows, token + tokens
+        assert output is not None
+        return output
+
+    def _encode_frames(
+        self,
+        pixels: torch.Tensor,
+        grid_shapes: tuple[tuple[int, int, int], ...],
+    ) -> tuple[torch.Tensor, ...]:
+        """Encode whole time steps; return the merged and DeepStack tokens."""
+        config = self.config
+        merge = config.spatial_merge_size
         hidden = self.patch_embedding(pixels)
         device = hidden.device
 
@@ -268,4 +331,4 @@ class VisionTower(nn.Module):
                     config.deepstack_visual_indexes.index(index)
                 ]
                 deepstack.append(merger(hidden))
-        return torch.cat((self.merger(hidden), *deepstack), dim=-1)
+        return (self.merger(hidden), *deepstack)
