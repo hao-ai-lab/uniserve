@@ -32,16 +32,19 @@ class Transformer(qwen3.Transformer):
         *,
         routes: tuple[RouteSpan, ...] = (),
         deepstack: torch.Tensor | None = None,
+        deepstack_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run this stage's resident layers, adding DeepStack features.
 
-        ``deepstack`` holds complete ``[tokens, depth, hidden]`` features,
-        zero at tokens that receive none; feature ``j`` joins the residual
-        stream after decoder layer ``j``, on the pipeline stage holding it.
-        Without it the decoder runs as ``qwen3.Transformer``.
+        ``deepstack`` holds the ``[vision tokens, depth, hidden]`` features
+        of the packed tokens at the increasing positions ``deepstack_index``;
+        feature ``j`` joins those tokens' residual stream after decoder layer
+        ``j``, on the pipeline stage holding it. Text tokens receive none, as
+        in the reference, so no prompt-sized feature tensor is formed.
+        Without features the decoder runs as ``qwen3.Transformer``.
 
         Raises:
-            ValueError: The features do not cover the tokens, or a routed
+            ValueError: The features and positions disagree, or a routed
                 pass receives them.
         """
         if deepstack is None:
@@ -51,15 +54,25 @@ class Transformer(qwen3.Transformer):
         if routes or self._default_route is not None:
             raise ValueError("DeepStack features require one packed stream")
         if (
-            deepstack.ndim != 3
-            or deepstack.shape[0] != positions.shape[-1]
+            deepstack_index is None
+            or deepstack.ndim != 3
+            or deepstack_index.shape != deepstack.shape[:1]
             or deepstack.shape[2] != self.hidden_size
         ):
             raise ValueError(
-                "DeepStack features must be [tokens, depth, hidden] rows"
+                "DeepStack features must be [vision tokens, depth, hidden] "
+                "rows at their packed token positions"
             )
 
         stream = self._enter(embeddings, positions, ())
+        # This shard's vision tokens: a run of the increasing positions.
+        interval = stream.partition.token_slice
+        lo, hi = torch.searchsorted(
+            deepstack_index,
+            deepstack_index.new_tensor([interval.start, interval.stop]),
+        ).tolist()
+        local_index = deepstack_index[lo:hi] - interval.start
+        local = deepstack[lo:hi]
         for key, layer in self.layers.items():
             stream.apply(layer, attention)
             index = int(key)
@@ -72,7 +85,9 @@ class Transformer(qwen3.Transformer):
             assert isinstance(stream.hidden, torch.Tensor)
             assert isinstance(stream.residual, torch.Tensor)
             residual = stream.residual + stream.hidden
-            features = stream.partition.local(deepstack[:, index])
-            stream.residual = residual + features.to(residual.dtype)
+            residual.index_add_(
+                0, local_index, local[:, index].to(residual.dtype)
+            )
+            stream.residual = residual
             stream.hidden = torch.zeros_like(residual)
         return self._exit(stream)
