@@ -30,6 +30,16 @@ Install UniServe as in the [README](../../README.md#install).
 
 The `-reference` files serve `ref2va`; the others serve `t2va` and `fl2va`. One replica across every GPU gives the lowest latency; more replicas serve more requests at once.
 
+### Hardware video engines
+
+A host media component can use a GPU's video engines. With `"accelerator"` in its entry, the video codec encodes H.264 on NVENC in the baseline profile (CAVLC without B-frames, as libx264's ultrafast preset writes it), and the media reader decodes reference videos on NVDEC before the same CPU resampling and scaling. A device such as `"cuda:3"` serves every rank of the component, and a list names one device per entry of its `ranks`:
+
+```json
+"video_codec": { "ranks": [0, 1, 2, 3], "parallel_config": {}, "accelerator": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"] }
+```
+
+Every video codec of a deployment uses NVENC, or none does, because the muxer copies a request's units under the first unit's parameters. NVENC needs PyAV built with `h264_nvenc`, and NVDEC an FFmpeg (`--ffmpeg`) with the `cuda` hardware accelerator, which the static build of `scripts/install-ffmpeg.sh` lacks. Startup encodes a frame on each NVENC device and opens each NVDEC device, and does not start without them.
+
 ### Validated settings
 
 These are the settings the [evaluation](evaluation.md) measured. GB200 deployments ran with `NCCL_NVLS_ENABLE=0`, and the FastH3 H200 deployments with `NCCL_CUMEM_HOST_ENABLE=1`. On a PCIe host such as RTX PRO 6000, leave `NCCL_P2P_LEVEL` at its default: `SYS` cuts eight-GPU all-to-all bandwidth from 24.5 to 1.1 GB/s.
