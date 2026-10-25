@@ -1,11 +1,12 @@
 //! Logical submissions and their worker-local protocol projection.
 //!
 //! The scheduler builds an [`ExecutionBatch`] of calls, each paired with the
-//! [`RequestPlacement`] it chose, plus lifecycle commands, and hands it to an
-//! `Executor`. `WorkerExecutor` splits it into one `ExecutionBatch` per target
-//! worker and lowers each with `ExecutionBatch::into_protocol`, which gathers
-//! the per-call placement fields into the flat, call-indexed arrays of the
-//! wire `Batch` and the persistent spans of each rank's own buffer pool.
+//! [`RequestPlacement`] it chose, plus lifecycle commands and route releases,
+//! and hands it to an `Executor`. `WorkerExecutor` splits it into one
+//! `ExecutionBatch` per target worker and lowers each with
+//! `ExecutionBatch::into_protocol`, which gathers the per-call placement
+//! fields into the flat, call-indexed arrays of the wire `Batch` and the
+//! persistent spans of each rank's own buffer pool.
 
 use super::WorkerId;
 use std::collections::BTreeMap;
@@ -78,6 +79,24 @@ pub struct RequestPlacement {
     pub readers: Option<BTreeMap<String, WorkerId>>,
 }
 
+/// One worker leaving the route of a request that continues on its other
+/// workers.
+///
+/// The scheduler releases a worker once the request has no further call for
+/// it and every product it published has been read. The worker alone
+/// receives the request's `Finish` and retires the request's row and
+/// products there; the request's other workers keep it until its own
+/// `Finish`. The release's receipt (`BatchResult::release_results`) tells the
+/// scheduler that the row and buffer spans it assigned the request on that
+/// worker are free again.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RouteRelease {
+    /// The worker leaving the route.
+    pub worker: WorkerId,
+    /// The exact request epoch it retires.
+    pub request_key: RequestKey,
+}
+
 /// One logical executor submission. Its rank projections are derived only inside an executor.
 ///
 /// `WorkerExecutor` also uses this type for the part of a logical batch routed
@@ -91,6 +110,11 @@ pub struct ExecutionBatch {
     pub requests: Vec<(Call, RequestPlacement)>,
     /// Ordered lifecycle and resource commands.
     pub commands: Vec<BatchCommand>,
+    /// Workers leaving the routes of requests that continue elsewhere, each
+    /// receipted in `BatchResult::release_results` by its position here.
+    /// `ExecutionBatch::new` leaves this empty. The slice is boxed so a batch
+    /// handed back in `ExecutorSubmitError::WouldBlock` stays small.
+    pub releases: Box<[RouteRelease]>,
     /// Published transfer descriptors supplied by an external storage owner.
     pub input_transfers: Vec<TensorPublication>,
     /// External cache publications consumed by explicit KV installation.
@@ -112,6 +136,7 @@ impl ExecutionBatch {
             id,
             requests,
             commands,
+            releases: Box::default(),
             input_transfers,
             kv_inputs: Vec::new(),
         }
@@ -130,11 +155,12 @@ impl ExecutionBatch {
     ///
     /// Drops the calls and `Start` commands of every request key in
     /// `requests`, then the input transfers and KV inputs no remaining call
-    /// reads. The requests' `Finish` and `Free` commands stay, since they still
-    /// retire physical state and reader obligations on the workers. Returns the
-    /// removed calls with the placements describing their resources. The batch
-    /// may be left with neither calls nor commands; callers decide whether to
-    /// discard it.
+    /// reads. The requests' `Finish` and `Free` commands and their route
+    /// releases stay, since they still retire physical state and reader
+    /// obligations on the workers. Returns the removed calls with the
+    /// placements describing their resources. The batch may be left with
+    /// neither calls, commands nor releases; callers decide whether to discard
+    /// it.
     pub(crate) fn retire_requests(
         &mut self,
         requests: &std::collections::HashSet<RequestKey>,
@@ -167,18 +193,19 @@ impl ExecutionBatch {
     /// Validates the scheduler's own bookkeeping: call identities, execution
     /// ownership and placement.
     ///
-    /// Requires at least one call or command; checks that call identities are
-    /// unique and belong to this batch, that each placement describes its own
-    /// call, and that every `Start` is unique and names a request with a call
-    /// in this batch. The records themselves and the wire-level constraints
+    /// Requires at least one call, command or route release; checks that call
+    /// identities are unique and belong to this batch, that each placement
+    /// describes its own call, that every `Start` is unique and names a
+    /// request with a call in this batch, and that no worker is released from
+    /// a request's route twice. The records themselves and the wire-level constraints
     /// between calls (one kind and component per batch, allocation tables
     /// matching their calls, non-overlapping spans) are checked once, by
     /// `Batch::validate_unplaced`, which `into_protocol` runs, and by
     /// `Batch::validate` on each rank's projection.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.requests.is_empty() || !self.commands.is_empty(),
-            "logical batch must carry at least one call or command"
+            !self.requests.is_empty() || !self.commands.is_empty() || !self.releases.is_empty(),
+            "logical batch must carry at least one call, command or release"
         );
 
         let mut requests = std::collections::HashSet::with_capacity(self.requests.len());
@@ -235,6 +262,15 @@ impl ExecutionBatch {
             );
         }
 
+        let mut released = std::collections::HashSet::with_capacity(self.releases.len());
+        for release in &*self.releases {
+            WorkerId::new(release.worker.0.clone())?;
+            anyhow::ensure!(
+                released.insert(release),
+                "logical batch releases a worker from a request twice"
+            );
+        }
+
         Ok(())
     }
 }
@@ -250,9 +286,11 @@ impl ExecutionBatch {
     /// returned beside it, in call order, for the worker group to project
     /// onto its ranks. `collective_seq` is the worker's next collective
     /// sequence, which `WorkerExecutor` commits only after the worker accepts
-    /// the batch. Fails when adding the call's position to a forward row's
-    /// call index overflows `u32` or `Batch::validate_unplaced` rejects the
-    /// result.
+    /// the batch. A worker's part carries no route releases: `WorkerExecutor`
+    /// lowers its releases into its `commands` as `Finish` commands. Fails
+    /// when the batch still carries a release, when adding the call's
+    /// position to a forward row's call index overflows `u32`, or when
+    /// `Batch::validate_unplaced` rejects the result.
     pub(crate) fn into_protocol(
         self,
         collective_seq: u64,
@@ -261,9 +299,14 @@ impl ExecutionBatch {
             id: batch_id,
             requests,
             commands,
+            releases,
             input_transfers: input_products,
             kv_inputs,
         } = self;
+        anyhow::ensure!(
+            releases.is_empty(),
+            "a worker batch carries its route releases as Finish commands"
+        );
         let mut block_tables = Vec::new();
         let mut new_cache_units = Vec::new();
         let mut forward = ForwardBatch::default();

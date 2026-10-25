@@ -36,7 +36,7 @@ use uniserve_worker_ipc::{
 
 mod batch;
 
-pub use batch::{ExecutionBatch, RankBuffer, RequestPlacement};
+pub use batch::{ExecutionBatch, RankBuffer, RequestPlacement, RouteRelease};
 
 /// What the engine launched one pool with.
 ///
@@ -251,10 +251,10 @@ impl ExecutorInfo {
     /// take the smallest nonzero value any pool reports.
     /// The exceptions are the KV cache, whose layout the KV pools must share
     /// and whose unit count is their smallest; request slots of a deployment
-    /// that muxes video,
-    /// the narrowest per-component sum of replica slots; and the video
-    /// denoiser and latent page geometry, taken from the first denoising
-    /// pool and absent or zero without one.
+    /// that muxes video, the narrowest per-component sum of replica slots
+    /// among the components serving a call beyond the conditioning calls; and
+    /// the video denoiser and latent page geometry, taken from the first
+    /// denoising pool and absent or zero without one.
     ///
     /// # Errors
     ///
@@ -364,15 +364,31 @@ impl ExecutorInfo {
         merged.request_slots = if merged.media_components.contains_key(&MediaCall::Muxing) {
             // A replicated media route owns an independent request-row bank in
             // every WorkerGroup. End-to-end concurrency is the narrowest sum
-            // of replica capacities among the graph's components. Each
-            // component is keyed to the first call it serves; its replicas are
-            // the pools that support that call and bind the component.
-            let mut components = BTreeMap::new();
+            // of replica capacities among the graph's components that hold a
+            // request's row until it finishes. A component serving only
+            // conditioning calls is left out: a worker that serves a request
+            // only such calls leaves the request's route once latent
+            // preparation has read what it published
+            // (`Scheduler::release_routes`), and admission waits for a free
+            // row there instead. Each component is keyed to the first call it
+            // serves; its replicas are the pools that support that call and
+            // bind the component.
+            let mut components = BTreeMap::<&str, Vec<MediaCall>>::new();
             for (call, component) in &merged.media_components {
-                components.entry(component.as_str()).or_insert(*call);
+                components
+                    .entry(component.as_str())
+                    .or_default()
+                    .push(*call);
             }
             components
                 .into_iter()
+                .filter(|(_, calls)| {
+                    !calls
+                        .iter()
+                        .copied()
+                        .all(crate::scheduler::graph::prepares_conditioning)
+                })
+                .filter_map(|(component, calls)| Some((component, *calls.first()?)))
                 .map(|(component, call)| {
                     self.workers
                         .iter()
@@ -558,10 +574,11 @@ pub enum CommandOutcome {
     Failed,
 }
 
-/// Terminal outcome of one logical lifecycle command.
+/// Terminal outcome of one logical lifecycle command or route release.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
-    /// Position among lifecycle commands, excluding request admissions.
+    /// Position among lifecycle commands, excluding request admissions, or,
+    /// in `BatchResult::release_results`, among the batch's route releases.
     pub command_index: u32,
     /// Request targeted by the command.
     pub request_key: RequestKey,
@@ -578,6 +595,9 @@ pub struct BatchResult {
     pub results: Vec<CallResult>,
     /// Receipts for the batch's lifecycle commands; empty unless `done`.
     pub command_results: Vec<CommandResult>,
+    /// Receipts for the batch's route releases (`ExecutionBatch::releases`);
+    /// empty unless `done`.
+    pub release_results: Vec<CommandResult>,
     /// Whether this join completes the batch.
     pub done: bool,
     /// Per-worker execution durations in microseconds.
@@ -591,14 +611,16 @@ pub struct BatchResult {
 /// `done` comes from the caller, not from `report.done`. A terminal result
 /// carries one `Applied` receipt per lifecycle command in `commands`,
 /// numbered with `Start` admissions skipped, so `commands` may be given with
-/// or without them; callers that track other outcomes overwrite the receipts.
-/// A partial result carries no receipts. `report.products` is not carried
-/// into the result: publications stay with the executor, and
-/// `WorkerExecutor` records them before converting.
+/// or without them, and one per route release in `releases`; callers that
+/// track other outcomes overwrite the receipts. A partial result carries no
+/// receipts. `report.products` is not carried into the result: publications
+/// stay with the executor, and `WorkerExecutor` records them before
+/// converting.
 pub(crate) fn logical_result(
     report: WorkerResult,
     done: bool,
     commands: &[BatchCommand],
+    releases: &[RouteRelease],
 ) -> BatchResult {
     let mut worker_exec_us = Vec::new();
     let mut forward_stats = Vec::new();
@@ -619,6 +641,19 @@ pub(crate) fn logical_result(
                 .map(|(index, command)| CommandResult {
                     command_index: index as u32,
                     request_key: command.request_key(),
+                    outcome: CommandOutcome::Applied,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+        release_results: if done {
+            releases
+                .iter()
+                .enumerate()
+                .map(|(index, release)| CommandResult {
+                    command_index: index as u32,
+                    request_key: release.request_key,
                     outcome: CommandOutcome::Applied,
                 })
                 .collect()
@@ -1499,6 +1534,51 @@ mod tests {
         // The two flow banks contribute four routes. The wider shared text
         // and host stages must not multiply that end-to-end capacity.
         assert_eq!(info.runtime_info()?.request_slots, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn narrower_conditioning_stages_leave_the_bound_to_the_later_stages() -> anyhow::Result<()> {
+        let flow = [
+            (MediaCall::LatentEncoding, "latent_encoder"),
+            (MediaCall::LatentPreparation, "denoiser"),
+            (MediaCall::Denoising, "denoiser"),
+            (MediaCall::VideoDecoding, "video_decoder"),
+            (MediaCall::AudioDecoding, "audio_decoder"),
+        ];
+        let host = [
+            (MediaCall::VideoEncoding, "video_codec"),
+            (MediaCall::AudioEncoding, "muxer"),
+            (MediaCall::Muxing, "muxer"),
+        ];
+        let text = [
+            (MediaCall::VisionEncoding, "text_encoder"),
+            (MediaCall::TextEncoding, "text_encoder"),
+        ];
+        let mut pools = vec![
+            media_pool("text", &text, 2),
+            media_pool("reader", &[(MediaCall::MediaReading, "media_reader")], 1),
+            media_pool("host", &host, 16),
+        ];
+        pools.extend((0..4).map(|replica| media_pool(&format!("flow-{replica}"), &flow, 2)));
+        let info = ExecutorInfo::from_workers(pools)?;
+
+        // A request leaves the text encoder and the media reader once latent
+        // preparation has read what they published, so their two rows and one
+        // row do not bound the eight routes of the four flow banks.
+        assert_eq!(info.runtime_info()?.request_slots, 8);
+
+        // A conditioning component sharing a worker with a later stage still
+        // bounds through that stage: the worker keeps each request's row
+        // until it finishes.
+        let shared = [text.as_slice(), &flow].concat();
+        let info = ExecutorInfo::from_workers(vec![
+            media_pool("reader", &[(MediaCall::MediaReading, "media_reader")], 1),
+            media_pool("flow-0", &shared, 2),
+            media_pool("flow-1", &shared, 3),
+            media_pool("host", &host, 16),
+        ])?;
+        assert_eq!(info.runtime_info()?.request_slots, 5);
         Ok(())
     }
 

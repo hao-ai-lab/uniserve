@@ -3,10 +3,11 @@
 //! `WorkerExecutor` is the `Executor` the scheduler drives over a set of
 //! `WorkerGroup`s. It splits each logical `ExecutionBatch` into one
 //! `WorkerSubmission` per target worker, delivers each request's `Start` with
-//! its first call on a worker and every other lifecycle command to the workers
-//! that hold what it releases, and joins the workers' reports back into
-//! `BatchResult`s: call completions are published as they arrive, command
-//! receipts once every worker has finished the batch.
+//! its first call on a worker, every other lifecycle command to the workers
+//! that hold what it releases, and each route release as a `Finish` to the
+//! one worker it names, and joins the workers' reports back into
+//! `BatchResult`s: call completions are published as they arrive, command and
+//! release receipts once every worker has finished the batch.
 //!
 //! Each destination has independent bounded capacity. Every worker has its own
 //! FIFO of submissions whose head waits until the products it depends on are
@@ -26,8 +27,8 @@ use std::time::Duration;
 use super::{BatchSubmitError, IncarnationRegistry, WorkerGroup};
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerId,
-    logical_result,
+    RankBuffer, RequestPlacement, RouteRelease, TransferConfig, UnroutableInputs, WorkerFailure,
+    WorkerId, logical_result,
 };
 use anyhow::Context;
 use uniserve_core::CommandWaker;
@@ -58,21 +59,35 @@ struct PendingBatch {
     commands: Vec<BatchCommand>,
     /// Outcomes other than `Applied`, keyed by position in `commands`.
     command_outcomes: HashMap<u32, CommandOutcome>,
+    /// The batch's route releases; a position here is the
+    /// `CommandResult::command_index` of its receipt.
+    releases: Vec<RouteRelease>,
+    /// Outcomes other than `Applied`, keyed by position in `releases`.
+    release_outcomes: HashMap<u32, CommandOutcome>,
 }
 
 impl PendingBatch {
-    /// Records `outcome` for every command that targets one of `requests`.
+    /// Records `outcome` for every command and route release that targets
+    /// one of `requests`.
     ///
     /// The first recorded outcome is kept, except that `Failed` replaces any
     /// other: a failed release keeps ownership even when another endpoint
     /// retires it.
     fn set_command_outcome(&mut self, requests: &HashSet<RequestKey>, outcome: CommandOutcome) {
+        let record = |outcomes: &mut HashMap<u32, CommandOutcome>, index: usize| {
+            let current = outcomes.entry(index as u32).or_insert(outcome);
+            if outcome == CommandOutcome::Failed {
+                *current = outcome;
+            }
+        };
         for (index, command) in self.commands.iter().enumerate() {
             if requests.contains(&command.request_key()) {
-                let current = self.command_outcomes.entry(index as u32).or_insert(outcome);
-                if outcome == CommandOutcome::Failed {
-                    *current = outcome;
-                }
+                record(&mut self.command_outcomes, index);
+            }
+        }
+        for (index, release) in self.releases.iter().enumerate() {
+            if requests.contains(&release.request_key) {
+                record(&mut self.release_outcomes, index);
             }
         }
     }
@@ -1038,6 +1053,7 @@ impl WorkerExecutor {
             id: batch.id,
             requests: batch.requests.clone(),
             commands,
+            releases: Box::default(),
             input_transfers: inputs,
             kv_inputs,
         }
@@ -1491,10 +1507,17 @@ impl WorkerExecutor {
         };
         let pending = entry.get();
         let done = pending.workers.is_empty();
-        let mut result = logical_result(report, done, &pending.commands);
+        let mut result = logical_result(report, done, &pending.commands, &pending.releases);
         for receipt in &mut result.command_results {
             receipt.outcome = pending
                 .command_outcomes
+                .get(&receipt.command_index)
+                .copied()
+                .unwrap_or(CommandOutcome::Applied);
+        }
+        for receipt in &mut result.release_results {
+            receipt.outcome = pending
+                .release_outcomes
                 .get(&receipt.command_index)
                 .copied()
                 .unwrap_or(CommandOutcome::Applied);
@@ -1528,6 +1551,14 @@ impl WorkerExecutor {
                     }
                 }
             }
+            for (index, release) in pending.releases.into_iter().enumerate() {
+                if pending.release_outcomes.get(&(index as u32)) == Some(&CommandOutcome::Failed) {
+                    continue;
+                }
+                if let Some(&worker_index) = self.routing.get(&release.worker) {
+                    self.forget_route(worker_index, release.request_key);
+                }
+            }
         }
         if !result.results.is_empty() || done {
             self.ready.push_back(result);
@@ -1551,6 +1582,39 @@ impl WorkerExecutor {
             .retain(|(_, _, buffer), _| buffer.owner != request || retained.contains(buffer));
         self.buffer_workers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
+    }
+
+    /// Retires one worker's part of a request that continues on its other
+    /// workers.
+    ///
+    /// The worker no longer holds the request's admission, its buffer
+    /// allocations there, or a place among the holders of the request's
+    /// buffers, so the request's later `Free` and `Finish` commands pass it
+    /// by. The buffers it produced lose their producer route and
+    /// publications: it revoked them when it retired the request, which
+    /// reads none of them again. A buffer no worker holds any longer is
+    /// forgotten.
+    fn forget_route(&mut self, worker_index: usize, request: RequestKey) {
+        self.admitted_workers.remove(&(worker_index, request));
+        self.buffer_allocations
+            .retain(|(worker, _, buffer), _| *worker != worker_index || buffer.owner != request);
+        let produced = self
+            .buffer_routes
+            .iter()
+            .filter(|(buffer, route)| buffer.owner == request && route.worker_index == worker_index)
+            .map(|(buffer, _)| *buffer)
+            .collect::<Vec<_>>();
+        for buffer in &produced {
+            self.buffer_routes.remove(buffer);
+            self.transfer_products.remove(buffer);
+            self.kv_transfers.remove(buffer);
+        }
+        self.buffer_workers.retain(|buffer, workers| {
+            if buffer.owner == request {
+                workers.remove(&worker_index);
+            }
+            !workers.is_empty()
+        });
     }
 
     /// Returns the command-channel waker.
@@ -1621,6 +1685,23 @@ impl Executor for WorkerExecutor {
         }
         for command in &batch.commands {
             targets.extend(self.command_workers(command));
+        }
+        // A route release targets the worker it names while that worker still
+        // holds the request; a worker that no longer does has nothing to
+        // retire.
+        let mut release_targets = Vec::with_capacity(batch.releases.len());
+        for release in &*batch.releases {
+            let Some(&index) = self.routing.get(&release.worker) else {
+                return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
+                    "route release names unknown worker {}",
+                    release.worker
+                )));
+            };
+            let holds = self.request_workers(release.request_key).contains(&index);
+            if holds {
+                targets.insert(index);
+            }
+            release_targets.push(holds.then_some(index));
         }
         if targets
             .iter()
@@ -1840,6 +1921,27 @@ impl Executor for WorkerExecutor {
                     worker_commands[worker_index].push(command.clone());
                 }
             }
+            // A route release reaches only the worker it names, as that
+            // worker's `Finish` of the request, unless the request's own
+            // `Finish` in this batch already retires it there.
+            for (release, target) in batch.releases.iter().zip(&release_targets) {
+                let Some(worker_index) = *target else {
+                    continue;
+                };
+                let finishing = worker_commands[worker_index].iter().any(|command| {
+                    matches!(
+                        command,
+                        BatchCommand::Finish { request_key, .. }
+                            if *request_key == release.request_key
+                    )
+                });
+                if !finishing {
+                    worker_commands[worker_index].push(BatchCommand::Finish {
+                        request_key: release.request_key,
+                        retained_buffers: Vec::new(),
+                    });
+                }
+            }
 
             // Queue one submission per worker that has calls or commands, and
             // register the batch before dispatching any of them.
@@ -1890,6 +1992,8 @@ impl Executor for WorkerExecutor {
                         .cloned()
                         .collect(),
                     command_outcomes: HashMap::new(),
+                    releases: batch.releases.to_vec(),
+                    release_outcomes: HashMap::new(),
                 },
             );
             self.dispatch_ready()?;

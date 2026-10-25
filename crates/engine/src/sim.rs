@@ -118,12 +118,14 @@ impl SimExecutor {
             .spawn(move || {
                 // Batches execute one at a time in submission order. Each
                 // returns whole, as one terminal result carrying an `Applied`
-                // receipt for every command other than `Start`; an execution
-                // or output validation error is forwarded to `poll` instead.
+                // receipt for every command other than `Start` and for every
+                // route release; an execution or output validation error is
+                // forwarded to `poll` instead.
                 while let Ok(job) = jobs.recv() {
                     match job {
                         Job::Batch(batch) => {
                             let commands = batch.commands.clone();
+                            let releases = batch.releases.clone();
                             let result = engine.execute(batch).and_then(|report| {
                                 report.validate()?;
                                 Ok((
@@ -131,6 +133,7 @@ impl SimExecutor {
                                         crate::executor::WorkerResult::receive(report),
                                         true,
                                         &commands,
+                                        &releases,
                                     ),
                                     commands,
                                 ))
@@ -1527,7 +1530,10 @@ impl SimEngine {
     /// Admissions register first, then `Free` commands release predicate
     /// values, then calls execute, and `Finish` commands drop their requests
     /// last, so calls in the same batch still execute against a finishing
-    /// request.
+    /// request. A route release changes nothing: the simulator is one worker
+    /// serving every component, so a request it releases from one route
+    /// worker keeps its state for the calls its other route workers still
+    /// send here, until the request's own `Finish`.
     ///
     /// Errors on a batch that fails validation, a readmission with a
     /// different descriptor, a call for a request that is not admitted or
