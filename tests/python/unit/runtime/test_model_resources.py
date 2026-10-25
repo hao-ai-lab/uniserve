@@ -353,6 +353,64 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
         arena.close()
 
 
+def test_an_idle_view_borrows_only_an_idle_arena_that_holds_it() -> None:
+    from uniserve_worker.protocol.batch import BufferAllocation
+    from uniserve_worker.protocol.identity import CallId, RequestKey
+    from uniserve_worker.protocol.tensor import (
+        DType,
+        ShapeBound,
+        StaticDim,
+        TensorRef,
+    )
+    from uniserve_worker.storage.buffer_pool import BufferPool
+
+    pool = BufferPool(byte_capacity=64, devices=("cpu",))
+    try:
+        view = pool.idle_view(device="cpu", dtype=torch.float32, shape=(4, 4))
+        view.fill_(3.0)
+        again = pool.idle_view(device="cpu", dtype=torch.float32, shape=(16,))
+        # The view is the arena's own storage, from its first byte.
+        assert torch.equal(again, torch.full((16,), 3.0))
+        with pytest.raises(WorkerError, match="idle device arena"):
+            pool.idle_view(device="cpu", dtype=torch.float32, shape=(17,))
+        # Views at offsets address the same bytes.
+        tail = pool.idle_view(
+            device="cpu", dtype=torch.float32, shape=(2,), offset=56
+        )
+        assert torch.equal(tail, again[14:])
+        with pytest.raises(WorkerError, match="idle device arena"):
+            pool.idle_view(
+                device="cpu", dtype=torch.float32, shape=(2,), offset=58
+            )
+        with pytest.raises(WorkerError, match="idle device arena"):
+            pool.idle_view(
+                device="cpu", dtype=torch.float32, shape=(3,), offset=56
+            )
+
+        product = TensorRef(
+            RequestKey(1, 1, 1),
+            CallId(1, 0),
+            0,
+            1,
+            DType.F32,
+            ShapeBound((StaticDim(1),)),
+        )
+        binding = pool.bind(
+            product,
+            BufferAllocation(product.buffer_id, 32, 4),
+            device="cpu",
+            dtype=torch.float32,
+            shape=(1,),
+        )
+        # A live binding anywhere in the arena makes it busy.
+        with pytest.raises(WorkerError, match="idle device arena"):
+            pool.idle_view(device="cpu", dtype=torch.float32, shape=(1,))
+        pool.release(binding)
+        pool.idle_view(device="cpu", dtype=torch.float32, shape=(1,))
+    finally:
+        pool.close()
+
+
 def test_cuda_capacity_query_failure_is_not_an_empty_budget(
     monkeypatch,
 ) -> None:

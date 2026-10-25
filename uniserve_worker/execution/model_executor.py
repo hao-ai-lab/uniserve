@@ -34,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
+from math import prod
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -41,6 +42,7 @@ import torch
 from torch import nn
 
 from uniserve.distributed import Communicator, DeviceMesh
+from uniserve.math import ceil_div
 from uniserve.model import (
     AudioDecoder,
     AudioEncoder,
@@ -53,6 +55,7 @@ from uniserve.model import (
     TextEncoder,
     TextSize,
     TokenDenoiser,
+    TubeletEncoder,
     VideoDecoder,
     VideoEncoder,
     VideoPostprocessor,
@@ -161,6 +164,7 @@ if TYPE_CHECKING:
     from uniserve_worker.model_executor.encoder_runner import EncoderRunner
     from uniserve_worker.model_executor.media_inputs import MediaBuilder
     from uniserve_worker.storage.block_tables import BlockTables
+    from uniserve_worker.storage.buffer_pool import BufferPool
     from uniserve_worker.storage.canvas_slots import CanvasSlots
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -184,6 +188,29 @@ def _observations(name, started, path):
         cuda_graph_captures=int(path == "graph_capture"),
         cuda_graph_replays=int(path == "graph_replay"),
     )
+
+
+def vision_probe_layout(
+    capacity: int, merge: int
+) -> tuple[tuple[tuple[int, int, int], ...], int]:
+    """Return a vision probe's image grids and its trailing text tokens.
+
+    The probe presents images of ``merge x merge``-patch merged tokens, each
+    behind one text token (a run of placeholders is one image block), and
+    fills ``capacity`` prompt tokens: one-step images of 128 x 256 patches
+    (a 2048 x 4096-pixel image at 16-pixel patches), then one narrower image
+    with whole merged columns, then fewer than one column of text tokens.
+    """
+    height, width = 128, 256
+    column = height // merge
+    full = column * (width // merge)
+    count, rest = divmod(capacity, full + 1)
+    grids = [(1, height, width)] * count
+    if rest - 1 >= column:
+        tokens = (rest - 1) // column * column
+        grids.append((1, height, tokens // column * merge))
+        rest -= 1 + tokens
+    return tuple(grids), rest
 
 
 class ModelExecutor:
@@ -964,6 +991,120 @@ class ModelExecutor:
                 self.encode_text((0,) * capacity)
             if "conditioning" in kinds and text is not None:
                 self.encode_conditioning(features(capacity))
+
+    @torch.inference_mode()
+    def replay_reference_request(self, products: BufferPool) -> None:
+        """Run the text path of a largest reference request.
+
+        A ``ref2va`` request's vision tokens are prompt tokens, so its largest
+        prompt fills the largest text capacity with vision blocks. Its calls
+        run here in a request's order, each on the ranks that hold it: the
+        probe's zero patch rows (``vision_probe_layout``) through the vision
+        encoder, the prompt holding their features through the text encoder,
+        and the text encoder's features, or zero rows on a rank that encodes
+        no text, through the conditioning encoder. Each call's product is
+        joined and staged as a request publishes it, in ``products``, the
+        rank's idle product pool, where the next call reads it; the call's
+        allocator outputs are freed first, as publication frees them.
+
+        Measuring device storage empties the caching allocator
+        (``process_device_bytes``), so a call's peak is checked by running
+        the call alone. Warmup runs this replay last, next to everything
+        startup keeps resident, so a grant that cannot hold a reference
+        request's text path fails startup instead of the request. Only a
+        deployment serving ``ref2va`` runs it: a keyframe request brings at
+        most two images. Collective across each encoder's ranks.
+        """
+        builder = self.media_builder
+        if builder is None or "ref2va" not in builder.denoiser.tasks:
+            return
+        capacity = max(builder.text_capacities)
+        kinds = self.encoder_kinds
+        offset = 0
+
+        def stage(value: torch.Tensor) -> torch.Tensor:
+            nonlocal offset
+            view = products.idle_view(
+                device=value.device,
+                dtype=value.dtype,
+                shape=tuple(value.shape),
+                offset=offset,
+            )
+            view.copy_(value)
+            # Products start on the pool's 256-byte binding alignment.
+            offset += ceil_div(view.numel() * view.element_size(), 256) * 256
+            return view
+
+        features = None
+        vision = capability(self.model, TubeletEncoder)
+        encoder = capability(self.model, MultimodalEncoder)
+        found = [
+            name
+            for (name, _, method), (_, call) in self._module_calls.items()
+            if method == "encode" and isinstance(call.module, PatchEncoder)
+        ]
+        if vision is not None and len(found) == 1:
+            merge = vision.downsample
+            grids, padding = vision_probe_layout(capacity, merge)
+            device = self.bindings[found[0]].device
+            row = vision.pixels_layout(1).shape[1]
+            result = self.encode_vision(
+                VisionInput(
+                    tuple(
+                        torch.zeros(
+                            (prod(grid), row),
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                        for grid in grids
+                    ),
+                    tuple(
+                        torch.tensor([grid], dtype=torch.int64, device=device)
+                        for grid in grids
+                    ),
+                    grids,
+                )
+            )
+            joined = torch.cat(result.values)
+            del result
+            visual = stage(joined)
+            del joined
+            if "text" in kinds and encoder is not None:
+                # The first placeholder marks an image block; token 0
+                # separates the blocks and pads the prompt, as encode_text
+                # pads it.
+                image = encoder.placeholders[0]
+                token_ids = []
+                for grid in grids:
+                    token_ids += [0] + [image] * (prod(grid) // merge**2)
+                token_ids += [0] * padding
+                result = self.encode_text(
+                    tuple(token_ids), visual=visual, image_grids=grids
+                )
+                features = stage(result.values[0])
+                del result
+
+        text = capability(self.model, TextEncoder)
+        if "conditioning" in kinds and text is not None:
+            if features is None:
+                calls = self._module_calls.items()
+                name = next(
+                    name
+                    for (name, _, method), (_, call) in calls
+                    if method == "encode"
+                    and self._encoder_kind(call.module) == "conditioning"
+                )
+                layout = text.output_layout(
+                    capacity, getattr(torch, self.worker_config.model_dtype)
+                )["conditioning"]
+                features = stage(
+                    torch.zeros(
+                        layout.shape,
+                        dtype=layout.dtype,
+                        device=self.bindings[name].device,
+                    )
+                )
+            self.encode_conditioning(features)
 
     @torch.inference_mode()
     def run_module(
@@ -1854,8 +1995,11 @@ class ModelExecutor:
         entry = self._forward_calls.get((call.component, call.kind))
         return source, source if entry is None else entry.device, source
 
-    def warmup(self, storage):
-        """Run media warmup passes, then drain every owned stream."""
+    def warmup(self, storage, products: BufferPool):
+        """Run media warmup passes, then drain every owned stream.
+
+        ``products`` is the rank's product pool, idle until serving.
+        """
         if self.media_builder is not None:
             from uniserve_worker.execution.media import (
                 prepare_denoising,
@@ -1868,6 +2012,9 @@ class ModelExecutor:
             warmup_decoders(self)
             warmup_postprocess(self, storage)
         self.capture_tiles()
+        # Last: a reference request's peaks must fit next to everything the
+        # steps above leave resident.
+        self.replay_reference_request(products)
         self.synchronize()
 
     def capture_tiles(self):

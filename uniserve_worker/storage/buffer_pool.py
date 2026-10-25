@@ -209,6 +209,46 @@ class BufferPool:
                 raise _invariant("stale persistent buffer binding")
             self._active.pop(key)
 
+    def idle_view(
+        self,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+        shape: tuple[int, ...],
+        offset: int = 0,
+    ) -> torch.Tensor:
+        """Return a ``dtype`` view at ``offset`` of an idle device arena.
+
+        A startup probe stages products in the storage a request's products
+        occupy while serving, so the probe charges the device what a request
+        does. No binding may be live on the device; the pool does not track
+        the view, and the caller drops it before the pool binds a buffer.
+
+        Raises:
+            WorkerError: A fatal ``INVARIANT_VIOLATION`` when the device has
+                no arena, a binding is live on it, the offset is not aligned
+                for ``dtype``, or the view exceeds the arena.
+        """
+        name = str(canonical_device(device))
+        element_bytes = int(torch.empty((), dtype=dtype).element_size())
+        required = int(math.prod(shape)) * element_bytes
+        with self._lock:
+            arena = self._arenas.get(name)
+            if (
+                arena is None
+                or offset < 0
+                or offset % element_bytes
+                or offset + required > self.byte_capacity
+                or any(
+                    active.device_name == name
+                    for active in self._active.values()
+                )
+            ):
+                raise _invariant(
+                    "an idle view requires an idle device arena that holds it"
+                )
+            return arena.narrow(0, offset, required).view(dtype).reshape(shape)
+
     def close(self) -> None:
         """Drop every binding and arena reference.
 
