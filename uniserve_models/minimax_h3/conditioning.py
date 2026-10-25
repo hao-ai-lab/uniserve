@@ -11,11 +11,13 @@ attention, so they never reach the prompt's rows.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import cast
 
 import torch
 from torch import nn
 
+from uniserve.distributed.chunks import payload_rows
 from uniserve.loading import weights
 from uniserve.model import TextConditioner
 from uniserve.nn import (
@@ -36,6 +38,49 @@ from uniserve.nn.attention import (
 from uniserve.nn.functional import Rounding
 
 from .config import TransformerConfig
+
+
+def _feed_forward_rows(hidden_size: int, itemsize: int) -> int:
+    """Rows of one refiner range.
+
+    The feed-forward is row-local, so a block runs it over successive row
+    ranges and its intermediates (the gate and up projections and their
+    gated product, each ``intermediate_size`` wide) stay the size of one
+    range; the attention's projections and its query rows take the same
+    ranges. The 84,529-token prompt of nine 2048x3648 reference images, a
+    15 s reference video and a 10,000-character prompt holds about 13.5 GiB
+    of whole-prompt intermediates in BF16, against about 1 GiB per 6144-row
+    range; on eight RTX PRO 6000 those whole-prompt intermediates ran a
+    resident Ulysses8 deployment out of memory between 54,577 prompt tokens
+    (served) and 58,609 (failed). A range is one payload of the hidden width,
+    as for the denoiser's feed-forward ranges; ranges this long keep the
+    projections compute-bound.
+    """
+    return payload_rows(hidden_size, itemsize)
+
+
+def _query_rows(visible: VisibleInput, rows: int) -> VisibleInput:
+    """``visible`` for ``rows`` query rows of each document, all its keys.
+
+    Every query row of a document shares its key endpoint, so a range of the
+    document's query rows sees what those rows saw among all of them.
+    """
+    documents = visible.queries.batch_size
+    device = visible.queries.values.device
+    return replace(
+        visible,
+        queries=SequenceLengths(
+            torch.full((documents,), rows, dtype=torch.int32, device=device),
+            torch.arange(
+                0,
+                (documents + 1) * rows,
+                rows,
+                dtype=torch.int32,
+                device=device,
+            ),
+            (rows,) * documents,
+        ),
+    )
 
 
 class RefinerBlock(nn.Module):
@@ -84,31 +129,66 @@ class RefinerBlock(nn.Module):
         # ``visible`` bounds the keys of padded documents, packed one after
         # another; without it every row of a document is text.
         batch, tokens, _ = hidden.shape
-        projections = self.qkv(self.norms[0](hidden))
-        q, k, v = (
-            projections[name].reshape(batch, tokens, -1, self.head_dim)
-            for name in ("q", "k", "v")
-        )
-        q, k = self.norms[2](q), self.norms[3](k)
+        rows = hidden.view(-1, hidden.shape[-1])
+        step = _feed_forward_rows(rows.shape[-1], rows.element_size())
 
-        if visible is None:
-            attended = self.attention(
-                q.transpose(1, 2),  # [batch, heads, tokens, head_dim]
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                AttentionBatch.single(DenseInput(causal=False, mask=None)),
-            ).transpose(1, 2)
-        else:
-            # Packed [batch * tokens, heads, head_dim] rows, each document's
-            # queries seeing only its text keys.
-            attended = self.attention(
-                q.flatten(0, 1),
-                k.flatten(0, 1),
-                v.flatten(0, 1),
-                AttentionBatch.single(visible),
+        # Every row's normalized queries, keys and values, projected over row
+        # ranges so that one range's fused projection is live at a time.
+        qkv: list[torch.Tensor] = []
+        for start in range(0, len(rows), step):
+            projections = self.qkv(self.norms[0](rows[start : start + step]))
+            parts = [
+                projections[name].unflatten(-1, (-1, self.head_dim))
+                for name in ("q", "k", "v")
+            ]
+            parts[0], parts[1] = (
+                self.norms[2](parts[0]),
+                self.norms[3](parts[1]),
             )
-        hidden = hidden + self.output(attended.reshape(batch, tokens, -1))
-        return hidden + self.mlp(self.norms[1](hidden))
+            if not qkv:
+                qkv = [
+                    part.new_empty((len(rows), *part.shape[1:]))
+                    for part in parts
+                ]
+            for whole, part in zip(qkv, parts, strict=True):
+                whole[start : start + len(part)] = part
+        q, k, v = (whole.unflatten(0, (batch, tokens)) for whole in qkv)
+
+        # Each range of query rows attends to all of its document's keys. No
+        # query row reads another, so the ranges leave every row's output
+        # unchanged, and the residual stream takes them in place: every key
+        # and value above was read from it first.
+        ranges = {}
+        for start in range(0, tokens, step):
+            count = min(step, tokens - start)
+            if visible is None:
+                attended = self.attention(
+                    # [batch, heads, rows, head_dim]
+                    q[:, start : start + count].transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    AttentionBatch.single(DenseInput(causal=False, mask=None)),
+                ).transpose(1, 2)
+            else:
+                # Packed [batch * rows, heads, head_dim] rows, each document's
+                # queries seeing only its text keys.
+                if count not in ranges:
+                    ranges[count] = _query_rows(visible, count)
+                attended = self.attention(
+                    q[:, start : start + count].flatten(0, 1),
+                    k.flatten(0, 1),
+                    v.flatten(0, 1),
+                    AttentionBatch.single(ranges[count]),
+                )
+            hidden[:, start : start + count] += self.output(
+                attended.reshape(batch, count, -1)
+            )
+        del q, k, v, qkv
+
+        for start in range(0, len(rows), step):
+            part = rows[start : start + step]
+            part += self.mlp(self.norms[1](part))
+        return hidden
 
 
 class TokenRefiner(nn.Module):
