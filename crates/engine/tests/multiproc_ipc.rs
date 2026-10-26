@@ -1405,6 +1405,102 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
 }
 
 #[test]
+fn an_execution_error_a_submission_drains_stays_with_its_batch() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // The `rank_error` fixture answers batch 1 with a non-fatal execution
+    // error on every rank and serves later batches. Batch 2 is submitted only
+    // once both ranks have answered, so the submission, not a poll, drains
+    // the error. The group must reconcile it with batch 1 and keep its ranks,
+    // as when a poll drains it, and serve batch 2.
+    let directory = tempfile::tempdir()?;
+    let wrapper = directory.path().join("worker");
+    let answered = directory.path().join("answered");
+    let python = serde_json::to_string(&worker_python())?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = serde_json::to_string(&root.join("tests/python/fixtures/rank_error.py"))?;
+    let import_root = serde_json::to_string(&root.canonicalize()?)?;
+    let marker = serde_json::to_string(&answered)?;
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env python3\nimport os, sys\npaths = [{import_root}, os.environ.get('PYTHONPATH', '')]\nenv = dict(os.environ, PYTHONPATH=os.pathsep.join(path for path in paths if path), UNISERVE_TEST_ANSWERED={marker})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    let mut args = rank_group_args();
+    args.python = wrapper;
+    let mut worker = WorkerGroup::spawn(args)?;
+
+    let failing = text_admission(91, 1, 1)?;
+    let failing_key = failing.request_key;
+    worker.submit_placed(token_batch(
+        1,
+        1,
+        failing_key,
+        Some(failing),
+        CallId::new(1, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[7],
+        UnitId(1),
+        0,
+    ))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while (0..WORLD_SIZE).any(|rank| !Path::new(&format!("{}-{rank}", answered.display())).exists())
+    {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the ranks did not answer batch 1"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let served = text_admission(92, 1, 2)?;
+    let served_key = served.request_key;
+    worker.submit_placed(token_batch(
+        2,
+        2,
+        served_key,
+        Some(served),
+        CallId::new(2, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[9],
+        UnitId(2),
+        0,
+    ))?;
+
+    let mut failed = false;
+    let mut completed = false;
+    while std::time::Instant::now() < deadline && !(failed && completed) {
+        match worker.poll_batch(Duration::from_millis(100)) {
+            Err(error) => {
+                let failure = error.downcast::<WorkerFailure>()?;
+                assert!(!failed, "batch 1 must fail once");
+                assert!(
+                    failure.endpoints.is_empty(),
+                    "the rank group was replaced: {}",
+                    failure.message
+                );
+                assert_eq!(failure.requests, vec![failing_key]);
+                failed = true;
+            }
+            Ok(Some(report)) => {
+                for result in report.results {
+                    assert_eq!(result.output.call_id, CallId::new(2, 0));
+                    assert_eq!(result.output.status, CallStatus::Ok);
+                    assert_eq!(result.output.committed_tokens, vec![1000]);
+                    completed = true;
+                }
+            }
+            Ok(None) => {}
+        }
+    }
+    assert!(failed && completed);
+    worker.close()?;
+    Ok(())
+}
+
+#[test]
 fn multiprocess_topology_handles_rank_failure_and_capacity_limits() -> anyhow::Result<()> {
     check_rank_ipc()?;
     qualify_slow_transfer()?;
