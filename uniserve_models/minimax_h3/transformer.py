@@ -447,13 +447,24 @@ class Transformer(nn.Module):
         chunks = ((inputs.token_slice, hidden),)
         # [resident layer, group, 18 * hidden] products of this step.
         modulation = self.adaln_cache(step)
+        # Composed layers overlap one layer's exchanges with the next layer's
+        # projections, so two layers' attention projections are live at once.
+        # A single-device evaluation has no exchange to overlap: each layer's
+        # output is drained into one shard before the next layer projects,
+        # and one layer's projections are live at a time.
+        drain = all(size == 1 for size in self.mesh.shape)
         for index, layer in enumerate(self.layers.values()):
             layer = cast(TransformerLayer, layer)
-            # The loop only composes generators; the layers run when
-            # ``chunks`` is consumed below.
+            # Otherwise the loop only composes generators; the layers run
+            # when ``chunks`` is consumed below.
             chunks = layer.forward_chunks(
                 chunks, modulation[index], inputs, tables=tables
             )
+            if drain:
+                outputs = [value for _, value in chunks]
+                hidden = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+                del outputs
+                chunks = ((inputs.token_slice, hidden),)
 
         outputs = tuple(value for _, value in chunks)
         hidden = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
