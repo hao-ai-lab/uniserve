@@ -86,3 +86,11 @@ Eight RTX PRO 6000 Blackwell Server Edition GPUs on one PCIe host, `FastVideo/Fa
 | `ulysses4x2.json` | 4 | 0.0415 | 89.9 / 149.6 s | 74,408 MiB | `rtx-pro-6000-8-nvfp4-throughput-c4` |
 | `dp8-text-tp8.json` | 8 | 0.0426 | 127.9 / 318.5 s | 97,156 MiB | `rtx-pro-6000-8-nvfp4-dp8-throughput-c8` |
 | `dp8-text-tp8-host-weights.json`, BF16 checkpoint | 8 | 0.0346 | 167.2 / 366.5 s | 79,692 MiB | `rtx-pro-6000-8-bf16-dp8-throughput-c8` |
+
+Steady state, issue #5's whole-node metric. Closed-loop clients, two per replica, cycle the 5 s workload `fasth3-throughput-5s.jsonl` (six 1K- and six 10K-token prompts). Throughput counts the accepted videos that complete inside a 30-minute window opened 10 minutes after the load starts. Run `uniserve-eval --config uniserve_eval/fasth3.toml run rtx-pro-6000-8-nvfp4-steady`. The TP2x4 and DP7 rows were measured with the same clients and window outside `uniserve-eval`; measured that way, the DP8 point gave 352 videos per node-hour (176 in the window), p50 165.4 s and p95 200.9 s.
+
+| Deployment | Clients | Accepted videos / node-hour | Latency p50 / p95 | Peak device memory | Point |
+| --- | --- | --- | --- | --- | --- |
+| `dp8-text-tp8.json` | 16 | 348 (174 in the window) | 160.9 / 201.1 s | 96,114 MiB; the warmup also sends 10 and 15 s requests | `rtx-pro-6000-8-nvfp4-dp8-steady-5s` |
+| `dp8-text-tp2x4.json` | 16 | 392 (196) | 147.0 / 180.6 s | 97,292 MiB | `rtx-pro-6000-8-nvfp4-dp8-tp2x4-steady-5s` |
+| `dp7-text-tp1.json` | 14 | 318 (159) | 152.2 / 225.9 s | 68,421 MiB, 61,109 MiB on the text GPU | `rtx-pro-6000-8-nvfp4-dp7-steady-5s` |
