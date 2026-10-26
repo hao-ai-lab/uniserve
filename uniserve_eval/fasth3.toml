@@ -871,6 +871,180 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
+# Four TP2 text encoders on GPU pairs hold 31 GiB of weights on every GPU,
+# which leaves a replica too little for a 15-second sequence, so this
+# deployment serves 5-second videos only.
+[servers.rtx-pro-6000-8-nvfp4-dp8-tp2x4]
+host = "127.0.0.1"
+port = 18083
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FASTH3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/dp8-text-tp2x4.json", "--max-running-requests", "8", "--max-model-len", "10240", "--max-video-seconds", "5", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024", "--video-aspect-ratios", "16:9"]
+
+# Seven one-GPU replicas, the text encoder alone on the eighth GPU.
+[servers.rtx-pro-6000-8-nvfp4-dp7]
+host = "127.0.0.1"
+port = 18083
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FASTH3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/dp7-text-tp1.json", "--max-running-requests", "7", "--max-model-len", "10240", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024", "--video-aspect-ratios", "16:9"]
+
+# Whole-node steady state (issue #5): closed-loop clients, two per replica,
+# cycle the rows in order, and throughput counts the videos that complete
+# inside a 30-minute window opened 10 minutes after the load starts. The
+# 5-second points cycle the workload's twelve 5 s rows (six 1K- and six
+# 10K-token prompts); the mixed points cycle all 32 rows (5, 10 and 15 s).
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-steady-5s]
+server = "rtx-pro-6000-8-nvfp4-dp8"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput-5s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-steady-5s.load]
+num_prompts = 12
+request_rate = inf
+max_concurrency = 16
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+window_s = 1800
+settle_s = 600
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-steady-5s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-steady-mixed]
+server = "rtx-pro-6000-8-nvfp4-dp8"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-steady-mixed.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 16
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+window_s = 1800
+settle_s = 600
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-steady-mixed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-tp4x2-steady-5s]
+server = "rtx-pro-6000-8-nvfp4-dp8-tp4x2"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput-5s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-tp4x2-steady-5s.load]
+num_prompts = 12
+request_rate = inf
+max_concurrency = 16
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+window_s = 1800
+settle_s = 600
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-tp4x2-steady-5s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-tp4x2-steady-mixed]
+server = "rtx-pro-6000-8-nvfp4-dp8-tp4x2"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-tp4x2-steady-mixed.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 16
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+window_s = 1800
+settle_s = 600
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-tp4x2-steady-mixed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-tp2x4-steady-5s]
+server = "rtx-pro-6000-8-nvfp4-dp8-tp2x4"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput-5s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-tp2x4-steady-5s.load]
+num_prompts = 12
+request_rate = inf
+max_concurrency = 16
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+window_s = 1800
+settle_s = 600
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp8-tp2x4-steady-5s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp7-steady-5s]
+server = "rtx-pro-6000-8-nvfp4-dp7"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput-5s.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp7-steady-5s.load]
+num_prompts = 12
+request_rate = inf
+max_concurrency = 14
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+window_s = 1800
+settle_s = 600
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp7-steady-5s.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp7-steady-mixed]
+server = "rtx-pro-6000-8-nvfp4-dp7"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp7-steady-mixed.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 14
+request_timeout_s = 21600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+window_s = 1800
+settle_s = 600
+
+[benchmarks.rtx-pro-6000-8-nvfp4-dp7-steady-mixed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
 # The BF16 checkpoint's 50 transformer layers hold 0.79 GiB of projection
 # weights each, which would leave a replica too little device memory for a
 # 15-second step beside the text encoder's shard. Each replica keeps them in
@@ -1002,6 +1176,9 @@ points = ["rtx-pro-6000-8-nvfp4-dp8-throughput-c8", "rtx-pro-6000-8-nvfp4-dp8-th
 
 [suites.rtx-pro-6000-8-nvfp4-dp8-tp4x2]
 points = ["rtx-pro-6000-8-nvfp4-dp8-tp4x2-throughput-c8"]
+
+[suites.rtx-pro-6000-8-nvfp4-steady]
+points = ["rtx-pro-6000-8-nvfp4-dp8-steady-5s", "rtx-pro-6000-8-nvfp4-dp8-steady-mixed", "rtx-pro-6000-8-nvfp4-dp8-tp4x2-steady-5s", "rtx-pro-6000-8-nvfp4-dp8-tp4x2-steady-mixed", "rtx-pro-6000-8-nvfp4-dp8-tp2x4-steady-5s", "rtx-pro-6000-8-nvfp4-dp7-steady-5s", "rtx-pro-6000-8-nvfp4-dp7-steady-mixed"]
 [servers.h200-4-bf16]
 host = "127.0.0.1"
 port = 18083

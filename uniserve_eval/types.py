@@ -63,6 +63,15 @@ class LoadConfig:
             requests, in file order, in place of the repeated first row.
         seed: Seeds arrival intervals and the generation seed of rows that
             carry none.
+        window_s: Length in seconds of a steady-state measured window, or
+            ``None`` for a load that sends each row once. With a window,
+            ``max_concurrency`` closed-loop clients resubmit the rows in
+            order, cycling through them, so that many requests stay in flight
+            until the window closes; the measured requests are those that
+            complete inside it, and throughput divides by its length.
+        settle_s: Seconds the steady-state load runs before its window opens,
+            so that queues and replicas are full when measurement starts.
+            Requests completing earlier, or after the window, are excluded.
     """
 
     num_prompts: int = 1000
@@ -73,6 +82,8 @@ class LoadConfig:
     warmup_manifest: str | None = None
     priming_manifest: str | None = None
     request_timeout_s: float = 6 * 60 * 60
+    window_s: float | None = None
+    settle_s: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate load parameters that govern request scheduling."""
@@ -89,6 +100,20 @@ class LoadConfig:
             or self.request_timeout_s <= 0
         ):
             raise ValueError("request_timeout_s must be finite and positive")
+        if not math.isfinite(self.settle_s) or self.settle_s < 0:
+            raise ValueError("settle_s must be finite and non-negative")
+        if self.window_s is None:
+            if self.settle_s:
+                raise ValueError("settle_s requires a steady-state window_s")
+            return
+        if not math.isfinite(self.window_s) or self.window_s <= 0:
+            raise ValueError("window_s must be finite and positive")
+        # A steady-state load is closed-loop: its in-flight limit is the
+        # offered load, and arrivals follow completions rather than a rate.
+        if self.max_concurrency is None:
+            raise ValueError("window_s requires max_concurrency")
+        if self.request_rate != float("inf"):
+            raise ValueError("window_s requires an infinite request_rate")
 
 
 # Video tasks the video benchmark builds requests for. A t2va request carries

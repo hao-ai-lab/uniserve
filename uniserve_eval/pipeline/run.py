@@ -106,6 +106,8 @@ async def run_point(
     selection: dict[str, Any] | None = None
     warmup_records: list[RequestRecord] = []
     priming_records: list[RequestRecord] = []
+    # A steady-state load's requests that completed outside its window.
+    excluded_records: list[RequestRecord] = []
     records: list[RequestRecord] = []
     sampler: GpuStorageSampler | None = None
     duration = 0.0
@@ -264,6 +266,8 @@ async def run_point(
                     warmup_rows=[] if priming_rows else warmup_rows,
                     inspect_warmup=inspect,
                     before_measure=snapshot_metrics,
+                    window_s=point.load.window_s,
+                    settle_s=point.load.settle_s,
                 )
             finally:
                 sampler.stop()
@@ -274,6 +278,7 @@ async def run_point(
             # `submit` collected.
             if not priming_rows:
                 warmup_records = list(load_result.warmup_outputs)
+            excluded_records = list(load_result.excluded_outputs)
             records = cast(list[RequestRecord], list(load_result.outputs))
             duration = load_result.duration_s
             inspect(records)
@@ -313,7 +318,12 @@ async def run_point(
             * 1024,
             "retained_body_bytes": sum(
                 len(record.video_body or b"")
-                for record in [*warmup_records, *priming_records, *records]
+                for record in [
+                    *warmup_records,
+                    *priming_records,
+                    *excluded_records,
+                    *records,
+                ]
             ),
         }
 
@@ -335,6 +345,8 @@ async def run_point(
         # artifact so it acts as the bundle's commit marker.
         _write_records(writer, "warmup_requests.jsonl", warmup_records)
         _write_records(writer, "priming_requests.jsonl", priming_records)
+        if excluded_records:
+            _write_records(writer, "excluded_requests.jsonl", excluded_records)
         _write_records(writer, "requests.jsonl", records, point.video.media_dir)
         writer.write_jsonl("gpu_samples.jsonl", list(sampler.sample_records))
         writer.write_json(
