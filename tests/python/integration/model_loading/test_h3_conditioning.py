@@ -17,6 +17,7 @@ from safetensors.torch import save_file
 from tests.python.fixtures.h3 import transformer_config
 from uniserve import loading
 from uniserve.loading import checkpoint, weights
+from uniserve_models.minimax_h3 import conditioning
 from uniserve_models.minimax_h3.conditioning import Conditioner, assignments
 from uniserve_models.minimax_h3.modulation import TimestepEmbedding
 
@@ -40,7 +41,16 @@ def _config():
 
 
 @pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
-def test_conditioning_loader_preserves_variable_documents(tmp_path, dtype):
+# None keeps one feed-forward range per block; 4 rows split every document
+# and the padded batch into ranges with a partial last range.
+@pytest.mark.parametrize("range_rows", (None, 4))
+def test_conditioning_loader_preserves_variable_documents(
+    tmp_path, monkeypatch, dtype, range_rows
+):
+    if range_rows is not None:
+        monkeypatch.setattr(
+            conditioning, "_feed_forward_rows", lambda *_: range_rows
+        )
     config = _config()
     torch.manual_seed(108)
     projection = (

@@ -188,11 +188,14 @@ class Encoder(MultimodalEncoder):
             spatial_merge_size=self.vision.downsample,
         )
 
-    def _vision_inputs(self, rows: torch.Tensor) -> Mapping[str, torch.Tensor]:
+    def _vision_inputs(
+        self, rows: torch.Tensor, index: torch.Tensor
+    ) -> Mapping[str, torch.Tensor]:
         """Return the DeepStack features following each row's embedding.
 
-        ``rows`` are packed ``[tokens, (1 + depth) * hidden]`` vision rows;
-        the network receives their ``[tokens, depth, hidden]`` tail.
+        ``rows`` are ``[vision tokens, (1 + depth) * hidden]`` vision rows at
+        the packed token positions ``index``; the network receives their
+        ``[vision tokens, depth, hidden]`` tail, a view, with the positions.
         """
         hidden = self.network.hidden_size
         if rows.shape[-1] != (1 + self.deepstack_depth) * hidden:
@@ -205,5 +208,6 @@ class Encoder(MultimodalEncoder):
         return {
             "deepstack": rows[:, hidden:].unflatten(
                 -1, (self.deepstack_depth, hidden)
-            )
+            ),
+            "deepstack_index": index,
         }

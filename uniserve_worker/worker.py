@@ -892,7 +892,9 @@ class Worker:
                     target,
                     resident.get(target, 0) + max(0, available - pending),
                 )
-            self.runner.warmup(self.requests.storage.tensor_slots)
+            self.runner.warmup(
+                self.requests.storage.tensor_slots, self.buffer_pool
+            )
             self.runner.capture(
                 tokenizer=self.tokenizer, latents=self.latent_pool
             )

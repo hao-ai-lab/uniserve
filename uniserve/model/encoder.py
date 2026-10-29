@@ -13,7 +13,7 @@ from uniserve.media import image
 from uniserve.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
 from uniserve.tensors import OutputLayout
 
-from .inputs import EmbeddingReplacement, VisionInput
+from .inputs import VisionInput
 from .transformer import TransformerDecoder
 
 InputT = TypeVar("InputT")
@@ -677,11 +677,15 @@ class MultimodalEncoder(TextEncoder, ABC):
         if self.network._pipeline.rank == 0:
             embeddings = self.network.embed_input_ids(packed)
             if rows is not None:
-                values, mask = rows
-                embeddings = EmbeddingReplacement(
-                    values[:, : self.network.hidden_size], mask
-                ).apply(embeddings)
-        inputs = {} if rows is None else self._vision_inputs(rows[0])
+                values, index = rows
+                # The fresh token embeddings take each vision token's leading
+                # values in place, so no prompt-sized copy of the rows forms.
+                embeddings.index_copy_(
+                    0,
+                    index,
+                    values[:, : self.network.hidden_size].to(embeddings.dtype),
+                )
+        inputs = {} if rows is None else self._vision_inputs(*rows)
         return self._decode(embeddings, packed_positions, counts, **inputs)
 
     def _vision_rows(
@@ -689,12 +693,15 @@ class MultimodalEncoder(TextEncoder, ABC):
         tokens: tuple[torch.Tensor, ...],
         visual: tuple[torch.Tensor | None, ...],
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Place the prompts' vision rows at their packed placeholder tokens.
+        """Return the prompts' vision rows and their placeholders' positions.
 
-        Returns dense packed ``[tokens, width]`` rows, zero at text tokens,
-        and the ``[tokens]`` placeholder mask, or None when no prompt holds
-        vision tokens. One host read checks every prompt's placeholder count
-        against its rows.
+        The rows are every prompt's ``[placeholders, width]`` rows in prompt
+        order, and the positions the ``[placeholders]`` increasing packed
+        token indices they stand at; None when no prompt holds vision tokens.
+        One prompt's rows are returned as given, without a copy: a reference
+        prompt's rows are the size of its vision tokens times the vision
+        width, several GiB at the largest prompts. One host read checks every
+        prompt's placeholder count against its rows.
         """
         if len(visual) != len(tokens):
             raise ValueError("vision rows must align with the prompts")
@@ -718,18 +725,19 @@ class MultimodalEncoder(TextEncoder, ABC):
                     "vision rows must cover their prompt's placeholders with "
                     "one width"
                 )
-        mask = torch.cat(masks)
-        values = provided[0].new_zeros((mask.numel(), width))
-        values[mask] = torch.cat(provided)
-        return values, mask
+        rows = provided[0] if len(provided) == 1 else torch.cat(provided)
+        return rows, torch.cat(masks).nonzero().squeeze(1)
 
-    def _vision_inputs(self, rows: torch.Tensor) -> Mapping[str, torch.Tensor]:
+    def _vision_inputs(
+        self, rows: torch.Tensor, index: torch.Tensor
+    ) -> Mapping[str, torch.Tensor]:
         """Return the network inputs the values of vision rows past their
         embedding carry.
 
-        ``rows`` holds packed ``[tokens, width]`` vision rows, zero at text
-        tokens. Here a row holds only its token's embedding; an architecture
-        whose vision rows carry further values overrides this.
+        ``rows`` holds the ``[vision tokens, width]`` rows ``_vision_rows``
+        returns and ``index`` their packed token positions. Here a row holds
+        only its token's embedding; an architecture whose vision rows carry
+        further values overrides this.
         """  # noqa: D205
         if rows.shape[-1] != self.network.hidden_size:
             raise ValueError("vision rows must hold one language embedding")

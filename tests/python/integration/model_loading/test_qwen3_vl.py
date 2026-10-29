@@ -214,8 +214,17 @@ def _close(actual, expected):
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+# The image's one 24-patch time step and the video's two 16-patch steps run
+# in one pass, in passes of 16 rows (each step its own pass, the image's
+# larger than the budget), or in passes of 40 rows (the image with the video's
+# first step, then its second).
+@pytest.mark.parametrize("group_patches", (None, 16, 40))
 @torch.no_grad()
-def test_vision_tokens_carry_embeddings_and_deepstack_features(models):
+def test_vision_tokens_carry_embeddings_and_deepstack_features(
+    models, monkeypatch, group_patches
+):
+    if group_patches is not None:
+        monkeypatch.setattr(qwen3_vl.vision, "_GROUP_PATCHES", group_patches)
     reference, model = models
     media = _media()
     rows = model.vision.encode(
