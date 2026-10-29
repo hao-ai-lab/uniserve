@@ -339,6 +339,10 @@ class DiffusionRunner(ModelRunner):
         ):
             backing = TensorBuffers.allocate(requirements, device=device)
             rows = torch.empty((2, pages), dtype=torch.int64, device=device)
+        # The storage comes from the caller's stream; preparation on the
+        # runner's stream follows the work queued there on its last use.
+        if context.stream is not None:
+            context.stream.wait(torch.cuda.current_stream(device))
         try:
             constants = backing.view(requirements)
             workspace = self._workspace.view(
