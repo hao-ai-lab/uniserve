@@ -18,6 +18,8 @@ import traceback
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+import torch
+
 from uniserve_worker.errors import (
     ErrorCode,
     WorkerError,
@@ -266,6 +268,14 @@ def execute_batch(
             ),
             request_pool=request_pool,
         )
+    else:
+        if model_executor.release_cache:
+            # The caching allocator synchronizes only a segment's own stream
+            # before it unmaps the segment, so the device is synchronized
+            # first: a kernel on another stream may still read a block the
+            # batch freed.
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
 
 def _classify_failure(

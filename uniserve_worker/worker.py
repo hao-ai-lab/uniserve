@@ -39,7 +39,11 @@ from uniserve.nn import Linear
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizedTensor
 from uniserve.runtime import EventPool, KVCache
-from uniserve.runtime.device import canonical_device, device_storage_budget
+from uniserve.runtime.device import (
+    canonical_device,
+    device_shared,
+    device_storage_budget,
+)
 from uniserve.runtime.process_groups import (
     ProcessGroups,
     initialize_process_groups,
@@ -905,6 +909,23 @@ class Worker:
             self.worker_config,
             self._layout.arena.device_product_bytes,
             self.tensor_store,
+        )
+        # A rank that runs no denoiser on a device another process shares,
+        # such as a shared text encoder's rank beside a data-parallel
+        # replica, returns its free cached blocks after each batch. Its calls
+        # differ in shape from request to request, so the blocks a large one
+        # leaves cached would otherwise stay mapped, and the replica on the
+        # same device cannot reclaim them when it needs the memory.
+        self.runner.release_cache = not self.runner.denoises and any(
+            device_shared(device)
+            for device in dict.fromkeys(
+                (
+                    self.worker_config.device,
+                    self.worker_config.generation_device
+                    or self.worker_config.device,
+                )
+            )
+            if canonical_device(device).type == "cuda"
         )
         self._warmed_up = True
 

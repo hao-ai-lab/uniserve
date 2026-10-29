@@ -12,6 +12,7 @@ import torch
 __all__ = [
     "async_tensor_h2d",
     "canonical_device",
+    "device_shared",
     "fill_cpu_bools",
     "fill_cpu_ints",
     "process_device_bytes",
@@ -44,16 +45,10 @@ def process_device_bytes(device: torch.device | str) -> int:
     torch.cuda.synchronize(target)
     torch.cuda.empty_cache()
 
-    # NVML enumerates physical devices, while CUDA ordinals follow
-    # CUDA_VISIBLE_DEVICES, so the device is matched by its UUID.
-    identity = uuid.UUID(str(torch.cuda.get_device_properties(target).uuid))
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{identity}")
-
     pid = os.getpid()
     usage = [
         process.usedGpuMemory
-        for process in pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        for process in _device_processes(target)
         if process.pid == pid
     ]
     if not usage or any(used is None for used in usage):
@@ -64,6 +59,33 @@ def process_device_bytes(device: torch.device | str) -> int:
             "NVML reports"
         )
     return sum(usage)
+
+
+def device_shared(device: torch.device | str) -> bool:
+    """Return whether another process holds storage on one CUDA device.
+
+    The processes are NVML's compute processes on the device. Worker groups
+    placed on one device, such as a data-parallel replica beside a rank of
+    a shared encoder, see each other here.
+
+    Raises:
+        ValueError: ``device`` is not a CUDA device.
+    """
+    target = canonical_device(device)
+    if target.type != "cuda":
+        raise ValueError("device sharing requires a CUDA device")
+    pid = os.getpid()
+    return any(process.pid != pid for process in _device_processes(target))
+
+
+def _device_processes(target: torch.device) -> list:
+    """Return NVML's compute processes on one CUDA device."""
+    # NVML enumerates physical devices, while CUDA ordinals follow
+    # CUDA_VISIBLE_DEVICES, so the device is matched by its UUID.
+    identity = uuid.UUID(str(torch.cuda.get_device_properties(target).uuid))
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{identity}")
+    return list(pynvml.nvmlDeviceGetComputeRunningProcesses(handle))
 
 
 def device_storage_budget(

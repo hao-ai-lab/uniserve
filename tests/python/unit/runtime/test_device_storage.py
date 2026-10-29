@@ -9,7 +9,7 @@ from tests.python.fixtures.device_storage import (
     DeviceStorage,
     install_device_storage,
 )
-from uniserve.runtime.device import device_storage_budget
+from uniserve.runtime.device import device_shared, device_storage_budget
 
 pytestmark = pytest.mark.unit
 
@@ -42,6 +42,22 @@ def test_device_budget_never_exceeds_physical_free_storage(
 
     assert grant == 10_000
     assert free == 10_000
+
+
+def test_a_device_is_shared_only_with_another_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = DeviceStorage(total=100_000, free=10_000)
+    storage.held = 5_000
+    install_device_storage(monkeypatch, storage)
+
+    assert not device_shared("cuda:0")
+
+    # Another worker group's rank, such as a replica beside a shared
+    # encoder's rank, holds storage on the same device.
+    storage.processes[os.getpid() + 1] = 85_000
+
+    assert device_shared("cuda:0")
 
 
 @pytest.mark.parametrize("reported", [{}, {os.getpid(): None}])

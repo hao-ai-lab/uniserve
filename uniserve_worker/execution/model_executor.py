@@ -229,6 +229,9 @@ class ModelExecutor:
         attention_ranks=0,
     ):
         self.model, self.worker_config = model, worker_config
+        # Whether each batch returns the caching allocator's free blocks to
+        # the device once it commits (set at startup; see Worker.warmup).
+        self.release_cache = False
         self.expert_group, self.attention_ranks = expert_group, attention_ranks
         self._event_slots = max_inflight + 1
         self.attention = attention_backend(
