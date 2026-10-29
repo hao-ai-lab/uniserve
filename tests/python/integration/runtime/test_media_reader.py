@@ -24,6 +24,11 @@ its planned raster and compared with Pillow's own LANCZOS resize of the
 decoded file, byte for byte, since the reader runs that resize as bands on
 several threads.
 
+A reference video decoded on a GPU's NVDEC is compared with the CPU decode
+of the same file, byte for byte; that case needs a CUDA device and an FFmpeg
+with the ``cuda`` hardware accelerator (``UNISERVE_FFMPEG``, or ``ffmpeg``
+on ``PATH``).
+
 The cases need the reference artifacts (``UNISERVE_MINIMAX_H3_REFERENCE``,
 holding ``inputs/media`` and ``reference/diffusers``); the recorded runs'
 cases also need the FFmpeg build the reference decoded with
@@ -35,7 +40,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -52,8 +59,12 @@ from tests.python.fixtures.h3_conditions import (
 )
 from uniserve.media import image
 from uniserve_models.minimax_h3.packing import FPS
-from uniserve_worker.media.reader import read_image
-from uniserve_worker.protocol.video import ImageFit
+from uniserve_worker.media.reader import (
+    read_image,
+    read_video,
+    require_hwaccel,
+)
+from uniserve_worker.protocol.video import ImageFit, VideoClip
 
 pytestmark = [
     pytest.mark.integration,
@@ -202,3 +213,62 @@ def test_image_references_resize_as_pillow(name, enlarge, root):
     )
     pixels = read_image(data, fit)
     np.testing.assert_array_equal(pixels[0], np.asarray(expected))
+
+
+def _cuda_ffmpeg() -> str | None:
+    """An FFmpeg that decodes on NVDEC here, or None."""
+    value = os.environ.get("UNISERVE_FFMPEG") or shutil.which("ffmpeg")
+    if value is None or not torch.cuda.is_available():
+        return None
+    listed = subprocess.run(
+        [value, "-hide_banner", "-hwaccels"], capture_output=True, text=True
+    ).stdout.split()
+    return value if "cuda" in listed else None
+
+
+@pytest.mark.skipif(_cuda_ffmpeg() is None, reason="NVDEC is unavailable")
+def test_nvdec_reads_a_reference_video_as_the_cpu_does(tmp_path):
+    import av
+
+    # A 30 fps H.264 clip of moving gradients, resampled to the model's
+    # 24 fps, trimmed and scaled onto a smaller canvas of another aspect.
+    height, width, frames = 720, 1280, 60
+    path = tmp_path / "reference.mp4"
+    rows = np.arange(height)[:, None]
+    columns = np.arange(width)[None, :]
+    with av.open(str(path), mode="w") as container:
+        stream = container.add_stream("libx264", rate=30)
+        stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+        for index in range(frames):
+            pixels = np.stack(
+                (
+                    (rows + 4 * index) % 256 + 0 * columns,
+                    (columns + 7 * index) % 256 + 0 * rows,
+                    (rows + columns + 3 * index) % 256,
+                ),
+                axis=-1,
+            ).astype(np.uint8)
+            frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+            frame.pts, frame.time_base = index, Fraction(1, 30)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+
+    clip = VideoClip(
+        canvas=image.Config(height=480, width=832),
+        start_frame=5,
+        frames=33,
+        vae_frames=33,
+    )
+    ffmpeg = _cuda_ffmpeg()
+    cpu = read_video(path, clip, frame_rate=FPS, ffmpeg=ffmpeg)
+    nvdec = read_video(path, clip, frame_rate=FPS, ffmpeg=ffmpeg, gpu=0)
+    np.testing.assert_array_equal(nvdec, cpu)
+
+
+@pytest.mark.skipif(_cuda_ffmpeg() is None, reason="NVDEC is unavailable")
+def test_a_reader_accelerator_must_name_a_gpu_ffmpeg_can_open():
+    require_hwaccel(_cuda_ffmpeg(), 0)
+    with pytest.raises(RuntimeError, match="cannot decode on cuda:99"):
+        require_hwaccel(_cuda_ffmpeg(), 99)

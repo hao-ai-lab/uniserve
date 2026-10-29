@@ -57,7 +57,9 @@ from uniserve_worker.bootstrap.capacity import (
     resolve_request_capacity,
 )
 from uniserve_worker.bootstrap.components import (
+    MEDIA_READER_COMPONENT,
     MUXER_COMPONENT,
+    VIDEO_CODEC_COMPONENT,
     holds_host_components,
 )
 from uniserve_worker.bootstrap.distributed import initialize_components
@@ -81,10 +83,12 @@ from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.execution.request import RequestPool
 from uniserve_worker.media.container import (
     AUDIO_CODEC,
+    NVENC_VIDEO_CODEC,
     VIDEO_CODEC,
     require_media_codecs,
 )
 from uniserve_worker.media.mux import MediaMux
+from uniserve_worker.media.reader import require_hwaccel
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.profiling import (
     WorkerProfiler,
@@ -667,6 +671,26 @@ class Worker:
             self.codec_slot = holds_host_components(
                 name for name, _ in components
             )
+            # The GPU whose NVENC this slot's video codec encodes on, if any.
+            self.video_gpu = next(
+                (
+                    component.accelerator_index(worker_config.rank)
+                    for name, component in components
+                    if name == VIDEO_CODEC_COMPONENT
+                    and worker_config.rank in component.ranks
+                ),
+                None,
+            )
+            # The GPU whose NVDEC this rank's media reader decodes on, if any.
+            self.reader_gpu = next(
+                (
+                    component.accelerator_index(worker_config.rank)
+                    for name, component in components
+                    if name == MEDIA_READER_COMPONENT
+                    and worker_config.rank in component.ranks
+                ),
+                None,
+            )
             self.host_tasks = (
                 HostLane(max_inflight=1, workers=1)
                 if self.codec_slot
@@ -899,7 +923,13 @@ class Worker:
         # A host rank is ready once its codecs load, so a missing codec
         # surfaces here and not under a request.
         if self.codec_slot:
-            require_media_codecs(VIDEO_CODEC, AUDIO_CODEC)
+            require_media_codecs(
+                VIDEO_CODEC if self.video_gpu is None else NVENC_VIDEO_CODEC,
+                AUDIO_CODEC,
+                video_gpu=self.video_gpu,
+            )
+            if self.reader_gpu is not None:
+                require_hwaccel(self.worker_config.ffmpeg, self.reader_gpu)
         self.runner.complete_startup()
         check_startup_storage(
             self.worker_config,

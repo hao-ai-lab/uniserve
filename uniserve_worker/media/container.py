@@ -16,12 +16,14 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass, replace
 from fractions import Fraction
+from threading import Lock
 from typing import Any
 
 import numpy as np
 
 __all__ = [
     "AUDIO_CODEC",
+    "NVENC_VIDEO_CODEC",
     "VIDEO_CODEC",
     "AvMuxConfig",
     "AvMuxSession",
@@ -31,9 +33,28 @@ __all__ = [
     "require_media_codecs",
 ]
 
-# The encoders every served container uses.
+# The encoders every served container uses: a codec slot encodes video with
+# libx264 on the CPU, or with NVENC on the GPU its component names as its
+# accelerator (`ComponentConfig.accelerator`).
 VIDEO_CODEC = "libx264"
+NVENC_VIDEO_CODEC = "h264_nvenc"
 AUDIO_CODEC = "aac"
+
+# NVENC's fastest preset and ultra-low-latency tuning, the counterparts of
+# libx264's ultrafast preset and zerolatency tuning, at constant quality 23,
+# libx264's default CRF. Baseline profile keeps the CAVLC syntax and the
+# absence of B-frames that `encoded_video_bytes` bounds. One 124-frame 768p
+# unit encodes to about the size and fidelity of libx264's (2.74 against
+# 2.50 MB, 42.1 against 41.5 dB PSNR to the decoded RGB24 source, measured on
+# an RTX PRO 6000).
+_NVENC_OPTIONS = {
+    "preset": "p1",
+    "tune": "ull",
+    "profile": "baseline",
+    "rc": "vbr",
+    "cq": "23",
+    "b": "0",
+}
 
 # Each media unit is its own encoder session, and several ranks encode at once
 # on one host, so a session must not size its thread pool to the machine.
@@ -44,11 +65,46 @@ AUDIO_CODEC = "aac"
 # (`encoded_unit_bytes` in `uniserve_worker.media.mux`).
 _ENCODER_THREADS = 8
 
+# The CUDA device contexts this process holds for NVENC, by GPU index.
+_NVENC_DEVICES: dict[int, Any] = {}
+_NVENC_DEVICES_LOCK = Lock()
+
+
+def _nvenc_device(gpu: int) -> Any:
+    """Return the CUDA device an NVENC stream on ``gpu`` encodes with.
+
+    Without a device, FFmpeg's NVENC creates a CUDA context for every
+    encoder session and destroys it when the session closes, once per media
+    unit. Each stream instead opens on the GPU's primary context, which this
+    process retains for its life from its first stream on (the codec slot's
+    startup probe, `require_media_codecs`), so a session finds the context
+    alive. Measured on an RTX PRO 6000, one 124-frame 768p unit then takes
+    0.42 s and 0.40 CPU seconds instead of 0.54 and 0.53, with the same
+    bytes.
+    """
+    import av
+
+    with _NVENC_DEVICES_LOCK:
+        if gpu not in _NVENC_DEVICES:
+            primary = av.codec.hwaccel.HWAccel(
+                "cuda", device=str(gpu), options={"primary_ctx": "1"}
+            )
+            _NVENC_DEVICES[gpu] = primary.create(
+                av.codec.Codec(NVENC_VIDEO_CODEC, "w"), for_encoding=True
+            )
+    return av.codec.hwaccel.HWAccel(
+        "cuda",
+        device=str(gpu),
+        allow_software_fallback=False,
+        options={"primary_ctx": "1"},
+    )
+
 
 def encoded_video_bytes(frames: int, height: int, width: int) -> int:
     """Bound the MP4 bytes of the serving libx264/yuv420p/ultrafast encoder.
 
-    This preset uses baseline CAVLC. A padded 16x16 macroblock has at most
+    This preset uses baseline CAVLC, as NVENC's baseline profile does, so
+    the bound holds for both encoders. A padded 16x16 macroblock has at most
     27 residual blocks (including the separate DC blocks), each with up to
     16 coefficients. Baseline level codes occupy at most 28 bits; x264
     re-encodes CAVLC overflows at a higher QP. Per-block token, zero and run
@@ -57,11 +113,11 @@ def encoded_video_bytes(frames: int, height: int, width: int) -> int:
     adds at most one byte per two source bytes.
 
     Up to `_ENCODER_THREADS` slice headers per frame need at most 1024 bytes
-    each. MP4 sample tables need at most 64 bytes per packet; parameter sets,
-    encoder SEI and fixed container boxes fit in 64 KiB. These are syntax
-    bounds, independent of image entropy or the achieved compression ratio.
-    See x264's encoder/cavlc.c and encoder/encoder.c and FFmpeg's
-    libavformat/movenc.c.
+    each; NVENC writes one slice per frame. MP4 sample tables need at most 64
+    bytes per packet; parameter sets, encoder SEI and fixed container boxes
+    fit in 64 KiB. These are syntax bounds, independent of image entropy or
+    the achieved compression ratio. See x264's encoder/cavlc.c and
+    encoder/encoder.c and FFmpeg's libavformat/movenc.c.
     """
     if any(
         type(value) is not int or value < 1 for value in (frames, height, width)
@@ -76,15 +132,19 @@ def encoded_video_bytes(frames: int, height: int, width: int) -> int:
     )
 
 
-def require_media_codecs(video_codec: str, audio_codec: str) -> None:
+def require_media_codecs(
+    video_codec: str, audio_codec: str, *, video_gpu: int | None = None
+) -> None:
     """Verify that the configured encoders are available through PyAV.
 
     Both codec names must be listed by PyAV and open as an encoder context.
+    With ``video_gpu``, NVENC must also encode a one-frame unit on that GPU,
+    so a GPU without a usable encoder fails at startup.
 
     Raises:
         RuntimeError: When PyAV is not installed or does not list a codec.
             PyAV raises its own error when a listed codec cannot be created
-            as an encoder.
+            as an encoder, or when NVENC cannot encode on ``video_gpu``.
     """
     try:
         import av
@@ -103,6 +163,18 @@ def require_media_codecs(video_codec: str, audio_codec: str) -> None:
         )
     for name in (video_codec, audio_codec):
         av.CodecContext.create(name, "w")
+    if video_gpu is not None:
+        probe = AvMuxConfig(
+            width=256,
+            height=256,
+            frame_count=1,
+            frame_rate=24,
+            audio_rate=48000,
+            video_unit_frames=(1,),
+            video_codec=video_codec,
+            video_gpu=video_gpu,
+        )
+        encode_video_unit(probe, np.zeros((1, 256, 256, 3), dtype=np.uint8))
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,11 +190,15 @@ class AvMuxConfig:
     video_codec: str = VIDEO_CODEC
     audio_codec: str = AUDIO_CODEC
     audio_frame_samples: int = 1024
+    # The GPU whose NVENC encodes the units: set exactly when `video_codec`
+    # is `NVENC_VIDEO_CODEC`.
+    video_gpu: int | None = None
 
     def __post_init__(self) -> None:
         """Validate positive media dimensions.
 
-        Also validate complete media unit coverage.
+        Also validate complete media unit coverage, and that NVENC, and only
+        NVENC, names its GPU.
         """
         if (
             min(
@@ -142,6 +218,10 @@ class AvMuxConfig:
             raise ValueError(
                 "media mux media units must cover the output frame count"
             )
+        if (self.video_codec == NVENC_VIDEO_CODEC) != (
+            self.video_gpu is not None
+        ):
+            raise ValueError("NVENC encodes on exactly one named GPU")
 
 
 def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
@@ -168,7 +248,11 @@ def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
     container = av.open(buffer, mode="w", format="mp4")
     try:
         stream = container.add_stream(
-            config.video_codec, rate=config.frame_rate
+            config.video_codec,
+            rate=config.frame_rate,
+            hwaccel=None
+            if config.video_gpu is None
+            else _nvenc_device(config.video_gpu),
         )
         if not isinstance(stream, av.VideoStream):
             raise ValueError(f"{config.video_codec} is not a video encoder")
@@ -178,8 +262,11 @@ def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
         # reserved product row, which `frame_encoded_unit` in
         # `uniserve_worker.media.mux` rejects.
         stream.pix_fmt = "yuv420p"
-        stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
-        stream.codec_context.thread_count = _ENCODER_THREADS
+        if config.video_gpu is None:
+            stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
+            stream.codec_context.thread_count = _ENCODER_THREADS
+        else:
+            stream.options = {**_NVENC_OPTIONS, "gpu": str(config.video_gpu)}
         for index, pixels in enumerate(rgb24):
             frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
             frame.pts = index

@@ -79,6 +79,7 @@ def read_conditions(
     sample_rate: int,
     frame_rate: int,
     ffmpeg: str,
+    gpu: int | None = None,
 ) -> None:
     """Decode a request's conditions into its condition products.
 
@@ -87,7 +88,8 @@ def read_conditions(
     storage, each None when no condition contributes to it. ``vision``
     packs the conditioner's patch rows, ``sample_rate`` is the audio
     encoder's rate, ``frame_rate`` the output frame rate reference videos
-    resample to and ``ffmpeg`` the executable they decode with.
+    resample to and ``ffmpeg`` the executable they decode with, on the NVDEC
+    of ``gpu`` when one is named.
 
     Raises:
         ValueError: A condition decodes to other extents than planned, or
@@ -118,6 +120,7 @@ def read_conditions(
                 condition.video,
                 frame_rate=frame_rate,
                 ffmpeg=ffmpeg,
+                gpu=gpu,
             )
         view = condition.vision
         if view is None:
@@ -246,6 +249,9 @@ def execute(
             sample_rate=audio.sample_rate,
             frame_rate=postprocessor.frame_rate,
             ffmpeg=model_executor.worker_config.ffmpeg,
+            gpu=model_executor.bindings[
+                call.component
+            ].config.accelerator_index(model_executor.worker_config.rank),
         ),
         profile_name=(
             "uniserve.host.read "

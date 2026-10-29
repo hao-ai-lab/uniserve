@@ -20,6 +20,7 @@ rejected.
 from __future__ import annotations
 
 import argparse
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from math import prod
@@ -255,6 +256,12 @@ class ParallelConfig:
         }
 
 
+def _cuda_index(device: str) -> int | None:
+    """Return the index of a ``cuda:<index>`` device, or None for another."""
+    match = re.fullmatch(r"cuda:(0|[1-9][0-9]*)", device)
+    return None if match is None else int(match.group(1))
+
+
 @dataclass(frozen=True, slots=True)
 class ComponentConfig:
     """Configure rank placement and parallelism for one model component.
@@ -272,6 +279,12 @@ class ComponentConfig:
     descriptor always carries it. ``weights`` is ``device`` unless the
     deployment keeps the dense projection weights of the component's layer
     stack in host memory (``host``); ``load_worker_model`` installs that.
+    ``accelerator`` names the GPUs (``cuda:<index>``) whose hardware video
+    engines a host media component uses: the video codec encodes on their
+    NVENC and the media reader decodes reference videos on their NVDEC. One
+    device serves every rank, or a tuple names one per entry of ``ranks``,
+    in order; ``None`` keeps both on the CPU. ``validate_components``
+    refuses it on any other component.
     """
 
     ranks: tuple[int, ...]
@@ -279,6 +292,7 @@ class ComponentConfig:
     distribution: str | None = None
     units_per_rank: int = 1
     weights: str = "device"
+    accelerator: str | tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.ranks or len(set(self.ranks)) != len(self.ranks):
@@ -293,6 +307,23 @@ class ComponentConfig:
             raise ValueError("units_per_rank must be a positive integer")
         if self.weights not in ("device", "host"):
             raise ValueError(f"unsupported component weights {self.weights!r}")
+        if self.accelerator is not None:
+            devices = (
+                (self.accelerator,)
+                if isinstance(self.accelerator, str)
+                else self.accelerator
+            )
+            if not isinstance(self.accelerator, str) and len(devices) != len(
+                self.ranks
+            ):
+                raise ValueError(
+                    "a component accelerator list names one device per rank"
+                )
+            for device in devices:
+                if _cuda_index(device) is None:
+                    raise ValueError(
+                        f"component accelerator {device!r} is not cuda:<index>"
+                    )
         if (
             self.distribution is None
             and len(self.ranks) != self.parallel_config.world_size
@@ -317,6 +348,7 @@ class ComponentConfig:
             "distribution",
             "units_per_rank",
             "weights",
+            "accelerator",
         }
         if unknown:
             raise ValueError(f"unknown component fields: {sorted(unknown)}")
@@ -334,12 +366,21 @@ class ComponentConfig:
         distribution = value.get("distribution")
         units = value.get("units_per_rank", 1)
         weights = value.get("weights", "device")
+        accelerator = value.get("accelerator")
         if distribution is not None and not isinstance(distribution, str):
             raise ValueError("component distribution must be a string")
         if type(units) is not int:
             raise ValueError("units_per_rank must be a positive integer")
         if not isinstance(weights, str):
             raise ValueError("component weights must be a string")
+        if isinstance(accelerator, list) and all(
+            isinstance(device, str) for device in accelerator
+        ):
+            accelerator = tuple(accelerator)
+        elif accelerator is not None and not isinstance(accelerator, str):
+            raise ValueError(
+                "component accelerator must be a device or a list of devices"
+            )
 
         return cls(
             tuple(ranks),
@@ -347,12 +388,27 @@ class ComponentConfig:
             distribution,
             units,
             weights,
+            accelerator,
         )
 
+    def accelerator_index(self, rank: int) -> int | None:
+        """Return the index of the GPU ``rank`` uses, or None without one.
+
+        ``rank`` is the worker group rank, one of ``ranks``.
+        """
+        if self.accelerator is None:
+            return None
+        device = (
+            self.accelerator
+            if isinstance(self.accelerator, str)
+            else self.accelerator[self.ranks.index(rank)]
+        )
+        return _cuda_index(device)
+
     def to_dict(self) -> dict[str, object]:
-        # The distribution fields appear only with a distribution and the
-        # weights only off the device; ``from_dict`` restores their defaults
-        # when they are absent.
+        # The distribution fields appear only with a distribution, the
+        # weights only off the device and the accelerator only when one is
+        # named; ``from_dict`` restores their defaults when they are absent.
         value: dict[str, object] = {
             "ranks": list(self.ranks),
             "parallel_config": self.parallel_config.to_dict(),
@@ -364,6 +420,12 @@ class ComponentConfig:
             )
         if self.weights != "device":
             value["weights"] = self.weights
+        if self.accelerator is not None:
+            value["accelerator"] = (
+                self.accelerator
+                if isinstance(self.accelerator, str)
+                else list(self.accelerator)
+            )
         return value
 
 

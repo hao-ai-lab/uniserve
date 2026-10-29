@@ -97,3 +97,44 @@ def test_component_weights_are_written_only_off_the_device():
     assert "weights" not in ComponentConfig.from_dict({"ranks": [0]}).to_dict()
     with pytest.raises(ValueError, match="unsupported component weights"):
         ComponentConfig.from_dict({"ranks": [0], "weights": "disk"})
+
+
+def test_a_component_accelerator_names_its_ranks_gpus():
+    shared = ComponentConfig.from_dict(
+        {
+            "ranks": [0, 1],
+            "distribution": "temporal_units",
+            "accelerator": "cuda:3",
+        }
+    )
+    assert (shared.accelerator_index(0), shared.accelerator_index(1)) == (3, 3)
+    assert shared.to_dict()["accelerator"] == "cuda:3"
+    # A list follows the order of ``ranks``, not the rank numbers.
+    each = ComponentConfig.from_dict(
+        {
+            "ranks": [2, 0],
+            "distribution": "temporal_units",
+            "accelerator": ["cuda:5", "cuda:4"],
+        }
+    )
+    assert (each.accelerator_index(2), each.accelerator_index(0)) == (5, 4)
+    assert each.to_dict()["accelerator"] == ["cuda:5", "cuda:4"]
+    plain = ComponentConfig.from_dict({"ranks": [0]})
+    assert plain.accelerator_index(0) is None
+    assert "accelerator" not in plain.to_dict()
+    pair = {"ranks": [0, 1], "distribution": "temporal_units"}
+    for invalid in ("cuda", "cuda:-1", "cuda:01", "cpu", ["cuda:0", "cpu"]):
+        with pytest.raises(ValueError, match="is not cuda:<index>"):
+            ComponentConfig.from_dict({**pair, "accelerator": invalid})
+    with pytest.raises(ValueError, match="one device per rank"):
+        ComponentConfig.from_dict({**pair, "accelerator": ["cuda:0"]})
+
+
+def test_only_host_media_components_take_an_accelerator():
+    model = Encoder(torch.nn.Identity())
+    with pytest.raises(WorkerError, match="take an accelerator"):
+        validate_components(
+            model,
+            {"encoder": ComponentConfig((0,), accelerator="cuda:0")},
+            entries={"encoder": ComponentEntry("", (EntryPoint("encode"),))},
+        )
