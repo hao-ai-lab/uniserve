@@ -1251,10 +1251,17 @@ impl RankProcess {
     /// Hands the batch back as `WouldBlock` when `depth` requests are already
     /// outstanding or a socket send queue is full; the batch is not recorded
     /// as pending then.
-    /// Fails when draining earlier responses or the send fails.
+    /// Fails when the send fails. An error that draining earlier responses
+    /// produces is queued for `poll_batch`, as a drain there queues it.
     pub(super) fn submit_batch(&mut self, batch: Batch) -> Result<(), BatchSubmitError> {
-        // Answered requests free their slots before the depth check.
-        self.drain_ready().map_err(BatchSubmitError::Failed)?;
+        // Answered requests free their slots before the depth check. An
+        // earlier batch's execution error belongs to that batch: the group
+        // reconciles it with its batch (`join_rank_errors`) whichever of a
+        // submission or a poll drains it first, instead of a submission
+        // failing, which would replace the rank group.
+        if let Err(error) = self.drain_ready() {
+            self.ready.push_back(Err(error));
+        }
         // Without this check, a shared-storage send beyond the client's
         // request limit would fail as a transport error rather than
         // `WouldBlock`.
