@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -222,3 +222,28 @@ class ExecutionOutput:
             if self.request_pool_indices is None
             else self.request_pool_indices.clone(),
         )
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        """Mark every device tensor of this output as used on ``stream``.
+
+        An output allocated on one stream (a runner's lane) and read and
+        freed on another must be recorded there: otherwise the caching
+        allocator reuses its storage for the allocating stream, or releases
+        it to the driver, while the other stream's work may still read it.
+        """
+        pending: list[object] = [
+            *self.values,
+            self.request_pool_indices,
+            self.greedy,
+        ]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, torch.Tensor):
+                if value.is_cuda:
+                    value.record_stream(stream)
+            elif isinstance(value, (tuple, list)):
+                pending.extend(value)
+            elif is_dataclass(value) and not isinstance(value, type):
+                pending.extend(
+                    getattr(value, field.name) for field in fields(value)
+                )

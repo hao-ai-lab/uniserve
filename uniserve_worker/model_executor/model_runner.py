@@ -241,7 +241,10 @@ class ModelRunner(Execution, ABC):
         than capturing on the request path. The lane stream, when present,
         waits for the caller's current stream before the call, and after a
         successful call the caller's stream waits for the lane. The returned
-        output is a clone that does not alias graph storage. Its statistics
+        output is a clone that does not alias graph storage; it is allocated
+        on the lane and recorded on the caller's stream, which reads and
+        frees it, so the allocator keeps its storage until that stream's
+        work on it completes. Its statistics
         count one call of this runner's mode and no tokens, since module
         arguments carry no query-token notion.
         """
@@ -301,7 +304,9 @@ class ModelRunner(Execution, ABC):
             output = self.result(result).clone()
 
         if stream is not None:
-            torch.cuda.current_stream(self.device).wait_stream(stream.stream)
+            caller = torch.cuda.current_stream(self.device)
+            caller.wait_stream(stream.stream)
+            output.record_stream(caller)
         elapsed = (time.perf_counter_ns() - started) // 1000
         return replace(
             output,
