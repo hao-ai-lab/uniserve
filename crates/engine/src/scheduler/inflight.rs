@@ -4,7 +4,8 @@
 //! result: batches awaiting submission, submitted batches awaiting their
 //! results and command receipts, each request's queue of submitted calls,
 //! completions staged until their call may apply, deferred terminal events,
-//! lifecycle commands awaiting a batch, and the transfer reservation count.
+//! lifecycle commands and route releases awaiting a batch, and the transfer
+//! reservation count.
 //!
 //! Results arrive in executor order, but a request's calls apply in submission
 //! order: a staged completion is released only when its call is at the front
@@ -71,6 +72,9 @@ pub(super) struct PendingBatch {
     /// Lifecycle commands other than `Start`, in batch order, so a position
     /// here is the executor's `CommandResult::command_index`.
     pub(super) commands: Vec<BatchCommand>,
+    /// Route releases in batch order, so a position here is the
+    /// `CommandResult::command_index` of the release's receipt.
+    pub(super) releases: Vec<RouteRelease>,
     /// Worker execution time accumulated across partial results, in
     /// microseconds.
     pub(super) worker_exec_us: u64,
@@ -102,6 +106,8 @@ pub(super) struct Inflight {
     pub(super) pending_batches: HashMap<u64, PendingBatch>,
     /// `Finish` and `Free` commands awaiting a batch to carry them.
     pub(super) pending_commands: VecDeque<BatchCommand>,
+    /// Route releases awaiting a batch to carry them.
+    pub(super) pending_releases: VecDeque<RouteRelease>,
 }
 
 impl Inflight {
@@ -116,6 +122,7 @@ impl Inflight {
             pending_finishes: HashMap::new(),
             pending_batches: HashMap::new(),
             pending_commands: VecDeque::new(),
+            pending_releases: VecDeque::new(),
         }
     }
 
@@ -140,6 +147,7 @@ impl Inflight {
                     .filter(|command| !matches!(command, BatchCommand::Start { .. }))
                     .cloned()
                     .collect(),
+                releases: batch.releases.to_vec(),
                 worker_exec_us: 0,
                 prefill: batch
                     .requests
@@ -332,19 +340,22 @@ impl Inflight {
     ///
     /// Clears the per-request call queues, staged completions, registered
     /// batches, and transfer reservations. Returns the ids of requests that
-    /// owned a submitted call and the recorded commands of every dropped
-    /// batch. `pending_submissions`, `pending_finishes`, and `pending_commands`
-    /// are left for the caller.
-    pub(super) fn clear_failed_calls(&mut self) -> (Vec<RequestId>, Vec<BatchCommand>) {
+    /// owned a submitted call and the recorded commands and route releases of
+    /// every dropped batch. `pending_submissions`, `pending_finishes`,
+    /// `pending_commands` and `pending_releases` are left for the caller.
+    pub(super) fn clear_failed_calls(
+        &mut self,
+    ) -> (Vec<RequestId>, Vec<BatchCommand>, Vec<RouteRelease>) {
         let ids = self.pending_calls.keys().copied().collect();
-        let commands = self
-            .pending_batches
-            .drain()
-            .flat_map(|(_, batch)| batch.commands)
-            .collect();
+        let mut commands = Vec::new();
+        let mut releases = Vec::new();
+        for (_, batch) in self.pending_batches.drain() {
+            commands.extend(batch.commands);
+            releases.extend(batch.releases);
+        }
         self.pending_calls.clear();
         self.num_pending_transfers = 0;
         self.pending_completions.clear();
-        (ids, commands)
+        (ids, commands, releases)
     }
 }

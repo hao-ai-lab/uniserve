@@ -213,6 +213,7 @@ impl Scheduler {
             running: HashMap::new(),
             running_media: HashMap::new(),
             retiring_requests: HashMap::new(),
+            retiring_routes: HashMap::new(),
             transfer_capacity,
             latent_dtype,
             engine_id: 1,

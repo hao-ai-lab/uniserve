@@ -89,6 +89,26 @@ const GENERATION_CALLS: [MediaCall; 8] = [
     MediaCall::Muxing,
 ];
 
+/// Whether `call` prepares a request's conditioning: reading its condition
+/// media, or encoding its vision blocks, its condition latents or its prompt.
+///
+/// Every product these calls publish is read by another of them or by
+/// latent preparation, so once latent preparation has completed, a request
+/// runs none of them again and reads nothing they published. A worker that
+/// serves a request only these calls therefore leaves the request's route
+/// before it denoises (`Scheduler::release_routes`), and a component serving
+/// only these calls does not bound how many requests run
+/// (`ExecutorInfo::runtime_info`).
+pub(crate) const fn prepares_conditioning(call: MediaCall) -> bool {
+    matches!(
+        call,
+        MediaCall::MediaReading
+            | MediaCall::VisionEncoding
+            | MediaCall::LatentEncoding
+            | MediaCall::TextEncoding
+    )
+}
+
 /// The media calls a request of `task` runs: the generation calls, and for a
 /// conditioned task the calls reading and encoding its conditions. Every
 /// keyframe and every `ref2va` request presents vision blocks, so a
@@ -449,6 +469,31 @@ mod tests {
             7 * 5040 + 2016 + 1008
         );
         assert_eq!(extent(product::CONDITION_AUDIO_LATENTS), 414);
+    }
+
+    /// Every product a conditioning call publishes is read by another
+    /// conditioning call or by latent preparation, and no call from latent
+    /// preparation on prepares conditioning: once latent preparation has
+    /// completed, a request reads nothing a conditioning call published.
+    #[test]
+    fn latent_preparation_is_the_last_reader_of_every_conditioning_product() {
+        for call in MediaCall::ALL {
+            if prepares_conditioning(call) {
+                assert!(
+                    call.readers().iter().all(|reader| {
+                        prepares_conditioning(*reader) || *reader == MediaCall::LatentPreparation
+                    }),
+                    "{call:?} is read by {:?}",
+                    call.readers()
+                );
+            }
+        }
+        let generation = GENERATION_CALLS
+            .iter()
+            .skip_while(|call| **call != MediaCall::LatentPreparation)
+            .collect::<Vec<_>>();
+        assert_eq!(generation.len(), GENERATION_CALLS.len() - 1);
+        assert!(generation.iter().all(|call| !prepares_conditioning(**call)));
     }
 
     /// An audio reference adds only audio products: no pixels, no vision.

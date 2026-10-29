@@ -7,7 +7,9 @@
 //! retirement: a finished request registered with its workers parks its
 //! allocations in a `RetiringRequest` until its `Finish` command is
 //! acknowledged, so storage is reused only after the workers' physical readers
-//! have finished.
+//! have finished. A media request releases a conditioning worker from its
+//! route before it finishes: its row and spans on that worker wait in a
+//! `RetiringRoute` until the worker acknowledges the release.
 
 use super::*;
 use uniserve_worker_ipc::BufferId;
@@ -211,11 +213,42 @@ impl RequestAllocations {
 
 /// Storage one media request reserves at admission in the per-worker address
 /// spaces of `Storage::media_storage`.
+///
+/// A worker released from the request's route (`MediaAllocations::take_route`)
+/// leaves both maps.
 pub(super) struct MediaAllocations {
     /// Declared results keyed by component name and output index.
     pub(super) tensors: HashMap<(String, u32), MediaTensorAllocation>,
     /// The request's row on each worker of its route.
     pub(super) request_slots: HashMap<crate::WorkerId, RequestSlot>,
+}
+
+/// A media request's row and buffer spans on one worker released from its
+/// route, held until that worker acknowledges the release
+/// (`crate::executor::RouteRelease`), since the worker reads them until it
+/// has retired the request.
+pub(super) struct RetiringRoute {
+    pub(super) request_slot: RequestSlot,
+    /// The spans the request held in the worker's rank pools, by rank.
+    pub(super) buffers: Vec<(u32, BufferSpan)>,
+}
+
+impl RetiringRoute {
+    /// Returns the row and spans to `worker`'s address spaces.
+    ///
+    /// Every span is returned even when `worker` has no media storage; the
+    /// unknown worker is then reported.
+    pub(super) fn free(
+        self,
+        worker: &crate::WorkerId,
+        storage: &mut Storage,
+    ) -> Result<(), UnknownMediaWorker> {
+        let mut released = Ok(());
+        for (rank, allocation) in self.buffers {
+            released = released.and(storage.free_media_buffer(worker, rank, allocation));
+        }
+        released.and(storage.free_media_request(worker, self.request_slot))
+    }
 }
 
 /// A request reserves each declared result in the buffer pool of every rank
@@ -337,9 +370,36 @@ impl MediaTensorAllocation {
 }
 
 impl MediaAllocations {
-    /// Returns the request row assigned in one physical worker address space.
-    pub(super) fn request_slot(&self, worker: &crate::WorkerId) -> u32 {
-        self.request_slots[worker].index()
+    /// Returns the request row assigned in one physical worker address space,
+    /// or `None` for a worker the request does not hold a row on.
+    pub(super) fn request_slot(&self, worker: &crate::WorkerId) -> Option<u32> {
+        self.request_slots.get(worker).map(RequestSlot::index)
+    }
+
+    /// Takes the request's row and every span it holds on `worker`, which
+    /// leaves the request's route.
+    ///
+    /// Returns `None`, taking nothing, when the request holds no row there.
+    pub(super) fn take_route(&mut self, worker: &crate::WorkerId) -> Option<RetiringRoute> {
+        let request_slot = self.request_slots.remove(worker)?;
+        let mut buffers = Vec::new();
+        for tensor in self.tensors.values_mut() {
+            let ranks = tensor
+                .allocations
+                .keys()
+                .filter(|(owner, _)| owner == worker)
+                .map(|(_, rank)| *rank)
+                .collect::<Vec<_>>();
+            for rank in ranks {
+                if let Some(span) = tensor.allocations.remove(&(worker.clone(), rank)) {
+                    buffers.push((rank, span));
+                }
+            }
+        }
+        Some(RetiringRoute {
+            request_slot,
+            buffers,
+        })
     }
 
     /// Releases the owned request allocation.

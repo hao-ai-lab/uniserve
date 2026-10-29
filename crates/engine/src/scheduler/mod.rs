@@ -67,7 +67,7 @@ mod placement;
 mod run;
 
 pub(crate) use crate::executor::{
-    BatchResult, ExecutionBatch, Executor, ExecutorSubmitError, RequestPlacement,
+    BatchResult, ExecutionBatch, Executor, ExecutorSubmitError, RequestPlacement, RouteRelease,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -104,7 +104,7 @@ use crate::executor::{RankBuffer, WorkerFailure};
 use crate::scheduler::image_artifact::png_artifact_info;
 use allocation::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
-    UnknownMediaWorker,
+    RetiringRoute, UnknownMediaWorker,
 };
 use denoising::{Denoising, LatentPlacement};
 use generation::RequestState;
@@ -348,6 +348,9 @@ pub struct Scheduler {
     /// Finished requests whose storage stays allocated until their workers
     /// acknowledge the `Finish` command.
     retiring_requests: HashMap<RequestId, RetiringRequest>,
+    /// Media requests' rows and spans on workers released from their routes,
+    /// held until each worker acknowledges its release.
+    retiring_routes: HashMap<RouteRelease, RetiringRoute>,
     /// Maximum number of transfer calls holding a reservation at once
     /// (`Inflight::num_pending_transfers`).
     transfer_capacity: usize,

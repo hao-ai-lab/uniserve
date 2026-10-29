@@ -11,9 +11,9 @@
 
 mod support;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1521,4 +1521,534 @@ fn media_buffers_are_placed_in_the_pool_of_each_rank_that_backs_them() {
             "rank {rank} packs from its own offset zero"
         );
     }
+}
+
+/// How long a `RoutedExecutor` gate stays closed at most.
+const GATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What a `RoutedExecutor` saw at its boundary, in the order it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Routed {
+    /// A media call accepted on `pool`, with the request row its placement
+    /// names there.
+    Call {
+        request: RequestId,
+        call: MediaCall,
+        pool: String,
+        row: Option<u32>,
+        batch_id: u64,
+    },
+    /// A route release accepted for `pool`.
+    Release { request: RequestId, pool: String },
+    /// The result of batch `batch_id`, handed to the scheduler.
+    Delivered { batch_id: u64 },
+}
+
+/// The simulator's components served from worker pools that each report
+/// their own request rows, as `dp8-text-tp8-host-weights.json` places
+/// denoiser replicas beside one shared text encoder.
+///
+/// Every pool's calls run on the one simulator, which receives them placed
+/// on itself, so the executor keeps its own record (`Routed`) of the pool
+/// and row each call named and of each route release. With a gate, the
+/// results of the gated request's denoising calls are held back until a
+/// call of another request is accepted on the gate pool, as a replica still
+/// denoising one request while the other pools complete independent work:
+/// a later request that reaches the gate pool before the gated request
+/// finishes denoising shows that pool's row was free to it meanwhile. A gate
+/// still closed after `GATE_TIMEOUT` opens, so a request that never reaches
+/// the gate pool fails the test's assertions rather than stalling it.
+struct RoutedExecutor {
+    inner: SimExecutor,
+    info: ExecutorInfo,
+    /// The worker the simulator itself reports.
+    simulator: WorkerId,
+    record: Arc<Mutex<Vec<Routed>>>,
+    /// The request whose denoising results are held, and the gate pool.
+    gate: Option<(RequestId, WorkerId)>,
+    gate_open: bool,
+    /// When a gate still closed opens on its own.
+    gate_deadline: Instant,
+    /// Batches carrying a denoising call of the gated request.
+    gated: HashSet<u64>,
+    /// Results held back while the gate is closed, in arrival order.
+    held: VecDeque<BatchResult>,
+}
+
+impl RoutedExecutor {
+    /// Splits the simulator's components into `pools`, each named with the
+    /// components it serves and the request rows it reports. Returns the
+    /// executor, the simulator's own submission record and the routed record.
+    fn new(
+        sim: SimEngine,
+        pools: &[(&str, &[&str], u32)],
+        gate: Option<(RequestId, &str)>,
+    ) -> (Self, Receiver<BatchEvent>, Arc<Mutex<Vec<Routed>>>) {
+        let mut inner = SimExecutor::new(sim);
+        let boundary = inner.observe();
+        let simulator = inner.info().workers[0].0.clone();
+        let worker = inner.info().workers[0].1.clone();
+        let launched = inner.info().placements[&simulator].clone();
+        let ranks = inner.info().rank_buffer_bytes[&simulator].clone();
+
+        let mut info = ExecutorInfo::from_workers(
+            pools
+                .iter()
+                .map(|(id, components, rows)| {
+                    let mut info = worker.clone();
+                    info.request_slots = *rows;
+                    info.components
+                        .retain(|component| components.contains(&component.name.as_str()));
+                    info.media_components
+                        .retain(|_, component| components.contains(&component.as_str()));
+                    info.supported_calls = info
+                        .media_components
+                        .keys()
+                        .map(|call| CallKind::Media(*call))
+                        .collect();
+                    (WorkerId((*id).to_owned()), info)
+                })
+                .collect(),
+        )
+        .unwrap();
+        for (id, components, _) in pools {
+            let id = WorkerId((*id).to_owned());
+            let mut placement = launched.clone();
+            placement
+                .components
+                .retain(|name, _| components.contains(&name.as_str()));
+            info.placements.insert(id.clone(), placement);
+            info.rank_buffer_bytes.insert(id, ranks.clone());
+        }
+
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let executor = Self {
+            inner,
+            info,
+            simulator,
+            record: Arc::clone(&record),
+            gate: gate.map(|(request, pool)| (request, WorkerId(pool.to_owned()))),
+            gate_open: false,
+            gate_deadline: Instant::now() + GATE_TIMEOUT,
+            gated: HashSet::new(),
+            held: VecDeque::new(),
+        };
+        (executor, boundary, record)
+    }
+
+    /// Records a result handed to the scheduler.
+    fn deliver(&mut self, result: BatchResult) -> BatchResult {
+        self.record.lock().unwrap().push(Routed::Delivered {
+            batch_id: result.batch_id,
+        });
+        result
+    }
+}
+
+impl Executor for RoutedExecutor {
+    fn info(&self) -> &ExecutorInfo {
+        &self.info
+    }
+
+    fn is_ready(&self, worker: &WorkerId) -> bool {
+        self.info.workers.iter().any(|(id, _)| id == worker) && self.inner.is_ready(&self.simulator)
+    }
+
+    fn has_capacity(&self, worker: &WorkerId) -> bool {
+        self.is_ready(worker) && self.inner.has_capacity(&self.simulator)
+    }
+
+    fn command_has_capacity(&self, command: &uniserve_worker_ipc::BatchCommand) -> bool {
+        self.inner.command_has_capacity(command)
+    }
+
+    fn submit(&mut self, mut batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+        let batch_id = batch.id;
+        let mut routed = batch
+            .requests
+            .iter()
+            .filter_map(|(call, placement)| {
+                let CallKind::Media(media_call) = call.kind else {
+                    return None;
+                };
+                Some(Routed::Call {
+                    request: call.request_key.request_id,
+                    call: media_call,
+                    pool: placement.worker.0.clone(),
+                    row: placement.request_pool_idx,
+                    batch_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        routed.extend(batch.releases.iter().map(|release| Routed::Release {
+            request: release.request_key.request_id,
+            pool: release.worker.0.clone(),
+        }));
+        let (gated, opens) = self.gate.as_ref().map_or((false, false), |(held, pool)| {
+            let calls = || batch.requests.iter();
+            (
+                calls().any(|(call, _)| {
+                    call.request_key.request_id == *held
+                        && call.kind == CallKind::Media(MediaCall::Denoising)
+                }),
+                calls().any(|(call, placement)| {
+                    call.request_key.request_id != *held && placement.worker == *pool
+                }),
+            )
+        });
+
+        let pools = batch
+            .requests
+            .iter_mut()
+            .map(|(_, placement)| std::mem::replace(&mut placement.worker, self.simulator.clone()))
+            .collect::<Vec<_>>();
+        match self.inner.submit(batch) {
+            Ok(()) => {
+                self.record.lock().unwrap().extend(routed);
+                if gated {
+                    self.gated.insert(batch_id);
+                }
+                self.gate_open |= opens;
+                Ok(())
+            }
+            Err(ExecutorSubmitError::WouldBlock(mut batch)) => {
+                for ((_, placement), pool) in batch.requests.iter_mut().zip(pools) {
+                    placement.worker = pool;
+                }
+                Err(ExecutorSubmitError::WouldBlock(batch))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError> {
+        self.gate_open |= Instant::now() >= self.gate_deadline;
+        if self.gate_open
+            && let Some(result) = self.held.pop_front()
+        {
+            return Ok(Some(self.deliver(result)));
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Some(result) = self.inner.poll(remaining)? else {
+                return Ok(None);
+            };
+            if !self.gate_open && self.gated.contains(&result.batch_id) {
+                self.held.push_back(result);
+                continue;
+            }
+            return Ok(Some(self.deliver(result)));
+        }
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        self.inner.close()
+    }
+}
+
+/// The pools of a `ref2va` deployment whose denoiser replicas share one
+/// media reader and one text encoder, each of which holds a single request
+/// row: two denoiser replicas of one row each, every one also holding the
+/// latent encoder and both decoders, and a host pool of two rows holding
+/// the video codec and the muxer.
+const SHARED_ENCODER_POOLS: [(&str, &[&str], u32); 5] = [
+    ("reader", &["media_reader"], 1),
+    ("text", &["text_encoder"], 1),
+    (
+        "flow-0",
+        &[
+            "denoiser",
+            "latent_encoder",
+            "video_decoder",
+            "audio_decoder",
+        ],
+        1,
+    ),
+    (
+        "flow-1",
+        &[
+            "denoiser",
+            "latent_encoder",
+            "video_decoder",
+            "audio_decoder",
+        ],
+        1,
+    ),
+    ("host", &["video_codec", "muxer"], 2),
+];
+
+/// The record's position of the first entry `entry` accepts.
+fn position(record: &[Routed], entry: impl Fn(&Routed) -> bool) -> Option<usize> {
+    record.iter().position(entry)
+}
+
+/// The batch ids of a request's calls of one kind, in acceptance order.
+fn routed_batches(record: &[Routed], request: RequestId, media_call: MediaCall) -> Vec<u64> {
+    record
+        .iter()
+        .filter_map(|entry| match entry {
+            Routed::Call {
+                request: owner,
+                call,
+                batch_id,
+                ..
+            } if *owner == request && *call == media_call => Some(*batch_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The pool and row of a request's first call of one kind.
+fn routed_call(
+    record: &[Routed],
+    request: RequestId,
+    media_call: MediaCall,
+) -> (String, Option<u32>) {
+    record
+        .iter()
+        .find_map(|entry| match entry {
+            Routed::Call {
+                request: owner,
+                call,
+                pool,
+                row,
+                ..
+            } if *owner == request && *call == media_call => Some((pool.clone(), *row)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{request:?} ran no {media_call:?}"))
+}
+
+/// A shared encoder's request rows do not bound how many requests run: a
+/// request holds a row there only until latent preparation has read what
+/// the encoder published, so the running limit is the narrowest of the
+/// pools that hold a request until it finishes, two here, while the text
+/// encoder and the media reader report one row each.
+#[test]
+fn a_shared_text_encoder_does_not_bound_the_running_requests() {
+    let (executor, _boundary, _record) =
+        RoutedExecutor::new(video_worker(1, 2), &SHARED_ENCODER_POOLS, None);
+    let info = executor.info();
+    for pool in ["reader", "text"] {
+        let (_, worker) = info
+            .workers
+            .iter()
+            .find(|(id, _)| id.0 == pool)
+            .expect("the pool is placed");
+        assert_eq!(worker.request_slots, 1, "{pool}");
+    }
+    assert_eq!(info.runtime_info().unwrap().request_slots, 2);
+
+    let scheduler = support::scheduler_with(
+        Box::new(executor),
+        SimEngine::special_tokens(),
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(scheduler.config().max_num_seqs, 2);
+}
+
+/// The record's releases, as request and pool, sorted.
+fn routed_releases(record: &[Routed]) -> Vec<(RequestId, &str)> {
+    let mut releases = record
+        .iter()
+        .filter_map(|entry| match entry {
+            Routed::Release { request, pool } => Some((*request, pool.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    releases.sort();
+    releases
+}
+
+/// The record's position of the result of batch `batch_id`.
+fn delivered(record: &[Routed], batch_id: u64) -> usize {
+    position(record, |entry| *entry == Routed::Delivered { batch_id })
+        .expect("every batch is handed back")
+}
+
+/// The record's position of the release of `request` from `pool`.
+fn released(record: &[Routed], request: RequestId, pool: &str) -> usize {
+    position(record, |entry| {
+        *entry
+            == Routed::Release {
+                request,
+                pool: pool.to_owned(),
+            }
+    })
+    .unwrap_or_else(|| panic!("{request:?} never left {pool}"))
+}
+
+/// A request releases the shared media reader and text encoder from its
+/// route once each has served its last call and its products have been
+/// read: the reader once the vision and latent encodings that read its
+/// condition media have returned, the text encoder once latent preparation
+/// has. Both leave before the request's last denoising step returns; the
+/// denoiser replica and the host pool, which serve later calls, never leave
+/// early.
+#[test]
+fn a_shared_encoder_leaves_a_route_once_its_products_are_read() {
+    let request = RequestId(1);
+    let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
+    let (executor, boundary, record) =
+        RoutedExecutor::new(video_worker(1, 2), &SHARED_ENCODER_POOLS, None);
+    let served = serve_through(
+        Box::new(executor),
+        boundary,
+        vec![reference_request(1, &media)],
+        None,
+    );
+    served.assert_completed(request);
+    let record = record.lock().unwrap().clone();
+
+    assert_eq!(
+        routed_releases(&record),
+        [(request, "reader"), (request, "text")]
+    );
+    let returned = |media_call| {
+        routed_batches(&record, request, media_call)
+            .into_iter()
+            .map(|batch_id| delivered(&record, batch_id))
+            .collect::<Vec<_>>()
+    };
+    let reads = [MediaCall::VisionEncoding, MediaCall::LatentEncoding]
+        .into_iter()
+        .flat_map(returned)
+        .max()
+        .unwrap();
+    let preparation = returned(MediaCall::LatentPreparation)[0];
+    let last_step = *returned(MediaCall::Denoising).last().unwrap();
+    let reader = released(&record, request, "reader");
+    let text = released(&record, request, "text");
+    assert!(reads < reader && reader < last_step, "{record:?}");
+    assert!(preparation < text && text < last_step, "{record:?}");
+}
+
+/// A row a request released from the shared text encoder admits the next
+/// request, which encodes in that row on its own denoiser replica while
+/// the first request's last denoising step is still out. The text encoder
+/// holds one row, so the second request waits for the release.
+#[test]
+fn a_released_text_row_admits_the_next_request_while_the_first_still_denoises() {
+    let first = RequestId(1);
+    let second = RequestId(2);
+    let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
+    let (executor, boundary, record) = RoutedExecutor::new(
+        video_worker(1, 2),
+        &SHARED_ENCODER_POOLS,
+        Some((first, "text")),
+    );
+    let served = serve_through(
+        Box::new(executor),
+        boundary,
+        vec![reference_request(1, &media), reference_request(2, &media)],
+        None,
+    );
+    served.assert_completed(first);
+    served.assert_completed(second);
+    let record = record.lock().unwrap().clone();
+
+    assert_eq!(
+        routed_releases(&record),
+        [
+            (first, "reader"),
+            (first, "text"),
+            (second, "reader"),
+            (second, "text"),
+        ]
+    );
+    let steps = routed_batches(&record, first, MediaCall::Denoising);
+    assert_eq!(steps.len(), STEPS as usize);
+    let last_step = delivered(&record, *steps.last().unwrap());
+    let text_release = released(&record, first, "text");
+
+    let (first_text, first_row) = routed_call(&record, first, MediaCall::VisionEncoding);
+    let (second_text, second_row) = routed_call(&record, second, MediaCall::VisionEncoding);
+    assert_eq!(
+        (first_text.as_str(), second_text.as_str()),
+        ("text", "text")
+    );
+    assert_eq!(second_row, first_row);
+    let second_encodes = position(&record, |entry| {
+        matches!(
+            entry,
+            Routed::Call { request, pool, .. } if *request == second && pool == "text"
+        )
+    })
+    .unwrap();
+    assert!(text_release < second_encodes, "{record:?}");
+    assert!(second_encodes < last_step, "{record:?}");
+    let replica = |request| routed_call(&record, request, MediaCall::Denoising).0;
+    assert_ne!(replica(first), replica(second));
+}
+
+/// A deployment whose every worker serves some call after latent
+/// preparation keeps each request on its whole route until it finishes: one
+/// simulated worker holding every component, and the two pools of
+/// `ulysses8-reference.json`, the model's components on one and the media
+/// reader, video codec and muxer on the host. No route release is sent.
+#[test]
+fn a_route_whose_every_worker_serves_a_later_call_releases_nothing() {
+    let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
+    let requests = || {
+        vec![
+            reference_request(1, &media),
+            reference_request(2, &media),
+            video_request(3, 2),
+        ]
+    };
+
+    // `serve_through` drains the simulator's record of submitted batches; a
+    // relay on the way notes whether any of them carried a release.
+    let mut single = SimExecutor::new(video_worker(1, 2));
+    let boundary = single.observe();
+    let released = Arc::new(AtomicBool::new(false));
+    let (relay, observed) = crossbeam_channel::unbounded();
+    let watcher = {
+        let released = Arc::clone(&released);
+        thread::spawn(move || {
+            for event in boundary.iter() {
+                if let BatchEvent::Submitted(batch) = &event
+                    && !batch.releases.is_empty()
+                {
+                    released.store(true, Ordering::SeqCst);
+                }
+                let _ = relay.send(event);
+            }
+        })
+    };
+    let served = serve_through(Box::new(single), observed, requests(), None);
+    watcher.join().unwrap();
+    for id in [1, 2, 3] {
+        served.assert_completed(RequestId(id));
+    }
+    assert!(!released.load(Ordering::SeqCst));
+
+    let pools: [(&str, &[&str], u32); 2] = [
+        (
+            "model",
+            &[
+                "text_encoder",
+                "denoiser",
+                "latent_encoder",
+                "video_decoder",
+                "audio_decoder",
+            ],
+            2,
+        ),
+        ("host", &["media_reader", "video_codec", "muxer"], 2),
+    ];
+    let (executor, boundary, record) = RoutedExecutor::new(video_worker(1, 2), &pools, None);
+    let served = serve_through(Box::new(executor), boundary, requests(), None);
+    for id in [1, 2, 3] {
+        served.assert_completed(RequestId(id));
+    }
+    let record = record.lock().unwrap();
+    assert!(
+        !record
+            .iter()
+            .any(|entry| matches!(entry, Routed::Release { .. })),
+        "{record:?}"
+    );
 }

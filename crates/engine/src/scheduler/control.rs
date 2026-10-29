@@ -138,6 +138,22 @@ impl Scheduler {
         selected
     }
 
+    /// Selects the route releases whose worker can accept a submission.
+    ///
+    /// A release waits for no command of its request: a `Free` that reaches
+    /// the released worker after its `Finish` names a product the worker has
+    /// already released with the request, and a worker ignores a product it
+    /// no longer holds. Deferred releases keep their relative order in
+    /// `pending_releases`.
+    pub(super) fn take_releases(&mut self) -> Vec<RouteRelease> {
+        let (selected, deferred): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.inflight.pending_releases)
+                .into_iter()
+                .partition(|release| self.executor.has_capacity(&release.worker));
+        self.inflight.pending_releases = deferred.into();
+        selected
+    }
+
     /// Records cancellation or abortion across queued, media, and running request states.
     ///
     /// A queued request finishes here with `Aborted` or `Cancelled`. A running

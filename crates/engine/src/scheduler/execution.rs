@@ -20,6 +20,9 @@
 //! - Result reconciliation: `apply_result` validates every returned call
 //!   identity against the in-flight window before any completion is applied,
 //!   stages completions, and applies them in request-local dependency order.
+//!   A video request whose conditioning workers have served their last call
+//!   and been read releases them from its route (`release_routes`), so their
+//!   request rows return before the request finishes.
 //! - Failure reconciliation: `on_executor_error` retires only the work a
 //!   `WorkerFailure` invalidates. Any other executor error, and a worker
 //!   failure classified as a control-plane invariant violation, is
@@ -233,21 +236,28 @@ impl Scheduler {
             }
         }
 
-        // Lifecycle commands that no scheduling pass carried go out in
-        // command-only batches while nothing else awaits submission.
+        // Lifecycle commands and route releases that no scheduling pass
+        // carried go out in command-only batches while nothing else awaits
+        // submission, the releases in a batch of their own (`release_batch`).
         while self.inflight.pending_submissions.is_empty()
-            && !self.inflight.pending_commands.is_empty()
+            && (!self.inflight.pending_commands.is_empty()
+                || !self.inflight.pending_releases.is_empty())
             && self.a_rank_queue_admits()
         {
             let commands = self.take_commands(|_| true);
-            if commands.is_empty() {
+            let releases = self.take_releases();
+            if commands.is_empty() && releases.is_empty() {
                 break;
             }
-            let batch = self.finish_generation_batch(
-                ExecutionBatch::new(0, Vec::new(), commands, Vec::new()),
-                Instant::now(),
-            );
-            self.inflight.pending_submissions.push_back(batch);
+            let batches = [
+                (!commands.is_empty())
+                    .then(|| ExecutionBatch::new(0, Vec::new(), commands, Vec::new())),
+                Self::release_batch(releases),
+            ];
+            for batch in batches.into_iter().flatten() {
+                let batch = self.finish_generation_batch(batch, Instant::now());
+                self.inflight.pending_submissions.push_back(batch);
+            }
             progressed = true;
             self.dispatch_submissions(&mut blocked_workers);
             if self.fatal {
@@ -1382,8 +1392,12 @@ impl Scheduler {
             .collect();
 
         // Request slots are allocated per worker; the denoiser derives the
-        // latent pages of its slot from its own pool.
-        let request_pool_idx = state.allocations.request_slot(&worker);
+        // latent pages of its slot from its own pool. A worker released from
+        // the request's route serves none of its later calls.
+        let request_pool_idx = state
+            .allocations
+            .request_slot(&worker)
+            .ok_or("a placed media call's worker holds the request's row")?;
 
         // Admission routed every component of the request, so the replicas
         // reading this call's products are known here: the producer names
@@ -1426,7 +1440,8 @@ impl Scheduler {
 
     /// Selects the ready calls of running video requests and builds one
     /// media pass: one batch per selected call kind, followed by a
-    /// command-only batch for any lifecycle commands the pass takes.
+    /// command-only batch for any lifecycle commands the pass takes and one
+    /// for any route releases it takes.
     ///
     /// Independent audio and video branches are linked by tensor inputs, not
     /// by a state predecessor. Returns no batches when nothing fits, and when
@@ -1470,13 +1485,15 @@ impl Scheduler {
         }
 
         let submit_at = Instant::now();
-        // The pass also takes the queued commands of its candidate requests
-        // and every queued `Finish`, except those `take_commands` defers.
+        // The pass also takes the queued commands of its candidate requests,
+        // every queued `Finish` and every queued route release, except those
+        // `take_commands` and `take_releases` defer.
         let candidate_requests = candidates.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
         let commands = self.take_commands(|command| {
             candidate_requests.contains(&command.request_key().request_id)
                 || matches!(command, BatchCommand::Finish { .. })
         });
+        let releases = self.take_releases();
 
         // One batch per media call: a batch is one numerical call on one component,
         // so a rank receives it as a single homogeneous group. Batches keep the
@@ -1560,7 +1577,28 @@ impl Scheduler {
             self.inflight.register_pending_batch(&batch, submit_at);
             batches.push(batch);
         }
+        if let Some(mut batch) = Self::release_batch(releases) {
+            batch.id = self.inflight.next_batch_id();
+            self.inflight.register_pending_batch(&batch, submit_at);
+            batches.push(batch);
+        }
         batches
+    }
+
+    /// Builds the batch carrying `releases` alone, with batch id zero, or
+    /// `None` when there are none.
+    ///
+    /// A release reaches only the worker it names. Carried apart from
+    /// lifecycle commands, it waits for no other worker's queue, so a
+    /// conditioning worker's row returns as soon as that worker has retired
+    /// the request.
+    fn release_batch(releases: Vec<RouteRelease>) -> Option<ExecutionBatch> {
+        if releases.is_empty() {
+            return None;
+        }
+        let mut batch = ExecutionBatch::new(0, Vec::new(), Vec::new(), Vec::new());
+        batch.releases = releases.into();
+        Some(batch)
     }
 
     /// Publishes request, in-flight batch, KV-cache and encoder-cache gauges
@@ -2026,6 +2064,31 @@ impl Scheduler {
                     self.invariant_broken(&unknown.to_string());
                 }
             }
+        }
+    }
+
+    /// Applies a worker's acknowledged release from a media request's route.
+    ///
+    /// The worker has retired the request, so the row and spans the request
+    /// held there return to the worker's address spaces and the request's
+    /// residency on the worker is forgotten. A release that matches no
+    /// retiring route latches engine-fatal.
+    pub(super) fn acknowledge_release(&mut self, release: RouteRelease) {
+        let Some(route) = self.retiring_routes.remove(&release) else {
+            tracing::error!(
+                request_id = release.request_key.request_id.0,
+                request_epoch = release.request_key.request_epoch,
+                worker = %release.worker,
+                "route release acknowledgement does not match a retiring route"
+            );
+            self.fatal = true;
+            return;
+        };
+        self.placement.affinity.retain(|(request, _), worker| {
+            *request != release.request_key || *worker != release.worker
+        });
+        if let Err(unknown) = route.free(&release.worker, &mut self.storage) {
+            self.invariant_broken(&unknown.to_string());
         }
     }
 
@@ -2692,6 +2755,118 @@ impl Scheduler {
         });
         if let Some(event) = terminal {
             self.finish_media(id, event);
+        } else {
+            self.release_routes(id);
+        }
+    }
+
+    /// Whether every call of kind `media_call` the request runs has been
+    /// scheduled and has completed; a call the request does not run counts as
+    /// completed.
+    ///
+    /// Answers for the conditioning calls (`graph::prepares_conditioning`)
+    /// and latent preparation, the calls that read what they publish; any
+    /// later call counts as not completed.
+    fn call_completed(&self, state: &MediaFlowState, media_call: MediaCall) -> bool {
+        let graph = &state.graph;
+        if !graph.runs(media_call) {
+            return true;
+        }
+        let scheduled = match media_call {
+            MediaCall::MediaReading => state.media_reading_scheduled,
+            MediaCall::VisionEncoding => state.vision_encoding_scheduled,
+            MediaCall::TextEncoding => state.text_encoding_scheduled,
+            MediaCall::LatentEncoding => {
+                state.scheduled_condition_units == graph.condition_units().len() as u32
+                    && (!graph.encodes_condition_audio() || state.condition_audio_latents.is_some())
+            }
+            MediaCall::LatentPreparation => state.latent_preparation_scheduled,
+            _ => false,
+        };
+        scheduled
+            && !self
+                .inflight
+                .pending_calls
+                .get(&state.request.request_id)
+                .is_some_and(|calls| {
+                    calls
+                        .iter()
+                        .any(|pending| pending.call.kind == CallKind::Media(media_call))
+                })
+    }
+
+    /// Releases from a running video request's route every worker that has
+    /// served its last call of the request and whose products the request
+    /// has read.
+    ///
+    /// Only a worker serving nothing but the request's conditioning calls
+    /// (`graph::prepares_conditioning`) leaves early: once each of those
+    /// calls and every call reading their products has completed, the
+    /// request sends it no further call and reads nothing it published.
+    /// Latent preparation reads every conditioning product, so every such
+    /// worker has left by its completion, before the request denoises. A
+    /// worker serving a later call keeps the request until it finishes. The
+    /// request's row and spans on a released worker move to
+    /// `retiring_routes` until the worker acknowledges the queued
+    /// `RouteRelease`, and admission can then give that row to another
+    /// request. A request with a terminal intent releases nothing here: its
+    /// own `Finish` retires every worker.
+    fn release_routes(&mut self, id: RequestId) {
+        let Some(state) = self.media_state(id) else {
+            return;
+        };
+        if state.terminal_intent.is_terminal() {
+            return;
+        }
+        let request_key = state.admission.request_key;
+        let released = state
+            .allocations
+            .request_slots
+            .keys()
+            .filter(|worker| {
+                let mut calls = state
+                    .graph
+                    .calls()
+                    .iter()
+                    .copied()
+                    .filter(|call| {
+                        self.info
+                            .media_components
+                            .get(call)
+                            .is_some_and(|component| {
+                                self.placement
+                                    .affinity
+                                    .get(&(request_key, component.clone()))
+                                    == Some(*worker)
+                            })
+                    })
+                    .peekable();
+                calls.peek().is_some()
+                    && calls.all(|call| {
+                        graph::prepares_conditioning(call)
+                            && self.call_completed(state, call)
+                            && state
+                                .graph
+                                .consumers(call)
+                                .into_iter()
+                                .all(|reader| self.call_completed(state, reader))
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for worker in released {
+            let Some(route) = self
+                .media_state_mut(id)
+                .and_then(|state| state.allocations.take_route(&worker))
+            else {
+                continue;
+            };
+            let release = RouteRelease {
+                worker,
+                request_key,
+            };
+            self.retiring_routes.insert(release.clone(), route);
+            self.inflight.pending_releases.push_back(release);
         }
     }
 
@@ -3014,6 +3189,19 @@ impl Scheduler {
                     }
                 } else {
                     self.acknowledge_commands(std::slice::from_ref(&command));
+                }
+            }
+            // A failed route release keeps the worker's state, and is queued
+            // again like a failed `Finish`.
+            for (index, release) in pending.releases.into_iter().enumerate() {
+                let failed = report.release_results.iter().any(|result| {
+                    result.command_index == index as u32
+                        && result.outcome == crate::executor::CommandOutcome::Failed
+                });
+                if failed {
+                    self.inflight.pending_releases.push_back(release);
+                } else {
+                    self.acknowledge_release(release);
                 }
             }
             pending.worker_exec_us
@@ -3487,15 +3675,19 @@ impl Scheduler {
     /// Fails every submitted call while preserving requests that can be rescheduled.
     ///
     /// Every request owning an in-flight call fails with `msg`; requests with
-    /// no call in flight stay queued or running. The lifecycle commands of
-    /// the dropped batches are acknowledged as if they had completed.
+    /// no call in flight stay queued or running. The lifecycle commands and
+    /// route releases of the dropped batches are acknowledged as if they had
+    /// completed.
     pub(super) fn fail_all_inflight(&mut self, msg: &str) {
         self.inflight.pending_submissions.clear();
         self.fail_inflight_domain_credits();
         // Submitted batches cannot return after this boundary, so their timing
         // and command ownership must be retired together.
-        let (ids, commands) = self.inflight.clear_failed_calls();
+        let (ids, commands, releases) = self.inflight.clear_failed_calls();
         self.acknowledge_commands(&commands);
+        for release in releases {
+            self.acknowledge_release(release);
+        }
         for id in ids {
             if self.media_state(id).is_some() {
                 self.finish_media(id, DiffusionTerminal::Failed(msg.to_string()));
@@ -3596,7 +3788,7 @@ impl Scheduler {
             self.reclaim_domain_credit(inflight.call.kind, true);
         }
         for batch in pending {
-            if batch.requests.is_empty() && batch.commands.is_empty() {
+            if batch.requests.is_empty() && batch.commands.is_empty() && batch.releases.is_empty() {
                 self.inflight.pending_batches.remove(&batch.id);
             } else {
                 self.inflight.pending_submissions.push_back(batch);

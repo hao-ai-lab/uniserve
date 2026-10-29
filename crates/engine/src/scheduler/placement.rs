@@ -189,14 +189,16 @@ impl Placement {
 
     /// Includes lifecycle commands in destination ordering, even when a batch has no compute.
     ///
-    /// Returns each call's placed worker plus every worker holding residency
-    /// for a command's request. `Scheduler::dispatch_submissions` uses this
-    /// set to hold back later batches that share a blocked destination.
+    /// Returns each call's placed worker, every worker a route release names,
+    /// and every worker holding residency for a command's request.
+    /// `Scheduler::dispatch_submissions` uses this set to hold back later
+    /// batches that share a blocked destination.
     pub(super) fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::WorkerId> {
         let mut targets = batch
             .requests
             .iter()
             .map(|(_, placement)| placement.worker.clone())
+            .chain(batch.releases.iter().map(|release| release.worker.clone()))
             .collect::<HashSet<_>>();
         for command in &batch.commands {
             targets.extend(self.affinity.iter().filter_map(|((request, _), worker)| {

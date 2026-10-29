@@ -15,7 +15,13 @@
 //! the groups' unit demand with the free units. Its prefill worker is
 //! recorded in `Placement::affinity`. A media request
 //! reserves a request row and every declared result buffer on each worker of
-//! its route.
+//! its route, all at once or not at all: a head that finds no free row on
+//! some worker waits holding nothing. A worker serving the request only its
+//! conditioning calls hands its row back once latent preparation has read
+//! what it published (`Scheduler::release_routes`), so a shared text encoder
+//! with fewer rows than the denoiser replicas holds each request's row only
+//! until its latent preparation, not until it finishes. An admitted request
+//! never waits for a row, so rows cannot be held in a cycle.
 
 use super::*;
 use uniserve_worker_ipc::ForwardMode;
@@ -621,7 +627,18 @@ impl Scheduler {
             // the admission carries the denoiser's row, and a call placed on
             // another worker uses that worker's row.
             let primary_component = self.info.media_components[&MediaCall::Denoising].as_str();
-            let request_pool_idx = allocations.request_slot(&routes[primary_component]);
+            let Some(request_pool_idx) = routes
+                .get(primary_component)
+                .and_then(|worker| allocations.request_slot(worker))
+            else {
+                let released = allocations.free(&mut self.storage);
+                self.waiting_media.push_front(submission);
+                self.invariant_broken("a routed media request holds a row on its denoiser");
+                if let Err(unknown) = released {
+                    self.invariant_broken(&unknown.to_string());
+                }
+                break;
+            };
             // Submission validated the prompt, sampling and conditions this
             // admission carries.
             let admission = match NewRequest::new_media(
