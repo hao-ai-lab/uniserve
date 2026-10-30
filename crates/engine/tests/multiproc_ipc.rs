@@ -3058,6 +3058,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "load_threads": null,
     "model_dtype": "bfloat16",
     "quantization_config": {},
+    "lora": [],
     "kv_cache_dtype": null,
     "mem_fraction_static": 0.7,
     "max_total_tokens": 4096,

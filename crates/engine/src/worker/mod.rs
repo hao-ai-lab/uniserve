@@ -25,7 +25,7 @@ mod registration;
 pub use executor::WorkerExecutor;
 pub(crate) use incarnations::IncarnationRegistry;
 pub use instance::{CallReaders, WorkerGroup};
-pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig};
+pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig, LoraAdapter};
 use process::{PendingRank, RankProcess};
 
 /// Backpressure and terminal failures returned by a WorkerGroup run submission.
@@ -118,6 +118,9 @@ pub struct WorkerProcessArgs {
     pub model_dtype: uniserve_core::ModelDtype,
     /// WorkerGroup-specific quantization policy.
     pub quantization_config: serde_json::Value,
+    /// LoRA adapters the worker merges into the checkpoint's weights at
+    /// load, in order.
+    pub lora: Vec<LoraAdapter>,
     /// Numeric data type used by the KV cache, when explicitly selected.
     pub kv_cache_dtype: Option<uniserve_core::KvCacheDtype>,
     /// Each rank's share of its device's total memory, which bounds the

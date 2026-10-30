@@ -24,7 +24,7 @@ from uniserve_models import qwen3_vl
 from . import audio_vae, video_vae
 from .checkpoint import TASK_PARTITIONS
 from .conditioning import assignments as conditioning_assignments
-from .config import DenoiserConfig
+from .config import Config, DenoiserConfig
 from .denoiser import adaln_timesteps
 from .modulation import TimestepEmbedding
 from .transformer import StepProjection
@@ -46,6 +46,25 @@ checkpoint_sources = (
         "audio_encoder", "audio_vae", module_path="audio_encoder"
     ),
 )
+
+# FastVideo trains H3 adapters on its own module names; these rename the three
+# that differ from the released diffusers names its param_names_mapping
+# loads (fastvideo/configs/models/dits/minimax_h3.py).
+lora_names = (
+    (r"^(.*)\.attn\.to_out$", r"\1.attn.to_out.0"),
+    (r"^(.*)\.ff\.fc_in$", r"\1.ff.net.0.proj"),
+    (r"^(.*)\.ff\.fc_out$", r"\1.ff.net.2"),
+)
+
+
+def lora_sources(config: Config) -> frozenset[str]:
+    """Name the DiT partitions LoRA adapters merge into.
+
+    A deployment places one partition, so adapters merge into the one it
+    loads.
+    """
+    return frozenset(config.denoisers)
+
 
 # Each VAE checkpoint holds an encoder half and a decoder half; a component
 # loads one and leaves the other to its sibling. The audio VAE's ``logs_proj``

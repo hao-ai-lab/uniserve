@@ -7,8 +7,10 @@ encoder, one denoiser per DiT partition the checkpoint holds (each with its
 token refiner), the video decoder with its RGB post-processor, and the audio
 decoder. ``read_config`` recognizes the base release or a FastH3 export and
 normalizes its JSON sidecars, ``base_checkpoint`` names the base revision a
-FastH3 export reads its omitted components from, and
-``checkpoint_mappings`` maps the tensors onto the modules.
+FastH3 export reads its omitted components from,
+``checkpoint_mappings`` maps the tensors onto the modules, and
+``lora_sources`` and ``lora_names`` merge FastVideo LoRA adapters into the
+placed denoiser.
 """
 
 from .attention import Dense, Sparse
@@ -39,7 +41,12 @@ from .output import VideoPostprocessor
 from .packing import DensePacking, SegmentPacking
 from .precision import checkpoint_precision, precisions, weight_config
 from .transformer import StepProjection, Transformer, TransformerLayer
-from .weights import checkpoint_mappings, checkpoint_sources
+from .weights import (
+    checkpoint_mappings,
+    checkpoint_sources,
+    lora_names,
+    lora_sources,
+)
 
 # The model loader reads these package attributes. H3 accepts no image inputs
 # and runs without classifier-free guidance, so it supplies neither an image
@@ -84,6 +91,8 @@ __all__ = [
     "read_config",
     "checkpoint_sources",
     "checkpoint_mappings",
+    "lora_names",
+    "lora_sources",
     "entry_points",
     "precisions",
     "checkpoint_precision",

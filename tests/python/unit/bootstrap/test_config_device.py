@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tests.python.fixtures.launch import worker_args
+from uniserve.loading.lora import Adapter
 from uniserve_worker.protocol.call import ForwardMode
 
 pytestmark = pytest.mark.unit
@@ -64,6 +67,24 @@ def test_quantization_config_defaults_to_model_policy(tmp_path) -> None:
 
     assert config.model is not None
     assert config.model.quantization_config == {}
+
+
+def test_lora_adapters_reach_the_model_launch_in_order(tmp_path) -> None:
+    config = worker_args(
+        tmp_path,
+        model="model",
+        max_batch_tokens=8192,
+        lora=[
+            {"path": "/models/voice.safetensors", "strength": 1.5},
+            {"path": "/models/style.safetensors", "strength": 1.0},
+        ],
+    )
+
+    assert config.model is not None
+    assert config.model.adapters == (
+        Adapter(Path("/models/voice.safetensors"), 1.5),
+        Adapter(Path("/models/style.safetensors"), 1.0),
+    )
 
 
 def test_engine_capacities_reach_worker_resources(tmp_path) -> None:

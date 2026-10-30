@@ -22,6 +22,7 @@ from safetensors.torch import load as load_safetensors
 from uniserve._slices import within
 from uniserve.quantization import QuantizedTensor, Quantizer
 
+from . import lora
 from .config import Config as IOConfig
 
 
@@ -206,6 +207,10 @@ class Source:
     headers, with safetensors dtype names such as ``"BF16"``. Such entries
     carry metadata but no values, so only dummy reads, which generate values
     from metadata alone, accept a source with headers.
+
+    ``adapters`` are LoRA files merged into the source's weights as they are
+    read (see ``LoRAWeight``); their module paths, after renaming, are
+    logical names without ``prefix``.
     """
 
     name: str
@@ -213,6 +218,7 @@ class Source:
     files: tuple[Path, ...]
     prefix: str = ""
     headers: tuple[tuple[str, tuple[int, ...], str], ...] = ()
+    adapters: tuple[lora.Adapter, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "root", Path(self.root))
@@ -243,6 +249,7 @@ class Source:
                     "checkpoint headers require tensor names and shapes"
                 )
             _dtype(dtype)
+        object.__setattr__(self, "adapters", tuple(self.adapters))
 
     def open(self, *, io: IOConfig) -> Reader:
         """Verify integrity and encoding, then open a reader for the IO mode."""
@@ -489,6 +496,41 @@ class NVFP4Weight(Weight):
 
 
 @dataclass(frozen=True, slots=True)
+class LoRAWeight(Weight):
+    """Expose a dense weight with its adapters' low-rank products merged.
+
+    A read adds each adapter's ``scale * up @ down`` over the read rectangle
+    to the FP32 weight, in adapter order, and rounds the sum once to the
+    weight's dtype. A complete read of one adapter equals merging it into
+    the checkpoint file beforehand.
+    """
+
+    base: Weight
+    adapters: tuple[lora.LowRank, ...]
+
+    @property
+    def name(self):
+        return self.base.name
+
+    @property
+    def shape(self):
+        return self.base.shape
+
+    @property
+    def dtype(self):
+        return self.base.dtype
+
+    def read(self, region=None):
+        rows, columns = _region(self.shape, region)
+        value = self.base.read((rows, columns)).to(torch.float32, copy=True)
+        for adapter in self.adapters:
+            value += adapter.scale * (
+                adapter.up[rows].float() @ adapter.down[:, columns].float()
+            )
+        return value.to(self.dtype)
+
+
+@dataclass(frozen=True, slots=True)
 class _ScaleWeight(Weight):
     """Interpret singleton or vector checkpoint scales.
 
@@ -645,6 +687,40 @@ class Reader:
             self._weights[name] = FP8Weight(
                 value, _ScaleWeight(scale, shape), axis
             )
+
+        adapted: dict[str, list[lora.LowRank]] = {}
+        for adapter in self.source.adapters:
+            for name, product in lora.read(adapter).items():
+                adapted.setdefault(self.source.prefix + name, []).append(
+                    product
+                )
+        for name, products in adapted.items():
+            base = self._weights.get(name)
+            if base is None:
+                raise ValueError(
+                    f"source {self.source.name!r} has no weight {name!r} "
+                    "for its LoRA adapters"
+                )
+            # Encoded checkpoint values would have to be decoded and
+            # re-encoded with derived scales; adapters merge into the dense
+            # weights a precision preset quantizes after the merge.
+            if (
+                isinstance(base, (FP8Weight, NVFP4Weight))
+                or not base.dtype.is_floating_point
+                or len(base.shape) != 2
+            ):
+                raise ValueError(
+                    f"LoRA adapters merge into dense floating matrices; "
+                    f"{name!r} is {base.dtype} {base.shape}"
+                )
+            for product in products:
+                shape = (product.up.shape[0], product.down.shape[1])
+                if shape != base.shape:
+                    raise ValueError(
+                        f"a LoRA adapter for {name!r} makes {shape}, "
+                        f"not {base.shape}"
+                    )
+            self._weights[name] = LoRAWeight(base, tuple(products))
 
     def _declare(self, name, shape, dtype) -> str:
         """Register one stored tensor and return its prefixed logical name."""

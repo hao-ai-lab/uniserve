@@ -15,8 +15,11 @@ A model package provides ``config_sources``, ``read_config``, ``Model``,
 ``checkpoint_precision``. A package whose checkpoints may omit components
 that a base revision supplies also provides ``base_checkpoint(root)``, which
 returns that revision's ``(repository, revision)`` or ``None``; a directory
-the checkpoint omits is then read from the base revision. This module also
-recognizes calibrated ModelOpt NVFP4 exports.
+the checkpoint omits is then read from the base revision. A package that
+takes LoRA adapters provides ``lora_sources(config)``, naming the sources
+adapters merge into, and ``lora_names``, the ``Adapter.names`` renaming its
+adapters' module paths. This module also recognizes calibrated ModelOpt
+NVFP4 exports.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from torch import nn
 
 from uniserve import loading
 from uniserve.distributed import Communicator, DeviceMesh
-from uniserve.loading import checkpoint
+from uniserve.loading import checkpoint, lora
 from uniserve.loading import weights as weight_options
 from uniserve.model import ComponentEntry
 from uniserve.nn.attention import AttentionParallelConfig
@@ -734,6 +737,7 @@ def read_config(
     io: loading.Config = loading.Config(),
     modules: frozenset[str] | None = None,
     exclude_modules: frozenset[str] = frozenset(),
+    adapters: tuple[lora.Adapter, ...] = (),
 ) -> Config:
     """Normalize one local or immutable Hub snapshot without materializing a
     model.
@@ -753,13 +757,16 @@ def read_config(
             whole model, and an empty set resolves no payload source.
         exclude_modules: Subtrees to leave unmaterialized, including their
             aliases. Their architecture metadata remains available.
+        adapters: LoRA files, in merge order, that the sources the package's
+            ``lora_sources`` names merge into their weights as they load.
 
     Raises:
         FileNotFoundError: The checkpoint, its metadata, its base revision,
             or a declared source's files cannot be found.
         ValueError: The checkpoint metadata or selection is invalid or
             unsupported, including an architecture outside the catalog, a
-            selected path that is not a module, and malformed architecture,
+            selected path that is not a module, adapters for a package or
+            checkpoint that takes none, and malformed architecture,
             model configuration, index, tokenizer or quantization metadata
             (a required field that is missing or a field of the wrong type).
     """  # noqa: D205
@@ -874,6 +881,23 @@ def read_config(
                 io,
             )
         sources.append(declaration.resolve(snapshot.root, io=io))
+    if adapters:
+        if not hasattr(package, "lora_sources"):
+            raise ValueError(
+                f"{architectures[0]} checkpoints take no LoRA adapters"
+            )
+        # Every rank resolves the targets, so a checkpoint that takes no
+        # adapters fails on each rank, whatever sources that rank loads.
+        targets = package.lora_sources(model_config)
+        named = tuple(
+            replace(adapter, names=package.lora_names) for adapter in adapters
+        )
+        sources = [
+            replace(source, adapters=named)
+            if source.name in targets
+            else source
+            for source in sources
+        ]
 
     processor = (
         None

@@ -19,7 +19,7 @@ use thiserror_ext::AsReport as _;
 use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::{
     DEFAULT_COMPONENT, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_SEQS, FlashInferBackend, LaneConfig,
-    TransferConfig, WorkerConfig, WorkerProcessArgs,
+    LoraAdapter, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::profile::diffusion_gemma::DenoisingOverrides;
 use uniserve_server::serving::MAX_VIDEO_SECONDS;
@@ -597,6 +597,12 @@ pub(crate) struct WorkerProcessOptions {
         value_name = "JSON"
     )]
     pub quantization_config: serde_json::Value,
+    /// Repeatable JSON LoRA adapter merged into the checkpoint's weights at
+    /// load, for example {"path":"/models/style.safetensors","strength":0.8};
+    /// `strength` defaults to 1.0. Adapters merge in the order given, and
+    /// changing one requires a restart.
+    #[arg(long = "lora", value_name = "JSON")]
+    pub lora: Vec<LoraAdapter>,
     #[arg(long)]
     pub kv_cache_dtype: Option<KvCacheDtype>,
     /// Each worker rank's share of its device's total memory for static
@@ -697,6 +703,7 @@ impl WorkerProcessOptions {
             load_threads: self.load_threads,
             model_dtype: self.model_dtype,
             quantization_config: self.quantization_config.clone(),
+            lora: self.lora.clone(),
             kv_cache_dtype: self.kv_cache_dtype,
             mem_fraction_static: self.mem_fraction_static,
             mesh: self.worker_mesh.clone(),
@@ -1006,6 +1013,34 @@ mod tests {
         assert_eq!(
             worker.quantization_config["components"]["transformer.mlp"],
             "nvfp4"
+        );
+    }
+
+    /// Repeated `--lora` adapters reach the worker in the order given.
+    #[test]
+    fn serve_forwards_lora_adapters_in_order() {
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model",
+            "--lora",
+            r#"{"path":"/models/voice.safetensors","strength":1.5}"#,
+            "--lora",
+            r#"{"path":"/models/style.safetensors"}"#,
+        ])
+        .expect("LoRA adapters");
+        let Command::Serve(args) = parsed.command;
+        let worker = args.runtime.worker_process.to_args();
+        assert_eq!(
+            worker
+                .lora
+                .iter()
+                .map(|adapter| (adapter.path.to_str().expect("path"), adapter.strength))
+                .collect::<Vec<_>>(),
+            [
+                ("/models/voice.safetensors", 1.5),
+                ("/models/style.safetensors", 1.0)
+            ]
         );
     }
 
