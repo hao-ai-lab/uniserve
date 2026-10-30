@@ -46,6 +46,7 @@ DEFAULTS: dict[str, Any] = {
     "load_threads": None,
     "model_dtype": "bfloat16",
     "quantization_config": {},
+    "lora": [],
     "kv_cache_dtype": None,
     "mem_fraction_static": 0.70,
     "max_total_tokens": None,

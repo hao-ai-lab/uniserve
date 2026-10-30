@@ -120,6 +120,7 @@ A video has `duration_seconds × 24` frames, rounded up to the next count of the
 | `--mem-fraction-static` | Device memory each worker may hold; 0.70 by default. |
 | `--graph-policy` | `auto` (default) captures CUDA graphs at startup, `full` refuses to start without them, and `off` runs eagerly with less memory. |
 | `--quantization-config` | Precision of a BF16 checkpoint, below. |
+| `--lora` | A LoRA adapter merged into the denoiser at load, below; repeatable. |
 
 Startup prepares every admitted request shape, and `/health` reports ready when it is done; fewer canvases, capacities and seconds start faster and use less memory. A deployment whose prepared shapes do not fit fails at startup and logs what each component holds.
 
@@ -133,6 +134,10 @@ Startup prepares every admitted request shape, and `/health` reports ready when 
 | `maximum` | NVFP4 | FP8 | NVFP4 |
 
 Attention stays BF16, and NVFP4 needs Blackwell. `components` overrides parts of a mode, as in `{"mode":"performance","components":{"video_vae":"bf16"}}`. The NVFP4 checkpoints carry their own precision and take no `--quantization-config`. Modes other than `quality` change the generated media.
+
+## LoRA
+
+`--lora '{"path":"/models/lora/style.safetensors","strength":0.8}'` merges a FastVideo H3 adapter into the denoiser's weights as they load: each adapted weight gains `strength × alpha / rank × B @ A`, summed in FP32 over the adapters in the order given and rounded once to the checkpoint's dtype. `strength` defaults to 1.0. One adapter gives the same weights as merging it into the checkpoint files beforehand, and serving then costs nothing more. Adapters merge before `--quantization-config` quantizes, so they combine with every mode but not with an NVFP4 checkpoint. Changing an adapter or its strength needs a restart; every request uses the same merged weights.
 
 ## Build and run with Docker
 
@@ -154,6 +159,7 @@ Mount `/root/.cache` and `/root/.triton` to keep the kernels the first start com
 | Compile error during `uv sync` | Check CUDA 13 `nvcc`, `CUDA_HOME`, the C++ tools, and `TORCH_CUDA_ARCH_LIST` when no GPU is visible. |
 | `unsupported FastH3 checkpoint` | Use a checkpoint from the table above; the message names the field it cannot serve. |
 | `nvfp4 conversion requires an SM100-class CUDA device` | Use `quality`, or FP8 overrides, on Hopper. |
+| `has no weight ... for its LoRA adapters`, or `makes (...), not (...)` | The adapter was trained for another model; check that it names this checkpoint's denoiser. |
 | `NVML reports no device storage for process` | Run the container with `--pid=host`. |
 | Startup refuses a memory grant, or out of memory | Raise `--mem-fraction-static`, serve fewer canvases, capacities or seconds, use `--graph-policy off`, or spread the denoiser over more GPUs. |
 | `invalid_request` naming rows or the prompt length | Serve with a larger `--max-condition-rows` or `--max-model-len`, or send fewer or smaller references. |

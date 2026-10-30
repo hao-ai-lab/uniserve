@@ -153,6 +153,46 @@ impl LaneConfig {
     }
 }
 
+/// One LoRA adapter passed in [`WorkerProcessArgs`], parsed from a `--lora`
+/// JSON descriptor such as `{"path":"/models/style.safetensors","strength":0.8}`.
+///
+/// The engine only parses and forwards adapters; the worker's loader merges
+/// each file into the checkpoint's weights and refuses one that does not fit
+/// them. Unknown fields are refused, as for [`LaneConfig`], so a misspelled
+/// strength cannot silently merge at 1.0.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoraAdapter {
+    /// Adapter safetensors file, as the worker host sees it.
+    pub path: std::path::PathBuf,
+    /// Multiplier of the adapter's `alpha / rank` scale.
+    #[serde(default = "LoraAdapter::default_strength")]
+    pub strength: f64,
+}
+
+impl LoraAdapter {
+    fn default_strength() -> f64 {
+        1.0
+    }
+}
+
+impl std::str::FromStr for LoraAdapter {
+    type Err = String;
+
+    /// Parses one JSON adapter descriptor, as the `--lora` option passes it.
+    ///
+    /// Refuses invalid JSON, a field other than `path` and `strength`, and
+    /// an empty path. JSON numbers are finite, so every strength parses.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let adapter: Self = serde_json::from_str(value)
+            .map_err(|error| format!("invalid LoRA adapter JSON: {error}"))?;
+        if adapter.path.as_os_str().is_empty() {
+            return Err("a LoRA adapter requires its path".into());
+        }
+        Ok(adapter)
+    }
+}
+
 /// FlashInfer implementation selected in [`WorkerProcessArgs`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -269,6 +309,7 @@ impl Default for WorkerProcessArgs {
             load_threads: None,
             model_dtype: Self::DEFAULT_MODEL_DTYPE,
             quantization_config: serde_json::json!({}),
+            lora: Vec::new(),
             kv_cache_dtype: None,
             mem_fraction_static: Self::DEFAULT_MEM_FRACTION_STATIC,
             mesh: None,
@@ -482,6 +523,7 @@ impl WorkerProcessArgs {
             "quantization_config".into(),
             self.quantization_config.clone(),
         );
+        fields.insert("lora".into(), json!(self.lora));
         fields.insert(
             "kv_cache_dtype".into(),
             json!(self.kv_cache_dtype.as_ref().map(|value| value.as_str())),
@@ -1544,7 +1586,7 @@ impl Drop for RankProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaneConfig, allocator_environment};
+    use super::{LaneConfig, LoraAdapter, allocator_environment};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
 
@@ -1573,6 +1615,37 @@ mod tests {
             assert!(zero.is_err(), "{limit} of zero must be refused");
             let positive = format!(r#"{lane},"{limit}":1}}"#).parse::<LaneConfig>();
             assert!(positive.is_ok(), "{limit} of one must be accepted");
+        }
+    }
+
+    /// `--lora` names a file and optionally its strength, which defaults to
+    /// 1.0; a misspelled strength or an empty path fails at argument parsing
+    /// instead of merging the adapter at the default.
+    #[test]
+    fn a_lora_adapter_names_its_file_and_strength() {
+        let adapter: LoraAdapter = r#"{"path":"/models/style.safetensors"}"#
+            .parse()
+            .expect("adapter path");
+        assert_eq!(
+            adapter.path,
+            std::path::Path::new("/models/style.safetensors")
+        );
+        assert_eq!(adapter.strength, 1.0);
+        let adapter: LoraAdapter = r#"{"path":"a.safetensors","strength":1.5}"#
+            .parse()
+            .expect("adapter strength");
+        assert_eq!(adapter.strength, 1.5);
+
+        for refused in [
+            r#"{"path":"a.safetensors","strenght":1.5}"#,
+            r#"{"path":""}"#,
+            r#"{"strength":1.5}"#,
+            "a.safetensors",
+        ] {
+            assert!(
+                refused.parse::<LoraAdapter>().is_err(),
+                "{refused} must be refused"
+            );
         }
     }
 

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Literal
 
 from uniserve.loading import Config as IOConfig
+from uniserve.loading.lora import Adapter
 from uniserve.runtime.process_groups import Rendezvous
 from uniserve_worker.config.execution import (
     WorkerConfig,
@@ -432,10 +433,14 @@ class WorkerIpcConfig:
 
 @dataclass(frozen=True)
 class ModelLaunchConfig:
-    """Selects the checkpoint and its quantization policy."""
+    """Selects the checkpoint, its quantization policy and LoRA adapters.
+
+    ``adapters`` merge into the checkpoint's weights at load, in order.
+    """
 
     path: str
     quantization_config: dict[str, object]
+    adapters: tuple[Adapter, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -537,6 +542,12 @@ class WorkerProcessArgs:
                 ModelLaunchConfig(
                     path=model_path,
                     quantization_config=dict(namespace.quantization_config),
+                    # The engine refuses a malformed --lora descriptor; the
+                    # loader checks each file against the checkpoint.
+                    adapters=tuple(
+                        Adapter(item["path"], item["strength"])
+                        for item in namespace.lora
+                    ),
                 )
                 if model_path
                 else None

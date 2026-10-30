@@ -174,6 +174,7 @@ def prepare_worker_model(
         exclude_modules=expert_paths
         if split and not dedicated
         else frozenset(),
+        adapters=launch.adapters,
     )
 
     return (
