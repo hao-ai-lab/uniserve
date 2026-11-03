@@ -10,7 +10,9 @@ the audio hop of the timeline, the ``[1, 2, 2]`` patch and the text
 encoder's SiLU gating. A checkpoint also states each denoiser's grids and
 attention (``DenoiserConfig``): the base release's uniform schedule and
 dense attention, or a FastH3 student's distilled schedule and sparse
-attention as its ``fastvideo_inference.json`` states them.
+attention as its ``fastvideo_inference.json`` states them. A base release
+whose DiT was merged with a step-distillation LoRA states its shorter
+uniform schedule in ``schedule.json`` (``SCHEDULE_FILE``).
 """
 
 from __future__ import annotations
@@ -58,6 +60,13 @@ NUM_TRAIN_TIMESTEPS = 1000.0
 # The base release evaluates the released sigma grid of 50 points: 49
 # network evaluations and the clean endpoint.
 UNIFORM_GRID_POINTS = 50
+
+# A base-release checkpoint may replace that count with its own:
+# ``{"points": 9}`` evaluates the network 8 times, as a few-step LoRA such as
+# larryvrh's MiniMax-H3 Turbo, merged into the DiT, is sampled. The count
+# includes the clean endpoint, as ``UniformGrid.points`` does. Only the count
+# changes; the shifts stay the schedulers'.
+SCHEDULE_FILE = "schedule.json"
 
 # The released (adapt_shape_v1) canvas rule: a 768-pixel short edge, an area
 # cap of the 16:9 canvas, sides on the packing's 32-pixel grid, and aspect
@@ -676,6 +685,29 @@ def _audio_vae(values: Mapping[str, Any]) -> audio_vae.Config:
     return config
 
 
+def _uniform_points(schedule: Mapping[str, Any] | None) -> int:
+    """The sigma points of a base release's uniform grid.
+
+    Raises:
+        ValueError: ``schedule.json`` holds a field other than ``points``,
+            or a count below two.
+    """
+    if schedule is None:
+        return UNIFORM_GRID_POINTS
+    if set(schedule) != {"points"}:
+        raise ValueError(
+            f"MiniMax-H3 {SCHEDULE_FILE} must hold only points, got "
+            f"{sorted(schedule)}"
+        )
+    points = schedule["points"]
+    if not _is_integer(points) or points < 2:
+        raise ValueError(
+            f"MiniMax-H3 {SCHEDULE_FILE} points must be an integer of at "
+            f"least 2, got {points!r}"
+        )
+    return points
+
+
 def _shifts(metadata: Mapping[str, Mapping[str, Any]]) -> dict[str, float]:
     shifts = {}
     for modality, name in (
@@ -696,7 +728,8 @@ def normalize(
     ``metadata`` holds the parsed JSON of ``text_encoder``, ``processor``
     (the image processor's ``preprocessor_config.json``), ``video_vae``,
     ``audio_vae``, ``scheduler``, ``audio_scheduler`` and one entry per DiT
-    partition the layout holds (its ``config.json``).
+    partition the layout holds (its ``config.json``), and ``schedule`` when
+    the checkpoint holds ``schedule.json``.
     """
     for name in (
         "text_encoder",
@@ -718,6 +751,15 @@ def normalize(
         )
     shifts = _shifts(metadata)
     contract = layout.contract
+    schedule = metadata.get("schedule")
+    if schedule is not None and contract is not None:
+        raise ValueError(
+            f"a FastH3 checkpoint states its schedule in "
+            f"fastvideo_inference.json and takes no {SCHEDULE_FILE}"
+        )
+    if schedule is not None and not isinstance(schedule, Mapping):
+        raise ValueError(f"MiniMax-H3 {SCHEDULE_FILE} must hold a JSON object")
+    points = _uniform_points(schedule)
     denoisers: dict[str, DenoiserConfig] = {}
     for partition, tasks in layout.partitions.items():
         values = metadata[partition]
@@ -735,7 +777,7 @@ def normalize(
         transformer = _transformer(values, heads=heads)
         if contract is None:
             grids = _modality_grids(
-                partial(UniformGrid, UNIFORM_GRID_POINTS), shifts
+                partial(UniformGrid, points), shifts
             )
         else:
             grids = _fasth3_grids(contract, transformer, shifts)
@@ -782,6 +824,12 @@ def read_config(root: Path, io, *, sources, base: Path | None = None) -> Config:
     """
     layout = detect(root)
     metadata: dict[str, Any] = {}
+    # The checkpoint's own file only: a FastH3 export's base revision is the
+    # unmerged release.
+    if (root / SCHEDULE_FILE).is_file():
+        metadata["schedule"] = json.loads(
+            (root / SCHEDULE_FILE).read_text(encoding="utf-8")
+        )
     for name, relative in (
         *_SIDECARS.items(),
         *(

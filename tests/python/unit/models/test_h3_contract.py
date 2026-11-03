@@ -115,6 +115,37 @@ def test_base_release_serves_both_task_families(base):
     assert model.transformer.num_steps == model.transformer_ref.num_steps == 49
 
 
+def test_base_release_takes_a_shorter_uniform_schedule(base):
+    """A Turbo-LoRA merge of the release states its 9-point grid."""
+    (base / "schedule.json").write_text(json.dumps({"points": 9}))
+    config = read_config(base, IOConfig(), sources={})
+    for denoiser in config.denoisers.values():
+        assert denoiser.grids == {
+            "video": UniformGrid(9, shift=12.0),
+            "audio": UniformGrid(9, shift=3.0),
+        }
+        assert denoiser.attention == DenseAttention()
+    with torch.device("meta"):
+        model = Model(config)
+    assert model.transformer_ref.num_steps == 8
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    [{"points": 1}, {"points": 9.0}, {"points": True}, {"steps": 8}, [9]],
+)
+def test_base_release_refuses_a_malformed_schedule(base, schedule):
+    (base / "schedule.json").write_text(json.dumps(schedule))
+    with pytest.raises(ValueError, match="schedule.json"):
+        read_config(base, IOConfig(), sources={})
+
+
+def test_fasth3_export_refuses_a_schedule_file(checkpoint):
+    (checkpoint / "schedule.json").write_text(json.dumps({"points": 9}))
+    with pytest.raises(ValueError, match="takes no schedule.json"):
+        read_config(checkpoint, IOConfig(), sources={})
+
+
 def _ref2va_export(checkpoint, **fields):
     """Turn the fixture into a ref2va student of the release's partition."""
     contract = {
