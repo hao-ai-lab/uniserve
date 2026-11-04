@@ -12,6 +12,8 @@ Install UniServe as in the [README](../../README.md#install).
 
 `t2va` is text to video, `fl2va` text and first or last keyframe to video, and `ref2va` reference to video; every task returns an H.264 MP4 at 24 fps with stereo 32-kHz AAC audio. The NVFP4 checkpoints need Blackwell. FastH3 Omni ships only its denoiser: UniServe reads the text encoder, tokenizer and VAEs from the Hugging Face cache at the MiniMax-H3 revision its `fastvideo_inference.json` pins, and downloads what the cache lacks. A server loads one checkpoint, so it serves either `t2va` and `fl2va` or `ref2va`.
 
+UniServe also serves the MiniMax-H3 base release, at 768p with dense attention, on its released uniform grid of 50 sigma points (49 network evaluations). A copy of the release whose DiT was merged with a step-distillation LoRA, such as larryvrh's MiniMax-H3 Turbo, states its shorter grid in a `schedule.json` at the checkpoint root: `{"points": 9}` evaluates the network 8 times. Only the point count changes; the shifts stay the schedulers'. A FastH3 checkpoint states its schedule in `fastvideo_inference.json` and refuses the file. `GET /v1/capabilities` reports the point count as `schedule.num_inference_steps`.
+
 ## Deployments
 
 `--workers` takes a deployment file from `configs/minimax_h3/`, which places the components on GPUs and hosts:
