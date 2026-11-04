@@ -776,9 +776,7 @@ def normalize(
         )
         transformer = _transformer(values, heads=heads)
         if contract is None:
-            grids = _modality_grids(
-                partial(UniformGrid, points), shifts
-            )
+            grids = _modality_grids(partial(UniformGrid, points), shifts)
         else:
             grids = _fasth3_grids(contract, transformer, shifts)
         denoisers[partition] = DenoiserConfig(
