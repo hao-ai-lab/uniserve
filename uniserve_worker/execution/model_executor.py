@@ -73,6 +73,7 @@ from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.device import canonical_device, process_device_bytes
 from uniserve.runtime.resources import close_resources
+from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import OutputLayout
 from uniserve_worker.bootstrap.components import (
     VIDEO_CODEC_COMPONENT,
@@ -305,6 +306,10 @@ class ModelExecutor:
         # Transient work areas the startup contexts of one (entry, path,
         # method) borrow on that entry's stream; see ``prepare_module``.
         self._module_scratch: dict[tuple[str, str, str], Scratch] = {}
+        # Workspaces the startup contexts of one video post-processor share,
+        # by (entry, path, method) and workspace requirements; see
+        # ``prepare_module``.
+        self._module_workspaces: dict[tuple, TensorBuffers] = {}
         # Replays of the still-frame tile encodings startup captured, by
         # ``TiledEncoder``; every context prepared afterwards binds them
         # (see ``capture_tiles``).
@@ -543,8 +548,11 @@ class ModelExecutor:
             try:
                 if stream is not None:
                     stream.wait(torch.cuda.current_stream(binding.device))
+                workspace = self._shared_workspace(
+                    key, call.module, size, binding.device
+                )
                 with self.graph_storage.allocate(entry):
-                    context.prepare(size)
+                    context.prepare(size, workspace=workspace)
                 self.graph_storage.check()
             except BaseException:
                 entry.close()
@@ -735,6 +743,31 @@ class ModelExecutor:
                             ),
                         )
                     )
+
+    def _shared_workspace(self, key, module, size, device):
+        """The workspace a startup video post-processor context borrows.
+
+        A post-processor never captures and runs eagerly on its entry's one
+        stream, one call at a time, and a call consumes its workspace before
+        it returns: it is transient storage like the context's scratch. Its
+        startup contexts whose requirements match therefore share one
+        backing (every frame count of one canvas does, since the longest
+        clip is the same), instead of each holding its own for the life of
+        the process. Every other context, and one prepared while serving,
+        owns its workspace. Returns ``None`` for those.
+        """
+        if self._startup_complete or not isinstance(module, VideoPostprocessor):
+            return None
+        query = getattr(module, "workspace_buffers", None)
+        requirements = {} if query is None else dict(query(size))
+        if not requirements:
+            return None
+        shared = (*key[:3], tuple(requirements.items()))
+        backing = self._module_workspaces.get(shared)
+        if backing is None:
+            backing = TensorBuffers.allocate(requirements, device=device)
+            self._module_workspaces[shared] = backing
+        return backing
 
     def _retire_module(self, key):
         """Retire the module entry under ``key`` and its captured graphs.
@@ -2211,6 +2244,9 @@ class ModelExecutor:
         actions.extend(
             scratch.close for scratch in self._module_scratch.values()
         )
+        actions.extend(
+            backing.close for backing in self._module_workspaces.values()
+        )
         if self._diffusion is not None:
             actions.append(self._diffusion.close)
         for entry in self.entries.values():
@@ -2241,6 +2277,7 @@ class ModelExecutor:
             self.entries.clear()
             self._module_entries.clear()
             self._module_scratch.clear()
+            self._module_workspaces.clear()
             self._diffusion = None
             self.graph_storage.close()
             self._module_streams.clear()
