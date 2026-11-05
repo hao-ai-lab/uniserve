@@ -160,11 +160,14 @@ NAMED_CANVASES = MappingProxyType(
     }
 )
 
-# A FastH3 export, DMD or FastH3 Omni, generates 12 buckets: the named aspect
-# ratios at the 768p and 480p resolutions. The 768p buckets are the canvas
-# rule's canvases; the 480p buckets, (height, width) below in the same ratio
-# order, are the training table's own rather than a rescaled rule (21:9 is
-# 992x416, not 960x416). A deployment prepares a subset of them.
+# Every H3 checkpoint generates 12 buckets: the named aspect ratios at the
+# 768p and 480p resolutions. The 768p buckets are the canvas rule's canvases;
+# the 480p buckets, (height, width) below in the same ratio order, are the
+# FastH3 training table's own rather than a rescaled rule (21:9 is 992x416,
+# not 960x416). The base release was published with the canvas rule alone,
+# but its DiTs are not tied to one raster, so it offers the same 480p buckets
+# and a request gets the same size from either release. A deployment
+# prepares a subset of them.
 FASTH3_CANVASES = MappingProxyType(
     {
         **NAMED_CANVASES,
@@ -319,7 +322,8 @@ class DenoiserConfig:
         tasks: The tasks this DiT serves, in canonical order.
         canvases: The only canvases the checkpoint generates, keyed by the
             ``(short_edge, "W:H")`` a request selects them with, or None
-            when it generates every canvas of the canvas rule.
+            when it generates every canvas of the canvas rule and the 480p
+            buckets of ``FASTH3_CANVASES``.
     """
 
     transformer: TransformerConfig

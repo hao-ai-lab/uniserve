@@ -51,7 +51,7 @@ from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
 from .conditioning import Conditioner
 from .config import (
-    NAMED_CANVASES,
+    FASTH3_CANVASES,
     DenoiserConfig,
     DenseAttention,
     SparseAttention,
@@ -204,11 +204,12 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
         A checkpoint that generates only some canvases offers those; one
         that follows the canvas rule offers every named aspect ratio's
-        canvas at the rule's short edge.
+        canvas at the rule's short edge and at 480p, the buckets of a FastH3
+        export.
         """
         if self.config.canvases is not None:
             return self.config.canvases
-        return NAMED_CANVASES
+        return FASTH3_CANVASES
 
     @property
     def tasks(self) -> tuple[str, ...]:

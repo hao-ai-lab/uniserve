@@ -651,8 +651,8 @@ pub(crate) struct WorkerProcessOptions {
     /// Comma-separated resolution classes (`768p`, `480p`) a video
     /// deployment prepares, each at every `--video-aspect-ratios` entry. A
     /// request's `target.short_edge` selects one. The video worker refuses a
-    /// class its denoiser does not generate: a released base checkpoint
-    /// generates 768p, a FastH3 DMD export also 480p.
+    /// class its denoiser does not generate; every H3 checkpoint generates
+    /// 768p and 480p.
     #[arg(long, default_value = "768p", value_name = "LIST")]
     pub video_resolutions: String,
     /// Comma-separated aspect ratios (`21:9`, `16:9`, `4:3`, `1:1`, `3:4`,
