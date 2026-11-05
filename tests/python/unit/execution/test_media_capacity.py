@@ -18,7 +18,7 @@ from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
 from uniserve_models.minimax_h3 import Model
 from uniserve_models.minimax_h3 import config as h3_config
-from uniserve_models.minimax_h3.config import FASTH3_CANVASES, NAMED_CANVASES
+from uniserve_models.minimax_h3.config import FASTH3_CANVASES
 from uniserve_models.minimax_h3.processing import REFERENCE_IMAGE_SHORT_EDGE
 from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
@@ -204,7 +204,7 @@ def test_every_named_canvas_has_layouts_that_fit_the_slot_storage():
         min_frames=96,
         text_capacities=(1024, 4096),
     )
-    assert set(builder.canvases) == set(NAMED_CANVASES.values())
+    assert set(builder.canvases) == set(FASTH3_CANVASES.values())
     layouts = builder.layouts()
     assert layouts[0] == builder.maximum
     assert len(layouts) == len(builder.canvases) * len(ADMITTED_FRAMES) * 2

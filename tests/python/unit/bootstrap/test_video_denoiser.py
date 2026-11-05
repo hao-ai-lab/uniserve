@@ -10,7 +10,7 @@ from tests.python.fixtures.h3 import (
 from tests.python.fixtures.worker_config import cpu_worker_config
 from uniserve.model import ReferenceLimits
 from uniserve_models.minimax_h3 import Model
-from uniserve_models.minimax_h3.config import FASTH3_CANVASES, NAMED_CANVASES
+from uniserve_models.minimax_h3.config import FASTH3_CANVASES
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import media_builder, video_denoiser
 from uniserve_worker.bootstrap.report import (
@@ -92,10 +92,11 @@ def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
     )
     # The worker executes both tasks of the t2va/fl2va DiT on the released
     # schedule: 50 sigma points, video shift 12, audio shift 3, the canvas
-    # rule's canvas of every named aspect ratio at 768p.
+    # rule's canvas of every named aspect ratio at 768p and FastH3's 480p
+    # buckets.
     assert (info.tasks, info.schedule_points) == (("t2va", "fl2va"), 50)
     assert (info.video_shift, info.audio_shift) == (12.0, 3.0)
-    assert _declared(info) == _trained(NAMED_CANVASES)
+    assert _declared(info) == _trained(FASTH3_CANVASES)
 
     # It takes no references.
     assert info.references == ReferenceLimits()

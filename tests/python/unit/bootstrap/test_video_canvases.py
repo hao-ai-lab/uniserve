@@ -132,15 +132,21 @@ def test_a_canvas_the_checkpoint_does_not_generate_is_refused(
         media_builder(model, _config(resolutions, aspect_ratios))
 
 
-def test_the_released_base_checkpoint_generates_768p_only():
+@pytest.mark.parametrize("placed", ["transformer", "transformer_ref"])
+def test_the_released_base_checkpoint_generates_the_fasth3_buckets(placed):
+    """Both base DiTs prepare 480p at FastH3's buckets, not a rescaled rule."""
     with torch.device("meta"):
         base = Model(base_config())
-    placed = ("transformer",)
-    served = media_builder(
-        base, _config(("768p",), ("16:9",), deployment_components=placed)
+    config = _config(
+        ("768p", "480p"), ("21:9", "9:16"), deployment_components=(placed,)
     )
-    assert served.canvases == (NAMED_CANVASES[(768, "16:9")],)
-    with pytest.raises(ValueError, match="generates only"):
-        media_builder(
-            base, _config(("480p",), ("16:9",), deployment_components=placed)
-        )
+    served = media_builder(base, config)
+    names = ((768, "21:9"), (768, "9:16"), (480, "21:9"), (480, "9:16"))
+    assert served.canvases == tuple(FASTH3_CANVASES[name] for name in names)
+    assert served.canvases[2] == image.Config(416, 992)
+    # The CLI's default selection, 768p, keeps a base deployment at the
+    # canvas rule.
+    default = media_builder(
+        base, _config(("768p",), ("16:9",), deployment_components=(placed,))
+    )
+    assert default.canvases == (NAMED_CANVASES[(768, "16:9")],)
