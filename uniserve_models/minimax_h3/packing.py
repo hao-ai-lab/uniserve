@@ -44,10 +44,12 @@ __all__ = [
     "TEXT_TAG",
     "CLIP_FRAMES",
     "CLIP_LATENTS",
+    "CONTINUATION_FRAMES",
     "VIDEO_TAG",
     "align_num_frames",
     "audio_latent_frames",
     "condition_segments",
+    "continuation_latent_frames",
     "dense_packing",
     "dense_tables",
     "latent_raster",
@@ -78,6 +80,10 @@ AUDIO_SAMPLE_RATE = 32_000
 AUDIO_LATENTS_PER_SECOND = 40
 AUDIO_HOP = AUDIO_SAMPLE_RATE // AUDIO_LATENTS_PER_SECOND
 ROPE_FRAME_RESCALE = 5.0 / 3.0
+# Frame counts a continuation clip may have: it ends on a causal-VAE clip
+# boundary, 17 * n + 5 frames with n of 0 to 2, so it encodes to 2, 7 or 12
+# latent frames.
+CONTINUATION_FRAMES = (5, 22, 39)
 # Output frames covered by each of the five latent frames of one 17-frame
 # clip: 1 + 4 * 4 = 17.
 ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
@@ -107,6 +113,9 @@ class SegmentKind(StrEnum):
     VIDEO = "video"
     # A reference track's stereo audio rows.
     AUDIO = "audio"
+    # The end of an earlier video on the target canvas, after its
+    # soundtrack's audio rows, aliasing the start of the generated video.
+    CONTINUATION = "continuation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,29 +162,43 @@ def condition_segments(
     """Order a request's conditions as the packed sequence holds them.
 
     Keyframes come first, in request order, then the references in request
-    order: the ``fl2va`` layout holds only keyframes, and a ``ref2va``
-    request's keyframes lead its references. A one-frame
-    reference is an image; a longer one is a video, with its soundtrack
-    when it carries audio; a reference without pixels is audio.
+    order, then a continuation clip: the ``fl2va`` layout holds only
+    keyframes, a ``ref2va`` request's keyframes lead its references, and a
+    clip follows them wherever the request lists it, as the reference
+    implementation of continuation (FastVideo's ``continuation_video``)
+    packs it. A one-frame reference is an image; a longer one is a video,
+    with its soundtrack when it carries audio; a reference without pixels
+    is audio.
 
     Raises:
-        ValueError: A keyframe off the target canvas, or a raster or frame
-            count the VAE does not encode.
+        ValueError: A keyframe or a continuation clip off the target canvas,
+            a raster or frame count the VAE does not encode, a clip frame
+            count outside ``CONTINUATION_FRAMES``, more than one clip, or a
+            clip together with keyframes.
     """
     keyframes: list[Segment] = []
     references: list[Segment] = []
+    clips: list[Segment] = []
     for index, condition in enumerate(conditions):
         pixels = condition.video
+        continuation = condition.role == ConditionRole.CONTINUATION
         height = width = frames = 0
         if pixels is not None:
             height, width = latent_raster(pixels.frame)
-            frames = (
-                1
-                if pixels.num_frames == 1
-                else video_latent_frames(pixels.num_frames)
-            )
+            if continuation:
+                frames = continuation_latent_frames(pixels.num_frames)
+            elif pixels.num_frames == 1:
+                frames = 1
+            else:
+                frames = video_latent_frames(pixels.num_frames)
         audio = math.ceil(condition.audio_samples / AUDIO_HOP)
-        if condition.role != ConditionRole.REFERENCE:
+        if continuation:
+            if pixels is None or pixels.frame != canvas:
+                raise ValueError(
+                    "an H3 continuation clip lies on the target canvas"
+                )
+            kind = SegmentKind.CONTINUATION
+        elif condition.role.is_keyframe:
             if pixels is None or pixels.frame != canvas:
                 raise ValueError("H3 keyframes are fitted to the target canvas")
             kind = SegmentKind.KEYFRAME
@@ -194,10 +217,17 @@ def condition_segments(
             width,
             audio,
         )
-        (keyframes if kind == SegmentKind.KEYFRAME else references).append(
-            segment
-        )
-    return (*keyframes, *references)
+        if kind == SegmentKind.KEYFRAME:
+            keyframes.append(segment)
+        elif kind == SegmentKind.CONTINUATION:
+            clips.append(segment)
+        else:
+            references.append(segment)
+    if len(clips) > 1:
+        raise ValueError("an H3 request continues at most one clip")
+    if clips and keyframes:
+        raise ValueError("an H3 continuation takes no keyframes")
+    return (*keyframes, *references, *clips)
 
 
 def latent_raster(canvas: image.Config) -> tuple[int, int]:
@@ -247,6 +277,26 @@ def video_latent_frames(num_frames: int) -> int:
         raise ValueError("H3 frame count must have the form 17 * n + 5")
     clips = (num_frames - CLIP_LATENTS) // CLIP_FRAMES
     return clips * CLIP_LATENTS + 2
+
+
+def continuation_latent_frames(num_frames: int) -> int:
+    """Convert a continuation clip's frame count into video-VAE latents.
+
+    A clip is ``17 * n + 5`` frames with ``n`` of 0 to 2
+    (``CONTINUATION_FRAMES``): its complete 17-frame clips yield five latent
+    frames each and its trailing five frames two more, so 5 frames encode to
+    2 latent frames, 22 to 7 and 39 to 12.
+
+    Raises:
+        ValueError: A frame count outside ``CONTINUATION_FRAMES``.
+    """
+    if type(num_frames) is not int or num_frames not in CONTINUATION_FRAMES:
+        raise ValueError(
+            "an H3 continuation clip has "
+            + ", ".join(map(str, CONTINUATION_FRAMES))
+            + " frames"
+        )
+    return (num_frames - CLIP_LATENTS) // CLIP_FRAMES * CLIP_LATENTS + 2
 
 
 def audio_latent_frames(num_frames: int) -> int:
@@ -504,6 +554,45 @@ def _place_keyframe(
     positions[rows, 1:] = spatial
 
 
+def _clip_span(segment: Segment) -> float:
+    """Rotary time a continuation clip advances the clock by.
+
+    As a reference video with its soundtrack: the longer of its audio
+    latents and its frames' sequential span.
+    """
+    return max(float(segment.audio_frames), _video_span(segment.latent_frames))
+
+
+def _place_clip(
+    positions: torch.Tensor,
+    audio: slice | torch.Tensor | None,
+    visual: slice | torch.Tensor,
+    clip: Segment,
+    origin: float,
+    spatial: torch.Tensor,
+    width_grid: torch.Tensor,
+) -> None:
+    """Place a continuation clip at the start of the generated timeline.
+
+    The generated audio and video start at ``origin``. The clip's latent
+    frames take the coordinates of the generated video's first latent
+    frames, on the target's spatial grid ``spatial``, and its stereo audio
+    those of the generated audio's first latents, at the ends of the target
+    width grid; ``visual`` lists the clip's packed rows in raster order and
+    ``audio`` its audio rows, None for a clip without sound.
+    """
+    if audio is not None and clip.audio_rows:
+        _place_audio(positions, audio, clip.audio_frames, origin, width_grid)
+    block = torch.empty(
+        (clip.latent_frames, spatial.shape[0], 3),
+        dtype=torch.float64,
+        device="cpu",
+    )
+    block[:, :, 0] = _temporal_grid(clip.latent_frames, origin)[:, None]
+    block[:, :, 1:] = spatial[None]
+    positions[visual] = block.reshape(-1, 3)
+
+
 def _keyframe_span(frames: int) -> float:
     """Rotary time ``frames`` latent frames occupy, summed pairwise.
 
@@ -539,7 +628,11 @@ def dense_tables(
     start where the references leave the clock, the audio one unit per
     latent and the video frames at ``(5 / 3) * (1, 4, 4, 4, 4)[k mod 5]``
     spacing. A keyframe sits on the generated timeline at the target grid:
-    at its start, or at its last latent frame.
+    at its start, or at its last latent frame. A continuation clip, packed
+    after the references, advances the clock as a video with its soundtrack
+    does and then takes the coordinates of the generated video's first
+    latent frames and of the generated audio's first latents, so it
+    conditions the start of the generation in place.
 
     Text rows in ``vision_spans`` are tagged video; visual condition rows
     read the visual-condition timestep group and audio reference rows the
@@ -595,6 +688,7 @@ def dense_tables(
     )
     clock = float(num_text_tokens)
     keyframes = []
+    clips = []
     for segment in segments:
         audio = slice(cursor, cursor + segment.audio_rows)
         visual = slice(audio.stop, audio.stop + segment.video_rows)
@@ -604,6 +698,11 @@ def dense_tables(
         if segment.kind == SegmentKind.KEYFRAME:
             # Placed once the generated timeline's origin is known.
             keyframes.append((segment, visual))
+        elif segment.kind == SegmentKind.CONTINUATION:
+            # Advances the clock as a video with its soundtrack does, then
+            # sits at the generated timeline's origin.
+            clips.append((segment, audio, visual))
+            clock += _clip_span(segment)
         elif segment.kind == SegmentKind.IMAGE:
             grid, _ = _frame_grid(
                 segment.latent_height, segment.latent_width, patch_size
@@ -630,6 +729,10 @@ def dense_tables(
             )
     for segment, visual in keyframes:
         _place_keyframe(positions, visual, segment, clock, frames, spatial)
+    for segment, audio_rows, visual in clips:
+        _place_clip(
+            positions, audio_rows, visual, segment, clock, spatial, width_grid
+        )
 
     _place_frames(
         positions, slice(0, packing.video_rows), frames, clock, spatial
@@ -691,11 +794,16 @@ def _video_grid(
 def segment_tiles(segment: Segment, tile: int) -> int:
     """Tiles one condition occupies in a segment packing of ``tile`` rows.
 
-    Its audio rows fill whole tiles, then a keyframe's or an image's rows
-    fill whole tiles and a video's rows fill the tiles of its token grid.
+    Its audio rows fill whole tiles, then a keyframe's, an image's or a
+    continuation clip's rows fill whole tiles and a video's rows fill the
+    tiles of its token grid.
     """
     tiles = math.ceil(segment.audio_rows / tile)
-    if segment.kind in (SegmentKind.KEYFRAME, SegmentKind.IMAGE):
+    if segment.kind in (
+        SegmentKind.KEYFRAME,
+        SegmentKind.IMAGE,
+        SegmentKind.CONTINUATION,
+    ):
         tiles += math.ceil(segment.video_rows / tile)
     elif segment.kind == SegmentKind.VIDEO:
         grid = _video_grid(
@@ -915,9 +1023,10 @@ def segment_tables(
     ``dense_tables``, held in tiles.
     The prompt fills the text tiles from the first. The conditions follow in
     packed order from the first condition tile, each segment in its own
-    tiles: a keyframe's rows fill whole dense tiles, as an image's do after a
-    reference's audio rows, and a reference video forms its own segment of
-    video tiles over its token grid. Dense tiles attend and are attended
+    tiles: a keyframe's rows fill whole dense tiles, as an image's and a
+    continuation clip's do after their audio rows, and a reference video
+    forms its own segment of video tiles over its token grid; a clip is
+    placed as in ``dense_tables``. Dense tiles attend and are attended
     densely, as the segment-pure prefix tiles of the FastVideo VSA-H3 layout
     are. The generated audio fills dense tiles and the generated video forms
     the last segment. A video query keeps
@@ -997,6 +1106,7 @@ def segment_tables(
     next_tile = packing.text_rows // tile
     source = packing.text_rows
     keyframes = []
+    clips = []
     for segment in segments:
         if segment.audio_rows:
             audio = dense_rows(next_tile, segment.audio_rows)
@@ -1015,6 +1125,20 @@ def segment_tables(
             source += segment.video_rows
             tags[visual], groups[visual] = VIDEO_TAG, VISUAL_CONDITION_GROUP
             keyframes.append((segment, visual))
+        elif segment.kind == SegmentKind.CONTINUATION:
+            # Dense tiles, attended and attending densely: the generated
+            # video continues the clip exactly, so no tile of it is skipped.
+            visual = dense_rows(next_tile, segment.video_rows)
+            next_tile += math.ceil(segment.video_rows / tile)
+            prefix_index[visual] = torch.arange(
+                source, source + segment.video_rows
+            )
+            source += segment.video_rows
+            tags[visual], groups[visual] = VIDEO_TAG, VISUAL_CONDITION_GROUP
+            clips.append(
+                (segment, audio if segment.audio_rows else None, visual)
+            )
+            clock += _clip_span(segment)
         elif segment.kind == SegmentKind.IMAGE:
             visual = dense_rows(next_tile, segment.video_rows)
             next_tile += math.ceil(segment.video_rows / tile)
@@ -1069,6 +1193,10 @@ def segment_tables(
 
     for segment, visual in keyframes:
         _place_keyframe(positions, visual, segment, clock, frames, spatial)
+    for segment, audio_rows, visual in clips:
+        _place_clip(
+            positions, audio_rows, visual, segment, clock, spatial, width_grid
+        )
 
     # The generated audio and video start where the references leave the
     # clock; their rows are the layout's.

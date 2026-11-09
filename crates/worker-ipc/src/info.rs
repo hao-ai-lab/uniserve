@@ -352,9 +352,19 @@ pub struct FrameClips {
 }
 
 impl FrameClips {
-    /// Returns the decode units of a video of `frames` legal frames.
+    /// Returns the complete clips of a video of `frames` frames, each one
+    /// decode or encode unit before the tail.
+    ///
+    /// `frames` is a legal count or a lone tail: the `min_frames -
+    /// clip_frames` frames past the last clip (5 for H3), which a
+    /// continuation clip may be on its own and which has no complete clip.
     pub fn units(&self, frames: u32) -> u32 {
-        frames.saturating_sub(self.min_frames) / self.clip_frames + 1
+        frames.saturating_sub(self.tail_frames()) / self.clip_frames
+    }
+
+    /// Returns the frames of the tail past a video's complete clips.
+    pub const fn tail_frames(&self) -> u32 {
+        self.min_frames - self.clip_frames
     }
 
     /// Returns the fewest legal frame count that is at least `requested`.
@@ -370,7 +380,8 @@ impl FrameClips {
         Some(self.min_frames + beyond / self.clip_frames * self.clip_frames)
     }
 
-    /// Returns the latent frames the VAE encodes `frames` legal frames to.
+    /// Returns the latent frames the VAE encodes `frames` frames to, a legal
+    /// count or a lone tail (see [`Self::units`]).
     pub fn latent_frames(&self, frames: u32) -> u32 {
         self.units(frames) * self.clip_latent_frames + self.tail_latent_frames
     }

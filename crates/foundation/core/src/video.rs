@@ -23,6 +23,11 @@ pub enum ConditionRole {
     LastFrame,
     /// A reference conditioning the generation as a whole.
     Reference,
+    /// The end of an earlier video, on the target canvas and with its
+    /// soundtrack when it has one, that the generated video continues: the
+    /// generation regenerates these frames in place and the artifact omits
+    /// them.
+    Continuation,
 }
 
 impl ConditionRole {
@@ -168,7 +173,7 @@ pub struct ConditionVision {
 /// One condition of a video request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VideoCondition {
-    /// Keyframe anchor or reference.
+    /// Keyframe anchor, reference or continuation clip.
     pub role: ConditionRole,
     /// The fetched media bytes.
     pub source: MediaLocator,
@@ -198,7 +203,8 @@ impl VideoCondition {
     }
 
     /// Checks the condition's internal consistency: a keyframe is one still
-    /// image the conditioner may read; a condition with pixels encodes to
+    /// image the conditioner may read; a continuation clip is a video the
+    /// conditioner does not read; a condition with pixels encodes to
     /// positive rows in at least one unit and one without has none; a
     /// condition with an audio track encodes to positive audio rows and one
     /// without has none; a video's conditioner view samples kept frames in
@@ -210,6 +216,11 @@ impl VideoCondition {
         }
         if self.role.is_keyframe() && !matches!(self.media, ConditionMedia::Image(_)) {
             return Err("a keyframe is one still image");
+        }
+        if self.role == ConditionRole::Continuation
+            && (!matches!(self.media, ConditionMedia::Video { .. }) || self.vision.is_some())
+        {
+            return Err("a continuation clip is a video the conditioner does not read");
         }
         let canvases_positive = |canvas: Canvas| canvas.width > 0 && canvas.height > 0;
         match &self.media {
@@ -361,5 +372,16 @@ mod tests {
             frame_indices: vec![0, 12, 24],
         });
         assert!(video.validate().is_err(), "frame 24 is not kept");
+
+        let mut clip = video.clone();
+        clip.role = ConditionRole::Continuation;
+        clip.vision = None;
+        assert_eq!(clip.validate(), Ok(()));
+        clip.vision = video.vision.clone();
+        clip.vision.as_mut().unwrap().frame_indices = vec![0, 12];
+        assert!(clip.validate().is_err(), "the conditioner reads no clip");
+        let mut still = image(ConditionRole::Continuation);
+        still.vision = None;
+        assert!(still.validate().is_err(), "a clip is a video");
     }
 }

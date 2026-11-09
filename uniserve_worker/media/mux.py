@@ -236,11 +236,17 @@ class MediaEncoder:
         A borrowed unit is read in place and its borrow released, which
         acknowledges the producer's segment, once the encoder has read it.
         The encoded bytes become this call's product when the task
-        completes; their length is not known until then.
+        completes; their length is not known until then. A unit the
+        container omits wholly (``AvMuxConfig.unit_skip``) encodes to no
+        bytes, and one it omits in part encodes only its remaining frames.
         """
+        skip = config.unit_skip(unit_index)
 
         def encode() -> bytes:
-            return encode_video_unit(config, _pixels(source, config))
+            pixels = _pixels(source, config)
+            if skip >= pixels.shape[0]:
+                return b""
+            return encode_video_unit(config, pixels[skip:])
 
         return reservation.configure(
             encode,

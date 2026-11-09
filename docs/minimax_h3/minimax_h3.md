@@ -94,7 +94,7 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 | `model` | The served model name. |
 | `task` | `t2va`, `fl2va` or `ref2va`, one the served checkpoint serves. |
 | `prompt` | Plain text. A `ref2va` prompt names its references in request order as `<Picture n>`, `<Video n>` and `<Audio n>`. |
-| `conditions` | `t2va` takes none; `fl2va` one or two image keyframes (`frame_index` 0 or -1); `ref2va` up to 9 images, 3 videos and 3 audio tracks, 12 in all. Each has `type` (`image`, `video`, `video_audio` or `audio`), `uri` (`data:`, `http(s)://` or `file://`), `role` (`keyframe` or `reference`), and optionally `frame_index` or `start_time_seconds`. |
+| `conditions` | `t2va` takes none; `fl2va` one or two image keyframes (`frame_index` 0 or -1); `ref2va` up to 9 images, 3 videos and 3 audio tracks, 12 in all, and one continuation clip besides ([below](#continuing-a-video)). Each has `type` (`image`, `video`, `video_audio` or `audio`), `uri` (`data:`, `http(s)://` or `file://`), `role` (`keyframe`, `reference` or `continuation`), and optionally `frame_index` or `start_time_seconds`. |
 | `target` | `short_edge` (768 or 480), `aspect_ratio` (below, or `auto`: the keyframe's aspect for `fl2va`, 16:9 otherwise) and `duration_seconds` (4 to the served maximum). |
 | `seed` | Default 42. |
 
@@ -104,6 +104,33 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 | 480 | 992×416 | 832×480 | 640×480 | 480×480 | 480×640 | 480×832 |
 
 A video has `duration_seconds × 24` frames, rounded up to the next count of the form 17n + 5: 5 seconds give 124 frames and 15 give 362. Any other field is refused.
+
+### Continuing a video
+
+A `ref2va` request can continue an earlier video. Its `conditions` then hold one `{"type": "video_audio", "role": "continuation", "uri": ...}` (or `"type": "video"`): the earlier video's last 5, 22 or 39 frames and their sound, as a clip of its own. The generated video starts by regenerating the clip's frames in place, and the response holds only the frames after them and the sound from the same instant, so the caller appends it to the earlier video. Of 5, 22 and 39 frames, 22 continue an earlier video most smoothly.
+
+```json
+{
+  "model": "MiniMax-H3",
+  "task": "ref2va",
+  "prompt": "She keeps walking toward the camera and ...",
+  "conditions": [
+    {"type": "video_audio", "uri": "file:///srv/media/tail.mp4", "role": "continuation"}
+  ],
+  "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 10},
+  "seed": 0
+}
+```
+
+| Rule | Detail |
+| --- | --- |
+| Clip | Exactly 5, 22 or 39 frames once resampled to 24 fps, on the target canvas (1344×768 above). It is not cropped or scaled, and it is not presented to the text encoder. A `video_audio` clip needs sound within its frames; a `video` clip conditions with its sound when it has any, otherwise with its frames alone. A soundtrack is cut to the clip's duration. `GET /v1/capabilities` lists the frame counts as `task_conditions.ref2va.continuation_frames`. |
+| Count | At most one clip a request. It takes none of the reference slots and suffices as the request's only visual condition; images, videos and audio may still follow it as references. A continuation takes no keyframes, `frame_index` or `start_time_seconds`. |
+| Duration | `target.duration_seconds` is required and counts the new frames only. The video generates the clip's frames and the new ones, rounded up to `17n + 5`: 22 frames and 5 seconds generate 158 and return 136. Both together may not exceed the longest video served (362 frames at 15 seconds), so a 22-frame clip allows 14.17 seconds, a 5-frame one 14.875 and a 39-frame one 13.46; a longer duration is refused, not shortened. |
+| Capacity | The clip's rows count toward `--max-condition-rows`: a 22-frame clip with sound adds 7,130 rows at 1344×768 and 2,804 at 832×480. |
+| Prompt | Write it from the clip's actual end state. When its opening contradicts the clip, the model tends to cut to a new shot right after it. |
+
+The clip is placed as FastVideo's `continuation_video` places it, the reference context of [ComfyUI-H3-Continuum](https://github.com/ukr8b3g-cmyk/ComfyUI-H3-Continuum): after the references, it advances the rotary clock as a video reference with its soundtrack does, and its latent frames and audio latents then take the coordinates of the generated video's first latent frames and audio latents. Its frames are anchored at the visual-condition timestep and its sound at the audio-reference one, as a reference's are, and FastH3 Omni's sparse attention keeps its tiles dense. Every continuation drifts a little toward higher saturation and sharpness, so a chain of fewer, longer segments (two of 15 seconds rather than six of 5) holds up better.
 
 `POST /v1/videos` creates an asynchronous job instead: `GET /v1/videos/{id}` reports its state, `GET /v1/videos/{id}/content` returns the MP4 and `DELETE /v1/videos/{id}` cancels it. `GET /v1/capabilities` reports the served tasks, canvases, durations and capacities.
 

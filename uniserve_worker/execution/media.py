@@ -31,7 +31,12 @@ from typing import TYPE_CHECKING
 import torch
 
 from uniserve.media import video
-from uniserve.model import AudioDecoder, VideoDecoder, VideoPostprocessor
+from uniserve.model import (
+    AudioDecoder,
+    ConditionRole,
+    VideoDecoder,
+    VideoPostprocessor,
+)
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.tensors import TensorOutput, concatenate_views
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
@@ -633,18 +638,47 @@ def warmup_postprocess(
             cursor += count
 
 
-def mux_config(runner: ModelExecutor, media) -> AvMuxConfig:
-    """Return the container settings one request's media units encode under."""
+def continuation_frames(admission: NewRequest) -> int:
+    """Frames of the clip a video request continues; 0 without one.
+
+    The generated video starts by regenerating the clip's frames in place,
+    and the artifact omits them and the matching start of the audio track.
+    """
+    video = admission.video
+    if video is None:
+        return 0
+    return sum(
+        condition.video.vae_frames
+        for condition in video.conditions
+        if condition.role == ConditionRole.CONTINUATION
+        and condition.video is not None
+    )
+
+
+def mux_config(runner: ModelExecutor, admission: NewRequest) -> AvMuxConfig:
+    """Return the container settings one request's media units encode under.
+
+    Raises:
+        WorkerError: ``invalid_descriptor`` for an admission without media
+            dimensions, or a continuation clip that leaves no new frame.
+    """
+    media = admission.diffusion
+    if media is None:
+        raise invalid_descriptor("video call has no admitted media dimensions")
     decoder = runner.video_decoder
     clips = decoder.clips(media.num_frames)
-    return AvMuxConfig(
-        width=media.width,
-        height=media.height,
-        frame_count=media.num_frames,
-        frame_rate=runner.video_postprocessor.frame_rate,
-        audio_rate=runner.audio_decoder.sample_rate,
-        video_unit_frames=tuple(clip.stop - clip.start for clip in clips),
-    )
+    try:
+        return AvMuxConfig(
+            width=media.width,
+            height=media.height,
+            frame_count=media.num_frames,
+            frame_rate=runner.video_postprocessor.frame_rate,
+            audio_rate=runner.audio_decoder.sample_rate,
+            video_unit_frames=tuple(clip.stop - clip.start for clip in clips),
+            skip_frames=continuation_frames(admission),
+        )
+    except ValueError as error:
+        raise invalid_descriptor(str(error)) from error
 
 
 def sample_generation(step_index: int) -> int:

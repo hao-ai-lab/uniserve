@@ -315,7 +315,7 @@ def execute(
         from uniserve_worker.execution.media import decode_range
 
         cursor = int(decode_range(call, state=state).cursor)
-        config = mux_config(model_executor, media)
+        config = mux_config(model_executor, request.request.admission)
         publication = _input_publication(call, state)
         # Batch preparation borrows the round only when it is published over
         # shared storage on this node; otherwise the tensor store holds it.
@@ -438,7 +438,7 @@ def execute(
     elif call.kind is MediaCall.AUDIO_ENCODING:
         if media_mux is None:
             raise unsupported_setup("audio encoding has no muxer resources")
-        config = mux_config(model_executor, media)
+        config = mux_config(model_executor, request.request.admission)
         media_mux.open(call.request_key, config=config)
         if len(call.inputs) != 1:
             raise invalid_descriptor("audio encoding requires one PCM input")
@@ -466,7 +466,8 @@ def execute(
         if media_mux is None:
             raise unsupported_setup("artifact assembly has no muxer resources")
         media_mux.open(
-            call.request_key, config=mux_config(model_executor, media)
+            call.request_key,
+            config=mux_config(model_executor, request.request.admission),
         )
         # A muxing call carries the encode rounds completed since the last
         # one, one product per round in media unit order, and the muxer
