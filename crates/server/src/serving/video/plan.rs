@@ -47,7 +47,7 @@ use uniserve_engine::{FrameClips, ReferenceLimits, ServedCanvas};
 
 use super::probe::{AudioFacts, ImageFacts, MediaFacts, VideoFacts};
 use super::{RequestField, VideoInputError};
-use crate::serving::video_frame_count;
+use crate::serving::{requested_video_frames, video_frame_count};
 
 /// Short edge of the adapt_shape_v1 canvas rule, in pixels.
 pub const CANVAS_SHORT_EDGE: u32 = 768;
@@ -725,6 +725,15 @@ impl ConditionPlan {
             source_samples: clip.source_samples,
             samples: clip.samples,
         };
+        let video = |clip: &VideoClip| ConditionMedia::Video {
+            clip: uniserve_core::VideoClip {
+                canvas: clip.canvas,
+                start_frame: clip.start_frame,
+                frames: clip.frames,
+                vae_frames: clip.vae_frames,
+            },
+            soundtrack: clip.soundtrack.as_ref().map(audio),
+        };
         let (role, media) = match &self.prepared {
             Prepared::Keyframe(fit) => {
                 let role = match fit.position {
@@ -762,22 +771,10 @@ impl ConditionPlan {
                     size: *size,
                 }),
             ),
-            Prepared::Video(clip) | Prepared::Continuation(clip) => (
-                if matches!(self.prepared, Prepared::Continuation(_)) {
-                    uniserve_core::ConditionRole::Continuation
-                } else {
-                    uniserve_core::ConditionRole::Reference
-                },
-                ConditionMedia::Video {
-                    clip: uniserve_core::VideoClip {
-                        canvas: clip.canvas,
-                        start_frame: clip.start_frame,
-                        frames: clip.frames,
-                        vae_frames: clip.vae_frames,
-                    },
-                    soundtrack: clip.soundtrack.as_ref().map(audio),
-                },
-            ),
+            Prepared::Video(clip) => (uniserve_core::ConditionRole::Reference, video(clip)),
+            Prepared::Continuation(clip) => {
+                (uniserve_core::ConditionRole::Continuation, video(clip))
+            }
             Prepared::Audio(clip) => (
                 uniserve_core::ConditionRole::Reference,
                 ConditionMedia::Audio(audio(clip)),
@@ -827,9 +824,6 @@ pub struct RequestPlan {
     /// Generated frames, a legal count of the deployment's frame rule; a
     /// continuation's include its clip's.
     pub num_frames: u32,
-    /// Frames of the continuation clip the generation starts by
-    /// regenerating, which the artifact omits; 0 without one.
-    pub continuation_frames: u32,
     /// One plan per condition, in request order.
     pub conditions: Vec<ConditionPlan>,
 }
@@ -837,8 +831,20 @@ pub struct RequestPlan {
 impl RequestPlan {
     /// Frames the artifact holds: the generated ones past a continuation
     /// clip's.
-    pub const fn output_frames(&self) -> u32 {
-        self.num_frames - self.continuation_frames
+    pub fn output_frames(&self) -> u32 {
+        self.num_frames - self.continuation_frames()
+    }
+
+    /// Frames of the continuation clip the generation starts by
+    /// regenerating, which the artifact omits; 0 without one.
+    pub fn continuation_frames(&self) -> u32 {
+        self.conditions
+            .iter()
+            .find_map(|plan| match plan.prepared {
+                Prepared::Continuation(clip) => Some(clip.frames),
+                _ => None,
+            })
+            .unwrap_or(0)
     }
 
     /// The units each condition's reference image is encoded in when one
@@ -1705,37 +1711,25 @@ pub fn plan_request(
     let continuation = conditions
         .iter()
         .position(|condition| condition.role == ConditionRole::Continuation);
+    // `check_request` requires the duration of a continuation.
     if continuation.is_some() && target.duration_seconds.is_none() {
-        return Err(VideoInputError::invalid(
-            RequestField::TargetDuration,
-            "is required with a continuation clip, and counts its new frames only",
+        return Err(VideoInputError::internal(
+            "a continuation was planned without its duration",
         ));
     }
-    let (duration_seconds, mut frames) = resolve_frames(target, &soundtracks, limits)?;
+    let (duration_seconds, generated) = resolve_frames(target, &soundtracks, limits)?;
 
     let size = target_canvas(task, target, media, limits)?;
     check_served(size, limits)?;
 
     // A continuation generates its clip's frames again before the new ones.
-    let mut clip = None;
-    if let Some(index) = continuation {
-        let MediaFacts::Video(video) = &media[index] else {
-            return Err(VideoInputError::condition(
-                index,
-                "a continuation clip must be a video",
-            ));
-        };
-        let planned = continuation_clip(video, size, limits.frame_rate, &limits.frames)
-            .map_err(|error| VideoInputError::condition(index, error))?;
-        if condition_needs_sound(&conditions[index]) && planned.soundtrack.is_none() {
-            return Err(VideoInputError::condition(
-                index,
-                "a video_audio continuation clip needs sound within its frames",
-            ));
-        }
-        frames = continuation_frame_count(duration_seconds, planned.frames, limits)?;
-        clip = Some(planned);
-    }
+    let clip = continuation
+        .map(|index| plan_continuation(index, &conditions[index], &media[index], size, limits))
+        .transpose()?;
+    let frames = match clip {
+        Some(clip) => continuation_frame_count(duration_seconds, clip.frames, limits)?,
+        None => generated,
+    };
 
     let mut plans = Vec::with_capacity(conditions.len());
     let mut keyframes = 0;
@@ -1774,14 +1768,40 @@ pub fn plan_request(
         canvas: size,
         duration_seconds,
         num_frames: frames,
-        continuation_frames: clip.map_or(0, |clip| clip.frames),
         conditions: plans,
     })
 }
 
-/// Whether a condition's type requires a soundtrack.
-fn condition_needs_sound(condition: &ConditionSpec) -> bool {
-    condition.condition_type == ConditionType::VideoAudio
+/// Sizes the continuation clip `media` of condition `index` on the
+/// generated canvas `size` ([`continuation_clip`]).
+///
+/// # Errors
+///
+/// Returns [`VideoInputError::Invalid`] for the condition when the clip is
+/// off the canvas or its frame count, or a `video_audio` clip has no sound
+/// within its frames, and [`VideoInputError::Internal`] for media that is
+/// not a video, which `check_media` rejects first.
+fn plan_continuation(
+    index: usize,
+    condition: &ConditionSpec,
+    media: &MediaFacts,
+    size: Canvas,
+    limits: &PlanLimits,
+) -> Result<VideoClip, VideoInputError> {
+    let MediaFacts::Video(video) = media else {
+        return Err(VideoInputError::internal(
+            "a continuation clip was planned without video media",
+        ));
+    };
+    let clip = continuation_clip(video, size, limits.frame_rate, &limits.frames)
+        .map_err(|error| VideoInputError::condition(index, error))?;
+    if condition.condition_type == ConditionType::VideoAudio && clip.soundtrack.is_none() {
+        return Err(VideoInputError::condition(
+            index,
+            "a video_audio continuation clip needs sound within its frames",
+        ));
+    }
+    Ok(clip)
 }
 
 /// The generated frames of a continuation: its clip's `clip_frames`, then
@@ -1797,15 +1817,11 @@ fn continuation_frame_count(
     clip_frames: u32,
     limits: &PlanLimits,
 ) -> Result<u32, VideoInputError> {
-    let longest = video_frame_count(
-        limits.max_video_seconds,
+    let longest = limits.frames.align_up(requested_video_frames(
         limits.max_video_seconds,
         limits.frame_rate,
-        &limits.frames,
-    )
-    .map_err(|error| VideoInputError::internal(format!("the longest video: {error}")))?;
-    // `check_request` bounded the duration, so the product is exact.
-    let new = (seconds * f64::from(limits.frame_rate)).round_ties_even() as u32;
+    ));
+    let new = requested_video_frames(seconds, limits.frame_rate);
     let frames = limits.frames.align_up(clip_frames + new);
     if frames > longest {
         let most = longest.saturating_sub(clip_frames);
@@ -2583,12 +2599,7 @@ pub(super) mod tests {
             },
             ..limits()
         };
-        let reference = |condition_type| ConditionSpec {
-            condition_type,
-            role: ConditionRole::Reference,
-            frame_index: None,
-            start_seconds: None,
-        };
+        let reference = |condition_type| spec(condition_type, ConditionRole::Reference);
         let image = reference(ConditionType::Image);
         let video = reference(ConditionType::Video);
         let audio = reference(ConditionType::Audio);
@@ -2621,7 +2632,7 @@ pub(super) mod tests {
     /// Limits at the two 16:9 canvases, for continuation clips.
     fn continuation_limits() -> PlanLimits {
         PlanLimits {
-            tasks: vec![VideoTask::Ref2va],
+            tasks: vec![VideoTask::T2va, VideoTask::Fl2va, VideoTask::Ref2va],
             canvases: vec![
                 served(768, "16:9", 1344, 768),
                 served(480, "16:9", 832, 480),
@@ -2630,6 +2641,7 @@ pub(super) mod tests {
         }
     }
 
+    /// A condition of `condition_type` and `role` with no other field.
     fn spec(condition_type: ConditionType, role: ConditionRole) -> ConditionSpec {
         ConditionSpec {
             condition_type,
@@ -2673,6 +2685,29 @@ pub(super) mod tests {
         }
     }
 
+    /// Plans a `ref2va` request at a 16:9 canvas under `continuation_limits`.
+    fn plan(
+        conditions: &[ConditionSpec],
+        media: &[MediaFacts],
+        short_edge: u32,
+        seconds: f64,
+    ) -> Result<RequestPlan, super::VideoInputError> {
+        plan_request(
+            VideoTask::Ref2va,
+            &target(short_edge, Some(seconds)),
+            conditions,
+            media,
+            &vision(&fixture()),
+            &continuation_limits(),
+        )
+    }
+
+    /// Asserts that `error` names `field` and says `message`.
+    fn assert_refused(error: &super::VideoInputError, field: RequestField, message: &str) {
+        assert_eq!(error.field(), Some(field), "{message}: {error}");
+        assert!(error.to_string().contains(message), "{message}: {error}");
+    }
+
     /// The continuation clip frame counts follow the frame rule: a lone tail,
     /// then one or two whole clips before it.
     #[test]
@@ -2693,8 +2728,6 @@ pub(super) mod tests {
     /// duration; the artifact omits its frames.
     #[test]
     fn a_continuation_plans_its_clip_and_the_new_frames() {
-        let limits = continuation_limits();
-        let vision = vision(&fixture());
         let conditions = [
             spec(ConditionType::Image, ConditionRole::Reference),
             spec(ConditionType::VideoAudio, ConditionRole::Continuation),
@@ -2704,7 +2737,7 @@ pub(super) mod tests {
             height: 1024,
         });
         for (short_edge, (width, height), frames, generated, latents, audio) in [
-            (768, (1344, 768), 22, 142 + 16, 7, 37),
+            (768, (1344, 768), 22, 158, 7, 37),
             (768, (1344, 768), 39, 175, 12, 65),
             (768, (1344, 768), 5, 141, 2, 9),
             (480, (832, 480), 22, 158, 7, 37),
@@ -2713,21 +2746,13 @@ pub(super) mod tests {
                 image.clone(),
                 clip_facts(width, height, frames, 24, Some(96_000)),
             ];
-            let plan = plan_request(
-                VideoTask::Ref2va,
-                &target(short_edge, Some(5.0)),
-                &conditions,
-                &media,
-                &vision,
-                &limits,
-            )
-            .unwrap();
+            let plan = plan(&conditions, &media, short_edge, 5.0).unwrap();
             let canvas = Canvas {
                 width: width as u32,
                 height: height as u32,
             };
             assert_eq!(plan.num_frames, generated, "{frames}");
-            assert_eq!(plan.continuation_frames, frames as u32);
+            assert_eq!(plan.continuation_frames(), frames as u32);
             assert_eq!(plan.output_frames(), generated - frames as u32);
             let clip = &plan.conditions[1];
             assert!(clip.vision.is_none());
@@ -2777,78 +2802,42 @@ pub(super) mod tests {
     /// new frames only and a longer one is refused, not shortened.
     #[test]
     fn a_continuation_duration_counts_new_frames_only() {
-        let limits = continuation_limits();
-        let vision = vision(&fixture());
         let conditions = [spec(ConditionType::Video, ConditionRole::Continuation)];
         for (frames, longest, refused) in [
             (5, 14.875, 14.9),
             (22, 340.0 / 24.0, 14.2),
             (39, 323.0 / 24.0, 13.5),
+            // 15 seconds of new frames do not fit with any clip.
+            (22, 340.0 / 24.0, 15.0),
         ] {
             let media = [clip_facts(1344, 768, frames, 24, None)];
-            let plan = |seconds| {
-                plan_request(
-                    VideoTask::Ref2va,
-                    &target(768, Some(seconds)),
-                    &conditions,
-                    &media,
-                    &vision,
-                    &limits,
-                )
-            };
-            let accepted = plan(longest).unwrap();
+            let accepted = plan(&conditions, &media, 768, longest).unwrap();
             assert_eq!(accepted.num_frames, 362, "{frames}");
             assert_eq!(accepted.output_frames(), 362 - frames as u32);
             // A clip without sound conditions with its frames alone.
             assert_eq!(accepted.conditions[0].audio_rows, 0);
-            let error = plan(refused).unwrap_err();
-            assert_eq!(
-                error.field(),
-                Some(RequestField::TargetDuration),
-                "{frames}"
-            );
-            assert!(
-                error.to_string().contains("counts new frames only"),
-                "{error}"
+            let error = plan(&conditions, &media, 768, refused).unwrap_err();
+            assert_refused(
+                &error,
+                RequestField::TargetDuration,
+                "counts new frames only",
             );
         }
-        // 15 seconds of new frames do not fit with any clip.
-        let error = plan_request(
-            VideoTask::Ref2va,
-            &target(768, Some(15.0)),
-            &conditions,
-            &[clip_facts(1344, 768, 22, 24, None)],
-            &vision,
-            &limits,
-        )
-        .unwrap_err();
-        assert_eq!(error.field(), Some(RequestField::TargetDuration));
     }
 
     /// The clip must have a continuation frame count at the output rate and
     /// lie on the target canvas; a source rate is resampled first.
     #[test]
     fn a_continuation_clip_is_checked_against_the_target() {
-        let limits = continuation_limits();
-        let vision = vision(&fixture());
         let conditions = [spec(ConditionType::Video, ConditionRole::Continuation)];
-        let plan = |media: MediaFacts, short_edge| {
-            plan_request(
-                VideoTask::Ref2va,
-                &target(short_edge, Some(5.0)),
-                &conditions,
-                &[media],
-                &vision,
-                &limits,
-            )
-        };
         // 44 frames at 48 fps are 22 at 24.
-        assert_eq!(
-            plan(clip_facts(1344, 768, 44, 48, None), 768)
-                .unwrap()
-                .continuation_frames,
-            22
+        let resampled = plan(
+            &conditions,
+            &[clip_facts(1344, 768, 44, 48, None)],
+            768,
+            5.0,
         );
+        assert_eq!(resampled.unwrap().continuation_frames(), 22);
         for (media, short_edge, message) in [
             (
                 clip_facts(1344, 768, 23, 24, None),
@@ -2871,21 +2860,18 @@ pub(super) mod tests {
                 "on the target canvas 832x480",
             ),
         ] {
-            let error = plan(media, short_edge).unwrap_err();
-            assert_eq!(error.field(), Some(RequestField::Condition(0)), "{message}");
-            assert!(error.to_string().contains(message), "{message}: {error}");
+            let error = plan(&conditions, &[media], short_edge, 5.0).unwrap_err();
+            assert_refused(&error, RequestField::Condition(0), message);
         }
         // A video_audio clip needs sound within its frames.
-        let error = plan_request(
-            VideoTask::Ref2va,
-            &target(768, Some(5.0)),
+        let error = plan(
             &[spec(ConditionType::VideoAudio, ConditionRole::Continuation)],
             &[clip_facts(1344, 768, 22, 24, Some(0))],
-            &vision,
-            &limits,
+            768,
+            5.0,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("needs sound"), "{error}");
+        assert_refused(&error, RequestField::Condition(0), "needs sound");
     }
 
     /// The request rules of a continuation: ref2va only, one video clip, no
@@ -2895,7 +2881,6 @@ pub(super) mod tests {
     #[test]
     fn continuation_request_rules_apply_before_fetching() {
         let limits = PlanLimits {
-            tasks: vec![VideoTask::T2va, VideoTask::Fl2va, VideoTask::Ref2va],
             reference_limits: ReferenceLimits {
                 images: 1,
                 videos: 1,
@@ -2915,32 +2900,34 @@ pub(super) mod tests {
             frame_index: Some(-1),
             ..spec(ConditionType::Image, ConditionRole::Keyframe)
         };
+        let five = Some(5.0);
 
-        assert!(check(VideoTask::Ref2va, std::slice::from_ref(&clip), Some(5.0)).is_ok());
-        assert!(check(VideoTask::Ref2va, &[clip.clone(), audio.clone()], Some(5.0)).is_ok());
+        assert!(check(VideoTask::Ref2va, std::slice::from_ref(&clip), five).is_ok());
+        assert!(check(VideoTask::Ref2va, &[clip.clone(), audio.clone()], five).is_ok());
         // The clip takes no reference slot: a full set of references and it.
         assert!(
             check(
                 VideoTask::Ref2va,
-                &[image.clone(), clip.clone(), video.clone()],
-                Some(5.0)
+                &[image.clone(), clip.clone(), video],
+                five
             )
             .is_ok()
         );
 
+        let first = RequestField::Condition(0);
         for (task, conditions, seconds, field, message) in [
             (
                 VideoTask::Fl2va,
                 vec![clip.clone()],
-                Some(5.0),
-                Some(RequestField::Condition(0)),
+                five,
+                first,
                 "only ref2va",
             ),
             (
                 VideoTask::Ref2va,
                 vec![spec(ConditionType::Image, ConditionRole::Continuation)],
-                Some(5.0),
-                Some(RequestField::Condition(0)),
+                five,
+                first,
                 "must be a video",
             ),
             (
@@ -2949,8 +2936,8 @@ pub(super) mod tests {
                     start_seconds: Some(1.0),
                     ..clip.clone()
                 }],
-                Some(5.0),
-                Some(RequestField::Condition(0)),
+                five,
+                first,
                 "start_time_seconds",
             ),
             (
@@ -2959,49 +2946,48 @@ pub(super) mod tests {
                     frame_index: Some(0),
                     ..clip.clone()
                 }],
-                Some(5.0),
-                Some(RequestField::Condition(0)),
+                five,
+                first,
                 "frame_index",
             ),
             (
                 VideoTask::Ref2va,
                 vec![clip.clone(), clip.clone()],
-                Some(5.0),
-                Some(RequestField::Conditions),
+                five,
+                RequestField::Conditions,
                 "at most 1 continuation clip",
             ),
             (
                 VideoTask::Ref2va,
-                vec![keyframe.clone(), clip.clone()],
-                Some(5.0),
-                Some(RequestField::Conditions),
+                vec![keyframe, clip.clone()],
+                five,
+                RequestField::Conditions,
                 "no keyframes",
             ),
             (
                 VideoTask::Ref2va,
                 vec![clip.clone()],
                 None,
-                Some(RequestField::TargetDuration),
+                RequestField::TargetDuration,
                 "required with a continuation clip",
             ),
             (
                 VideoTask::Ref2va,
                 vec![clip.clone()],
                 Some(3.0),
-                Some(RequestField::TargetDuration),
+                RequestField::TargetDuration,
                 "duration",
             ),
             (
                 VideoTask::Ref2va,
-                vec![audio.clone()],
-                Some(5.0),
-                Some(RequestField::Conditions),
+                vec![audio],
+                five,
+                RequestField::Conditions,
                 "or a continuation clip",
             ),
         ] {
             let error = check(task, &conditions, seconds).unwrap_err();
-            assert_eq!(error.field(), field, "{message}: {error}");
-            assert!(error.to_string().contains(message), "{message}: {error}");
+            assert_refused(&error, field, message);
         }
     }
 

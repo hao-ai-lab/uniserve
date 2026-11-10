@@ -647,24 +647,29 @@ def continuation_frames(admission: NewRequest) -> int:
     video = admission.video
     if video is None:
         return 0
-    return sum(
-        condition.video.vae_frames
-        for condition in video.conditions
-        if condition.role == ConditionRole.CONTINUATION
-        and condition.video is not None
+    # A request continues at most one clip (``packing.condition_segments``).
+    return next(
+        (
+            condition.video.vae_frames
+            for condition in video.conditions
+            if condition.role == ConditionRole.CONTINUATION
+            and condition.video is not None
+        ),
+        0,
     )
 
 
-def mux_config(runner: ModelExecutor, admission: NewRequest) -> AvMuxConfig:
+def mux_config(
+    runner: ModelExecutor, media, skip_frames: int = 0
+) -> AvMuxConfig:
     """Return the container settings one request's media units encode under.
 
+    ``skip_frames`` leading frames are omitted (``continuation_frames``).
+
     Raises:
-        WorkerError: ``invalid_descriptor`` for an admission without media
-            dimensions, or a continuation clip that leaves no new frame.
+        WorkerError: ``invalid_descriptor`` for a continuation clip that
+            leaves no new frame.
     """
-    media = admission.diffusion
-    if media is None:
-        raise invalid_descriptor("video call has no admitted media dimensions")
     decoder = runner.video_decoder
     clips = decoder.clips(media.num_frames)
     try:
@@ -675,7 +680,7 @@ def mux_config(runner: ModelExecutor, admission: NewRequest) -> AvMuxConfig:
             frame_rate=runner.video_postprocessor.frame_rate,
             audio_rate=runner.audio_decoder.sample_rate,
             video_unit_frames=tuple(clip.stop - clip.start for clip in clips),
-            skip_frames=continuation_frames(admission),
+            skip_frames=skip_frames,
         )
     except ValueError as error:
         raise invalid_descriptor(str(error)) from error

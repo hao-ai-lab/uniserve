@@ -690,9 +690,16 @@ pub fn video_frame_count(
              {max_video_seconds}]"
         ));
     }
-    // The range bounds the product well below `u32::MAX`, so the conversion is exact.
-    let requested = (seconds * f64::from(frame_rate)).round_ties_even() as u32;
-    Ok(frames.align_up(requested))
+    Ok(frames.align_up(requested_video_frames(seconds, frame_rate)))
+}
+
+/// Returns the frames `seconds` last at `frame_rate`, rounded half to even as the reference
+/// implementations round with Python's `round`, before any alignment.
+///
+/// `seconds` lies within the served duration range ([`video_frame_count`]), which bounds the
+/// product well below `u32::MAX`, so the conversion is exact.
+pub fn requested_video_frames(seconds: f64, frame_rate: u32) -> u32 {
+    (seconds * f64::from(frame_rate)).round_ties_even() as u32
 }
 
 /// Returns the chat conversation of a prompt for a model that serves chat only.

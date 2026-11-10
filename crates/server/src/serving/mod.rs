@@ -68,7 +68,7 @@ pub use input::{
 pub use media::ImageInput;
 pub use model::{
     InputProcessor, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, RequestRenderer, WorkerCapabilities,
-    video_frame_count,
+    requested_video_frames, video_frame_count,
 };
 pub(crate) use model::{LoadedModel, LoadedRenderer};
 pub use preprocessing::chat_image_urls;

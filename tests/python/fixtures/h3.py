@@ -5,12 +5,17 @@ checkpoint fixture ``fixtures/models/fasth3``; the factories below read them
 with the production reader and apply per-test overrides.
 """
 
+import json
 from dataclasses import replace
 from functools import cache
 from pathlib import Path
 
+import torch
+
 from uniserve.diffusion import BlockGrid, RungGrid, UniformGrid
 from uniserve.loading import Config as IOConfig
+from uniserve.media import image, video
+from uniserve.model import Condition, ConditionRole
 from uniserve_models.minimax_h3 import (
     Config,
     DenoiserConfig,
@@ -21,6 +26,7 @@ from uniserve_models.minimax_h3 import (
     video_vae,
 )
 from uniserve_models.minimax_h3.config import FASTH3_CANVASES, read_config
+from uniserve_models.minimax_h3.denoiser import Denoiser
 from uniserve_models.minimax_h3.encoder import TextEncoderConfig
 
 CHECKPOINT = Path(__file__).parent / "models/fasth3"
@@ -154,4 +160,63 @@ def text_only_config() -> Config:
         denoisers={"transformer": replace(dmd_denoiser(), tasks=("t2va",))},
         video_vae=video_vae_config(),
         audio_vae=audio_vae_config(),
+    )
+
+
+def meta_denoiser(config: DenoiserConfig) -> Denoiser:
+    """A denoiser of ``config`` on the meta device: sizes, no weights."""
+    with torch.device("meta"):
+        return Denoiser(config)
+
+
+def small_reference_denoiser() -> Denoiser:
+    """A one-layer ``ref2va`` denoiser with seeded input projections."""
+    transformer = transformer_config(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_hidden_layers=1,
+        num_refiner_layers=1,
+        intermediate_size=128,
+        text_dim=40,
+        frequency_dim=16,
+        time_hidden_dim=64,
+        time_dim=32,
+        rope_frequency_dim=4,
+    )
+    model = Denoiser(base_denoiser(transformer, tasks=("ref2va",)))
+    generator = torch.Generator().manual_seed(3)
+    with torch.no_grad():
+        for projection in (
+            model.transformer.video_input,
+            model.transformer.audio_input,
+        ):
+            for parameter in projection.parameters():
+                parameter.copy_(
+                    torch.randn(parameter.shape, generator=generator) * 0.1
+                )
+    return model
+
+
+def packing_vectors(name: str) -> dict:
+    """The JSON packing vectors ``fixtures/<name>`` recorded from FastVideo."""
+    return json.loads((Path(__file__).parent / name).read_text())
+
+
+def vector_conditions(case: dict) -> tuple[Condition, ...]:
+    """A vectors case's conditions; a condition without a role is a reference.
+
+    A condition of zero frames is audio alone.
+    """
+    return tuple(
+        Condition(
+            ConditionRole(condition.get("role", "reference")),
+            None
+            if not condition["frames"]
+            else video.Config(
+                condition["frames"],
+                image.Config(condition["height"], condition["width"]),
+            ),
+            condition["samples"],
+        )
+        for condition in case["conditions"]
     )

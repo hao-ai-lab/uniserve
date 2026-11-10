@@ -241,12 +241,13 @@ class MediaEncoder:
         bytes, and one it omits in part encodes only its remaining frames.
         """
         skip = config.unit_skip(unit_index)
+        # A wholly omitted unit's frames are never read.
+        omitted = skip == config.video_unit_frames[unit_index]
 
         def encode() -> bytes:
-            pixels = _pixels(source, config)
-            if skip >= pixels.shape[0]:
+            if omitted:
                 return b""
-            return encode_video_unit(config, pixels[skip:])
+            return encode_video_unit(config, _pixels(source, config)[skip:])
 
         return reservation.configure(
             encode,

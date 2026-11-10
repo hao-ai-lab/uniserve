@@ -16,10 +16,10 @@ import av
 import numpy as np
 import pytest
 
+from tests.python.fixtures.host_lane import run_on_lane
 from uniserve.model import ConditionRole
 from uniserve_models.minimax_h3.output import video_clips
 from uniserve_worker.errors import WorkerError
-from uniserve_worker.execution.host import HostLane
 from uniserve_worker.execution.media import continuation_frames, mux_config
 from uniserve_worker.media.container import (
     AvMuxConfig,
@@ -57,6 +57,13 @@ def _frames(colors) -> np.ndarray:
     return frames
 
 
+def _assert_audio_lasts(container, frames: int) -> None:
+    """The container's audio lasts ``frames`` video frames, to one AAC frame."""
+    track = container.streams.audio[0]
+    duration = float(track.duration * track.time_base)
+    assert abs(duration - frames / 24) <= 1024 / 32000
+
+
 def test_units_omit_the_frames_before_the_skip():
     config = AvMuxConfig(
         width=32,
@@ -89,35 +96,13 @@ def test_the_audio_track_starts_at_the_skip():
         config = _config(skip)
         encoded = encode_audio_track(config, pcm)
         with av.open(io.BytesIO(encoded)) as container:
-            track = container.streams.audio[0]
-            assert (
-                abs(
-                    float(track.duration * track.time_base)
-                    - config.output_frames / 24
-                )
-                <= 1024 / 32000
-            )
+            _assert_audio_lasts(container, config.output_frames)
             samples = np.concatenate(
                 [frame.to_ndarray() for frame in container.decode(audio=0)],
                 axis=1,
             )
         level = float(np.abs(samples).max())
         assert (level > 0.3) == loud, (skip, level)
-
-
-@pytest.fixture
-def lane():
-    lane = HostLane(max_inflight=1, workers=1)
-    try:
-        yield lane
-    finally:
-        lane.close()
-
-
-def _run(lane: HostLane, schedule):
-    task = schedule(lane.reserve())
-    task.submit_if_ready()
-    return task.promise.result(timeout=30)
 
 
 def test_an_artifact_holds_only_the_new_frames(lane):
@@ -142,7 +127,7 @@ def test_an_artifact_holds_only_the_new_frames(lane):
     encoder, mux = MediaEncoder(rank=0), MediaMux(rank=0)
     try:
         units = tuple(
-            _run(
+            run_on_lane(
                 lane,
                 lambda reservation, index=index, source=source: encoder.unit(
                     request,
@@ -162,16 +147,16 @@ def test_an_artifact_holds_only_the_new_frames(lane):
 
         mux.open(request, config=config)
         pcm = np.zeros((config.audio_samples(8), 2), dtype=np.int16)
-        _run(
+        run_on_lane(
             lane, lambda reservation: mux.audio(request, pcm, reservation, CALL)
         )
-        _run(
+        run_on_lane(
             lane,
             lambda reservation: mux.append_units(
                 request, units, reservation, CALL
             ),
         )
-        artifact = _run(
+        artifact = run_on_lane(
             lane,
             lambda reservation: mux.finalize_artifact(
                 request, reservation, CALL
@@ -196,10 +181,7 @@ def test_an_artifact_holds_only_the_new_frames(lane):
             assert float(frame.pts * frame.time_base) == index / 24
             pixels = frame.to_ndarray(format="rgb24").mean((0, 1))
             assert np.abs(pixels - np.array(color)).max() < 24, (index, pixels)
-        track = container.streams.audio[0]
-        assert abs(float(track.duration * track.time_base) - 3 / 24) <= (
-            1024 / 32000
-        )
+        _assert_audio_lasts(container, 3)
 
 
 def test_a_session_counts_an_omitted_unit():
@@ -249,9 +231,13 @@ def test_a_request_skips_its_continuation_clip():
     for clip, skip in ((None, 0), (5, 5), (22, 22), (39, 39)):
         admission = _admission(158, clip)
         assert continuation_frames(admission) == skip
-        config = mux_config(_runner(), admission)
+        config = mux_config(_runner(), admission.diffusion, skip)
         assert (config.frame_count, config.skip_frames) == (158, skip)
         assert config.output_frames == 158 - skip
     assert continuation_frames(SimpleNamespace(video=None)) == 0
+    assert mux_config(_runner(), _admission(158, 22).diffusion).skip_frames == 0
     with pytest.raises(WorkerError, match="keep at least one"):
-        mux_config(_runner(), _admission(39, 39))
+        admission = _admission(39, 39)
+        mux_config(
+            _runner(), admission.diffusion, continuation_frames(admission)
+        )

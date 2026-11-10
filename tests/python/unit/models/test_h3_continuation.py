@@ -19,9 +19,7 @@ with no reference besides its clip packs through the same loop over no
 references, past FastVideo's check that requires one.
 """
 
-import json
 import math
-from pathlib import Path
 
 import pytest
 import torch
@@ -30,12 +28,15 @@ from tests.python.fixtures.h3 import (
     WIDE,
     base_denoiser,
     dmd_denoiser,
+    meta_denoiser,
     omni_denoiser,
+    packing_vectors,
+    small_reference_denoiser,
+    vector_conditions,
 )
 from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
 from uniserve.nn.attention import vsa
-from uniserve_models.minimax_h3.denoiser import Denoiser
 from uniserve_models.minimax_h3.packing import (
     AUDIO_CONDITION_GROUP,
     AUDIO_GROUP,
@@ -47,6 +48,7 @@ from uniserve_models.minimax_h3.packing import (
     continuation_latent_frames,
     dense_packing,
     dense_tables,
+    patchify_video,
     segment_packing,
     segment_tables,
     segment_tiles,
@@ -55,11 +57,7 @@ from uniserve_models.minimax_h3.packing import (
 
 pytestmark = pytest.mark.unit
 
-FIXTURE = json.loads(
-    (
-        Path(__file__).parents[2] / "fixtures" / "minimax_h3_continuation.json"
-    ).read_text()
-)
+FIXTURE = packing_vectors("minimax_h3_continuation.json")
 CASES = {case["name"]: case for case in FIXTURE["cases"]}
 GROUP_TIMESTEPS = {
     VIDEO_GROUP: FIXTURE["group_timesteps"]["video"],
@@ -67,26 +65,10 @@ GROUP_TIMESTEPS = {
     VISUAL_CONDITION_GROUP: FIXTURE["group_timesteps"]["visual_condition"],
     AUDIO_CONDITION_GROUP: FIXTURE["group_timesteps"]["audio_condition"],
 }
-ROLES = {
-    "reference": ConditionRole.REFERENCE,
-    "continuation": ConditionRole.CONTINUATION,
-}
-
-
-def _conditions(case) -> tuple[Condition, ...]:
-    return tuple(
-        Condition(
-            ROLES[condition["role"]],
-            None
-            if not condition["frames"]
-            else video.Config(
-                condition["frames"],
-                image.Config(condition["height"], condition["width"]),
-            ),
-            condition["samples"],
-        )
-        for condition in case["conditions"]
-    )
+# A square image reference.
+STILL = Condition(
+    ConditionRole.REFERENCE, video.Config(1, image.Config(1024, 1024))
+)
 
 
 def _canvas(case) -> image.Config:
@@ -97,16 +79,33 @@ def _spans(case) -> tuple[tuple[int, int], ...]:
     return tuple(tuple(span) for span in case["vision_spans"])
 
 
-def _timesteps(groups: torch.Tensor) -> torch.Tensor:
-    return torch.tensor(
-        [GROUP_TIMESTEPS[int(group)] for group in groups], dtype=torch.float32
+def _condition_rows(segments) -> int:
+    return sum(segment.video_rows + segment.audio_rows for segment in segments)
+
+
+def _assert_reference_rows(case, tables, order: torch.Tensor) -> None:
+    """Our rows ``order`` hold the reference's coordinates, tags and groups."""
+    assert torch.equal(
+        tables.position_ids.index_select(0, order),
+        torch.tensor(case["position_ids"], dtype=torch.float64),
+    )
+    assert torch.equal(
+        tables.token_tags.index_select(0, order),
+        torch.tensor(case["token_tags"]),
+    )
+    timesteps = torch.tensor(
+        [GROUP_TIMESTEPS[int(group)] for group in tables.groups[order]],
+        dtype=torch.float32,
+    )
+    assert torch.equal(
+        timesteps, torch.tensor(case["row_timesteps"], dtype=torch.float32)
     )
 
 
 def _dense(case):
     canvas = _canvas(case)
-    segments = condition_segments(_conditions(case), canvas)
-    condition_rows = sum(s.video_rows + s.audio_rows for s in segments)
+    segments = condition_segments(vector_conditions(case), canvas)
+    condition_rows = _condition_rows(segments)
     packing = dense_packing(
         num_frames=case["frames"],
         canvas=canvas,
@@ -141,23 +140,14 @@ def test_dense_rows_follow_the_reference_packing(name):
             torch.arange(0, packing.video_rows),
         )
     )
-    expected = torch.tensor(case["position_ids"], dtype=torch.float64)
-    assert torch.equal(tables.position_ids.index_select(0, order), expected)
-    assert torch.equal(
-        tables.token_tags.index_select(0, order),
-        torch.tensor(case["token_tags"]),
-    )
-    assert torch.equal(
-        _timesteps(tables.groups.index_select(0, order)),
-        torch.tensor(case["row_timesteps"], dtype=torch.float32),
-    )
+    _assert_reference_rows(case, tables, order)
     assert tables.used == prefix + case["text_tokens"] + condition_rows
 
 
 def _segments(case):
     tile = FIXTURE["tile"]
     canvas = _canvas(case)
-    segments = condition_segments(_conditions(case), canvas)
+    segments = condition_segments(vector_conditions(case), canvas)
     packing = segment_packing(
         num_frames=case["frames"],
         canvas=canvas,
@@ -182,7 +172,7 @@ def _segments(case):
     taken = tables.prefix_index != packing.zero_row
     source = torch.full((packing.zero_row,), -1, dtype=torch.int64)
     source[tables.prefix_index[taken]] = torch.nonzero(taken).flatten()
-    conditions = sum(s.video_rows + s.audio_rows for s in segments)
+    conditions = _condition_rows(segments)
     order = torch.cat(
         (
             source[: case["text_tokens"]],
@@ -200,16 +190,7 @@ def test_segment_rows_and_tiles_follow_the_reference_packing(name):
     """FastH3 Omni holds the same rows; the clip's tiles stay dense."""
     case = CASES[name]
     packing, tables, order = _segments(case)
-    expected = torch.tensor(case["position_ids"], dtype=torch.float64)
-    assert torch.equal(tables.position_ids.index_select(0, order), expected)
-    assert torch.equal(
-        tables.token_tags.index_select(0, order),
-        torch.tensor(case["token_tags"]),
-    )
-    assert torch.equal(
-        _timesteps(tables.groups.index_select(0, order)),
-        torch.tensor(case["row_timesteps"], dtype=torch.float32),
-    )
+    _assert_reference_rows(case, tables, order)
 
     # Each reference tile maps to one of ours, every row at the same offset.
     tile = FIXTURE["tile"]
@@ -237,23 +218,20 @@ def test_segment_rows_and_tiles_follow_the_reference_packing(name):
             assert int(tables.tile_segments[ours]) == segment
 
 
-def _clip_case(frames: int, samples: int, *, canvas=WIDE, num_frames=158):
-    clip = Condition(
-        ConditionRole.CONTINUATION, video.Config(frames, canvas), samples
-    )
-    still = Condition(
-        ConditionRole.REFERENCE, video.Config(1, image.Config(1024, 1024))
-    )
-    # Listed first, the clip still packs after the references.
-    return (clip, still), num_frames
+# Generated frames of the aliasing cases.
+CLIP_CASE_FRAMES = 158
 
 
 @pytest.mark.parametrize("frames", CONTINUATION_FRAMES)
 @pytest.mark.parametrize("samples", [0, 29_334])
 def test_a_clip_aliases_the_start_of_the_generation(frames, samples):
     """Dense and tiled: the clip's rows sit on the generated rows' start."""
-    conditions, num_frames = _clip_case(frames, samples)
-    segments = condition_segments(conditions, WIDE)
+    num_frames = CLIP_CASE_FRAMES
+    continuation = Condition(
+        ConditionRole.CONTINUATION, video.Config(frames, WIDE), samples
+    )
+    # Listed first, the clip still packs after the references.
+    segments = condition_segments((continuation, STILL), WIDE)
     assert [segment.kind for segment in segments] == [
         SegmentKind.IMAGE,
         SegmentKind.CONTINUATION,
@@ -264,7 +242,7 @@ def test_a_clip_aliases_the_start_of_the_generation(frames, samples):
     assert clip.audio_frames == math.ceil(samples / 800)
 
     text = 80
-    rows = sum(s.video_rows + s.audio_rows for s in segments)
+    rows = _condition_rows(segments)
     packing = dense_packing(
         num_frames=num_frames,
         canvas=WIDE,
@@ -367,7 +345,6 @@ def test_clip_frame_counts_end_on_vae_clip_boundaries():
 
 
 def test_clips_are_refused_off_the_contract():
-    still = Condition(ConditionRole.REFERENCE, video.Config(1, WIDE))
     clip = Condition(ConditionRole.CONTINUATION, video.Config(22, WIDE))
     first = Condition(ConditionRole.FIRST_FRAME, video.Config(1, WIDE))
     with pytest.raises(ValueError, match="5, 22, 39 frames"):
@@ -386,7 +363,7 @@ def test_clips_are_refused_off_the_contract():
             WIDE,
         )
     with pytest.raises(ValueError, match="at most one clip"):
-        condition_segments((clip, still, clip), WIDE)
+        condition_segments((clip, STILL, clip), WIDE)
     with pytest.raises(ValueError, match="no keyframes"):
         condition_segments((first, clip), WIDE)
     with pytest.raises(ValueError, match="two or more frames"):
@@ -401,11 +378,6 @@ def test_clips_are_refused_off_the_contract():
         ).audio_samples
         == 6_667
     )
-
-
-def _meta(config) -> Denoiser:
-    with torch.device("meta"):
-        return Denoiser(config)
 
 
 @pytest.mark.parametrize(
@@ -426,7 +398,7 @@ def test_denoisers_count_a_clip_toward_their_condition_rows(
         clip = Condition(
             ConditionRole.CONTINUATION, video.Config(frames, canvas), samples
         )
-        dense = _meta(base_denoiser(tasks=("ref2va",)))
+        dense = meta_denoiser(base_denoiser(tasks=("ref2va",)))
         size = dense.make_size(158, 64, canvas=canvas, conditions=(clip,))
         assert size.condition_rows == latents * rows_per_frame + 2 * audio
         # The clip draws one noise latent of its own geometry.
@@ -434,7 +406,7 @@ def test_denoisers_count_a_clip_toward_their_condition_rows(
             (1, 24, latents, canvas.height // 16, canvas.width // 16),
         )
         # FastH3 Omni rounds the clip's audio and frames to whole tiles.
-        omni = _meta(omni_denoiser())
+        omni = meta_denoiser(omni_denoiser())
         tile = omni._tile
         size = omni.make_size(158, 64, canvas=canvas, conditions=(clip,))
         assert size.condition_rows == tile * (
@@ -446,7 +418,9 @@ def test_denoisers_count_a_clip_toward_their_condition_rows(
     # Only a reference-to-video network takes a clip.
     for config in (base_denoiser(), dmd_denoiser()):
         with pytest.raises(ValueError, match="no references"):
-            _meta(config).make_size(158, 64, canvas=WIDE, conditions=(clip,))
+            meta_denoiser(config).make_size(
+                158, 64, canvas=WIDE, conditions=(clip,)
+            )
 
 
 def test_a_clip_is_anchored_like_a_reference():
@@ -455,15 +429,9 @@ def test_a_clip_is_anchored_like_a_reference():
     Its frames mix in their draw at the visual-condition time and its
     soundtrack is projected unchanged.
     """
-    from tests.python.unit.models.test_h3_conditions import _small
-    from uniserve_models.minimax_h3.packing import patchify_video
-
-    model = _small()
+    model = small_reference_denoiser()
     clip = Condition(ConditionRole.CONTINUATION, video.Config(22, WIDE), 29_334)
-    still = Condition(
-        ConditionRole.REFERENCE, video.Config(1, image.Config(1024, 1024))
-    )
-    size = model.make_size(158, 50, canvas=WIDE, conditions=(clip, still))
+    size = model.make_size(158, 50, canvas=WIDE, conditions=(clip, STILL))
     layout = model.layout_size(size)
     generator = torch.Generator().manual_seed(7)
     clip_rows = torch.randn(7 * 1008, 96, generator=generator)

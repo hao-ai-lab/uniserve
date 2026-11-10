@@ -14,7 +14,7 @@ which of these functions runs as which lane task and for which request.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Any
 
@@ -125,6 +125,8 @@ class AvMuxConfig:
     audio_codec: str = AUDIO_CODEC
     audio_frame_samples: int = 1024
     skip_frames: int = 0
+    # The first decoded frame of each media unit.
+    _unit_starts: tuple[int, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Validate positive media dimensions.
@@ -156,6 +158,11 @@ class AvMuxConfig:
             raise ValueError(
                 "media mux must keep at least one of the decoded frames"
             )
+        starts, start = [], 0
+        for frames in self.video_unit_frames:
+            starts.append(start)
+            start += frames
+        object.__setattr__(self, "_unit_starts", tuple(starts))
 
     @property
     def output_frames(self) -> int:
@@ -167,9 +174,8 @@ class AvMuxConfig:
 
         A unit wholly inside the skipped frames omits all of its frames.
         """
-        start = sum(self.video_unit_frames[:unit])
         frames = self.video_unit_frames[unit]
-        return min(frames, max(0, self.skip_frames - start))
+        return min(frames, max(0, self.skip_frames - self._unit_starts[unit]))
 
     def audio_samples(self, frames: int) -> int:
         """Samples at ``audio_rate`` that ``frames`` video frames last."""

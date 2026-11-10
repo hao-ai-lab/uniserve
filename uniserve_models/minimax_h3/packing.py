@@ -81,9 +81,9 @@ AUDIO_LATENTS_PER_SECOND = 40
 AUDIO_HOP = AUDIO_SAMPLE_RATE // AUDIO_LATENTS_PER_SECOND
 ROPE_FRAME_RESCALE = 5.0 / 3.0
 # Frame counts a continuation clip may have: it ends on a causal-VAE clip
-# boundary, 17 * n + 5 frames with n of 0 to 2, so it encodes to 2, 7 or 12
-# latent frames.
-CONTINUATION_FRAMES = (5, 22, 39)
+# boundary, the trailing CLIP_LATENTS frames after 0 to 2 whole clips
+# (5, 22 or 39), so it encodes to 2, 7 or 12 latent frames.
+CONTINUATION_FRAMES = tuple(CLIP_LATENTS + n * CLIP_FRAMES for n in range(3))
 # Output frames covered by each of the five latent frames of one 17-frame
 # clip: 1 + 4 * 4 = 17.
 ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
@@ -192,16 +192,18 @@ def condition_segments(
             else:
                 frames = video_latent_frames(pixels.num_frames)
         audio = math.ceil(condition.audio_samples / AUDIO_HOP)
-        if continuation:
+        if continuation or condition.role.is_keyframe:
             if pixels is None or pixels.frame != canvas:
                 raise ValueError(
                     "an H3 continuation clip lies on the target canvas"
+                    if continuation
+                    else "H3 keyframes are fitted to the target canvas"
                 )
-            kind = SegmentKind.CONTINUATION
-        elif condition.role.is_keyframe:
-            if pixels is None or pixels.frame != canvas:
-                raise ValueError("H3 keyframes are fitted to the target canvas")
-            kind = SegmentKind.KEYFRAME
+            kind = (
+                SegmentKind.CONTINUATION
+                if continuation
+                else SegmentKind.KEYFRAME
+            )
         elif pixels is None:
             kind = SegmentKind.AUDIO
         else:
@@ -275,8 +277,12 @@ def video_latent_frames(num_frames: int) -> int:
         or num_frames % CLIP_FRAMES != CLIP_LATENTS
     ):
         raise ValueError("H3 frame count must have the form 17 * n + 5")
-    clips = (num_frames - CLIP_LATENTS) // CLIP_FRAMES
-    return clips * CLIP_LATENTS + 2
+    return _clip_latent_frames(num_frames)
+
+
+def _clip_latent_frames(num_frames: int) -> int:
+    """Latent frames of ``17 * n + 5`` frames: five per whole clip, two more."""
+    return (num_frames - CLIP_LATENTS) // CLIP_FRAMES * CLIP_LATENTS + 2
 
 
 def continuation_latent_frames(num_frames: int) -> int:
@@ -296,7 +302,7 @@ def continuation_latent_frames(num_frames: int) -> int:
             + ", ".join(map(str, CONTINUATION_FRAMES))
             + " frames"
         )
-    return (num_frames - CLIP_LATENTS) // CLIP_FRAMES * CLIP_LATENTS + 2
+    return _clip_latent_frames(num_frames)
 
 
 def audio_latent_frames(num_frames: int) -> int:
@@ -504,7 +510,7 @@ def _place_audio(
 
 def _place_frames(
     positions: torch.Tensor,
-    rows: slice,
+    rows: slice | torch.Tensor,
     frames: int,
     origin: float,
     spatial: torch.Tensor,
@@ -554,18 +560,18 @@ def _place_keyframe(
     positions[rows, 1:] = spatial
 
 
-def _clip_span(segment: Segment) -> float:
-    """Rotary time a continuation clip advances the clock by.
+def _video_with_sound_span(segment: Segment) -> float:
+    """Rotary time a video and its soundtrack advance the clock by.
 
-    As a reference video with its soundtrack: the longer of its audio
-    latents and its frames' sequential span.
+    The longer of its audio latents and its frames' sequential span; a
+    reference video and a continuation clip advance it alike.
     """
     return max(float(segment.audio_frames), _video_span(segment.latent_frames))
 
 
 def _place_clip(
     positions: torch.Tensor,
-    audio: slice | torch.Tensor | None,
+    audio: slice | torch.Tensor,
     visual: slice | torch.Tensor,
     clip: Segment,
     origin: float,
@@ -579,18 +585,11 @@ def _place_clip(
     frames, on the target's spatial grid ``spatial``, and its stereo audio
     those of the generated audio's first latents, at the ends of the target
     width grid; ``visual`` lists the clip's packed rows in raster order and
-    ``audio`` its audio rows, None for a clip without sound.
+    ``audio`` its audio rows.
     """
-    if audio is not None and clip.audio_rows:
+    if clip.audio_rows:
         _place_audio(positions, audio, clip.audio_frames, origin, width_grid)
-    block = torch.empty(
-        (clip.latent_frames, spatial.shape[0], 3),
-        dtype=torch.float64,
-        device="cpu",
-    )
-    block[:, :, 0] = _temporal_grid(clip.latent_frames, origin)[:, None]
-    block[:, :, 1:] = spatial[None]
-    positions[visual] = block.reshape(-1, 3)
+    _place_frames(positions, visual, clip.latent_frames, origin, spatial)
 
 
 def _keyframe_span(frames: int) -> float:
@@ -702,7 +701,7 @@ def dense_tables(
             # Advances the clock as a video with its soundtrack does, then
             # sits at the generated timeline's origin.
             clips.append((segment, audio, visual))
-            clock += _clip_span(segment)
+            clock += _video_with_sound_span(segment)
         elif segment.kind == SegmentKind.IMAGE:
             grid, _ = _frame_grid(
                 segment.latent_height, segment.latent_width, patch_size
@@ -724,9 +723,7 @@ def dense_tables(
                 positions, audio, segment.audio_frames, clock, own_width
             )
             _place_frames(positions, visual, segment.latent_frames, clock, grid)
-            clock += max(
-                float(segment.audio_frames), _video_span(segment.latent_frames)
-            )
+            clock += _video_with_sound_span(segment)
     for segment, visual in keyframes:
         _place_keyframe(positions, visual, segment, clock, frames, spatial)
     for segment, audio_rows, visual in clips:
@@ -1108,6 +1105,7 @@ def segment_tables(
     keyframes = []
     clips = []
     for segment in segments:
+        audio = torch.empty(0, dtype=torch.int64)
         if segment.audio_rows:
             audio = dense_rows(next_tile, segment.audio_rows)
             next_tile += math.ceil(segment.audio_rows / tile)
@@ -1116,7 +1114,13 @@ def segment_tables(
             )
             source += segment.audio_rows
             tags[audio], groups[audio] = AUDIO_TAG, AUDIO_CONDITION_GROUP
-        if segment.kind == SegmentKind.KEYFRAME:
+        if segment.kind in (
+            SegmentKind.KEYFRAME,
+            SegmentKind.CONTINUATION,
+            SegmentKind.IMAGE,
+        ):
+            # Dense tiles, attended and attending densely; a clip's too, as
+            # the generated video continues it exactly.
             visual = dense_rows(next_tile, segment.video_rows)
             next_tile += math.ceil(segment.video_rows / tile)
             prefix_index[visual] = torch.arange(
@@ -1124,36 +1128,19 @@ def segment_tables(
             )
             source += segment.video_rows
             tags[visual], groups[visual] = VIDEO_TAG, VISUAL_CONDITION_GROUP
-            keyframes.append((segment, visual))
-        elif segment.kind == SegmentKind.CONTINUATION:
-            # Dense tiles, attended and attending densely: the generated
-            # video continues the clip exactly, so no tile of it is skipped.
-            visual = dense_rows(next_tile, segment.video_rows)
-            next_tile += math.ceil(segment.video_rows / tile)
-            prefix_index[visual] = torch.arange(
-                source, source + segment.video_rows
-            )
-            source += segment.video_rows
-            tags[visual], groups[visual] = VIDEO_TAG, VISUAL_CONDITION_GROUP
-            clips.append(
-                (segment, audio if segment.audio_rows else None, visual)
-            )
-            clock += _clip_span(segment)
-        elif segment.kind == SegmentKind.IMAGE:
-            visual = dense_rows(next_tile, segment.video_rows)
-            next_tile += math.ceil(segment.video_rows / tile)
-            prefix_index[visual] = torch.arange(
-                source, source + segment.video_rows
-            )
-            source += segment.video_rows
-            grid, _ = _frame_grid(
-                segment.latent_height, segment.latent_width, (1, 2, 2)
-            )
-            positions[visual, 0] = clock
-            positions[visual, 1:] = grid
-            tags[visual], groups[visual] = VIDEO_TAG, VISUAL_CONDITION_GROUP
-            # An image takes one integer slot, not a latent frame's span.
-            clock += 1.0
+            if segment.kind == SegmentKind.KEYFRAME:
+                keyframes.append((segment, visual))
+            elif segment.kind == SegmentKind.CONTINUATION:
+                clips.append((segment, audio, visual))
+                clock += _video_with_sound_span(segment)
+            else:
+                grid, _ = _frame_grid(
+                    segment.latent_height, segment.latent_width, (1, 2, 2)
+                )
+                positions[visual, 0] = clock
+                positions[visual, 1:] = grid
+                # An image takes one integer slot, not a latent frame's span.
+                clock += 1.0
         elif segment.kind == SegmentKind.AUDIO:
             _place_audio(
                 positions, audio, segment.audio_frames, clock, width_grid
@@ -1187,9 +1174,7 @@ def segment_tables(
             positions[visual] = block.reshape(-1, 3).index_select(0, raster)
             source += segment.video_rows
             tags[visual], groups[visual] = VIDEO_TAG, VISUAL_CONDITION_GROUP
-            clock += max(
-                float(segment.audio_frames), _video_span(segment.latent_frames)
-            )
+            clock += _video_with_sound_span(segment)
 
     for segment, visual in keyframes:
         _place_keyframe(positions, visual, segment, clock, frames, spatial)
