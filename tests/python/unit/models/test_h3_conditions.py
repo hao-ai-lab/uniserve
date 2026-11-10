@@ -13,7 +13,9 @@ from tests.python.fixtures.h3 import (
     WIDE,
     base_denoiser,
     dmd_denoiser,
+    meta_denoiser,
     omni_denoiser,
+    small_reference_denoiser,
     transformer_config,
 )
 from uniserve.media import image, video
@@ -35,13 +37,8 @@ CLIP = Condition(
 )
 
 
-def _meta(config) -> Denoiser:
-    with torch.device("meta"):
-        return Denoiser(config)
-
-
 def test_each_denoiser_takes_the_conditions_of_its_tasks():
-    keyframes = _meta(base_denoiser())
+    keyframes = meta_denoiser(base_denoiser())
     size = keyframes.make_size(124, 64, canvas=WIDE, conditions=(FIRST,))
     # One latent frame of the 16:9 canvas: 24 x 42 patches.
     assert (size.condition_rows, size.conditions) == (1008, (FIRST,))
@@ -52,7 +49,7 @@ def test_each_denoiser_takes_the_conditions_of_its_tasks():
     with pytest.raises(ValueError, match="no references"):
         keyframes.make_size(124, 64, canvas=WIDE, conditions=(IMAGE,))
 
-    references = _meta(base_denoiser(tasks=("ref2va",)))
+    references = meta_denoiser(base_denoiser(tasks=("ref2va",)))
     size = references.make_size(
         124, 64, canvas=WIDE, conditions=(CLIP, IMAGE, FIRST)
     )
@@ -62,24 +59,24 @@ def test_each_denoiser_takes_the_conditions_of_its_tasks():
 
     # Sparse students pack each keyframe in whole tiles of their own: 1008
     # rows fill 16 tiles of 64 or 8 of 128.
-    students = _meta(dmd_denoiser())
+    students = meta_denoiser(dmd_denoiser())
     size = students.make_size(124, 64, canvas=WIDE, conditions=(FIRST, LAST))
     assert size.condition_rows == 2 * 1024
     with pytest.raises(ValueError, match="no references"):
         students.make_size(124, 64, canvas=WIDE, conditions=(IMAGE,))
-    size = _meta(omni_denoiser()).make_size(
+    size = meta_denoiser(omni_denoiser()).make_size(
         124, 64, canvas=WIDE, conditions=(IMAGE, FIRST)
     )
     assert size.condition_rows == 2304 + 1024
 
     with pytest.raises(ValueError, match="no keyframes"):
-        _meta(base_denoiser(tasks=("t2va",))).make_size(
+        meta_denoiser(base_denoiser(tasks=("t2va",))).make_size(
             124, 64, canvas=WIDE, conditions=(FIRST,)
         )
 
 
 def test_visual_condition_draws_lead_in_packed_order():
-    model = _meta(base_denoiser(tasks=("ref2va",)))
+    model = meta_denoiser(base_denoiser(tasks=("ref2va",)))
     size = model.make_size(
         124, 64, canvas=WIDE, conditions=(CLIP, IMAGE, FIRST)
     )
@@ -97,35 +94,8 @@ def test_visual_condition_draws_lead_in_packed_order():
     assert elements <= model.condition_noise_capacity(layout)
 
 
-def _small() -> Denoiser:
-    transformer = transformer_config(
-        hidden_size=64,
-        num_attention_heads=4,
-        num_hidden_layers=1,
-        num_refiner_layers=1,
-        intermediate_size=128,
-        text_dim=40,
-        frequency_dim=16,
-        time_hidden_dim=64,
-        time_dim=32,
-        rope_frequency_dim=4,
-    )
-    model = Denoiser(base_denoiser(transformer, tasks=("ref2va",)))
-    generator = torch.Generator().manual_seed(3)
-    with torch.no_grad():
-        for projection in (
-            model.transformer.video_input,
-            model.transformer.audio_input,
-        ):
-            for parameter in projection.parameters():
-                parameter.copy_(
-                    torch.randn(parameter.shape, generator=generator) * 0.1
-                )
-    return model
-
-
 def test_encoded_conditions_fill_the_rows_past_the_prompt():
-    model = _small()
+    model = small_reference_denoiser()
     size = model.make_size(124, 50, canvas=WIDE, conditions=(CLIP, FIRST))
     layout = model.layout_size(size)
     generator = torch.Generator().manual_seed(5)
@@ -181,7 +151,7 @@ def test_encoded_conditions_fill_the_rows_past_the_prompt():
 
 
 def test_reference_segments_take_whole_tiles():
-    model = _meta(omni_denoiser())
+    model = meta_denoiser(omni_denoiser())
     voice = Condition(ConditionRole.REFERENCE, None, 32_000)
     size = model.make_size(
         124, 300, canvas=WIDE, conditions=(CLIP, IMAGE, voice)
@@ -248,7 +218,7 @@ def test_reference_segment_state_follows_its_layout():
 
 
 def test_a_condition_layout_holds_its_condition_rows():
-    model = _meta(base_denoiser(tasks=("ref2va",)))
+    model = meta_denoiser(base_denoiser(tasks=("ref2va",)))
     layout = model.layout_size(model.make_size(124, 64, canvas=WIDE))
     # The clip's 4032 + 120 rows and the image's 2304 take 101 whole 64-row
     # tiles; the rest of the layout is kept.
@@ -269,13 +239,13 @@ def test_a_condition_layout_holds_its_condition_rows():
 
 def test_a_condition_layout_respects_the_attention_kind():
     with pytest.raises(ValueError, match="takes no conditions"):
-        model = _meta(base_denoiser(tasks=("t2va",)))
+        model = meta_denoiser(base_denoiser(tasks=("t2va",)))
         model.condition_layout(
             model.layout_size(model.make_size(124, 64, canvas=WIDE)), 64
         )
 
     # A DMD student takes keyframes in its 64-row tiles.
-    model = _meta(dmd_denoiser())
+    model = meta_denoiser(dmd_denoiser())
     layout = model.layout_size(model.make_size(124, 64, canvas=WIDE))
     size = model.make_size(124, 64, canvas=WIDE, conditions=(FIRST, LAST))
     widened = model.condition_layout(layout, size.condition_rows)
@@ -283,7 +253,7 @@ def test_a_condition_layout_respects_the_attention_kind():
     assert model.holds(widened, size)
 
     # Segment packing takes conditions in its own 128-row tiles.
-    model = _meta(omni_denoiser())
+    model = meta_denoiser(omni_denoiser())
     layout = model.layout_size(model.make_size(124, 300, canvas=WIDE))
     widened = model.condition_layout(layout, 7000)
     assert widened.condition_rows == 55 * 128

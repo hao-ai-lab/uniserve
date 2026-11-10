@@ -12,15 +12,13 @@ order, and selection must keep the reference's key tiles. The vectors,
 ``minimax_h3_segments.json``, are FastVideo's packing of these cases.
 """
 
-import json
 import math
-from pathlib import Path
 
 import pytest
 import torch
 
-from uniserve.media import image, video
-from uniserve.model import Condition, ConditionRole
+from tests.python.fixtures.h3 import packing_vectors, vector_conditions
+from uniserve.media import image
 from uniserve.nn.attention import vsa
 from uniserve.nn.attention.vsa.segments import select
 from uniserve_models.minimax_h3.packing import (
@@ -36,11 +34,7 @@ from uniserve_models.minimax_h3.packing import (
 
 pytestmark = pytest.mark.unit
 
-FIXTURE = json.loads(
-    (
-        Path(__file__).parents[2] / "fixtures" / "minimax_h3_segments.json"
-    ).read_text()
-)
+FIXTURE = packing_vectors("minimax_h3_segments.json")
 CASES = {case["name"]: case for case in FIXTURE["cases"]}
 GROUP_TIMESTEPS = {
     VIDEO_GROUP: FIXTURE["group_timesteps"]["video"],
@@ -50,27 +44,11 @@ GROUP_TIMESTEPS = {
 }
 
 
-def _conditions(case) -> tuple[Condition, ...]:
-    return tuple(
-        Condition(
-            ConditionRole.REFERENCE,
-            None
-            if not condition["frames"]
-            else video.Config(
-                condition["frames"],
-                image.Config(condition["height"], condition["width"]),
-            ),
-            condition["samples"],
-        )
-        for condition in case["conditions"]
-    )
-
-
 def _layout(case):
     """The case's segment layout, with one spare text and condition tile."""
     tile = FIXTURE["tile"]
     canvas = image.Config(case["height"], case["width"])
-    segments = condition_segments(_conditions(case), canvas)
+    segments = condition_segments(vector_conditions(case), canvas)
     packing = segment_packing(
         num_frames=case["frames"],
         canvas=canvas,

@@ -7,8 +7,8 @@ import av
 import numpy as np
 import pytest
 
+from tests.python.fixtures.host_lane import run_on_lane
 from uniserve_worker.errors import WorkerError
-from uniserve_worker.execution.host import HostLane
 from uniserve_worker.media.container import AvMuxConfig
 from uniserve_worker.media.mux import MediaEncoder, MediaMux
 from uniserve_worker.protocol.identity import CallId, RequestKey
@@ -28,22 +28,6 @@ def _config() -> AvMuxConfig:
         audio_rate=32000,
         video_unit_frames=(4, 2),
     )
-
-
-@pytest.fixture
-def lane():
-    # A host rank is one codec slot: one task at a time on one thread.
-    lane = HostLane(max_inflight=1, workers=1)
-    try:
-        yield lane
-    finally:
-        lane.close()
-
-
-def _run(lane: HostLane, schedule):
-    task = schedule(lane.reserve())
-    task.submit_if_ready()
-    return task.promise.result(timeout=30)
 
 
 def test_borrowed_and_imported_units_assemble_with_audio_into_an_artifact(
@@ -70,7 +54,7 @@ def test_borrowed_and_imported_units_assemble_with_audio_into_an_artifact(
         # A unit decoded on this host is read in place and its borrow is
         # released once encoded; an imported unit arrives as an array.
         units = tuple(
-            _run(
+            run_on_lane(
                 lane,
                 lambda reservation, index=index, source=source: encoder.unit(
                     request,
@@ -87,17 +71,17 @@ def test_borrowed_and_imported_units_assemble_with_audio_into_an_artifact(
 
         mux.open(request, config=config)
         pcm = np.zeros((8000, 2), dtype=np.int16)
-        _run(
+        run_on_lane(
             lane, lambda reservation: mux.audio(request, pcm, reservation, CALL)
         )
         for unit in units:
-            _run(
+            run_on_lane(
                 lane,
                 lambda reservation, unit=unit: mux.append_units(
                     request, (unit,), reservation, CALL
                 ),
             )
-        artifact = _run(
+        artifact = run_on_lane(
             lane,
             lambda reservation: mux.finalize_artifact(
                 request, reservation, CALL
@@ -128,7 +112,7 @@ def test_a_unit_whose_bytes_do_not_form_frames_fails_its_task(lane):
     config = _config()
     encoder = MediaEncoder(rank=0)
     with pytest.raises(WorkerError, match="RGB24 dimensions"):
-        _run(
+        run_on_lane(
             lane,
             lambda reservation: encoder.unit(
                 RequestKey(1, 8, 0),

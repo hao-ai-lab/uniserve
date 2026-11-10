@@ -503,6 +503,7 @@ fn video_condition_from_table(table: fbs::VideoCondition<'_>) -> CodecResult<Vid
         fbs::ConditionRole::FirstFrame => ConditionRole::FirstFrame,
         fbs::ConditionRole::LastFrame => ConditionRole::LastFrame,
         fbs::ConditionRole::Reference => ConditionRole::Reference,
+        fbs::ConditionRole::Continuation => ConditionRole::Continuation,
         other => codec_bail!("unknown condition role {}", other.0),
     };
     let audio = table.audio().map(audio_clip_from_fb);

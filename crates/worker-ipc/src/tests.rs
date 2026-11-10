@@ -224,7 +224,8 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
 }
 
 /// One condition of each media kind: a cover-cropped keyframe, an image
-/// reference, a video reference with its soundtrack and an audio reference.
+/// reference, a video reference with its soundtrack, an audio reference and a
+/// continuation clip.
 fn reference_conditions() -> Vec<uniserve_core::VideoCondition> {
     use uniserve_core::{
         AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator,
@@ -315,6 +316,23 @@ fn reference_conditions() -> Vec<uniserve_core::VideoCondition> {
             media: ConditionMedia::Audio(soundtrack),
             vision: None,
             latent_units: Vec::new(),
+            audio_rows: 74,
+        },
+        // A continuation clip the conditioner does not read.
+        VideoCondition {
+            role: ConditionRole::Continuation,
+            source: source(4),
+            media: ConditionMedia::Video {
+                clip: VideoClip {
+                    canvas,
+                    start_frame: 0,
+                    frames: 5,
+                    vae_frames: 5,
+                },
+                soundtrack: Some(soundtrack),
+            },
+            vision: None,
+            latent_units: vec![1536],
             audio_rows: 74,
         },
     ]

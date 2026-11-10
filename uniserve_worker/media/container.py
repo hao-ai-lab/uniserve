@@ -14,7 +14,7 @@ which of these functions runs as which lane task and for which request.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Any
 
@@ -107,7 +107,13 @@ def require_media_codecs(video_codec: str, audio_codec: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class AvMuxConfig:
-    """Codec, frame, audio, and media unit settings for one media container."""
+    """Codec, frame, audio, and media unit settings for one media container.
+
+    ``frame_count`` and ``video_unit_frames`` describe the decoded video;
+    the container holds all of it but its first ``skip_frames`` frames and
+    the matching start of the audio track, which a continuation regenerates
+    from the clip it continues.
+    """
 
     width: int
     height: int
@@ -118,6 +124,9 @@ class AvMuxConfig:
     video_codec: str = VIDEO_CODEC
     audio_codec: str = AUDIO_CODEC
     audio_frame_samples: int = 1024
+    skip_frames: int = 0
+    # The first decoded frame of each media unit.
+    _unit_starts: tuple[int, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Validate positive media dimensions.
@@ -142,6 +151,35 @@ class AvMuxConfig:
             raise ValueError(
                 "media mux media units must cover the output frame count"
             )
+        if (
+            type(self.skip_frames) is not int
+            or not 0 <= self.skip_frames < self.frame_count
+        ):
+            raise ValueError(
+                "media mux must keep at least one of the decoded frames"
+            )
+        starts, start = [], 0
+        for frames in self.video_unit_frames:
+            starts.append(start)
+            start += frames
+        object.__setattr__(self, "_unit_starts", tuple(starts))
+
+    @property
+    def output_frames(self) -> int:
+        """Frames the container holds: the decoded ones past the skipped."""
+        return self.frame_count - self.skip_frames
+
+    def unit_skip(self, unit: int) -> int:
+        """Leading frames of media unit ``unit`` the container omits.
+
+        A unit wholly inside the skipped frames omits all of its frames.
+        """
+        frames = self.video_unit_frames[unit]
+        return min(frames, max(0, self.skip_frames - self._unit_starts[unit]))
+
+    def audio_samples(self, frames: int) -> int:
+        """Samples at ``audio_rate`` that ``frames`` video frames last."""
+        return round(frames * self.audio_rate / self.frame_rate)
 
 
 def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
@@ -196,9 +234,11 @@ def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
 def encode_audio_track(config: AvMuxConfig, pcm: np.ndarray) -> bytes:
     """Encode the request's stereo PCM as a self-contained MP4.
 
-    ``pcm`` holds interleaved int16 samples as ``[samples, 2]``. The track is
-    truncated or zero-padded to the video's duration, ``frame_count /
-    frame_rate`` seconds at ``audio_rate``, and encoded in planar frames of
+    ``pcm`` holds interleaved int16 samples as ``[samples, 2]``, starting
+    with the decoded video. The track skips the duration of the video's
+    ``skip_frames``, is truncated or zero-padded to the container's video
+    duration, ``output_frames / frame_rate`` seconds at ``audio_rate``, and
+    is encoded in planar frames of
     ``audio_frame_samples`` samples; the last frame is zero-padded to that
     size when the track does not fill it.
 
@@ -211,8 +251,9 @@ def encode_audio_track(config: AvMuxConfig, pcm: np.ndarray) -> bytes:
 
     if pcm.ndim != 2 or pcm.shape[1] != 2:
         raise ValueError("audio capture has invalid stereo dimensions")
-    target = round(config.frame_count * config.audio_rate / config.frame_rate)
-    source = pcm[:target]
+    target = config.audio_samples(config.output_frames)
+    skip = config.audio_samples(config.skip_frames)
+    source = pcm[skip : skip + target]
     if source.shape[0] < target:
         source = np.pad(source, ((0, target - source.shape[0]), (0, 0)))
 
@@ -298,7 +339,12 @@ class AvMuxSession:
         finally:
             source.close()
         template = encode_audio_track(
-            replace(self.config, frame_count=1, video_unit_frames=(1,)),
+            replace(
+                self.config,
+                frame_count=1,
+                video_unit_frames=(1,),
+                skip_frames=0,
+            ),
             np.zeros((1, 2), dtype=np.int16),
         )
         track = av.open(io.BytesIO(template), mode="r")
@@ -312,7 +358,9 @@ class AvMuxSession:
     def append(self, units: tuple[bytes, ...]) -> None:
         """Copy the packets of the next media units, in order.
 
-        The first unit ever appended also creates the container (`_open`).
+        The first nonempty unit appended also creates the container
+        (`_open`). An empty unit is one the container omits wholly
+        (`AvMuxConfig.unit_skip`) and contributes no packet.
 
         Raises:
             ValueError: When the units would exceed the request's unit count;
@@ -325,6 +373,9 @@ class AvMuxSession:
                 "artifact assembly received more media units than the request"
             )
         for payload in units:
+            if not payload:
+                self.units_appended += 1
+                continue
             if self._container is None:
                 self._open(payload)
             source = av.open(io.BytesIO(payload), mode="r")

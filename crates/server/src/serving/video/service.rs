@@ -21,7 +21,7 @@ use uniserve_engine::VideoDenoiserInfo;
 
 use super::plan::{
     CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, PlanLimits, ProcessorConfig,
-    ReferenceConfig, Target,
+    ReferenceConfig, Target, continuation_frames,
 };
 use super::probe::{MediaProber, ProbeConfig};
 use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
@@ -43,8 +43,8 @@ pub struct ProcessedVideo {
     pub request: DiffusionRequest,
     /// The requested duration in seconds, before frame alignment.
     pub duration_seconds: f64,
-    /// The duration of the generated frames, in seconds: the frame count at
-    /// the deployment's frame rate.
+    /// The duration of the artifact's frames, in seconds: their count at the
+    /// deployment's frame rate. A continuation's omit its clip's frames.
     pub actual_seconds: f64,
     /// The generated canvas.
     pub canvas: Canvas,
@@ -180,6 +180,7 @@ impl VideoService {
                         "max_audios": self.denoiser.references.audios,
                         "max_references": self.denoiser.references.total,
                         "keyframe_frame_indices": [[], [0], [-1], [0, -1]],
+                        "continuation_frames": continuation_frames(&self.denoiser.frames),
                         "reference_image_short_edge": references.image_short_edge,
                         "enlarge_references": references.enlarge,
                     }),
@@ -302,7 +303,7 @@ impl VideoService {
                 },
             },
             duration_seconds: plan.duration_seconds,
-            actual_seconds: f64::from(plan.num_frames) / f64::from(self.denoiser.frame_rate),
+            actual_seconds: f64::from(plan.output_frames()) / f64::from(self.denoiser.frame_rate),
             canvas: plan.canvas,
         })
     }

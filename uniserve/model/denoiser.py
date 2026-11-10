@@ -39,6 +39,15 @@ class ConditionRole(StrEnum):
     LAST_FRAME = "last_frame"
     # Conditions the generation as a whole.
     REFERENCE = "reference"
+    # The end of an earlier video, with its soundtrack when it has one, that
+    # the generated video continues: the generation starts by regenerating
+    # these frames in place, and the output omits them.
+    CONTINUATION = "continuation"
+
+    @property
+    def is_keyframe(self) -> bool:
+        """Whether the condition anchors one generated frame."""
+        return self in (ConditionRole.FIRST_FRAME, ConditionRole.LAST_FRAME)
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +55,7 @@ class Condition:
     """One conditioning input of a video request, as its encoders see it.
 
     Attributes:
-        role: Keyframe anchor or reference.
+        role: Keyframe anchor, reference or continuation clip.
         video: The encoded pixels' frame count and raster, as the video
             encoder receives them; an image is one frame. None for audio
             alone.
@@ -67,7 +76,11 @@ class Condition:
             raise ValueError("a condition's audio samples must be nonnegative")
         if self.video is None and self.audio_samples == 0:
             raise ValueError("a condition must carry pixels or audio")
-        if self.role != ConditionRole.REFERENCE and (
+        if self.role == ConditionRole.CONTINUATION and (
+            self.video is None or self.video.num_frames < 2
+        ):
+            raise ValueError("a continuation clip is two or more frames")
+        if self.role.is_keyframe and (
             self.video is None
             or self.video.num_frames != 1
             or self.audio_samples

@@ -300,6 +300,7 @@ fn video_condition<'a>(
                 ConditionRole::FirstFrame => fbs::ConditionRole::FirstFrame,
                 ConditionRole::LastFrame => fbs::ConditionRole::LastFrame,
                 ConditionRole::Reference => fbs::ConditionRole::Reference,
+                ConditionRole::Continuation => fbs::ConditionRole::Continuation,
             },
             source_name,
             source_bytes: v.source.bytes,

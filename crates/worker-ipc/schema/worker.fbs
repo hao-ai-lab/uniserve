@@ -543,7 +543,7 @@ table BatchCommandEnvelope { command:BatchCommand; }
 // carry the field semantics.
 
 enum VideoTask : ubyte { T2va, Fl2va, Ref2va }
-enum ConditionRole : ubyte { FirstFrame, LastFrame, Reference }
+enum ConditionRole : ubyte { FirstFrame, LastFrame, Reference, Continuation }
 
 /// A still image resized to `resized`, then the `size` window at (`left`,
 /// `top`) kept.

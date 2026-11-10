@@ -931,6 +931,7 @@ fn video_condition_to_py<'py>(
         ConditionRole::FirstFrame => "first_frame",
         ConditionRole::LastFrame => "last_frame",
         ConditionRole::Reference => "reference",
+        ConditionRole::Continuation => "continuation",
     };
     dict.set_item(intern!(py, "role"), role)?;
 

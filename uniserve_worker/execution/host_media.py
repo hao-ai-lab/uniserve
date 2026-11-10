@@ -287,12 +287,14 @@ def execute(
             ``HostTask.configure`` rejects one.
     """
     from uniserve_worker.execution import transfer
-    from uniserve_worker.execution.media import mux_config
+    from uniserve_worker.execution.media import continuation_frames, mux_config
 
     request = state.pending_output(call.request_key.request_id)
     media = request.request.admission.diffusion
     if media is None:
         raise invalid_descriptor("host media call has no admitted media")
+    # A continuation's artifact omits the frames that regenerate its clip.
+    skip = continuation_frames(request.request.admission)
     reservations = request.host.tasks
     if not reservations:
         raise RuntimeError("host media call has no reserved lane slots")
@@ -315,7 +317,7 @@ def execute(
         from uniserve_worker.execution.media import decode_range
 
         cursor = int(decode_range(call, state=state).cursor)
-        config = mux_config(model_executor, media)
+        config = mux_config(model_executor, media, skip)
         publication = _input_publication(call, state)
         # Batch preparation borrows the round only when it is published over
         # shared storage on this node; otherwise the tensor store holds it.
@@ -438,7 +440,7 @@ def execute(
     elif call.kind is MediaCall.AUDIO_ENCODING:
         if media_mux is None:
             raise unsupported_setup("audio encoding has no muxer resources")
-        config = mux_config(model_executor, media)
+        config = mux_config(model_executor, media, skip)
         media_mux.open(call.request_key, config=config)
         if len(call.inputs) != 1:
             raise invalid_descriptor("audio encoding requires one PCM input")
@@ -466,7 +468,8 @@ def execute(
         if media_mux is None:
             raise unsupported_setup("artifact assembly has no muxer resources")
         media_mux.open(
-            call.request_key, config=mux_config(model_executor, media)
+            call.request_key,
+            config=mux_config(model_executor, media, skip),
         )
         # A muxing call carries the encode rounds completed since the last
         # one, one product per round in media unit order, and the muxer
